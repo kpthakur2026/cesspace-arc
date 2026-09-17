@@ -1,7 +1,7 @@
 # Trust Boundaries — CesSpace ARC
 
 > **Document:** Security Specification
-> **Status:** RC-00 Approved Baseline
+> **Status:** RC-00 Proposed Baseline — Pending Independent Review
 > **Classification:** Security Architecture
 
 ---
@@ -33,10 +33,10 @@ CesSpace ARC partitions the system into **four distinct security zones separated
                                             ▼
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
 │ ZONE 2: POLICY ENFORCEMENT & AUDIT DOMAIN                                              │
-│ - Authoritative Policy Engine (packages/policy)                                        │
+│ - Authoritative Policy Engine (RC-01: Minimal Security Kernel; RC-04: Declarative)    │
 │ - Precedence Rule: DENY > REQUIRE APPROVAL > ALLOW                                     │
 │ - Approval token issuance and verification                                             │
-│ - Append-only audit logger with automatic secret redaction (packages/audit)            │
+│ - Structured audit logger with data minimization & redaction (packages/audit)          │
 └───────────────────────────────────────────┬────────────────────────────────────────────┘
                                             │
   ══════════════════════════════════════════╡ TRUST BOUNDARY 3 (Host Execution Boundary)
@@ -44,7 +44,7 @@ CesSpace ARC partitions the system into **four distinct security zones separated
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
 │ ZONE 3: MACHINE EXECUTION DOMAIN                                                       │
 │ - Local VM agent supervisor                                                            │
-│ - Filesystem jail (canonicalized paths, symlink escape checks)                         │
+│ - Filesystem jail (canonicalized paths, symlink checks, descriptor-relative traversal) │
 │ - Git execution supervisor (branch immutability, sanitized git invocations)            │
 │ - Process supervisor (execution timeouts, memory caps, non-root execution)             │
 └────────────────────────────────────────────────────────────────────────────────────────┘
@@ -55,14 +55,15 @@ CesSpace ARC partitions the system into **four distinct security zones separated
 ## 2. Trust Boundary Detailed Analysis
 
 ### Trust Boundary 1: Client Ingress & Protocol Boundary
+
 **Separates:** Zone 0 (Untrusted Client) from Zone 1 (Control Plane Ingress).
 
-* **Threat Profile:**
+- **Threat Profile:**
   - Flooding / Denial of Service via massive JSON-RPC payloads.
   - Malformed protocol messages designed to crash or exploit parsers.
   - Impersonation or session hijacking.
   - Parameter tampering (e.g., injecting shell metacharacters into JSON fields).
-* **Defensive Controls:**
+- **Defensive Controls:**
   1. **Strict Transport Layer:** All remote connections require TLS 1.3 with pinned certificates. Local connections use non-networked UNIX stdio pipes.
   2. **Schema Validation:** Strict JSON schema validation on every message before parsing domain logic. Any extra or unexpected fields trigger rejection.
   3. **Payload Bounds:** Hard ceiling on JSON-RPC message size (default: 4 MB). Any oversized frame is dropped at the transport boundary.
@@ -72,15 +73,16 @@ CesSpace ARC partitions the system into **four distinct security zones separated
 ---
 
 ### Trust Boundary 2: Policy & Decision Boundary
+
 **Separates:** Zone 1 (Control Plane Ingress) from Zone 2 (Policy Enforcement & Audit).
 
-* **Threat Profile:**
+- **Threat Profile:**
   - Bypassing policy checks via logic flaws or race conditions.
   - Confused deputy attacks where a valid tool call acts on an unauthorized resource.
   - Agent attempting to alter policy rules or tamper with authorization state.
   - Inadvertent leaking of credentials into audit trails or error messages.
-* **Defensive Controls:**
-  1. **Policy Engine Monopoly:** Subsystem execution layers cannot be invoked directly; they accept requests exclusively via cryptographically signed or internal programmatic dispatch from the Policy Engine.
+- **Defensive Controls:**
+  1. **Policy Engine Monopoly:** Subsystem execution layers cannot be invoked directly; they accept requests exclusively via internal programmatic dispatch from the Policy Engine kernel.
   2. **Default Deny Evaluation:** In the absence of an explicit `ALLOW` rule matching the exact actor, workspace, tool, and parameters, the outcome is `DENY`.
   3. **Strict Precedence:** If any rule evaluates to `DENY`, the request is terminated immediately, overriding any matching `ALLOW` or `REQUIRE APPROVAL` rules.
   4. **Approval Binding:** For `REQUIRE APPROVAL` outcomes, execution pauses until an authenticated human operator approves the exact request payload. Approvals are one-time use, time-bounded (TTL 5 minutes), and bound to the specific payload hash.
@@ -89,20 +91,23 @@ CesSpace ARC partitions the system into **four distinct security zones separated
 ---
 
 ### Trust Boundary 3: Host Execution Boundary
+
 **Separates:** Zone 2 (Policy Enforcement & Audit) from Zone 3 (Machine Execution Domain).
 
-* **Threat Profile:**
+- **Threat Profile:**
   - Path traversal attacks (`../../etc/passwd`, `%2e%2e%2f`).
   - Symlink attacks (creating symlinks pointing to `/root`, `/home/user/.ssh`, or `/etc`).
+  - Hardlink aliasing bypassing path prefix checks.
   - Command injection via subshells, shell metacharacters (`|`, `&`, `;`, `$()`), or argument injection.
   - Privilege escalation (running `sudo`, abusing SUID binaries, interacting with `/var/run/docker.sock`).
   - Direct modification of protected Git branches (`main`, `master`) or tampering with Git internals (`.git/hooks/`, `.git/config`).
-* **Defensive Controls:**
-  1. **Filesystem Canonicalization & Jailing:** Every requested path is resolved to its real canonical path using `realpath()` on the host. The resolved path must strictly start with the approved workspace root directory followed by a path separator. If a symlink resolves outside the root, the operation is blocked with a security violation.
-  2. **Secret Path Blacklist:** Paths matching known secret locations (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config`, `/etc`, `/proc`, `/sys`, `.env`) are blocked at the path resolver level, even if located inside a workspace.
-  3. **Non-Root Execution:** Subprocesses run strictly under the unprivileged user account. Invocation of `sudo`, `su`, `pkexec`, or setuid binaries is filtered and denied.
-  4. **Direct Execution Without Shell:** Terminal commands are executed using direct `execve`-style argument vectors (`argv[]`) rather than passing raw strings to `/bin/sh -c`, completely eliminating shell injection vulnerabilities.
-  5. **Resource Sandboxing:** Commands are executed under supervision with aggressive timeouts (e.g., 30s default), maximum memory limits, and strict process tree tracking to eliminate fork bombs and zombie processes.
+- **Defensive Controls:**
+  1. **Filesystem Canonicalization & Jailing:** Every requested path is resolved to its real canonical path using `realpath()` on the host. The resolved path must strictly reside within the approved workspace root directory.
+  2. **Linux Descriptor Traversal (`openat2`):** Child paths are resolved relative to the workspace root directory file descriptor with `RESOLVE_BENEATH` to eliminate parent-component TOCTOU symlink races.
+  3. **Secret Path Blacklist:** Paths matching known secret locations (`~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.config`, `/etc`, `/proc`, `/sys`, `.env`) are blocked at the path resolver level, even if located inside a workspace.
+  4. **Non-Root Execution:** Subprocesses run strictly under the unprivileged user account. Invocation of `sudo`, `su`, `pkexec`, or setuid binaries is filtered and denied.
+  5. **Direct Execution Without Shell:** Terminal commands are executed using direct `execve`-style argument vectors (`argv[]`) rather than passing raw strings to `/bin/sh -c`, completely eliminating shell injection vulnerabilities.
+  6. **Resource Sandboxing:** Commands are executed under supervision with aggressive timeouts (e.g., 30s default), maximum memory limits, and strict process tree tracking to eliminate fork bombs and zombie processes.
 
 ---
 
@@ -128,12 +133,12 @@ sequenceDiagram
 
     alt Decision == DENY
         Policy->>Audit: Record Denied Event
-        Policy-->>Agent: Structured Error (ACCESS_DENIED)
+        Policy-->>Agent: Structured Error (ACCESS_DENIED / POLICY_DENIED)
     else Decision == REQUIRE_APPROVAL
         Policy->>Policy: Issue Pending Approval Request
         Policy-->>Agent: Request Pending Approval
     else Decision == ALLOW
-        Policy->>Audit: Record Pre-Execution Event (Redacted)
+        Policy->>Audit: Record Pre-Execution Event (Metadata & Hash)
         Policy->>Subsystem: Execute Tool Action
         Note over Policy,Subsystem: Crosses Trust Boundary 3 (Host Execution Boundary)
         Subsystem->>Subsystem: Canonicalize Paths & Validate Jail

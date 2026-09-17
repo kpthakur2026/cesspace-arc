@@ -1,7 +1,7 @@
 # Permission & Policy Model — CesSpace ARC
 
 > **Document:** Security & Policy Specification
-> **Status:** RC-00 Approved Baseline
+> **Status:** RC-00 Proposed Baseline — Pending Independent Review
 > **Classification:** Core Security Mechanism
 
 ---
@@ -11,6 +11,22 @@
 The **CesSpace ARC Policy Engine** (`packages/policy`) is the central authorization authority of the control plane. Every tool invocation crossing into the machine execution domain must be evaluated and authorized by this engine.
 
 The policy model is strictly declarative, deterministic, and fail-closed.
+
+### 1.1. Minimal Security Kernel & Evolution Across Stages
+
+To preserve the permanent invariant that **no operation may execute without policy enforcement and audit evidence**, the security pipeline is established as an unbroken continuum:
+
+1. **RC-01 (Minimal Security Kernel):** Establishes the authoritative admission boundary prior to any tool execution. It enforces:
+   - **Default-deny admission:** Any unrecognized caller, unauthenticated request, or unspecified parameter fails closed.
+   - **Explicit tool allowlist:** Only the 9 read-only inspection tools are admitted; all other tool calls are rejected at admission.
+   - **Authorized-workspace registry:** Validates that target paths bind to registered canonical workspace roots.
+   - **Canonical workspace binding:** Restricts operations to the verified workspace context.
+   - **Policy decision path:** Every tool request passes through the kernel's `evaluate()` pipeline.
+   - **Minimal structured audit sink:** Every admission, decision, and invocation emits an immutable `AuditRecord`.
+2. **RC-04 (Full Declarative Policy Engine):** Extends the exact same `packages/policy` kernel with user-configurable YAML/JSON rules, AST-based command classification, Git branch protection, and human-in-the-loop approval state machines.
+3. **RC-06 (Audit Hardening & Anchoring):** Hardens the exact same audit sink with persistent append-only storage, log rotation, tamper-evident cryptographic checkpoints, and compliance evidence packaging.
+
+There is strictly **one** policy and authorization system across all stages. RC-04 extends the kernel introduced in RC-01 rather than creating a second authorization mechanism.
 
 ---
 
@@ -33,9 +49,11 @@ Every policy evaluation terminates in exactly one of three discrete outcomes:
 ```
 
 ### 2.1. The Absolute Precedence Rule
+
 > **`DENY > REQUIRE APPROVAL > ALLOW`**
 
 If multiple policy rules match a requested operation, the most restrictive rule wins:
+
 - If any matching rule evaluates to `DENY`, the operation is **immediately blocked**, regardless of whether other rules would allow or require approval.
 - If a rule requires approval and no rule denies, the operation is **suspended pending human authorization**.
 - Only when all matching rules evaluate to `ALLOW` (and zero rules evaluate to `DENY` or `REQUIRE APPROVAL`) may the operation execute automatically.
@@ -48,7 +66,9 @@ If multiple policy rules match a requested operation, the most restrictive rule 
 Operations and tools are categorized into three policy classes:
 
 ### 3.1. `ALLOW` Operations (Automatic Execution)
+
 Safe, idempotent, read-only inspection operations confined entirely within approved workspace roots:
+
 - `health` check.
 - `list_directory` within approved roots.
 - `read_file` within approved roots (excluding blacklisted paths).
@@ -58,7 +78,9 @@ Safe, idempotent, read-only inspection operations confined entirely within appro
 - Pre-approved safe read-only commands (e.g. `npm test --dry-run`, `tsc --noEmit`).
 
 ### 3.2. `REQUIRE APPROVAL` Operations (Human-in-the-Loop)
+
 Operations that modify repository state, alter files, create executables, or run non-trivial builds:
+
 - `write_file` or `create_file`.
 - `apply_patch`.
 - `git commit` or checkout of feature branches.
@@ -67,7 +89,9 @@ Operations that modify repository state, alter files, create executables, or run
 - Creating executable binaries or scripts.
 
 ### 3.3. `DENY` Operations (Permanently Blocked)
+
 Dangerous, destructive, or privilege-escalating operations that are strictly prohibited in public/default environments:
+
 - Superuser / administrative commands (`sudo`, `su`, `pkexec`, `doas`).
 - Shell escalation or opening interactive root shells (`/bin/sh`, `/bin/bash` without args).
 - Recursive deletions targeting host directories (`rm -rf /`, `rm -rf ~`).
@@ -80,36 +104,41 @@ Dangerous, destructive, or privilege-escalating operations that are strictly pro
 
 ---
 
-## 4. Evaluation Context & Context Attributes
+## 4. Canonical Evaluation Context & Context Attributes
 
-The Policy Engine evaluates requests against an evaluation context tuple:
+The Policy Engine evaluates requests against a single, canonical context tuple defined in `@cesspace-arc/protocol`:
 
 ```typescript
-interface PolicyEvaluationContext {
+export interface PolicyEvaluationContext {
   actor: {
-    id: string;              // Client / Agent identifier
-    clientType: string;      // e.g. "antigravity", "claude-code", "codex"
-    authenticated: boolean;  // Must be true
+    clientId: string; // Unique client/agent identifier (e.g. "antigravity-worker-01")
+    clientType: string; // e.g. "antigravity", "claude-code", "codex", "opencode"
+    authenticated: boolean; // Must be verified by auth subsystem prior to policy
+    deviceId?: string; // Machine / client device identifier
+    sessionId?: string; // Authenticated session identifier
   };
   targetWorkspace: {
-    rootPath: string;        // Canonical absolute path of approved workspace
-    isGitRepo: boolean;      // True if workspace is a git repo
+    workspaceId: string; // Explicit workspace identifier
+    rootPath: string; // Canonical absolute path of approved workspace
+    isGitRepo: boolean; // True if workspace is a git repo
   };
   request: {
-    toolName: string;        // e.g. "read_file", "run_command"
+    toolName: string; // e.g. "read_file", "run_command"
     parameters: Record<string, unknown>; // Tool arguments
   };
   environment: {
-    timestamp: string;       // ISO 8601 evaluation timestamp
-    sessionDurationMs: number;
+    timestamp: string; // ISO 8601 evaluation timestamp
+    sessionDurationMs?: number; // Monotonic session duration in milliseconds
   };
 }
 ```
 
 ### Contextual Matching Rules
-1. **Workspace Boundary Matching:** The requested path is canonicalized. If the path does not reside under `targetWorkspace.rootPath`, the match result is automatically `DENY`.
-2. **Command Pattern Matching:** For execution tools, the command binary and arguments are matched against regular expressions and exact token lists. Shell metacharacters are forbidden.
-3. **Branch Target Matching:** For Git tools, target refs are parsed. If the target ref matches protected branch patterns (`refs/heads/main`, `refs/heads/master`, `refs/heads/release/*`), the result is `DENY`.
+
+1. **Separation of Authentication and Authorization:** The `actor.authenticated` field confirms caller identity verification. Authorization logic independently evaluates permissions regardless of who the caller is.
+2. **Workspace Boundary Matching:** The requested path is canonicalized. If the path does not reside under `targetWorkspace.rootPath`, the match result is automatically `DENY`.
+3. **Command Pattern Matching:** For execution tools, the command binary and arguments are matched against regular expressions and exact token lists. Shell metacharacters are forbidden.
+4. **Branch Target Matching:** For Git tools, target refs are parsed. If the target ref matches protected branch patterns (`refs/heads/main`, `refs/heads/master`, `refs/heads/release/*`), the result is `DENY`.
 
 ---
 
@@ -142,6 +171,7 @@ sequenceDiagram
 ```
 
 ### Approval Constraints
+
 1. **Payload Hash Binding:** The approval token is bound cryptographically to the SHA-256 hash of the exact tool arguments. Any variation in arguments invalidates the approval.
 2. **Time-To-Live (TTL):** Approvals expire after 300 seconds (5 minutes) if not executed.
 3. **One-Time Use:** An approval token is consumed upon execution and cannot be replayed.
@@ -154,78 +184,78 @@ sequenceDiagram
 Policies are expressed in structured YAML:
 
 ```yaml
-version: "1.0"
+version: '1.0'
 metadata:
-  name: "default-development-policy"
-  description: "Standard secure sandbox policy for development VMs"
+  name: 'default-development-policy'
+  description: 'Standard secure sandbox policy for development VMs'
 
 workspaces:
-  - id: "primary-repo"
-    path: "/home/cespr/cesspace-arc"
+  - id: 'primary-repo'
+    path: '/home/cespr/cesspace-arc'
     allowSymlinksOutside: false
 
 rules:
   # 1. Deny rules (Highest precedence)
-  - id: "deny-credentials"
-    effect: "DENY"
-    description: "Block access to all credentials and secret stores"
+  - id: 'deny-credentials'
+    effect: 'DENY'
+    description: 'Block access to all credentials and secret stores'
     paths:
       patterns:
-        - "**/.ssh/**"
-        - "**/.aws/**"
-        - "**/.gnupg/**"
-        - "**/.env*"
-        - "**/id_rsa*"
+        - '**/.ssh/**'
+        - '**/.aws/**'
+        - '**/.gnupg/**'
+        - '**/.env*'
+        - '**/id_rsa*'
 
-  - id: "deny-destructive-commands"
-    effect: "DENY"
-    description: "Block administrative and destructive system commands"
+  - id: 'deny-destructive-commands'
+    effect: 'DENY'
+    description: 'Block administrative and destructive system commands'
     commands:
       blockedBinaries:
-        - "sudo"
-        - "su"
-        - "pkexec"
-        - "shutdown"
-        - "reboot"
-        - "mkfs"
-        - "dd"
+        - 'sudo'
+        - 'su'
+        - 'pkexec'
+        - 'shutdown'
+        - 'reboot'
+        - 'mkfs'
+        - 'dd'
 
-  - id: "deny-protected-branches"
-    effect: "DENY"
-    description: "Prevent direct mutation of protected Git branches"
+  - id: 'deny-protected-branches'
+    effect: 'DENY'
+    description: 'Prevent direct mutation of protected Git branches'
     git:
       protectedBranches:
-        - "main"
-        - "master"
-        - "release/*"
+        - 'main'
+        - 'master'
+        - 'release/*'
 
   # 2. Require approval rules
-  - id: "approval-source-writes"
-    effect: "REQUIRE_APPROVAL"
-    description: "All file writes and patch applications require operator approval"
+  - id: 'approval-source-writes'
+    effect: 'REQUIRE_APPROVAL'
+    description: 'All file writes and patch applications require operator approval'
     tools:
-      - "write_file"
-      - "create_file"
-      - "apply_patch"
+      - 'write_file'
+      - 'create_file'
+      - 'apply_patch'
 
-  - id: "approval-test-execution"
-    effect: "REQUIRE_APPROVAL"
-    description: "Executing build or test commands requires approval"
+  - id: 'approval-test-execution'
+    effect: 'REQUIRE_APPROVAL'
+    description: 'Executing build or test commands requires approval'
     tools:
-      - "run_command"
+      - 'run_command'
 
   # 3. Allow rules (Lowest precedence)
-  - id: "allow-safe-reads"
-    effect: "ALLOW"
-    description: "Allow reading and inspecting files within authorized root"
+  - id: 'allow-safe-reads'
+    effect: 'ALLOW'
+    description: 'Allow reading and inspecting files within authorized root'
     tools:
-      - "health"
-      - "list_directory"
-      - "read_file"
-      - "search_files"
-      - "search_text"
-      - "git_status"
-      - "git_diff"
-      - "git_log"
-      - "system_status"
+      - 'health'
+      - 'list_directory'
+      - 'read_file'
+      - 'search_files'
+      - 'search_text'
+      - 'git_status'
+      - 'git_diff'
+      - 'git_log'
+      - 'system_status'
 ```

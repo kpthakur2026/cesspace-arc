@@ -15,4 +15,10 @@ export interface IPolicyEngine {
   loadPolicy(rules: PolicyRule[]): void;
 }
 
-export { PolicyOutcome, type PolicyEffect, type PolicyEvaluationContext, type PolicyDecisionResult, type PolicyRule };
+export {
+  PolicyOutcome,
+  type PolicyEffect,
+  type PolicyEvaluationContext,
+  type PolicyDecisionResult,
+  type PolicyRule,
+};

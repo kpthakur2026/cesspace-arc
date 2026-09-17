@@ -20,6 +20,7 @@ CesSpace ARC is a secure, vendor-neutral agent-to-machine control plane. Because
 ## 2. Development Workflow
 
 ### Branching Strategy
+
 - Feature branches must follow the naming pattern:
   - `feat/rc-XX-<feature-name>` (e.g., `feat/rc-00-architecture`)
   - `fix/rc-XX-<issue-description>`
@@ -27,6 +28,7 @@ CesSpace ARC is a secure, vendor-neutral agent-to-machine control plane. Because
 - Do not submit PRs targeting protected branches with unreviewed work.
 
 ### Commit Guidelines
+
 - Use clear, conventional commit messages:
   - `feat(policy): implement AST-based command whitelist`
   - `fix(filesystem): prevent symlink traversal across workspace root`

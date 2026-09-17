@@ -1,8 +1,8 @@
 # ADR-0005: Fail-Closed Error Model and Information Disclosure Prevention
 
-* **Status:** Accepted
-* **Date:** 2026-09-17
-* **Deciders:** Architecture Team
+- **Status:** Accepted
+- **Date:** 2026-09-17
+- **Deciders:** Architecture Team
 
 ---
 
@@ -11,6 +11,7 @@
 When an operation fails on a host development machine, the runtime or operating system typically returns detailed error messages, stack traces, and absolute path locations (e.g. `/home/developer_name/.config/app/secret.conf`).
 
 If these raw errors are returned directly to an untrusted AI agent or logged into unredacted client transcripts, they create an **information disclosure vulnerability**, revealing:
+
 - Local host usernames and account IDs.
 - System directory structures and installed software versions.
 - Private repository layouts outside the workspace.
@@ -33,9 +34,11 @@ We establish a **Structured, Fail-Closed Error Model** (`packages/protocol`):
 ## Consequences
 
 ### Positive
+
 - AI agents receive actionable, machine-readable errors without leaking host secrets or private directory topology.
 - Consistent error taxonomy across all MCP tools and transports.
 - Prevents reconnaissance attacks via error message probing.
 
 ### Negative / Trade-offs
+
 - Developers debugging internal server bugs must inspect local audit logs rather than relying on client-side JSON-RPC error responses.

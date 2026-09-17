@@ -1,8 +1,8 @@
 # ADR-0006: Monorepo Structure with Strict Layered Dependencies
 
-* **Status:** Accepted
-* **Date:** 2026-09-17
-* **Deciders:** Architecture Team
+- **Status:** Accepted
+- **Date:** 2026-09-17
+- **Deciders:** Architecture Team
 
 ---
 
@@ -11,6 +11,7 @@
 CesSpace ARC contains protocol definitions, policy enforcement, audit logging, host subsystems (filesystem, git, terminal, processes), and client/server applications (MCP server, CLI).
 
 If components are tightly coupled or organized into a monolithic package, the following risks emerge:
+
 - Circular dependencies between policy evaluation, audit logging, and tool dispatchers.
 - Accidental bypasses where execution code calls host system APIs directly without traversing policy middleware.
 - Difficulty in isolating dependencies and running focused security verification tests.
@@ -42,9 +43,11 @@ packages/protocol (Zero dependencies, pure contracts)
 ## Consequences
 
 ### Positive
+
 - Enforces clear architectural separation of concerns.
 - Makes policy enforcement points obvious and auditable.
 - Enables granular unit testing and independent security negative controls per package.
 
 ### Negative / Trade-offs
+
 - Managing monorepo package manifests and workspace linkages requires disciplined build and typecheck configurations.

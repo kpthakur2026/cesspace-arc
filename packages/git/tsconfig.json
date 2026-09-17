@@ -4,9 +4,6 @@
     "outDir": "./dist",
     "rootDir": "./src"
   },
-  "references": [
-    { "path": "../protocol" },
-    { "path": "../filesystem" }
-  ],
+  "references": [{ "path": "../protocol" }, { "path": "../filesystem" }],
   "include": ["src/**/*"]
 }

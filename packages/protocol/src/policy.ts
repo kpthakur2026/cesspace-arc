@@ -15,24 +15,30 @@ export enum PolicyOutcome {
 export type PolicyEffect = 'DENY' | 'REQUIRE_APPROVAL' | 'ALLOW';
 
 /**
- * Contextual information supplied to the policy engine for every evaluation.
+ * Canonical Policy Evaluation Context for CesSpace ARC.
+ * Formally separates cryptographic authentication identity from authorization evaluation.
  */
 export interface PolicyEvaluationContext {
   actor: {
-    clientId: string;
-    clientType: string;
-    authenticated: boolean;
+    clientId: string; // Unique client/agent identifier (e.g. "antigravity-worker-01")
+    clientType: string; // e.g. "antigravity", "claude-code", "codex", "opencode"
+    authenticated: boolean; // Must be verified by auth subsystem prior to policy
+    deviceId?: string; // Machine / client device identifier
+    sessionId?: string; // Authenticated session identifier
   };
   targetWorkspace: {
-    workspaceId: string;
-    rootPath: string;
-    isGitRepo: boolean;
+    workspaceId: string; // Explicit workspace identifier
+    rootPath: string; // Canonical absolute path of approved workspace
+    isGitRepo: boolean; // True if workspace is a git repo
   };
   request: {
-    toolName: string;
-    parameters: Record<string, unknown>;
+    toolName: string; // e.g. "read_file", "run_command"
+    parameters: Record<string, unknown>; // Tool arguments
   };
-  timestamp: string;
+  environment: {
+    timestamp: string; // ISO 8601 evaluation timestamp
+    sessionDurationMs?: number; // Monotonic session duration in milliseconds
+  };
 }
 
 /**

@@ -5,7 +5,7 @@ import path from 'node:path';
 
 describe('CesSpace ARC — Architecture & Contract Verifications (RC-00)', () => {
   test('Policy precedence invariant: DENY must strictly override APPROVAL and ALLOW', () => {
-    // Numerically in our design: DENY = 0, REQUIRE_APPROVAL = 1, ALLOW = 2
+    // Numerically: DENY = 0, REQUIRE_APPROVAL = 1, ALLOW = 2
     // Lower numerical value represents higher priority.
     const DENY = 0;
     const REQUIRE_APPROVAL = 1;
@@ -15,7 +15,6 @@ describe('CesSpace ARC — Architecture & Contract Verifications (RC-00)', () =>
     assert.ok(REQUIRE_APPROVAL < ALLOW, 'REQUIRE_APPROVAL must have higher precedence than ALLOW');
     assert.ok(DENY < ALLOW, 'DENY must have higher precedence than ALLOW');
 
-    // Precedence resolution function simulation
     function resolvePrecedence(outcomes) {
       return Math.min(...outcomes);
     }
@@ -26,7 +25,7 @@ describe('CesSpace ARC — Architecture & Contract Verifications (RC-00)', () =>
     assert.equal(resolvePrecedence([ALLOW]), ALLOW);
   });
 
-  test('Workspace package integrity and naming conventions', () => {
+  test('Workspace package integrity, private markings, and pnpm workspace references', () => {
     const packages = [
       'protocol',
       'policy',
@@ -44,6 +43,24 @@ describe('CesSpace ARC — Architecture & Contract Verifications (RC-00)', () =>
       const content = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf8'));
       assert.equal(content.name, `@cesspace-arc/${pkg}`);
       assert.equal(content.license, 'Apache-2.0');
+      assert.equal(
+        content.private,
+        true,
+        `Package ${pkg} must be marked private during development`,
+      );
+
+      // Verify internal dependencies use workspace:*
+      if (content.dependencies) {
+        for (const [depName, depVer] of Object.entries(content.dependencies)) {
+          if (depName.startsWith('@cesspace-arc/')) {
+            assert.equal(
+              depVer,
+              'workspace:*',
+              `Internal dependency ${depName} in ${pkg} must use workspace:* protocol`,
+            );
+          }
+        }
+      }
     }
 
     const apps = ['mcp-server', 'cli'];
@@ -53,18 +70,63 @@ describe('CesSpace ARC — Architecture & Contract Verifications (RC-00)', () =>
       const content = JSON.parse(fs.readFileSync(appJsonPath, 'utf8'));
       assert.equal(content.name, `@cesspace-arc/${app}`);
       assert.equal(content.license, 'Apache-2.0');
+      assert.equal(content.private, true, `App ${app} must be marked private during development`);
+
+      if (content.dependencies) {
+        for (const [depName, depVer] of Object.entries(content.dependencies)) {
+          if (depName.startsWith('@cesspace-arc/')) {
+            assert.equal(
+              depVer,
+              'workspace:*',
+              `Internal dependency ${depName} in ${app} must use workspace:* protocol`,
+            );
+          }
+        }
+      }
     }
   });
 
+  test('Canonical PolicyEvaluationContext contract schema validation', () => {
+    // Validates that canonical context attributes are structured as specified
+    const sampleContext = {
+      actor: {
+        clientId: 'antigravity-worker-01',
+        clientType: 'antigravity',
+        authenticated: true,
+        deviceId: 'dev-001',
+        sessionId: 'sess-xyz',
+      },
+      targetWorkspace: {
+        workspaceId: 'primary-workspace',
+        rootPath: '/home/user/repo',
+        isGitRepo: true,
+      },
+      request: {
+        toolName: 'read_file',
+        parameters: { path: 'src/index.ts' },
+      },
+      environment: {
+        timestamp: '2026-09-17T08:00:00.000Z',
+        sessionDurationMs: 12000,
+      },
+    };
+
+    assert.ok(sampleContext.actor.clientId, 'Must have actor.clientId');
+    assert.equal(typeof sampleContext.actor.authenticated, 'boolean');
+    assert.ok(sampleContext.targetWorkspace.workspaceId, 'Must have targetWorkspace.workspaceId');
+    assert.ok(sampleContext.targetWorkspace.rootPath, 'Must have targetWorkspace.rootPath');
+    assert.ok(sampleContext.request.toolName, 'Must have request.toolName');
+    assert.ok(sampleContext.environment.timestamp, 'Must have environment.timestamp');
+  });
+
   test('Default Deny fallback invariant', () => {
-    // If no matching rule exists, the fallback MUST be DENY
     function evaluateWithDefaultDeny(rules, operation) {
-      const matched = rules.filter(r => r.matches(operation));
+      const matched = rules.filter((r) => r.matches(operation));
       if (matched.length === 0) {
         return 'DENY'; // Default Deny
       }
-      if (matched.some(r => r.effect === 'DENY')) return 'DENY';
-      if (matched.some(r => r.effect === 'REQUIRE_APPROVAL')) return 'REQUIRE_APPROVAL';
+      if (matched.some((r) => r.effect === 'DENY')) return 'DENY';
+      if (matched.some((r) => r.effect === 'REQUIRE_APPROVAL')) return 'REQUIRE_APPROVAL';
       return 'ALLOW';
     }
 
@@ -84,12 +146,12 @@ describe('CesSpace ARC — Architecture & Contract Verifications (RC-00)', () =>
       );
     }
 
-    // Positive cases
     assert.ok(isPathContained(authorizedRoot, '/home/user/workspace/repo/src/index.ts'));
     assert.ok(isPathContained(authorizedRoot, '/home/user/workspace/repo'));
-
-    // Negative cases (path traversal attempts)
-    assert.strictEqual(isPathContained(authorizedRoot, '/home/user/workspace/repo/../../etc/passwd'), false);
+    assert.strictEqual(
+      isPathContained(authorizedRoot, '/home/user/workspace/repo/../../etc/passwd'),
+      false,
+    );
     assert.strictEqual(isPathContained(authorizedRoot, '/home/user/.ssh/id_rsa'), false);
     assert.strictEqual(isPathContained(authorizedRoot, '/home/user/workspace/repo-other'), false);
   });

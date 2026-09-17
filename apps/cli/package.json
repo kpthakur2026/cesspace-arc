@@ -3,6 +3,7 @@
   "version": "0.0.0-rc00",
   "description": "Command-line administration and approval interface for CesSpace ARC",
   "license": "Apache-2.0",
+  "private": true,
   "type": "module",
   "bin": {
     "arc": "./dist/index.js"
@@ -14,8 +15,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@cesspace-arc/protocol": "*",
-    "@cesspace-arc/policy": "*",
-    "@cesspace-arc/audit": "*"
+    "@cesspace-arc/audit": "workspace:*",
+    "@cesspace-arc/policy": "workspace:*",
+    "@cesspace-arc/protocol": "workspace:*"
   }
 }

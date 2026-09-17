@@ -1,7 +1,4 @@
-import type {
-  RunCommandRequest,
-  RunCommandResponse,
-} from '@cesspace-arc/protocol';
+import type { RunCommandRequest, RunCommandResponse } from '@cesspace-arc/protocol';
 
 /**
  * Interface definition for Controlled Terminal Subsystem.

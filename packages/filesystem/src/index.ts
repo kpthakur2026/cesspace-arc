@@ -15,7 +15,10 @@ import type {
  */
 export interface IFilesystemSubsystem {
   resolveSecurePath(workspaceRoot: string, requestedPath: string): Promise<string>;
-  listDirectory(workspaceRoot: string, request: ListDirectoryRequest): Promise<ListDirectoryResponse>;
+  listDirectory(
+    workspaceRoot: string,
+    request: ListDirectoryRequest,
+  ): Promise<ListDirectoryResponse>;
   readFile(workspaceRoot: string, request: ReadFileRequest): Promise<ReadFileResponse>;
   searchFiles(workspaceRoot: string, request: SearchFilesRequest): Promise<SearchFilesResponse>;
   searchText(workspaceRoot: string, request: SearchTextRequest): Promise<SearchTextResponse>;

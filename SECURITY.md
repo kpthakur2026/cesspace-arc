@@ -16,7 +16,7 @@ CesSpace ARC is designed as an agent-to-machine control plane. By definition, it
 2. **Default deny:** Any action, path, command, or parameter not explicitly allowed by active policy is denied.
 3. **Least privilege:** Operations run with the absolute minimum system permissions required.
 4. **Fail closed:** Any error, unexpected condition, unparseable input, or crash results in complete rejection.
-5. **Separation of authentication and authorization:** Establishing *who* an agent is does not grant permissions to *what* it may execute.
+5. **Separation of authentication and authorization:** Establishing _who_ an agent is does not grant permissions to _what_ it may execute.
 6. **Mandatory policy mediation:** No privileged operation may execute without passing through policy enforcement.
 7. **No policy bypass:** Subsystems and tools cannot be called directly; all invocations traverse the control plane pipeline.
 8. **Authorized filesystem roots only:** Filesystem access is strictly jailed to explicitly configured workspace paths.
@@ -40,7 +40,9 @@ CesSpace ARC is designed as an agent-to-machine control plane. By definition, it
 This repository (`kpthakur2026/cesspace-arc`) is **public**.
 
 ### Strictly Prohibited Artifacts
+
 Under no circumstances may any contributor or automated agent commit:
+
 - API keys (OpenAI, DeepSeek, Google, Anthropic, AWS, GCP, Azure)
 - SSH private keys (`id_rsa`, `id_ed25519`, etc.)
 - OAuth client secrets, access tokens, refresh tokens
@@ -51,6 +53,7 @@ Under no circumstances may any contributor or automated agent commit:
 - Private deployment manifests or production credentials
 
 ### Allowed Artifacts
+
 - Sanitized templates: `.env.example`, `config.example.yaml`, `policy.example.yaml`
 - Documentation placeholders (e.g., `REPLACE_WITH_YOUR_KEY`, `EXAMPLE_TOKEN_DO_NOT_USE`)
 - RFC 5737 documentation IP addresses (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`)
@@ -62,6 +65,7 @@ Under no circumstances may any contributor or automated agent commit:
 We welcome vulnerability reports from the security community, researchers, and users.
 
 ### Responsible Disclosure Protocol
+
 - **Do NOT open a public GitHub issue** for a potential security vulnerability.
 - Please report vulnerabilities privately to the maintainers via GitHub Private Vulnerability Reporting or via email to:
   **`security-cesspace-arc@cespr.dev`** (or repository security advisory portal).
@@ -72,6 +76,7 @@ We welcome vulnerability reports from the security community, researchers, and u
   4. Suggested remediation if known.
 
 ### Response Timelines
+
 - **Initial Acknowledgement:** Within 48 hours of report receipt.
 - **Triage & Severity Assessment:** Within 5 business days.
 - **Remediation & Patch Release:** Priority aligned with severity (Critical: < 7 days; High: < 14 days; Moderate: < 30 days).
@@ -83,16 +88,17 @@ We welcome vulnerability reports from the security community, researchers, and u
 
 Only the current active release candidate or stable branch receives security updates.
 
-| Version | Supported | Notes |
-| :--- | :--- | :--- |
+| Version                | Supported          | Notes                              |
+| :--------------------- | :----------------- | :--------------------------------- |
 | `0.0.0-rc00` (Current) | :white_check_mark: | Architecture & Security Foundation |
-| Future Releases | :white_check_mark: | Active development stream |
+| Future Releases        | :white_check_mark: | Active development stream          |
 
 ---
 
 ## 5. Security Architecture References
 
 For detailed specifications, see:
+
 - [Threat Model](docs/threat-model/threat-model.md)
 - [Trust Boundaries](docs/architecture/trust-boundaries.md)
 - [Permanent Security Invariants](docs/architecture/security-invariants.md)
