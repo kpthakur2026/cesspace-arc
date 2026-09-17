@@ -164,10 +164,11 @@ describe('CesSpace ARC — RC-01 Mandatory Security Negative & Positive Controls
     assert.equal(parsed.code, 'PAYLOAD_TOO_LARGE');
   });
 
-  test('Negative 7: run_command invocation -> POLICY_DENIED', async () => {
+  test('Negative 7: run_command with denied executable -> POLICY_DENIED', async () => {
+    // rm is explicitly forbidden. Schema passes, policy must deny.
     const res = await server.dispatchToolCall('run_command', {
-      command: 'echo',
-      args: ['forbidden'],
+      executable: 'rm',
+      args: ['-rf', '/'],
     });
     assert.equal(res.isError, true);
     const parsed = JSON.parse(res.content[0].text);
@@ -240,7 +241,8 @@ describe('CesSpace ARC — RC-01 Mandatory Security Negative & Positive Controls
 
   test('Negative 13: denied operations still generate audit evidence', async () => {
     const preCount = auditLogger.getRecords().length;
-    await server.dispatchToolCall('run_command', { command: 'ls' });
+    // rm is explicitly forbidden — schema passes, policy denies with POLICY_DENIED
+    await server.dispatchToolCall('run_command', { executable: 'rm', args: ['-rf', '/'] });
     const postCount = auditLogger.getRecords().length;
     assert.equal(postCount, preCount + 1, 'Denied operation must produce exactly 1 audit record');
 
@@ -317,12 +319,12 @@ describe('CesSpace ARC — RC-01 Mandatory Security Negative & Positive Controls
   // POSITIVE CONTROLS (All 9 Tools)
   // ==========================================================================
 
-  test('Positive 1: health returns HEALTHY and RC-01 stage metadata', async () => {
+  test('Positive 1: health returns HEALTHY and RC-02 stage metadata', async () => {
     const res = await server.dispatchToolCall('health', {});
     assert.equal(res.isError, undefined);
     const parsed = JSON.parse(res.content[0].text);
     assert.equal(parsed.status, 'HEALTHY');
-    assert.equal(parsed.stage, 'RC-01');
+    assert.equal(parsed.stage, 'RC-02');
     assert.equal(parsed.policyEngineActive, true);
     assert.equal(parsed.auditActive, true);
     assert.ok(parsed.authorizedWorkspacesCount >= 1);

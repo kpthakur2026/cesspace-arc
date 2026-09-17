@@ -1,5 +1,5 @@
 import { realpathSync, existsSync } from 'node:fs';
-import { resolve, sep } from 'node:path';
+import { resolve, sep, basename } from 'node:path';
 import {
   PolicyOutcome,
   type PolicyEffect,
@@ -18,7 +18,6 @@ export interface IPolicyEngine {
 
 /**
  * The 9 tools explicitly allowed in RC-01.
- * All other tools are denied at admission by the Minimal Security Kernel.
  */
 export const RC01_ALLOWED_TOOLS = [
   'health',
@@ -33,6 +32,83 @@ export const RC01_ALLOWED_TOOLS = [
 ] as const;
 
 export type Rc01AllowedTool = (typeof RC01_ALLOWED_TOOLS)[number];
+
+/**
+ * The 13 tools explicitly allowed in RC-02 (RC-01 read-only core + controlled execution).
+ */
+export const RC02_ALLOWED_TOOLS = [
+  ...RC01_ALLOWED_TOOLS,
+  'run_command',
+  'process_status',
+  'process_output',
+  'terminate_process',
+] as const;
+
+export type Rc02AllowedTool = (typeof RC02_ALLOWED_TOOLS)[number];
+
+export const ALLOWED_COMMANDS = [
+  'node',
+  'npm',
+  'pnpm',
+  'npx',
+  'git',
+  'tsc',
+  'eslint',
+  'prettier',
+  'vitest',
+  'pytest',
+] as const;
+
+export const DENIED_COMMANDS = [
+  'sudo',
+  'su',
+  'doas',
+  'pkexec',
+  'bash',
+  'sh',
+  'zsh',
+  'fish',
+  'dash',
+  'cmd',
+  'cmd.exe',
+  'powershell',
+  'powershell.exe',
+  'pwsh',
+  'rm',
+  'rmdir',
+  'mkfs',
+  'fdisk',
+  'parted',
+  'mount',
+  'umount',
+  'dd',
+  'shutdown',
+  'reboot',
+  'poweroff',
+  'halt',
+  'curl',
+  'wget',
+  'ssh',
+  'scp',
+  'sftp',
+  'nc',
+  'netcat',
+  'socat',
+  'docker',
+  'kubectl',
+  'terraform',
+  'aws',
+  'gcloud',
+  'az',
+  'systemctl',
+  'service',
+  'crontab',
+  'python',
+  'python3',
+  'perl',
+  'ruby',
+  'php',
+] as const;
 
 /**
  * Registered workspace record.
@@ -153,13 +229,13 @@ export class SecurityKernel implements IPolicyEngine {
     const toolName = request.toolName;
 
     // 1. Mandatory Tool Allowlist Gate (Default-Deny)
-    const isAllowedTool = (RC01_ALLOWED_TOOLS as readonly string[]).includes(toolName);
+    const isAllowedTool = (RC02_ALLOWED_TOOLS as readonly string[]).includes(toolName);
     if (!isAllowedTool) {
       return {
         outcome: PolicyOutcome.DENY,
         effect: 'DENY',
         matchingRuleId: 'default-deny-unregistered-tool',
-        reason: `Tool '${toolName}' is not permitted in RC-01 stage (read-only inspection core only).`,
+        reason: `Tool '${toolName}' is not permitted in RC-02 stage (read-only inspection and controlled execution only).`,
       };
     }
 
@@ -173,13 +249,35 @@ export class SecurityKernel implements IPolicyEngine {
       };
     }
 
-    // 3. System Tools Exemption from Workspace Target
+    // 3. System Tools & Process Supervision Exemption from Workspace Target
     if (toolName === 'health' || toolName === 'system_status') {
       return {
         outcome: PolicyOutcome.ALLOW,
         effect: 'ALLOW',
         matchingRuleId: 'allow-system-read',
         reason: 'Safe read-only system inspection allowed.',
+      };
+    }
+
+    if (
+      toolName === 'process_status' ||
+      toolName === 'process_output' ||
+      toolName === 'terminate_process'
+    ) {
+      const processId = request.parameters.processId;
+      if (!processId || typeof processId !== 'string' || !processId.startsWith('arc-proc-')) {
+        return {
+          outcome: PolicyOutcome.DENY,
+          effect: 'DENY',
+          matchingRuleId: 'deny-invalid-process-id',
+          reason: 'Invalid or missing process identifier.',
+        };
+      }
+      return {
+        outcome: PolicyOutcome.ALLOW,
+        effect: 'ALLOW',
+        matchingRuleId: 'allow-process-lifecycle',
+        reason: `Controlled process lifecycle operation '${toolName}' admitted for authenticated caller.`,
       };
     }
 
@@ -310,7 +408,281 @@ export class SecurityKernel implements IPolicyEngine {
       }
     }
 
-    // 7. Admitted by Default Allow for Read-Only Inspection
+    // 7. Command Policy Validation for Controlled Execution (RC-02)
+    if (toolName === 'run_command') {
+      const executable = String(request.parameters.executable || '').trim();
+      if (!executable) {
+        return {
+          outcome: PolicyOutcome.DENY,
+          effect: 'DENY',
+          matchingRuleId: 'deny-invalid-executable',
+          reason: 'Executable name must be a non-empty string.',
+        };
+      }
+
+      const rawName = basename(executable).toLowerCase();
+
+      // Check explicitly denied commands
+      if ((DENIED_COMMANDS as readonly string[]).includes(rawName)) {
+        return {
+          outcome: PolicyOutcome.DENY,
+          effect: 'DENY',
+          matchingRuleId: 'deny-forbidden-command',
+          reason: `Command '${rawName}' is explicitly forbidden by security policy.`,
+        };
+      }
+
+      // Check allowlist
+      if (!(ALLOWED_COMMANDS as readonly string[]).includes(rawName)) {
+        return {
+          outcome: PolicyOutcome.DENY,
+          effect: 'DENY',
+          matchingRuleId: 'deny-unapproved-executable',
+          reason: `Executable '${rawName}' is not in the approved RC-02 development tool allowlist.`,
+        };
+      }
+
+      const args = Array.isArray(request.parameters.args)
+        ? (request.parameters.args as string[])
+        : [];
+
+      // Check arguments
+      for (const arg of args) {
+        if (typeof arg !== 'string') {
+          return {
+            outcome: PolicyOutcome.DENY,
+            effect: 'DENY',
+            matchingRuleId: 'deny-invalid-argument',
+            reason: 'Command arguments must be strings.',
+          };
+        }
+        if (
+          arg === '-c' ||
+          arg === '/c' ||
+          arg.startsWith('--command') ||
+          arg.includes('`') ||
+          arg.includes('$(') ||
+          arg.includes('\n') ||
+          arg.includes('\r')
+        ) {
+          return {
+            outcome: PolicyOutcome.DENY,
+            effect: 'DENY',
+            matchingRuleId: 'deny-shell-injection',
+            reason: `Argument '${arg}' contains forbidden shell execution or command substitution syntax.`,
+          };
+        }
+        if (
+          (arg.startsWith('--config=') ||
+            arg.startsWith('--output=') ||
+            arg.startsWith('--project=') ||
+            arg.startsWith('-p=')) &&
+          (arg.includes('/etc/') ||
+            arg.includes('/root/') ||
+            arg.includes('/tmp/') ||
+            arg.includes('/var/') ||
+            arg.includes('..'))
+        ) {
+          return {
+            outcome: PolicyOutcome.DENY,
+            effect: 'DENY',
+            matchingRuleId: 'deny-argument-path-escape',
+            reason: `Argument '${arg}' attempts to target a path outside the authorized workspace.`,
+          };
+        }
+      }
+
+      // Per-executable restrictions
+      if (rawName === 'git') {
+        const allowedGitSubcommands = [
+          'status',
+          'diff',
+          'log',
+          'rev-parse',
+          'show',
+          'describe',
+          'branch',
+        ];
+        const deniedGitSubcommands = [
+          'commit',
+          'push',
+          'pull',
+          'fetch',
+          'checkout',
+          'switch',
+          'reset',
+          'clean',
+          'stash',
+          'config',
+          'tag',
+          'remote',
+          'merge',
+          'rebase',
+          'cherry-pick',
+          'clone',
+          'init',
+          'apply',
+        ];
+
+        const firstNonFlag = args.find((a) => !a.startsWith('-'));
+        if (!firstNonFlag || !allowedGitSubcommands.includes(firstNonFlag.toLowerCase())) {
+          return {
+            outcome: PolicyOutcome.DENY,
+            effect: 'DENY',
+            matchingRuleId: 'deny-git-mutation',
+            reason: `Git subcommand '${firstNonFlag || 'unknown'}' is not allowed in RC-02 (read-only Git inspection only).`,
+          };
+        }
+        if (deniedGitSubcommands.includes(firstNonFlag.toLowerCase())) {
+          return {
+            outcome: PolicyOutcome.DENY,
+            effect: 'DENY',
+            matchingRuleId: 'deny-git-mutation',
+            reason: `Git mutating subcommand '${firstNonFlag}' is strictly forbidden in RC-02.`,
+          };
+        }
+      } else if (rawName === 'node') {
+        const forbiddenNodeFlags = [
+          '-e',
+          '--eval',
+          '-p',
+          '--print',
+          '--inspect',
+          '--inspect-brk',
+          '--inspect-port',
+          '--expose-internals',
+          '-r',
+          '--require',
+          '--import',
+          '--loader',
+        ];
+        for (const arg of args) {
+          const flagName = arg.split('=')[0];
+          if (forbiddenNodeFlags.includes(flagName)) {
+            return {
+              outcome: PolicyOutcome.DENY,
+              effect: 'DENY',
+              matchingRuleId: 'deny-forbidden-node-flag',
+              reason: `Node flag '${arg}' is forbidden by policy (arbitrary code execution or debugging forbidden).`,
+            };
+          }
+        }
+      } else if (rawName === 'npm' || rawName === 'pnpm') {
+        const deniedNpmSubcommands = [
+          'install',
+          'i',
+          'add',
+          'update',
+          'upgrade',
+          'audit',
+          'publish',
+          'login',
+          'logout',
+          'token',
+          'config',
+          'link',
+          'init',
+          'create',
+          'uninstall',
+          'rm',
+        ];
+        const firstNonFlag = args.find((a) => !a.startsWith('-'));
+        if (firstNonFlag && deniedNpmSubcommands.includes(firstNonFlag.toLowerCase())) {
+          return {
+            outcome: PolicyOutcome.DENY,
+            effect: 'DENY',
+            matchingRuleId: 'deny-package-install',
+            reason: `Package manager command '${firstNonFlag}' is forbidden in RC-02 (package installation or mutation forbidden).`,
+          };
+        }
+      }
+
+      // Check environment overrides
+      if (request.parameters.env && typeof request.parameters.env === 'object') {
+        const env = request.parameters.env as Record<string, string>;
+        const allowedEnvKeys = ['CI', 'FORCE_COLOR', 'NO_COLOR', 'DEBUG', 'NODE_ENV'];
+        const forbiddenEnvPatterns = [
+          /^AWS_/i,
+          /^GOOGLE_/i,
+          /^GCP_/i,
+          /^AZURE_/i,
+          /^ANTHROPIC_/i,
+          /^OPENAI_/i,
+          /.*TOKEN$/i,
+          /.*KEY$/i,
+          /.*SECRET$/i,
+          /.*AUTH/i,
+          /DATABASE_URL/i,
+          /SSH_AUTH_SOCK/i,
+          /LD_PRELOAD/i,
+          /LD_LIBRARY_PATH/i,
+          /NODE_OPTIONS/i,
+          /^PATH$/i,
+          /^HOME$/i,
+          /^PYTHONPATH$/i,
+          /^SHELL$/i,
+          /^USER$/i,
+          /^SUDO_USER$/i,
+        ];
+
+        for (const [key, val] of Object.entries(env)) {
+          if (!allowedEnvKeys.includes(key)) {
+            return {
+              outcome: PolicyOutcome.DENY,
+              effect: 'DENY',
+              matchingRuleId: 'deny-forbidden-env',
+              reason: `Environment variable override '${key}' is forbidden by security policy.`,
+            };
+          }
+          for (const pattern of forbiddenEnvPatterns) {
+            if (pattern.test(key)) {
+              return {
+                outcome: PolicyOutcome.DENY,
+                effect: 'DENY',
+                matchingRuleId: 'deny-forbidden-env',
+                reason: `Environment variable '${key}' matches forbidden credential or system pattern.`,
+              };
+            }
+          }
+          if (typeof val !== 'string' || val.length > 512) {
+            return {
+              outcome: PolicyOutcome.DENY,
+              effect: 'DENY',
+              matchingRuleId: 'deny-invalid-env-value',
+              reason: `Environment variable value for '${key}' must be a string <= 512 characters.`,
+            };
+          }
+        }
+      }
+
+      // Check working directory
+      if (request.parameters.cwd && typeof request.parameters.cwd === 'string') {
+        const cwd = request.parameters.cwd;
+        if (cwd.includes('..') || cwd.startsWith('/') || cwd.startsWith('\\')) {
+          const resolved = resolve(registeredWs.rootPath, cwd);
+          if (
+            resolved !== registeredWs.rootPath &&
+            !resolved.startsWith(registeredWs.rootPath + sep)
+          ) {
+            return {
+              outcome: PolicyOutcome.DENY,
+              effect: 'DENY',
+              matchingRuleId: 'deny-cwd-escape',
+              reason: 'Working directory escapes authorized workspace root.',
+            };
+          }
+        }
+      }
+
+      return {
+        outcome: PolicyOutcome.ALLOW,
+        effect: 'ALLOW',
+        matchingRuleId: 'allow-controlled-command',
+        reason: `Command '${rawName}' admitted under controlled execution policy for workspace '${registeredWs.id}'.`,
+      };
+    }
+
+    // 8. Admitted by Default Allow for Read-Only Inspection
     return {
       outcome: PolicyOutcome.ALLOW,
       effect: 'ALLOW',

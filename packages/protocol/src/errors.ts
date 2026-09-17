@@ -47,6 +47,7 @@ export type ArcErrorCode =
   | 'PROCESS_NOT_FOUND'
   | 'PAYLOAD_TOO_LARGE'
   | 'RATE_LIMIT_EXCEEDED'
+  | 'RESOURCE_EXHAUSTED'
 
   // Internal Errors
   | 'INTERNAL_ERROR';
@@ -210,6 +211,50 @@ export class ArcError extends Error implements ArcErrorPayload {
       category: 'INTERNAL',
       message,
       retryable: false,
+    });
+  }
+
+  public static processNotFound(message = 'Process not found.'): ArcError {
+    return new ArcError({
+      code: 'PROCESS_NOT_FOUND',
+      category: 'RESOURCE',
+      message,
+      retryable: false,
+      remediationHint: 'Verify the processId returned from run_command.',
+    });
+  }
+
+  public static executionTimeout(
+    message = 'Command execution exceeded configured timeout.',
+  ): ArcError {
+    return new ArcError({
+      code: 'EXECUTION_TIMEOUT',
+      category: 'EXECUTION',
+      message,
+      retryable: true,
+      remediationHint: 'Increase timeoutMs if the command legitimately requires more time.',
+    });
+  }
+
+  public static resourceExhausted(message = 'Resource limit exceeded.'): ArcError {
+    return new ArcError({
+      code: 'RESOURCE_EXHAUSTED',
+      category: 'RESOURCE',
+      message,
+      retryable: true,
+      remediationHint: 'Wait for active processes to complete before launching new ones.',
+    });
+  }
+
+  public static forbiddenCommand(
+    message = 'Command or executable is forbidden by policy.',
+  ): ArcError {
+    return new ArcError({
+      code: 'FORBIDDEN_COMMAND',
+      category: 'AUTHORIZATION',
+      message,
+      retryable: false,
+      remediationHint: 'Ensure the executable is in the approved development tool allowlist.',
     });
   }
 }

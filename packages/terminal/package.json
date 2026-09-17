@@ -14,6 +14,7 @@
   "dependencies": {
     "@cesspace-arc/filesystem": "workspace:*",
     "@cesspace-arc/policy": "workspace:*",
+    "@cesspace-arc/processes": "workspace:*",
     "@cesspace-arc/protocol": "workspace:*"
   }
 }

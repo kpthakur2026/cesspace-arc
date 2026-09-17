@@ -15,17 +15,21 @@ import {
   type HealthResponse,
   type SystemStatusResponse,
   type PolicyEvaluationContext,
+  type RunCommandRequest,
 } from '@cesspace-arc/protocol';
 import { SecurityKernel, WorkspaceRegistry, type WorkspaceRecord } from '@cesspace-arc/policy';
 import { AuditLogger, computeSha256, canonicalJson } from '@cesspace-arc/audit';
 import { FilesystemSubsystem } from '@cesspace-arc/filesystem';
 import { GitSubsystem } from '@cesspace-arc/git';
+import { ProcessRegistry } from '@cesspace-arc/processes';
+import { ControlledProcessRunner, type ITerminalSubsystem } from '@cesspace-arc/terminal';
 import { z } from 'zod';
 
 export interface ArcServerConfig {
   transport: 'stdio';
   authorizedRoots: Array<{ id: string; path: string }>;
   defaultWorkspaceId?: string;
+  stage?: string;
 }
 
 const WorkspaceIdSchema = z
@@ -82,8 +86,34 @@ const RevisionTargetSchema = z
   .trim()
   .min(1, 'revision or target must not be empty or whitespace-only');
 
+const ExecutableSchema = z
+  .string()
+  .max(128, 'executable exceeds maximum allowed length of 128 characters')
+  .trim()
+  .min(1, 'executable must not be empty or whitespace-only');
+
+const ProcessIdSchema = z
+  .string()
+  .max(128, 'processId exceeds maximum allowed length of 128 characters')
+  .trim()
+  .min(1, 'processId must not be empty or whitespace-only');
+
+const CommandArgSchema = z
+  .string()
+  .max(1024, 'command argument exceeds maximum allowed length of 1024 characters');
+
+const EnvKeySchema = z
+  .string()
+  .max(128, 'env key exceeds maximum allowed length of 128 characters')
+  .trim()
+  .min(1, 'env key must not be empty');
+
+const EnvValueSchema = z
+  .string()
+  .max(512, 'env value exceeds maximum allowed length of 512 characters');
+
 /**
- * Strict Zod validation schemas for all 9 permitted RC-01 tools.
+ * Strict Zod validation schemas for all permitted tools (RC-01 read-only + RC-02 controlled execution).
  * Enforces runtime schema pre-admission rejection and audit logging.
  */
 export const TOOL_SCHEMAS = {
@@ -145,7 +175,151 @@ export const TOOL_SCHEMAS = {
       workspaceId: WorkspaceIdSchema.optional(),
     })
     .strict(),
+  run_command: z
+    .object({
+      executable: ExecutableSchema,
+      args: z.array(CommandArgSchema).max(100).optional(),
+      cwd: OptionalPathSchema.optional(),
+      timeoutMs: z.number().int().min(100).max(300000).optional(),
+      env: z.record(EnvKeySchema, EnvValueSchema).optional(),
+      workspaceId: WorkspaceIdSchema.optional(),
+      runInBackground: z.boolean().optional(),
+    })
+    .strict(),
+  process_status: z
+    .object({
+      processId: ProcessIdSchema,
+    })
+    .strict(),
+  process_output: z
+    .object({
+      processId: ProcessIdSchema,
+      offset: z.number().int().min(0).optional(),
+      maxBytes: z.number().int().min(1).max(131072).optional(),
+    })
+    .strict(),
+  terminate_process: z
+    .object({
+      processId: ProcessIdSchema,
+      signal: z.enum(['SIGTERM', 'SIGKILL']).optional(),
+    })
+    .strict(),
 } as const;
+
+/**
+ * Definition of the 4 RC-02 MCP Tools (controlled terminal & process execution).
+ */
+export const RC02_TOOL_DEFINITIONS: Tool[] = [
+  {
+    name: 'run_command',
+    description:
+      'Execute an approved command within an authorized workspace under policy control (executable allowlist, output bounded at 512 KiB, default-deny security kernel).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        executable: {
+          type: 'string',
+          description:
+            'Basename of the executable to run (no path separators). Must be on the allowlist.',
+        },
+        args: {
+          type: 'array',
+          description: 'Array of argument strings (max 100). Each argument max 1024 characters.',
+          items: { type: 'string' },
+          maxItems: 100,
+        },
+        cwd: {
+          type: 'string',
+          description: 'Working directory relative path within the workspace root.',
+        },
+        timeoutMs: {
+          type: 'integer',
+          description: 'Execution timeout in milliseconds (100–300000, default: 30000).',
+          minimum: 100,
+          maximum: 300000,
+        },
+        env: {
+          type: 'object',
+          description: 'Optional extra environment variables (allowlisted keys only).',
+          additionalProperties: { type: 'string' },
+        },
+        workspaceId: {
+          type: 'string',
+          description: 'Registered workspace ID.',
+        },
+        runInBackground: {
+          type: 'boolean',
+          description: 'If true, returns a processId immediately without waiting for completion.',
+        },
+      },
+      required: ['executable'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'process_status',
+    description: 'Query the status of an ARC-managed process by its opaque process ID.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        processId: {
+          type: 'string',
+          description: 'Opaque ARC process identifier (arc-proc-*).',
+        },
+      },
+      required: ['processId'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'process_output',
+    description:
+      'Read buffered stdout/stderr output from an ARC-managed process (max 128 KiB per read, 512 KiB total buffer).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        processId: {
+          type: 'string',
+          description: 'Opaque ARC process identifier (arc-proc-*).',
+        },
+        offset: {
+          type: 'integer',
+          description: 'Byte offset into the combined output buffer.',
+          minimum: 0,
+        },
+        maxBytes: {
+          type: 'integer',
+          description: 'Maximum bytes to return (max 131072).',
+          minimum: 1,
+          maximum: 131072,
+        },
+      },
+      required: ['processId'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'terminate_process',
+    description:
+      'Send a termination signal to an ARC-managed process. Defaults to SIGTERM with a SIGKILL escalation after 1 second.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        processId: {
+          type: 'string',
+          description: 'Opaque ARC process identifier (arc-proc-*).',
+        },
+        signal: {
+          type: 'string',
+          description: 'Signal to send: SIGTERM (default) or SIGKILL.',
+          enum: ['SIGTERM', 'SIGKILL'],
+        },
+      },
+      required: ['processId'],
+      additionalProperties: false,
+    },
+  },
+];
 
 /**
  * Definition of the 9 RC-01 MCP Tools.
@@ -392,6 +566,7 @@ export class ArcMcpServer implements IArcMcpServer {
     public readonly filesystemSubsystem: FilesystemSubsystem,
     public readonly gitSubsystem: GitSubsystem,
     config?: Partial<ArcServerConfig>,
+    public readonly terminalSubsystem?: ITerminalSubsystem,
   ) {
     this.defaultWorkspaceId = config?.defaultWorkspaceId;
 
@@ -407,7 +582,7 @@ export class ArcMcpServer implements IArcMcpServer {
     this.server = new Server(
       {
         name: 'cesspace-arc',
-        version: '0.1.0-rc01',
+        version: '0.2.0-rc02',
       },
       {
         capabilities: {
@@ -422,7 +597,7 @@ export class ArcMcpServer implements IArcMcpServer {
   private setupHandlers(): void {
     this.server.setRequestHandler(ListToolsRequestSchema, async () => {
       return {
-        tools: RC01_TOOL_DEFINITIONS,
+        tools: [...RC01_TOOL_DEFINITIONS, ...RC02_TOOL_DEFINITIONS],
       };
     });
 
@@ -588,7 +763,13 @@ export class ArcMcpServer implements IArcMcpServer {
     let workspaceConflict = false;
     let workspaceUnregistered = false;
 
-    if (toolName === 'health' || toolName === 'system_status') {
+    if (
+      toolName === 'health' ||
+      toolName === 'system_status' ||
+      toolName === 'process_status' ||
+      toolName === 'process_output' ||
+      toolName === 'terminate_process'
+    ) {
       targetWorkspaceRecord = this.defaultWorkspaceId
         ? this.workspaceRegistry.getWorkspace(this.defaultWorkspaceId)
         : undefined;
@@ -718,8 +899,8 @@ export class ArcMcpServer implements IArcMcpServer {
         case 'health': {
           const health: HealthResponse = {
             status: 'HEALTHY',
-            version: '0.1.0-rc01',
-            stage: 'RC-01',
+            version: '0.2.0-rc02',
+            stage: 'RC-02',
             policyEngineActive: true,
             auditActive: true,
             authorizedWorkspacesCount: this.workspaceRegistry.getWorkspaces().length,
@@ -822,6 +1003,71 @@ export class ArcMcpServer implements IArcMcpServer {
         case 'git_log': {
           const logRes = await this.gitSubsystem.getLog(targetWorkspace.rootPath, validatedParams);
           result = logRes;
+          break;
+        }
+
+        case 'run_command': {
+          if (!this.terminalSubsystem) {
+            throw ArcError.policyDenied(
+              'Terminal subsystem is not available in this configuration.',
+            );
+          }
+          if (!validatedParams.executable) {
+            throw ArcError.invalidRequestSchema(
+              'Executable parameter is required for run_command.',
+            );
+          }
+          const cmdRes = await this.terminalSubsystem.executeCommand(
+            validatedParams as unknown as RunCommandRequest,
+            actor,
+            targetWorkspace,
+          );
+          result = cmdRes;
+          break;
+        }
+
+        case 'process_status': {
+          if (!this.terminalSubsystem) {
+            throw ArcError.policyDenied(
+              'Terminal subsystem is not available in this configuration.',
+            );
+          }
+          const psRes = this.terminalSubsystem.getProcessStatus(
+            validatedParams.processId as string,
+            actor,
+          );
+          result = psRes;
+          break;
+        }
+
+        case 'process_output': {
+          if (!this.terminalSubsystem) {
+            throw ArcError.policyDenied(
+              'Terminal subsystem is not available in this configuration.',
+            );
+          }
+          const outputRes = this.terminalSubsystem.getProcessOutput(
+            validatedParams.processId as string,
+            validatedParams.offset as number | undefined,
+            validatedParams.maxBytes as number | undefined,
+            actor,
+          );
+          result = outputRes;
+          break;
+        }
+
+        case 'terminate_process': {
+          if (!this.terminalSubsystem) {
+            throw ArcError.policyDenied(
+              'Terminal subsystem is not available in this configuration.',
+            );
+          }
+          const termRes = await this.terminalSubsystem.terminateProcess(
+            validatedParams.processId as string,
+            validatedParams.signal as 'SIGTERM' | 'SIGKILL' | undefined,
+            actor,
+          );
+          result = termRes;
           break;
         }
 
@@ -949,6 +1195,8 @@ export function createArcMcpServer(config?: Partial<ArcServerConfig>): ArcMcpSer
   const auditLogger = new AuditLogger();
   const filesystemSubsystem = new FilesystemSubsystem();
   const gitSubsystem = new GitSubsystem();
+  const processRegistry = new ProcessRegistry();
+  const terminalSubsystem = new ControlledProcessRunner(processRegistry);
 
   return new ArcMcpServer(
     workspaceRegistry,
@@ -957,6 +1205,7 @@ export function createArcMcpServer(config?: Partial<ArcServerConfig>): ArcMcpSer
     filesystemSubsystem,
     gitSubsystem,
     config,
+    terminalSubsystem,
   );
 }
 

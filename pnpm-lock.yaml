@@ -211,9 +211,15 @@ importers:
       '@cesspace-arc/policy':
         specifier: workspace:*
         version: link:../../packages/policy
+      '@cesspace-arc/processes':
+        specifier: workspace:*
+        version: link:../../packages/processes
       '@cesspace-arc/protocol':
         specifier: workspace:*
         version: link:../../packages/protocol
+      '@cesspace-arc/terminal':
+        specifier: workspace:*
+        version: link:../../packages/terminal
       '@modelcontextprotocol/sdk':
         specifier: ^1.30.0
         version: 1.30.0(zod@4.6.5)
@@ -270,6 +276,9 @@ importers:
       '@cesspace-arc/policy':
         specifier: workspace:*
         version: link:../policy
+      '@cesspace-arc/processes':
+        specifier: workspace:*
+        version: link:../processes
       '@cesspace-arc/protocol':
         specifier: workspace:*
         version: link:../protocol
