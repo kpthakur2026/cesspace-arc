@@ -61,10 +61,103 @@ export function maskSensitiveDiff(diff: string): string {
 }
 
 /**
+ * Checks if a path is considered sensitive and forbidden from git inspection.
+ */
+export function isSensitiveGitPath(filePath: string): boolean {
+  const sensitivePatterns = [
+    /(^|[/\\])\.env($|\..*)/i,
+    /(^|[/\\])\.ssh([/\\]|$)/i,
+    /(^|[/\\])\.aws([/\\]|$)/i,
+    /(^|[/\\])\.gnupg([/\\]|$)/i,
+    /(^|[/\\])\.kube([/\\]|$)/i,
+    /(^|[/\\])\.git[/\\]config$/i,
+    /(^|[/\\])\.git[/\\]hooks([/\\]|$)/i,
+    /(^|[/\\])id_rsa/i,
+    /(^|[/\\])id_ed25519/i,
+    /\.(pem|key|p12|pfx)$/i,
+  ];
+  return sensitivePatterns.some((pattern) => pattern.test(filePath));
+}
+
+/**
+ * Purges file diff hunks belonging to sensitive files (even if tracked in git).
+ */
+export function purgeSensitiveDiffBlocks(diff: string): string {
+  const sensitivePatterns = [
+    /(^|[/\\])\.env($|\..*)/i,
+    /(^|[/\\])\.ssh([/\\]|$)/i,
+    /(^|[/\\])\.aws([/\\]|$)/i,
+    /(^|[/\\])\.gnupg([/\\]|$)/i,
+    /(^|[/\\])\.kube([/\\]|$)/i,
+    /(^|[/\\])\.git[/\\]config$/i,
+    /(^|[/\\])\.git[/\\]hooks([/\\]|$)/i,
+    /(^|[/\\])id_rsa/i,
+    /(^|[/\\])id_ed25519/i,
+    /\.(pem|key|p12|pfx)$/i,
+  ];
+
+  const blocks = diff.split(/(?=diff --git )/);
+  const sanitizedBlocks: string[] = [];
+
+  for (const block of blocks) {
+    if (!block.startsWith('diff --git ')) {
+      sanitizedBlocks.push(block);
+      continue;
+    }
+
+    const firstLine = block.split('\n', 1)[0];
+    const isSensitive = sensitivePatterns.some((pattern) => pattern.test(firstLine));
+
+    if (isSensitive) {
+      sanitizedBlocks.push(`${firstLine}\n[SENSITIVE FILE DIFF SUPPRESSED]\n`);
+    } else {
+      sanitizedBlocks.push(block);
+    }
+  }
+
+  return sanitizedBlocks.join('');
+}
+
+/**
+ * Truncates a UTF-8 string to a maximum byte limit without splitting multi-byte characters.
+ */
+export function truncateUtf8ToByteLimit(
+  str: string,
+  maxBytes: number,
+): { text: string; truncated: boolean } {
+  const buf = Buffer.from(str, 'utf8');
+  if (buf.length <= maxBytes) {
+    return { text: str, truncated: false };
+  }
+
+  let end = maxBytes;
+  while (end > 0 && (buf[end] & 0xc0) === 0x80) {
+    end--;
+  }
+
+  if (end > 0) {
+    const lead = buf[end];
+    let charLen = 1;
+    if ((lead & 0xe0) === 0xc0) charLen = 2;
+    else if ((lead & 0xf0) === 0xe0) charLen = 3;
+    else if ((lead & 0xf8) === 0xf0) charLen = 4;
+
+    if (end + charLen <= maxBytes) {
+      end += charLen;
+    }
+  }
+
+  return {
+    text: buf.subarray(0, end).toString('utf8'),
+    truncated: true,
+  };
+}
+
+/**
  * Interface definition for Sandboxed Git Subsystem.
  */
 export interface IGitSubsystem {
-  getStatus(workspaceRoot: string, request: GitStatusRequest): Promise<GitStatusResponse>;
+  getStatus(workspaceRoot: string, request?: GitStatusRequest): Promise<GitStatusResponse>;
   getDiff(workspaceRoot: string, request: GitDiffRequest): Promise<GitDiffResponse>;
   getLog(workspaceRoot: string, request: GitLogRequest): Promise<GitLogResponse>;
   assertBranchWritable(workspaceRoot: string, targetBranch: string): Promise<void>;
@@ -89,23 +182,46 @@ export class GitSubsystem implements IGitSubsystem {
       throw ArcError.fileNotFound(`Directory '${workspaceRoot}' is not a valid Git repository.`);
     }
 
+    const safeEnv: NodeJS.ProcessEnv = {
+      PATH: process.env.PATH || '/usr/bin:/bin',
+      HOME: process.env.HOME || '/tmp',
+      LC_ALL: 'C',
+      GIT_CONFIG_NOSYSTEM: '1',
+      GIT_TERMINAL_PROMPT: '0',
+      GIT_EXTERNAL_DIFF: '',
+      GIT_DIFF_OPTS: '',
+      GIT_PAGER: 'cat',
+      PAGER: 'cat',
+      GIT_SSH_COMMAND: '',
+      GIT_ASKPASS: '',
+      SSH_ASKPASS: '',
+    };
+
+    const safeGlobalArgs = [
+      '-c',
+      'core.hooksPath=/dev/null',
+      '-c',
+      'diff.external=',
+      '-c',
+      'diff.textconv=',
+      '-c',
+      'core.fsmonitor=false',
+    ];
+
     try {
-      const result = await execFileAsync('git', args, {
+      const result = await execFileAsync('git', [...safeGlobalArgs, ...args], {
         cwd: canonicalRoot,
         shell: false,
         timeout: 10000,
         maxBuffer,
-        env: {
-          ...process.env,
-          // Neutralize localized git output
-          LC_ALL: 'C',
-          GIT_CONFIG_NOSYSTEM: '1',
-          GIT_TERMINAL_PROMPT: '0',
-        },
+        env: safeEnv,
       });
       return { stdout: result.stdout, stderr: result.stderr };
     } catch (err: unknown) {
-      const execErr = err as { code?: number; message?: string; stderr?: string };
+      const execErr = err as { code?: string | number; message?: string; stderr?: string };
+      if (execErr.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
+        throw ArcError.payloadTooLarge('Git command output exceeded maximum buffer limit.');
+      }
       throw ArcError.internalError(
         `Git command failed: ${execErr.stderr || execErr.message || 'Unknown error'}`,
       );
@@ -114,9 +230,11 @@ export class GitSubsystem implements IGitSubsystem {
 
   public async getStatus(
     workspaceRoot: string,
-    request: GitStatusRequest,
+    _request?: GitStatusRequest,
   ): Promise<GitStatusResponse> {
-    const targetRoot = request.workspaceRoot || workspaceRoot;
+    // Non-bypassable: execution subsystems MUST receive only the canonical workspace root
+    // Caller parameters must never override the execution root after policy authorization.
+    const targetRoot = workspaceRoot;
 
     // Get current branch
     let branch = 'unknown';
@@ -150,6 +268,11 @@ export class GitSubsystem implements IGitSubsystem {
       const workTreeStatus = line[1];
       const filePath = line.substring(3).trim();
 
+      // Filter out blacklisted/sensitive file paths
+      if (isSensitiveGitPath(filePath)) {
+        continue;
+      }
+
       if (indexStatus === '?' && workTreeStatus === '?') {
         untrackedFiles.push(filePath);
       } else {
@@ -179,7 +302,14 @@ export class GitSubsystem implements IGitSubsystem {
     validateGitArgument('target', request.target);
     validateGitArgument('path', request.path);
 
-    const args = ['diff'];
+    if (request.path && isSensitiveGitPath(request.path)) {
+      throw ArcError.accessDenied(
+        'Target diff path matches sensitive credential or system blacklist pattern.',
+      );
+    }
+
+    // Git hardening: disable external diff helpers, textconv, and hooks
+    const args = ['diff', '--no-ext-diff', '--no-textconv'];
 
     if (request.cached) {
       args.push('--cached');
@@ -189,22 +319,38 @@ export class GitSubsystem implements IGitSubsystem {
       args.push(request.target.trim());
     }
 
+    // Negative pathspecs to exclude sensitive secrets from diff
+    const secretExcludes = [
+      ':(exclude)*.env*',
+      ':(exclude)*.pem',
+      ':(exclude)*.key',
+      ':(exclude)*.p12',
+      ':(exclude)*.pfx',
+      ':(exclude)*id_rsa*',
+      ':(exclude)*id_ed25519*',
+      ':(exclude).ssh/**',
+      ':(exclude).aws/**',
+      ':(exclude).gnupg/**',
+      ':(exclude).kube/**',
+    ];
+
     if (request.path) {
-      args.push('--', request.path.trim());
+      args.push('--', request.path.trim(), ...secretExcludes);
+    } else {
+      args.push('--', '.', ...secretExcludes);
     }
 
     const { stdout } = await this.runGit(workspaceRoot, args, MAX_DIFF_BYTES * 2);
 
-    let diffText = maskSensitiveDiff(stdout);
-    let truncated = false;
+    // Defense-in-depth: purge any diff hunks mentioning sensitive files
+    let diffText = purgeSensitiveDiffBlocks(stdout);
+    diffText = maskSensitiveDiff(diffText);
 
-    if (Buffer.byteLength(diffText, 'utf8') > MAX_DIFF_BYTES) {
-      diffText = diffText.slice(0, MAX_DIFF_BYTES);
-      truncated = true;
-    }
+    // Enforce safe byte-level UTF-8 truncation without splitting multi-byte characters
+    const { text, truncated } = truncateUtf8ToByteLimit(diffText, MAX_DIFF_BYTES);
 
     return {
-      diff: diffText,
+      diff: text,
       truncated,
     };
   }

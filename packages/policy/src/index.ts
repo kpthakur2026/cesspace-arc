@@ -1,5 +1,5 @@
 import { realpathSync, existsSync } from 'node:fs';
-import { resolve, normalize, sep } from 'node:path';
+import { resolve, sep } from 'node:path';
 import {
   PolicyOutcome,
   type PolicyEffect,
@@ -54,17 +54,27 @@ export class WorkspaceRegistry {
   /**
    * Register an authorized workspace root.
    * Resolves the path to its real canonical path and verifies it exists.
+   * Throws an error if the path does not exist or cannot be resolved.
    */
   public registerWorkspace(id: string, rawPath: string): WorkspaceRecord {
     if (!id || typeof id !== 'string' || id.trim().length === 0) {
       throw new Error('Workspace ID must be a non-empty string');
     }
+    if (!rawPath || typeof rawPath !== 'string' || rawPath.trim().length === 0) {
+      throw new Error('Workspace path must be a non-empty string');
+    }
     const resolvedPath = resolve(rawPath);
+    if (!existsSync(resolvedPath)) {
+      throw new Error(`Workspace root path does not exist: ${resolvedPath}`);
+    }
     let canonicalPath: string;
     try {
       canonicalPath = realpathSync(resolvedPath);
-    } catch {
-      canonicalPath = normalize(resolvedPath);
+    } catch (err: unknown) {
+      throw new Error(
+        `Failed to resolve canonical path for workspace root: ${resolvedPath} (${(err as Error).message})`,
+        { cause: err },
+      );
     }
 
     const isGitRepo =
@@ -90,11 +100,14 @@ export class WorkspaceRegistry {
   }
 
   public findWorkspaceForPath(targetPath: string): WorkspaceRecord | undefined {
+    if (!targetPath || typeof targetPath !== 'string') {
+      return undefined;
+    }
     let resolved: string;
     try {
       resolved = realpathSync(resolve(targetPath));
     } catch {
-      resolved = normalize(resolve(targetPath));
+      return undefined;
     }
 
     // Exact match
@@ -171,6 +184,24 @@ export class SecurityKernel implements IPolicyEngine {
     }
 
     // 4. Workspace Binding Gate
+    if (targetWorkspace.workspaceId === 'deny-conflicting-workspace-selectors') {
+      return {
+        outcome: PolicyOutcome.DENY,
+        effect: 'DENY',
+        matchingRuleId: 'deny-conflicting-workspace-selectors',
+        reason: 'Conflicting workspace selectors provided in request parameters.',
+      };
+    }
+
+    if (targetWorkspace.workspaceId === 'deny-unregistered-workspace') {
+      return {
+        outcome: PolicyOutcome.DENY,
+        effect: 'DENY',
+        matchingRuleId: 'deny-unregistered-workspace',
+        reason: `Workspace selector is not registered in authorized workspaces.`,
+      };
+    }
+
     const rootPath = targetWorkspace.rootPath;
     if (!rootPath || rootPath.trim().length === 0) {
       return {
@@ -182,11 +213,9 @@ export class SecurityKernel implements IPolicyEngine {
     }
 
     // Verify root is known to workspace registry
-    const registeredWs =
-      this.workspaceRegistry.getWorkspace(targetWorkspace.workspaceId) ||
-      this.workspaceRegistry.findWorkspaceForPath(rootPath);
+    const registeredWs = this.workspaceRegistry.getWorkspace(targetWorkspace.workspaceId);
 
-    if (!registeredWs) {
+    if (!registeredWs || registeredWs.rootPath !== rootPath) {
       return {
         outcome: PolicyOutcome.DENY,
         effect: 'DENY',
@@ -195,10 +224,39 @@ export class SecurityKernel implements IPolicyEngine {
       };
     }
 
+    // Explicit caller parameters check to ensure policy matches execution context
+    if (request.parameters.workspaceRoot) {
+      const explicitWs =
+        this.workspaceRegistry.findWorkspaceForPath(String(request.parameters.workspaceRoot)) ||
+        this.workspaceRegistry.getWorkspace(String(request.parameters.workspaceRoot));
+      if (!explicitWs || explicitWs.id !== registeredWs.id) {
+        return {
+          outcome: PolicyOutcome.DENY,
+          effect: 'DENY',
+          matchingRuleId: 'deny-unregistered-workspace',
+          reason: `Requested workspaceRoot '${request.parameters.workspaceRoot}' is not authorized.`,
+        };
+      }
+    }
+    if (request.parameters.workspaceId) {
+      const explicitWs = this.workspaceRegistry.getWorkspace(
+        String(request.parameters.workspaceId),
+      );
+      if (!explicitWs || explicitWs.id !== registeredWs.id) {
+        return {
+          outcome: PolicyOutcome.DENY,
+          effect: 'DENY',
+          matchingRuleId: 'deny-unregistered-workspace',
+          reason: `Requested workspaceId '${request.parameters.workspaceId}' is not authorized.`,
+        };
+      }
+    }
+
     // 5. Sensitive Path Pre-Check
     const rawPath =
       (request.parameters.path as string | undefined) ||
-      (request.parameters.subPath as string | undefined);
+      (request.parameters.subPath as string | undefined) ||
+      (request.parameters.target as string | undefined);
 
     if (rawPath) {
       const sensitivePatterns = [
@@ -211,6 +269,7 @@ export class SecurityKernel implements IPolicyEngine {
         /(^|[/\\])\.git[/\\]hooks([/\\]|$)/i,
         /(^|[/\\])id_rsa/i,
         /(^|[/\\])id_ed25519/i,
+        /\.(pem|key|p12|pfx)$/i,
       ];
 
       for (const pattern of sensitivePatterns) {

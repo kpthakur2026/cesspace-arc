@@ -29,6 +29,18 @@ export interface IFilesystemSubsystem {
 }
 
 /**
+ * Pluggable Search Backend interface (P2 architecture).
+ */
+export interface ISearchBackend {
+  searchFiles(
+    searchRoot: string,
+    canonicalRoot: string,
+    request: SearchFilesRequest,
+  ): Promise<SearchFilesResponse>;
+  searchText(canonicalRoot: string, request: SearchTextRequest): Promise<SearchTextResponse>;
+}
+
+/**
  * Sensitive path patterns permanently blacklisted.
  */
 export const SENSITIVE_PATH_PATTERNS: RegExp[] = [
@@ -108,6 +120,12 @@ export function isBinaryFile(filePath: string): boolean {
  * Enforces Tier 1 Userspace Canonicalization baseline as specified in the architecture.
  */
 export class FilesystemSubsystem implements IFilesystemSubsystem {
+  private searchBackend: ISearchBackend;
+
+  constructor(searchBackend?: ISearchBackend) {
+    this.searchBackend = searchBackend || new NodeSearchBackend();
+  }
+
   /**
    * Resolves and verifies that requestedPath resides strictly within workspaceRoot.
    * Rejects path escapes (relative traversal, symlink escapes) and blacklisted secrets.
@@ -387,6 +405,30 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
     workspaceRoot: string,
     request: SearchFilesRequest,
   ): Promise<SearchFilesResponse> {
+    const subPath = request.subPath || '.';
+    const searchRoot = await this.resolveSecurePath(workspaceRoot, subPath);
+    const canonicalRoot = realpathSync(resolve(workspaceRoot));
+    return this.searchBackend.searchFiles(searchRoot, canonicalRoot, request);
+  }
+
+  public async searchText(
+    workspaceRoot: string,
+    request: SearchTextRequest,
+  ): Promise<SearchTextResponse> {
+    const canonicalRoot = realpathSync(resolve(workspaceRoot));
+    return this.searchBackend.searchText(canonicalRoot, request);
+  }
+}
+
+/**
+ * Default Node.js filesystem search backend.
+ */
+export class NodeSearchBackend implements ISearchBackend {
+  public async searchFiles(
+    searchRoot: string,
+    canonicalRoot: string,
+    request: SearchFilesRequest,
+  ): Promise<SearchFilesResponse> {
     if (
       !request.pattern ||
       typeof request.pattern !== 'string' ||
@@ -399,10 +441,6 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
       request.maxResults && request.maxResults > 0 ? request.maxResults : 50,
       MAX_SEARCH_RESULTS,
     );
-
-    const subPath = request.subPath || '.';
-    const searchRoot = await this.resolveSecurePath(workspaceRoot, subPath);
-    const canonicalRoot = realpathSync(resolve(workspaceRoot));
 
     const pattern = request.pattern.trim();
     // Convert glob-like wildcard (*, ?) to regex
@@ -467,7 +505,7 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
   }
 
   public async searchText(
-    workspaceRoot: string,
+    canonicalRoot: string,
     request: SearchTextRequest,
   ): Promise<SearchTextResponse> {
     if (!request.query || typeof request.query !== 'string') {
@@ -479,7 +517,6 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
       MAX_SEARCH_RESULTS,
     );
 
-    const canonicalRoot = realpathSync(resolve(workspaceRoot));
     const isRegex = Boolean(request.isRegex);
 
     let matcher: (line: string) => boolean;
@@ -493,10 +530,11 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
       // Check for pathological nested quantifiers: (a+)+, (a*)*, etc.
       if (
         /(\+[*+]|\*[*+]|\{[0-9,]+\}[*+])/.test(request.query) ||
-        /\([^)]+[*+]\)[*+]/.test(request.query)
+        /\([^)]+[*+]\)[*+]/.test(request.query) ||
+        /([a-zA-Z0-9_]+)+\$/.test(request.query)
       ) {
         throw ArcError.invalidRequestSchema(
-          'Regex contains potentially dangerous nested quantifiers.',
+          'Regex contains potentially dangerous nested quantifiers (ReDoS protection).',
         );
       }
       try {
@@ -512,10 +550,29 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
       matcher = (line: string) => line.includes(q);
     }
 
+    // Optional filePattern filter (glob style)
+    let filePatternRegex: RegExp | undefined;
+    if (request.filePattern && typeof request.filePattern === 'string') {
+      const pat = request.filePattern.trim();
+      if (pat.length > 0) {
+        filePatternRegex = new RegExp(
+          '^' +
+            pat
+              .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+              .replace(/\*/g, '.*')
+              .replace(/\?/g, '.') +
+            '$',
+          'i',
+        );
+      }
+    }
+
     const matches: TextMatchItem[] = [];
+    const searchStartMs = Date.now();
+    const MAX_SEARCH_DURATION_MS = 5000;
 
     const walk = (currentDir: string): void => {
-      if (matches.length >= maxMatches) {
+      if (matches.length >= maxMatches || Date.now() - searchStartMs > MAX_SEARCH_DURATION_MS) {
         return;
       }
 
@@ -527,7 +584,7 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
       }
 
       for (const dirent of dirents) {
-        if (matches.length >= maxMatches) {
+        if (matches.length >= maxMatches || Date.now() - searchStartMs > MAX_SEARCH_DURATION_MS) {
           break;
         }
 
@@ -545,6 +602,15 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
           }
           walk(fullPath);
         } else if (dirent.isFile()) {
+          // If filePattern is specified, filter files
+          if (
+            filePatternRegex &&
+            !filePatternRegex.test(name) &&
+            !filePatternRegex.test(relFromRoot.replace(/\\/g, '/'))
+          ) {
+            continue;
+          }
+
           // Skip binary files
           if (isBinaryFile(fullPath)) {
             continue;
@@ -567,7 +633,10 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
 
             const lines = content.toString('utf8').split(/\r?\n/);
             for (let lineIdx = 0; lineIdx < lines.length; lineIdx++) {
-              if (matches.length >= maxMatches) {
+              if (
+                matches.length >= maxMatches ||
+                Date.now() - searchStartMs > MAX_SEARCH_DURATION_MS
+              ) {
                 break;
               }
               const line = lines[lineIdx];

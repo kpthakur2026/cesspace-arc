@@ -16,16 +16,82 @@ import {
   type SystemStatusResponse,
   type PolicyEvaluationContext,
 } from '@cesspace-arc/protocol';
-import { SecurityKernel, WorkspaceRegistry } from '@cesspace-arc/policy';
+import { SecurityKernel, WorkspaceRegistry, type WorkspaceRecord } from '@cesspace-arc/policy';
 import { AuditLogger, computeSha256, canonicalJson } from '@cesspace-arc/audit';
 import { FilesystemSubsystem } from '@cesspace-arc/filesystem';
 import { GitSubsystem } from '@cesspace-arc/git';
+import { z } from 'zod';
 
 export interface ArcServerConfig {
   transport: 'stdio';
   authorizedRoots: Array<{ id: string; path: string }>;
   defaultWorkspaceId?: string;
 }
+
+/**
+ * Strict Zod validation schemas for all 9 permitted RC-01 tools.
+ * Enforces runtime schema pre-admission rejection and audit logging.
+ */
+export const TOOL_SCHEMAS = {
+  health: z.object({}).strict(),
+  system_status: z.object({}).strict(),
+  list_directory: z
+    .object({
+      path: z.string().optional(),
+      recursive: z.boolean().optional(),
+      maxDepth: z.number().int().min(1).max(5).optional(),
+      includeHidden: z.boolean().optional(),
+      workspaceId: z.string().optional(),
+    })
+    .strict(),
+  read_file: z
+    .object({
+      path: z.string().min(1),
+      offset: z.number().int().min(0).optional(),
+      length: z.number().int().min(0).optional(),
+      workspaceId: z.string().optional(),
+    })
+    .strict(),
+  search_files: z
+    .object({
+      pattern: z.string().min(1),
+      subPath: z.string().optional(),
+      maxResults: z.number().int().min(1).max(200).optional(),
+      workspaceId: z.string().optional(),
+    })
+    .strict(),
+  search_text: z
+    .object({
+      query: z.string().min(1),
+      isRegex: z.boolean().optional(),
+      filePattern: z.string().optional(),
+      maxMatches: z.number().int().min(1).max(200).optional(),
+      workspaceId: z.string().optional(),
+    })
+    .strict(),
+  git_status: z
+    .object({
+      workspaceRoot: z.string().optional(),
+      workspaceId: z.string().optional(),
+    })
+    .strict(),
+  git_diff: z
+    .object({
+      target: z.string().optional(),
+      path: z.string().optional(),
+      cached: z.boolean().optional(),
+      workspaceId: z.string().optional(),
+    })
+    .strict(),
+  git_log: z
+    .object({
+      maxCount: z.number().int().min(1).max(100).optional(),
+      revision: z.string().optional(),
+      path: z.string().optional(),
+      workspaceId: z.string().optional(),
+    })
+    .strict(),
+} as const;
 
 /**
  * Definition of the 9 RC-01 MCP Tools.
@@ -340,26 +406,145 @@ export class ArcMcpServer implements IArcMcpServer {
       authenticated: actorOverride?.authenticated ?? true,
     };
 
-    // 2. Workspace Binding
-    const requestedWorkspaceId =
-      (parameters.workspaceId as string | undefined) ||
-      (parameters.workspaceRoot as string | undefined) ||
-      this.defaultWorkspaceId;
+    // 2. Pre-Admission Tool Name & Runtime Schema Validation Gate (P1-02)
+    const schema = (TOOL_SCHEMAS as Record<string, z.ZodTypeAny | undefined>)[toolName];
+    if (!schema) {
+      const arcErr = ArcError.policyDenied(
+        `Tool '${toolName}' is not permitted in RC-01 stage (read-only inspection core only).`,
+      );
+      await this.auditLogger.log({
+        timestamp: startTime,
+        actor: auditActor,
+        target: { workspaceId: 'unbound', workspacePath: '' },
+        invocation: {
+          toolName,
+          parametersRedacted: parameters,
+          payloadHash: computeSha256(canonicalJson(parameters)),
+        },
+        policy: {
+          decision: 'DENY',
+          ruleId: 'default-deny-unregistered-tool',
+          evaluationDurationMs: 0,
+        },
+        execution: {
+          status: 'DENIED',
+          startTime,
+          endTime: new Date().toISOString(),
+          durationMs: Date.now() - startMs,
+        },
+        error: {
+          code: arcErr.code,
+          message: arcErr.message,
+        },
+      });
+      return {
+        isError: true,
+        content: [{ type: 'text', text: JSON.stringify(arcErr.toJSON(), null, 2) }],
+      };
+    }
 
-    let targetWorkspaceRecord = requestedWorkspaceId
-      ? this.workspaceRegistry.getWorkspace(requestedWorkspaceId) ||
-        this.workspaceRegistry.findWorkspaceForPath(requestedWorkspaceId)
-      : undefined;
+    const parseResult = schema.safeParse(parameters);
+    if (!parseResult.success) {
+      const issueMessages = parseResult.error.issues
+        .map((iss) => `${iss.path.join('.') || 'root'}: ${iss.message}`)
+        .join('; ');
+      const arcErr = ArcError.invalidRequestSchema(
+        `Invalid parameters for tool '${toolName}': ${issueMessages}`,
+      );
+      await this.auditLogger.log({
+        timestamp: startTime,
+        actor: auditActor,
+        target: { workspaceId: 'unbound', workspacePath: '' },
+        invocation: {
+          toolName,
+          parametersRedacted: parameters,
+          payloadHash: computeSha256(canonicalJson(parameters)),
+        },
+        policy: {
+          decision: 'DENY',
+          ruleId: 'schema-validation-failure',
+          evaluationDurationMs: 0,
+        },
+        execution: {
+          status: 'DENIED',
+          startTime,
+          endTime: new Date().toISOString(),
+          durationMs: Date.now() - startMs,
+        },
+        error: {
+          code: 'INVALID_REQUEST_SCHEMA',
+          message: arcErr.message,
+        },
+      });
+      return {
+        isError: true,
+        content: [{ type: 'text', text: JSON.stringify(arcErr.toJSON(), null, 2) }],
+      };
+    }
 
-    if (!targetWorkspaceRecord) {
-      const allWorkspaces = this.workspaceRegistry.getWorkspaces();
-      if (allWorkspaces.length > 0) {
-        targetWorkspaceRecord = allWorkspaces[0];
+    // 3. Workspace Binding Gate (P1-01)
+    const hasExplicitId =
+      typeof parameters.workspaceId === 'string' && parameters.workspaceId.trim().length > 0;
+    const hasExplicitRoot =
+      typeof parameters.workspaceRoot === 'string' && parameters.workspaceRoot.trim().length > 0;
+
+    let targetWorkspaceRecord: WorkspaceRecord | undefined;
+    let workspaceConflict = false;
+    let workspaceUnregistered = false;
+
+    if (toolName === 'health' || toolName === 'system_status') {
+      targetWorkspaceRecord = this.defaultWorkspaceId
+        ? this.workspaceRegistry.getWorkspace(this.defaultWorkspaceId)
+        : undefined;
+    } else {
+      if (hasExplicitId && hasExplicitRoot) {
+        const wsById = this.workspaceRegistry.getWorkspace(parameters.workspaceId as string);
+        const wsByPath =
+          this.workspaceRegistry.findWorkspaceForPath(parameters.workspaceRoot as string) ||
+          this.workspaceRegistry.getWorkspace(parameters.workspaceRoot as string);
+
+        if (!wsById || !wsByPath) {
+          workspaceUnregistered = true;
+        } else if (wsById.id !== wsByPath.id) {
+          workspaceConflict = true;
+        } else {
+          targetWorkspaceRecord = wsById;
+        }
+      } else if (hasExplicitId) {
+        const ws = this.workspaceRegistry.getWorkspace(parameters.workspaceId as string);
+        if (!ws) {
+          workspaceUnregistered = true;
+        } else {
+          targetWorkspaceRecord = ws;
+        }
+      } else if (hasExplicitRoot) {
+        const ws =
+          this.workspaceRegistry.findWorkspaceForPath(parameters.workspaceRoot as string) ||
+          this.workspaceRegistry.getWorkspace(parameters.workspaceRoot as string);
+        if (!ws) {
+          workspaceUnregistered = true;
+        } else {
+          targetWorkspaceRecord = ws;
+        }
+      } else {
+        // Neither selector provided: fall back to defaultWorkspaceId or single registered workspace
+        if (this.defaultWorkspaceId) {
+          targetWorkspaceRecord = this.workspaceRegistry.getWorkspace(this.defaultWorkspaceId);
+        } else {
+          const allWorkspaces = this.workspaceRegistry.getWorkspaces();
+          if (allWorkspaces.length === 1) {
+            targetWorkspaceRecord = allWorkspaces[0];
+          }
+        }
       }
     }
 
     const targetWorkspace: PolicyEvaluationContext['targetWorkspace'] = {
-      workspaceId: targetWorkspaceRecord?.id || 'unbound',
+      workspaceId: workspaceConflict
+        ? 'deny-conflicting-workspace-selectors'
+        : workspaceUnregistered
+          ? 'deny-unregistered-workspace'
+          : targetWorkspaceRecord?.id || 'unbound',
       rootPath: targetWorkspaceRecord?.rootPath || '',
       isGitRepo: targetWorkspaceRecord?.isGitRepo || false,
     };
@@ -642,15 +827,22 @@ export function createArcMcpServer(config?: Partial<ArcServerConfig>): ArcMcpSer
 }
 
 // Auto-start in stdio transport mode if executed directly as script
+// Enforces P1-05: Remove implicit process.cwd() authorization; require explicit trusted workspace configuration
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const configuredWorkspace = process.env.CESSPACE_WORKSPACE;
+  const authorizedRoots = configuredWorkspace
+    ? [
+        {
+          id: 'workspace',
+          path: configuredWorkspace,
+        },
+      ]
+    : [];
+
   const server = createArcMcpServer({
     transport: 'stdio',
-    authorizedRoots: [
-      {
-        id: 'workspace',
-        path: process.env.CESSPACE_WORKSPACE || process.cwd(),
-      },
-    ],
+    authorizedRoots,
+    defaultWorkspaceId: configuredWorkspace ? 'workspace' : undefined,
   });
 
   server.start().catch((err) => {

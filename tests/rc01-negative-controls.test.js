@@ -9,7 +9,7 @@ import { ArcMcpServer } from '../apps/mcp-server/dist/index.js';
 import { WorkspaceRegistry, SecurityKernel } from '../packages/policy/dist/index.js';
 import { AuditLogger } from '../packages/audit/dist/index.js';
 import { FilesystemSubsystem } from '../packages/filesystem/dist/index.js';
-import { GitSubsystem } from '../packages/git/dist/index.js';
+import { GitSubsystem, truncateUtf8ToByteLimit } from '../packages/git/dist/index.js';
 
 describe('CesSpace ARC — RC-01 Mandatory Security Negative & Positive Controls', () => {
   let tempDir;
@@ -414,6 +414,218 @@ describe('CesSpace ARC — RC-01 Mandatory Security Negative & Positive Controls
     assert.ok(parsed.memoryFreeBytes > 0);
     assert.equal(parsed.hostname, undefined, 'Must NOT leak hostname');
     assert.equal(parsed.ip, undefined, 'Must NOT leak IP addresses');
+  });
+
+  // ==========================================================================
+  // INDEPENDENT SECURITY REVIEW REGRESSION CONTROLS
+  // ==========================================================================
+
+  test('P1-01: External workspaceRoot in git_status is rejected (cannot bypass workspace binding)', async () => {
+    const res = await server.dispatchToolCall('git_status', {
+      workspaceRoot: externalDir,
+    });
+    assert.equal(res.isError, true);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.equal(parsed.code, 'POLICY_DENIED');
+  });
+
+  test('P1-01: Invalid explicit workspaceId fails closed without falling back to default', async () => {
+    const res = await server.dispatchToolCall('read_file', {
+      workspaceId: 'non-existent-workspace-id',
+      path: 'README.md',
+    });
+    assert.equal(res.isError, true);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.equal(parsed.code, 'POLICY_DENIED');
+  });
+
+  test('P1-01: Conflicting workspaceId and workspaceRoot selectors fail closed with DENY', async () => {
+    // Register a secondary workspace in registry
+    const secondaryWsDir = path.join(tempDir, 'secondary-ws');
+    fs.mkdirSync(secondaryWsDir, { recursive: true });
+    server.workspaceRegistry.registerWorkspace('second-ws', secondaryWsDir);
+
+    const res = await server.dispatchToolCall('git_status', {
+      workspaceId: 'test-ws',
+      workspaceRoot: secondaryWsDir,
+    });
+    assert.equal(res.isError, true);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.equal(parsed.code, 'POLICY_DENIED');
+  });
+
+  test('P1-02: Schema validation fails closed on extra unknown properties for all 9 tools', async () => {
+    const toolNames = [
+      'health',
+      'system_status',
+      'list_directory',
+      'read_file',
+      'search_files',
+      'search_text',
+      'git_status',
+      'git_diff',
+      'git_log',
+    ];
+
+    for (const name of toolNames) {
+      const baseParams = {};
+      if (name === 'read_file') baseParams.path = 'README.md';
+      if (name === 'search_files') baseParams.pattern = '*.md';
+      if (name === 'search_text') baseParams.query = 'test';
+
+      const res = await server.dispatchToolCall(name, {
+        ...baseParams,
+        __unexpected_extra_field__: 'malicious_payload',
+      });
+      assert.equal(res.isError, true, `Tool '${name}' must reject unknown extra property`);
+      const parsed = JSON.parse(res.content[0].text);
+      assert.equal(parsed.code, 'INVALID_REQUEST_SCHEMA');
+    }
+  });
+
+  test('P1-02: Schema validation fails closed on wrong parameter types and emits audit record', async () => {
+    const res = await server.dispatchToolCall('read_file', {
+      path: 12345, // invalid type, string expected
+    });
+    assert.equal(res.isError, true);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.equal(parsed.code, 'INVALID_REQUEST_SCHEMA');
+
+    const records = auditLogger.getRecords();
+    const lastRecord = records[records.length - 1];
+    assert.equal(lastRecord.policy.decision, 'DENY');
+    assert.equal(lastRecord.error?.code, 'INVALID_REQUEST_SCHEMA');
+  });
+
+  test('P1-03: Git execution hardening: diff.external helper in .git/config is never executed', async () => {
+    const markerFile = path.join(tempDir, 'evil-marker-should-never-exist');
+    if (fs.existsSync(markerFile)) {
+      fs.unlinkSync(markerFile);
+    }
+
+    // Configure evil external diff script in workspace's .git/config
+    execFileSync('git', ['config', 'diff.external', `touch ${markerFile}`], {
+      cwd: workspaceDir,
+    });
+
+    const res = await server.dispatchToolCall('git_diff', {});
+    assert.equal(res.isError, undefined);
+
+    assert.equal(
+      fs.existsSync(markerFile),
+      false,
+      'External diff command must NEVER be executed by git_diff',
+    );
+
+    // Clean up config
+    execFileSync('git', ['config', '--unset', 'diff.external'], { cwd: workspaceDir });
+  });
+
+  test('P1-04: Git secret exclusion: tracked .env or private key diffs are purged and not disclosed', async () => {
+    // Create a tracked dummy secret file and commit it
+    const trackedSecret = path.join(workspaceDir, 'dummy.key');
+    fs.writeFileSync(trackedSecret, 'PRIVATE_KEY_SUPER_SECRET_VALUE\n');
+    execFileSync('git', ['add', 'dummy.key'], { cwd: workspaceDir });
+    execFileSync('git', ['commit', '-m', 'chore: commit tracked key'], { cwd: workspaceDir });
+
+    // Modify the tracked secret
+    fs.writeFileSync(trackedSecret, 'PRIVATE_KEY_SUPER_SECRET_MODIFIED\n');
+
+    const res = await server.dispatchToolCall('git_diff', {});
+    assert.equal(res.isError, undefined);
+    const parsed = JSON.parse(res.content[0].text);
+
+    assert.ok(
+      !parsed.diff.includes('PRIVATE_KEY_SUPER_SECRET_MODIFIED'),
+      'git_diff must NEVER disclose private key content',
+    );
+  });
+
+  test('P1-04: Git secret exclusion: sensitive files (.env, .ssh) are filtered from git_status', async () => {
+    const res = await server.dispatchToolCall('git_status', {});
+    assert.equal(res.isError, undefined);
+    const parsed = JSON.parse(res.content[0].text);
+
+    const allStatusFiles = [
+      ...parsed.stagedFiles,
+      ...parsed.unstagedFiles,
+      ...parsed.untrackedFiles,
+    ];
+
+    for (const f of allStatusFiles) {
+      assert.ok(!f.includes('.env'), `git_status must not list .env (${f})`);
+      assert.ok(!f.includes('.ssh'), `git_status must not list .ssh (${f})`);
+      assert.ok(!f.endsWith('.key'), `git_status must not list .key (${f})`);
+    }
+  });
+
+  test('P1-05: Server with no configured workspaces fails closed for workspace operations', async () => {
+    const emptyServer = new ArcMcpServer(
+      new WorkspaceRegistry(),
+      new SecurityKernel(new WorkspaceRegistry()),
+      new AuditLogger(),
+      new FilesystemSubsystem(),
+      new GitSubsystem(),
+      { authorizedRoots: [] },
+    );
+
+    const res = await emptyServer.dispatchToolCall('list_directory', {});
+    assert.equal(res.isError, true);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.equal(parsed.code, 'POLICY_DENIED');
+  });
+
+  test('P2: WorkspaceRegistry rejects non-existent workspace root registration', () => {
+    const reg = new WorkspaceRegistry();
+    assert.throws(
+      () => {
+        reg.registerWorkspace('nonexistent', '/path/that/definitely/does/not/exist/arc-test');
+      },
+      /does not exist/,
+      'Must reject non-existent workspace root',
+    );
+  });
+
+  test('P2: Multi-byte UTF-8 diff truncation respects byte bounds without breaking', async () => {
+    const multiByteString = '✨'.repeat(200000); // 3 bytes per emoji (0xE2 0x9C 0xA8)
+    const buf = Buffer.from(multiByteString, 'utf8');
+    assert.ok(buf.length > 512 * 1024);
+
+    const { text, truncated } = truncateUtf8ToByteLimit(multiByteString, 512 * 1024);
+    assert.equal(truncated, true);
+    assert.ok(Buffer.byteLength(text, 'utf8') <= 512 * 1024);
+    assert.ok(
+      !text.includes('\uFFFD'),
+      'Must not produce replacement characters due to cut codepoints',
+    );
+  });
+
+  test('P2: search_text filePattern filters files correctly', async () => {
+    const res = await server.dispatchToolCall('search_text', {
+      query: 'Hello CesSpace ARC',
+      filePattern: '*.md',
+    });
+    assert.equal(res.isError, undefined);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.equal(parsed.matches.length, 0, 'Must not match app.js when filePattern is *.md');
+
+    const resMatch = await server.dispatchToolCall('search_text', {
+      query: 'Hello CesSpace ARC',
+      filePattern: '*.js',
+    });
+    assert.equal(resMatch.isError, undefined);
+    const parsedMatch = JSON.parse(resMatch.content[0].text);
+    assert.ok(parsedMatch.matches.length >= 1, 'Must match app.js when filePattern is *.js');
+  });
+
+  test('P2: search_text rejects ReDoS nested quantifiers with INVALID_REQUEST_SCHEMA', async () => {
+    const res = await server.dispatchToolCall('search_text', {
+      query: '(a+)+$',
+      isRegex: true,
+    });
+    assert.equal(res.isError, true);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.equal(parsed.code, 'INVALID_REQUEST_SCHEMA');
   });
 
   test('Audit log hash chain integrity verification', async () => {

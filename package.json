@@ -12,12 +12,14 @@
     "pnpm": "^12.4.2"
   },
   "scripts": {
+    "build": "pnpm -r run build",
     "check": "pnpm run check:format && pnpm run lint && pnpm run typecheck && pnpm run test && pnpm run check:git && pnpm run check:secrets && pnpm audit",
     "check:format": "prettier --check .",
     "format": "prettier --write .",
     "lint": "eslint .",
     "typecheck": "tsc --build",
     "test": "node --test tests/protocol-contracts.test.js tests/rc01-negative-controls.test.js",
+    "bench:rc01": "node benchmarks/rc01-benchmark.js",
     "check:docs": "bash scripts/check-docs.sh",
     "check:secrets": "bash scripts/check-secrets.sh",
     "check:git": "git diff --check",
@@ -27,7 +29,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "@types/node": "^20.19.43",
+    "@types/node": "^24.13.5",
     "eslint": "^10.10.0",
     "prettier": "^3.9.7",
     "typescript": "^5.9.3",
