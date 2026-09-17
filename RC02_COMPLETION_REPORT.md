@@ -116,7 +116,7 @@ All 9 quality gates passed cleanly:
 | **Gate 2** | Code Formatting         | `pnpm run check:format`                   | Clean (zero Prettier issues)               |
 | **Gate 3** | Lint & Static Analysis  | `pnpm run lint`                           | Clean (zero ESLint errors/warnings)        |
 | **Gate 4** | TypeScript Build        | `pnpm run typecheck && pnpm -r run build` | Clean across all 11 packages               |
-| **Gate 5** | Test Suite              | `pnpm run test`                           | **142/142 passing**                        |
+| **Gate 5** | Test Suite              | `pnpm run test`                           | **143/143 passing**                        |
 | **Gate 6** | Documentation Integrity | `bash scripts/check-docs.sh`              | Clean (all docs & internal links verified) |
 | **Gate 7** | Secret Scanning         | `bash scripts/check-secrets.sh`           | Clean (zero secrets, zero private IPs)     |
 | **Gate 8** | Git Diff Cleanliness    | `git diff --check`                        | Clean (zero whitespace errors)             |
@@ -126,11 +126,11 @@ All 9 quality gates passed cleanly:
 
 ## 4. Test Suite Metrics
 
-- **Total Test Cases:** 142
+- **Total Test Cases:** 143
   - RC-00 Protocol & Architecture: 5 tests
   - RC-01 Read-Only Negative & Positive Controls: 49 tests
   - RC-02 Controlled Terminal & Process Controls: 41 tests
-  - RC-02 Independent Security Review Regressions: 47 tests
+  - RC-02 Independent Security Review Regressions: 48 tests
 - **Negative Controls & Invariants Verified:**
   - Denied executables (bash, sh, sudo, rm, curl, wget, dd, docker, cat, npx)
   - Denied script executions (`node script.js`, `node -e "..."`, `npm run`, `npm test`, `npm start`, `npm exec`, `pnpm run`, `pnpm exec`, `pnpm dlx`)
@@ -213,6 +213,7 @@ All 9 quality gates passed cleanly:
 | `RC02-REG-45` | `process_output` enforces `maxBytes` as combined total budget for stdout and stderr                         |
 | `RC02-REG-46` | `PROCESS_SPAWN_SUCCEEDED` is emitted only after child actually emits spawn event                            |
 | `RC02-REG-47` | `terminateProcess` hardens against already-exited/stale child PID races safely                              |
+| `RC02-REG-48` | Background execution handles asynchronous spawn failure safely and never reports `RUNNING`                  |
 
 ---
 

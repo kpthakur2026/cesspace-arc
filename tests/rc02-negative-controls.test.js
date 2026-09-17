@@ -1706,4 +1706,98 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
     assert.equal(parsed.terminated, false, 'Already-exited process returns terminated: false');
     assert.equal(parsed.signal, 'NONE');
   });
+
+  test('RC02-REG-48: background execution handles asynchronous spawn failure safely and never reports RUNNING', async () => {
+    const reg = new ProcessRegistry();
+    const testAuditLogger = new AuditLogger();
+    const wsReg = new WorkspaceRegistry();
+    wsReg.registerWorkspace('test-ws', workspaceDir);
+
+    const { ProcessAuditSink } = await import('../apps/mcp-server/dist/index.js');
+    reg.registerLifecycleSink(new ProcessAuditSink(testAuditLogger, wsReg));
+
+    // Controlled custom resolver that returns a non-existent binary to trigger an asynchronous spawn error (ENOENT)
+    const customResolver = {
+      resolveExecutable: (_name, _wsRoot) => {
+        return '/usr/bin/ces-nonexistent-async-spawn-failure-bin';
+      },
+    };
+
+    const runner = new ControlledProcessRunner(reg, undefined, customResolver);
+
+    const actor = {
+      clientId: 'client-test',
+      clientType: 'test',
+      sessionId: 'session-test',
+      deviceId: 'device-test',
+    };
+    const targetWs = {
+      workspaceId: 'test-ws',
+      rootPath: workspaceDir,
+    };
+
+    // 1. Test direct ControlledProcessRunner background execution
+    const res = await runner.executeCommand(
+      {
+        executable: 'node',
+        args: ['--version'],
+        runInBackground: true,
+      },
+      actor,
+      targetWs,
+    );
+
+    // Assert the returned result does NOT claim RUNNING and truthfully reports FAILED
+    assert.notEqual(res.state, 'RUNNING', 'Returned state must never be RUNNING on failed spawn');
+    assert.equal(res.state, 'FAILED', 'Returned state must be truthful FAILED state');
+
+    // Assert PROCESS_SPAWN_SUCCEEDED is NOT emitted for that failed spawn
+    const records = testAuditLogger.getRecords();
+    const spawnSucceededRec = records.find(
+      (r) =>
+        r.invocation.toolName === 'PROCESS_SPAWN_SUCCEEDED' &&
+        r.invocation.parametersRedacted.processId === res.processId,
+    );
+    assert.equal(
+      spawnSucceededRec,
+      undefined,
+      'PROCESS_SPAWN_SUCCEEDED must NOT be emitted for failed spawn',
+    );
+
+    // Assert PROCESS_SPAWN_FAILED IS emitted
+    const spawnFailedRec = records.find(
+      (r) =>
+        r.invocation.toolName === 'PROCESS_SPAWN_FAILED' &&
+        r.invocation.parametersRedacted.processId === res.processId,
+    );
+    assert.ok(spawnFailedRec, 'PROCESS_SPAWN_FAILED must be emitted for failed spawn');
+
+    // 2. Test execution via ArcMcpServer dispatchToolCall
+    const testKernel = new SecurityKernel(wsReg, reg);
+    const customServer = new ArcMcpServer(
+      wsReg,
+      testKernel,
+      testAuditLogger,
+      new FilesystemSubsystem(),
+      new GitSubsystem(),
+      { defaultWorkspaceId: 'test-ws' },
+      runner,
+      reg,
+    );
+
+    const toolCallRes = await customServer.dispatchToolCall(
+      'run_command',
+      {
+        executable: 'node',
+        args: ['--version'],
+        runInBackground: true,
+      },
+      { clientId: 'client-test', sessionId: 'session-test' },
+    );
+
+    assert.equal(toolCallRes.isError, undefined);
+    const parsedToolCall = JSON.parse(toolCallRes.content[0].text);
+    assert.notEqual(parsedToolCall.state, 'RUNNING', 'Tool call result state must not be RUNNING');
+    assert.equal(parsedToolCall.state, 'FAILED', 'Tool call result state must be FAILED');
+  });
 });

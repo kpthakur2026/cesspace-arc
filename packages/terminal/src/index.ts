@@ -485,8 +485,18 @@ export class ControlledProcessRunner implements ITerminalSubsystem {
     if (request.runInBackground) {
       // Ensure the spawn event or spawn error has been emitted before returning
       // so PROCESS_SPAWN_SUCCEEDED is reliably emitted and available in audit sinks.
-      if (!spawnSucceeded && !child.killed && child.exitCode === null) {
+      if (
+        !spawnSucceeded &&
+        !child.killed &&
+        child.exitCode === null &&
+        record.state === 'RUNNING'
+      ) {
         await new Promise<void>((resolvePromise) => {
+          const cleanup = () => {
+            clearTimeout(timer);
+            child.removeListener('spawn', onSpawn);
+            child.removeListener('error', onError);
+          };
           const onSpawn = () => {
             cleanup();
             resolvePromise();
@@ -495,13 +505,51 @@ export class ControlledProcessRunner implements ITerminalSubsystem {
             cleanup();
             resolvePromise();
           };
-          const cleanup = () => {
-            child.removeListener('spawn', onSpawn);
-            child.removeListener('error', onError);
+          const onTimeout = () => {
+            cleanup();
+            resolvePromise();
           };
+          const timer: NodeJS.Timeout = setTimeout(onTimeout, Math.min(timeoutMs, 5000));
+          timer.unref();
           child.once('spawn', onSpawn);
           child.once('error', onError);
         });
+      }
+
+      // If spawn failed or child encountered an asynchronous error before spawn, fail closed / report truthful state
+      if (!spawnSucceeded || record.state === 'FAILED') {
+        if (
+          record.state !== 'FAILED' &&
+          record.state !== 'COMPLETED' &&
+          record.state !== 'TERMINATED'
+        ) {
+          this.processRegistry.markSpawnFailed(record.processId, 'Process failed to spawn');
+        }
+        const status = this.processRegistry.getProcessStatus(record.processId, {
+          clientId: actor.clientId,
+          sessionId: actor.sessionId,
+          workspaceId: targetWorkspace.workspaceId,
+        });
+        const output = this.processRegistry.getProcessOutput(
+          record.processId,
+          0,
+          MAX_OUTPUT_READ_BYTES,
+          {
+            clientId: actor.clientId,
+            sessionId: actor.sessionId,
+            workspaceId: targetWorkspace.workspaceId,
+          },
+        );
+        return {
+          processId: record.processId,
+          state: status.state,
+          exitCode: status.exitCode,
+          signal: status.signal,
+          stdout: output.stdoutChunk,
+          stderr: output.stderrChunk,
+          timedOut: status.timedOut,
+          durationMs: status.durationMs,
+        };
       }
 
       return {
