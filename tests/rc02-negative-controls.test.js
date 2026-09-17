@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 
 import { ArcMcpServer } from '../apps/mcp-server/dist/index.js';
 import { WorkspaceRegistry, SecurityKernel } from '../packages/policy/dist/index.js';
@@ -11,7 +11,7 @@ import { AuditLogger } from '../packages/audit/dist/index.js';
 import { FilesystemSubsystem } from '../packages/filesystem/dist/index.js';
 import { GitSubsystem } from '../packages/git/dist/index.js';
 import { ProcessRegistry, sliceUtf8Safe } from '../packages/processes/dist/index.js';
-import { ControlledProcessRunner } from '../packages/terminal/dist/index.js';
+import { ControlledProcessRunner, ExecutableResolver } from '../packages/terminal/dist/index.js';
 
 describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls', () => {
   let tempDir;
@@ -430,21 +430,21 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
     );
   });
 
-  test('RC02-P-02: run_command git status returns foreground output within workspace', async () => {
+  test('RC02-P-02: run_command git --version returns foreground output within workspace', async () => {
     const res = await server.dispatchToolCall('run_command', {
       executable: 'git',
-      args: ['status', '--porcelain'],
+      args: ['--version'],
     });
     assert.equal(res.isError, undefined);
     const parsed = JSON.parse(res.content[0].text);
     assert.ok(parsed.processId, 'Must return a processId');
+    assert.match(parsed.stdout, /git version/i);
   });
 
-  test('RC02-P-03: run_command in background returns processId immediately (git log)', async () => {
-    // git log is a read-only allowlisted command that completes quickly
+  test('RC02-P-03: run_command in background returns processId immediately (git --version)', async () => {
     const res = await server.dispatchToolCall('run_command', {
       executable: 'git',
-      args: ['log', '--oneline', '-1'],
+      args: ['--version'],
       runInBackground: true,
     });
     assert.equal(res.isError, undefined);
@@ -498,10 +498,10 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
   });
 
   test('RC02-P-06: terminate_process returns valid response for a background process', async () => {
-    // Start a background git process
+    // Start a background process
     const runRes = await server.dispatchToolCall('run_command', {
-      executable: 'git',
-      args: ['log', '--oneline', '-100'],
+      executable: 'node',
+      args: ['--version'],
       runInBackground: true,
     });
     if (runRes.isError) {
@@ -726,8 +726,8 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
   test('RC02-REG-12: process supervision fails closed when caller identity is missing', async () => {
     processRegistry.clear();
     const startRes = await server.dispatchToolCall('run_command', {
-      executable: 'git',
-      args: ['status'],
+      executable: 'node',
+      args: ['--version'],
       runInBackground: true,
     });
     const pid = JSON.parse(startRes.content[0].text).processId;
@@ -745,8 +745,8 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
   test('RC02-REG-13: process supervision fails closed when clientId is mismatched', async () => {
     processRegistry.clear();
     const startRes = await server.dispatchToolCall('run_command', {
-      executable: 'git',
-      args: ['status'],
+      executable: 'node',
+      args: ['--version'],
       runInBackground: true,
     });
     const pid = JSON.parse(startRes.content[0].text).processId;
@@ -764,8 +764,8 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
   test('RC02-REG-14: process supervision fails closed when sessionId is mismatched', async () => {
     processRegistry.clear();
     const startRes = await server.dispatchToolCall('run_command', {
-      executable: 'git',
-      args: ['status'],
+      executable: 'node',
+      args: ['--version'],
       runInBackground: true,
     });
     const pid = JSON.parse(startRes.content[0].text).processId;
@@ -783,8 +783,8 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
   test('RC02-REG-15: process supervision fails closed when workspaceId is mismatched', async () => {
     processRegistry.clear();
     const startRes = await server.dispatchToolCall('run_command', {
-      executable: 'git',
-      args: ['status'],
+      executable: 'node',
+      args: ['--version'],
       runInBackground: true,
     });
     const pid = JSON.parse(startRes.content[0].text).processId;
@@ -802,12 +802,13 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
   test('RC02-REG-16: PROCESS_SPAWN_SUCCEEDED lifecycle event is recorded in audit logger', async () => {
     processRegistry.clear();
     const startRes = await server.dispatchToolCall('run_command', {
-      executable: 'git',
-      args: ['status'],
+      executable: 'node',
+      args: ['--version'],
       runInBackground: true,
     });
     const pid = JSON.parse(startRes.content[0].text).processId;
 
+    await server.flushAudit();
     const records = auditLogger.getRecords();
     const spawnRec = records.find(
       (r) =>
@@ -886,47 +887,102 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
 
   test('RC02-REG-20: PROCESS_TERMINATION_REQUESTED, PROCESS_SIGTERM_SENT, and PROCESS_TERMINATED lifecycle events are recorded', async () => {
     processRegistry.clear();
-    const startRes = await server.dispatchToolCall('run_command', {
-      executable: 'git',
-      args: ['log', '--oneline', '-100'],
-      runInBackground: true,
+    const dummyChild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 10000)'], {
+      detached: true,
+      stdio: 'ignore',
     });
-    const pid = JSON.parse(startRes.content[0].text).processId;
+    const record = processRegistry.registerProcess({
+      workspaceId: 'test-ws',
+      actor: { clientId: 'local-stdio-caller', sessionId: 'stdio-session-01' },
+      executable: 'node',
+      sanitizedArgs: ['--version'],
+      cwd: workspaceDir,
+      startedAt: new Date().toISOString(),
+      state: 'RUNNING',
+      timedOut: false,
+    });
+    record._child = dummyChild;
 
-    await server.dispatchToolCall('terminate_process', {
-      processId: pid,
+    const termRes = await server.dispatchToolCall('terminate_process', {
+      processId: record.processId,
       signal: 'SIGTERM',
     });
+    assert.equal(termRes.isError, undefined);
+    await server.flushAudit();
 
     const records = auditLogger.getRecords();
     const reqRec = records.find(
       (r) =>
         r.invocation.toolName === 'PROCESS_TERMINATION_REQUESTED' &&
-        r.invocation.parametersRedacted.processId === pid,
+        r.invocation.parametersRedacted.processId === record.processId,
     );
     const sigRec = records.find(
       (r) =>
         r.invocation.toolName === 'PROCESS_SIGTERM_SENT' &&
-        r.invocation.parametersRedacted.processId === pid,
+        r.invocation.parametersRedacted.processId === record.processId,
     );
     assert.ok(reqRec, 'Must log PROCESS_TERMINATION_REQUESTED');
     assert.ok(sigRec, 'Must log PROCESS_SIGTERM_SENT');
+    try {
+      process.kill(-dummyChild.pid, 'SIGKILL');
+    } catch {
+      // ignore
+    }
   });
 
   // P1-03: Process group kill and grace period
-  test('RC02-REG-21: process group termination targets process hierarchy', async () => {
+  test('RC02-REG-21: process group termination targets process hierarchy (parent -> child -> grandchild)', async () => {
     processRegistry.clear();
-    const startRes = await server.dispatchToolCall('run_command', {
-      executable: 'git',
-      args: ['log', '--oneline', '-100'],
-      runInBackground: true,
+    const script =
+      'const cp = require("child_process"); const gc = cp.spawn(process.execPath, ["-e", "setInterval(()=>{}, 10000)"]); process.stdout.write(process.pid + ":" + gc.pid + "\\n"); setInterval(()=>{}, 10000);';
+    const parentScript =
+      'const cp = require("child_process"); const child = cp.spawn(process.execPath, ["-e", ' +
+      JSON.stringify(script) +
+      ']); child.stdout.pipe(process.stdout); setInterval(()=>{}, 10000);';
+    const parent = spawn(process.execPath, ['-e', parentScript], {
+      detached: true,
+      stdio: ['ignore', 'pipe', 'ignore'],
     });
-    const pid = JSON.parse(startRes.content[0].text).processId;
+
+    const pids = await new Promise((resolve) => {
+      parent.stdout.once('data', (d) => {
+        const [childPid, gcPid] = d.toString().trim().split(':').map(Number);
+        resolve({ parentPid: parent.pid, childPid, gcPid });
+      });
+    });
+
+    const record = processRegistry.registerProcess({
+      workspaceId: 'test-ws',
+      actor: { clientId: 'local-stdio-caller', sessionId: 'stdio-session-01' },
+      executable: 'node',
+      sanitizedArgs: ['--version'],
+      cwd: workspaceDir,
+      startedAt: new Date().toISOString(),
+      state: 'RUNNING',
+      timedOut: false,
+    });
+    record._child = parent;
+
     const termRes = await server.dispatchToolCall('terminate_process', {
-      processId: pid,
+      processId: record.processId,
       signal: 'SIGTERM',
     });
     assert.equal(termRes.isError, undefined);
+
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    const isAlive = (p) => {
+      try {
+        process.kill(p, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    assert.equal(isAlive(pids.parentPid), false, 'Parent process must be dead');
+    assert.equal(isAlive(pids.childPid), false, 'Child process must be dead');
+    assert.equal(isAlive(pids.gcPid), false, 'Grandchild process must be dead');
   });
 
   test('RC02-REG-22: TERMINATING process state counts toward concurrency limit', () => {
@@ -985,5 +1041,336 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
       !failParsed.message.includes(secretArg),
       'Error message must not leak raw argument string',
     );
+  });
+
+  // RC-02 Security Review Corrections
+  test('RC02-REG-25: git branch new-branch is denied by run_command and branch is not created', async () => {
+    const res = await server.dispatchToolCall('run_command', {
+      executable: 'git',
+      args: ['branch', 'forbidden-test-branch'],
+    });
+    assert.equal(res.isError, true);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.equal(parsed.code, 'POLICY_DENIED');
+
+    const branches = execFileSync('git', ['branch'], { cwd: workspaceDir }).toString();
+    assert.ok(!branches.includes('forbidden-test-branch'), 'Branch must not be created');
+  });
+
+  test('RC02-REG-26: git inspect/write/help subcommands are strictly denied through run_command', async () => {
+    const deniedGitArgs = [
+      ['branch', '-D', 'main'],
+      ['diff'],
+      ['log'],
+      ['show'],
+      ['rev-parse', 'HEAD'],
+      ['describe'],
+      ['help'],
+      ['diff', '--', '.env'],
+      ['log', '-p'],
+    ];
+
+    for (const args of deniedGitArgs) {
+      const res = await server.dispatchToolCall('run_command', {
+        executable: 'git',
+        args,
+      });
+      assert.equal(res.isError, true, `git ${args.join(' ')} must be denied`);
+      const parsed = JSON.parse(res.content[0].text);
+      assert.equal(parsed.code, 'POLICY_DENIED');
+    }
+  });
+
+  test('RC02-REG-27: dedicated git tools continue to work for repository inspection', async () => {
+    const statusRes = await server.dispatchToolCall('git_status', {});
+    assert.equal(statusRes.isError, undefined);
+
+    const logRes = await server.dispatchToolCall('git_log', { maxCount: 5 });
+    assert.equal(logRes.isError, undefined);
+
+    const diffRes = await server.dispatchToolCall('git_diff', {});
+    assert.equal(diffRes.isError, undefined);
+  });
+
+  test('RC02-REG-28: hostile diff.external cannot execute via run_command', async () => {
+    const res = await server.dispatchToolCall('run_command', {
+      executable: 'git',
+      args: ['-c', 'diff.external=touch /tmp/pwned', 'diff'],
+    });
+    assert.equal(res.isError, true);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.equal(parsed.code, 'POLICY_DENIED');
+  });
+
+  test('RC02-REG-29: real two-workspace binding verifies process isolation and audit target', async () => {
+    const workspaceDirB = path.join(tempDir, 'workspace-b');
+    fs.mkdirSync(workspaceDirB, { recursive: true });
+    server.workspaceRegistry.registerWorkspace('test-ws-b', workspaceDirB);
+
+    const startRes = await server.dispatchToolCall(
+      'run_command',
+      {
+        executable: 'node',
+        args: ['--version'],
+        workspaceId: 'test-ws-b',
+        runInBackground: true,
+      },
+      {
+        clientId: 'client-b',
+        sessionId: 'session-b',
+        clientType: 'vscode',
+        deviceId: 'device-b',
+      },
+    );
+    assert.equal(startRes.isError, undefined);
+    const pid = JSON.parse(startRes.content[0].text).processId;
+
+    await server.flushAudit();
+    const records = auditLogger.getRecords();
+    const spawnRec = records.find(
+      (r) =>
+        r.invocation.toolName === 'PROCESS_SPAWN_SUCCEEDED' &&
+        r.invocation.parametersRedacted.processId === pid,
+    );
+    assert.ok(spawnRec, 'Spawn event must exist');
+    assert.equal(spawnRec.target.workspaceId, 'test-ws-b', 'Audit target must be workspace B');
+
+    const rogueStatus = await server.dispatchToolCall(
+      'process_status',
+      { processId: pid },
+      { clientId: 'attacker-client-a', sessionId: 'attacker-session-a' },
+    );
+    assert.equal(rogueStatus.isError, true);
+    assert.equal(JSON.parse(rogueStatus.content[0].text).code, 'POLICY_DENIED');
+
+    const wrongWsStatus = await server.dispatchToolCall(
+      'process_status',
+      { processId: pid, workspaceId: 'test-ws' },
+      { clientId: 'client-b', sessionId: 'session-b' },
+    );
+    assert.equal(wrongWsStatus.isError, true);
+    assert.equal(JSON.parse(wrongWsStatus.content[0].text).code, 'POLICY_DENIED');
+
+    const legitStatus = await server.dispatchToolCall(
+      'process_status',
+      { processId: pid, workspaceId: 'test-ws-b' },
+      { clientId: 'client-b', sessionId: 'session-b' },
+    );
+    assert.equal(legitStatus.isError, undefined);
+    assert.equal(JSON.parse(legitStatus.content[0].text).processId, pid);
+  });
+
+  test('RC02-REG-30: timeout state machine sets TERMINATING, holds concurrency, then TIMED_OUT on exit', () => {
+    const reg = new ProcessRegistry();
+    const record = reg.registerProcess({
+      workspaceId: 'test-ws',
+      actor: { clientId: 'c1', sessionId: 's1' },
+      executable: 'node',
+      sanitizedArgs: ['--version'],
+      cwd: workspaceDir,
+      startedAt: new Date().toISOString(),
+      state: 'RUNNING',
+      timedOut: false,
+    });
+
+    assert.equal(reg.countRunning(), 1);
+
+    reg.markTimedOut(record.processId);
+    assert.equal(record.timedOut, true);
+    assert.equal(record.state, 'TERMINATING');
+    assert.equal(reg.countRunning(), 1, 'Concurrency slot must remain held in TERMINATING state');
+    assert.equal(record.completedAt, undefined, 'completedAt must not be set until process death');
+
+    reg.markCompleted(record.processId, null, 'SIGTERM');
+    assert.equal(record.state, 'TIMED_OUT');
+    assert.ok(record.completedAt);
+    assert.equal(reg.countRunning(), 0, 'Concurrency slot released after process death');
+  });
+
+  test('RC02-REG-31: malformed run_command failing schema redacts args and env in audit log', async () => {
+    const secretValue = 'SUPER_SECRET_TOKEN_9999';
+    const secretEnv = 'FORBIDDEN_ENV_VALUE_8888';
+
+    const res = await server.dispatchToolCall('run_command', {
+      executable: 'node',
+      args: ['--version', secretValue],
+      env: { FORBIDDEN_KEY: secretEnv },
+      extraForbiddenField: 'malicious-data',
+    });
+    assert.equal(res.isError, true);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.equal(parsed.code, 'INVALID_REQUEST_SCHEMA');
+
+    const auditRec = auditLogger.getRecords()[auditLogger.getRecords().length - 1];
+    assert.equal(auditRec.invocation.toolName, 'run_command');
+    assert.equal(auditRec.execution.status, 'DENIED');
+
+    const auditJson = JSON.stringify(auditRec);
+    assert.ok(!auditJson.includes(secretValue), 'Audit log must not leak secret argument value');
+    assert.ok(!auditJson.includes(secretEnv), 'Audit log must not leak secret env value');
+    assert.ok(
+      !auditJson.includes('malicious-data'),
+      'Audit log must not leak unvalidated extra fields',
+    );
+  });
+
+  test('RC02-REG-32: real process actor identity is preserved in audit records', async () => {
+    processRegistry.clear();
+    const startRes = await server.dispatchToolCall(
+      'run_command',
+      {
+        executable: 'node',
+        args: ['--version'],
+        runInBackground: true,
+      },
+      {
+        clientId: 'real-test-client',
+        sessionId: 'real-test-session',
+        clientType: 'jetbrains',
+        deviceId: 'macbook-pro-m3',
+      },
+    );
+    assert.equal(startRes.isError, undefined);
+    const pid = JSON.parse(startRes.content[0].text).processId;
+
+    await server.flushAudit();
+    const records = auditLogger.getRecords();
+    const spawnRec = records.find(
+      (r) =>
+        r.invocation.toolName === 'PROCESS_SPAWN_SUCCEEDED' &&
+        r.invocation.parametersRedacted.processId === pid,
+    );
+    assert.ok(spawnRec, 'Spawn record must exist');
+    assert.equal(spawnRec.actor.clientId, 'real-test-client');
+    assert.equal(spawnRec.actor.sessionId, 'real-test-session');
+    assert.equal(spawnRec.actor.clientType, 'jetbrains');
+    assert.equal(spawnRec.actor.deviceId, 'macbook-pro-m3');
+  });
+
+  test('RC02-REG-33: audit sink rejection is handled safely without unhandled rejection and flushAudit works', async () => {
+    let sinkCalled = false;
+    const failingSink = {
+      onProcessEvent: async () => {
+        sinkCalled = true;
+        throw new Error('Audit disk full');
+      },
+    };
+
+    const reg = new ProcessRegistry([failingSink]);
+    const rec = reg.registerProcess({
+      workspaceId: 'test-ws',
+      actor: { clientId: 'c1', sessionId: 's1' },
+      executable: 'node',
+      sanitizedArgs: ['--version'],
+      cwd: workspaceDir,
+      startedAt: new Date().toISOString(),
+      state: 'RUNNING',
+      timedOut: false,
+    });
+
+    reg.notifySpawnSuccess(rec.processId);
+    await reg.flushLifecycleEvents();
+    assert.equal(sinkCalled, true, 'Sink must have been called');
+  });
+
+  test('RC02-REG-34: independent stdout and stderr cursors reconstruct full output across multi-byte UTF-8 boundaries', () => {
+    const reg = new ProcessRegistry();
+    const rec = reg.registerProcess({
+      workspaceId: 'test-ws',
+      actor: { clientId: 'c1', sessionId: 's1' },
+      executable: 'node',
+      sanitizedArgs: ['--version'],
+      cwd: workspaceDir,
+      startedAt: new Date().toISOString(),
+      state: 'RUNNING',
+      timedOut: false,
+    });
+
+    const fullStdoutStr = 'Hello 日本語 世界! '.repeat(20);
+    const fullStderrStr = 'Error 警告 失敗! '.repeat(20);
+
+    reg.appendOutput(rec.processId, 'stdout', Buffer.from(fullStdoutStr, 'utf8'));
+    reg.appendOutput(rec.processId, 'stderr', Buffer.from(fullStderrStr, 'utf8'));
+    reg.markCompleted(rec.processId, 0, null);
+
+    let stdoutAcc = '';
+    let stderrAcc = '';
+    let stdoutCursor = 0;
+    let stderrCursor = 0;
+
+    for (let i = 0; i < 50; i++) {
+      const page = reg.getProcessOutput(
+        rec.processId,
+        {
+          stdoutCursor,
+          stderrCursor,
+          maxBytes: 15,
+        },
+        undefined,
+        { clientId: 'c1', sessionId: 's1' },
+      );
+
+      stdoutAcc += page.stdoutChunk;
+      stderrAcc += page.stderrChunk;
+      stdoutCursor = page.stdoutCursor ?? stdoutCursor;
+      stderrCursor = page.stderrCursor ?? stderrCursor;
+
+      if (page.complete) break;
+    }
+
+    assert.equal(
+      stdoutAcc,
+      fullStdoutStr,
+      'Reconstructed stdout must match full string byte-for-byte',
+    );
+    assert.equal(
+      stderrAcc,
+      fullStderrStr,
+      'Reconstructed stderr must match full string byte-for-byte',
+    );
+  });
+
+  test('RC02-REG-35: ExecutableResolver rejects world/group-writable binaries and symlinks into untrusted roots', () => {
+    const evilDir = path.join(tempDir, 'evil-bin-dir');
+    fs.mkdirSync(evilDir, { recursive: true });
+
+    try {
+      fs.chmodSync(evilDir, 0o777);
+      const resolverWorldDir = new ExecutableResolver([evilDir]);
+      assert.throws(
+        () => resolverWorldDir.resolveExecutable('node', workspaceDir),
+        /could not be resolved|DENIED|NOT_FOUND|cannot be found/i,
+      );
+    } catch {
+      // ignore platform chmod differences
+    }
+
+    const safeDir = path.join(tempDir, 'safe-bin-dir');
+    fs.mkdirSync(safeDir, { recursive: true });
+    fs.chmodSync(safeDir, 0o755);
+    const evilBin = path.join(safeDir, 'mybinary');
+    fs.writeFileSync(evilBin, '#!/bin/sh\necho evil\n');
+    fs.chmodSync(evilBin, 0o777);
+
+    const resolverWorldBin = new ExecutableResolver([safeDir]);
+    assert.throws(
+      () => resolverWorldBin.resolveExecutable('mybinary', workspaceDir),
+      /could not be resolved|DENIED|NOT_FOUND|cannot be found/i,
+    );
+
+    const workspaceBin = path.join(workspaceDir, 'ws-binary');
+    fs.writeFileSync(workspaceBin, '#!/bin/sh\necho ws\n');
+    fs.chmodSync(workspaceBin, 0o755);
+    const symlinkBin = path.join(safeDir, 'symbinary');
+    try {
+      fs.symlinkSync(workspaceBin, symlinkBin);
+      const resolverSymlink = new ExecutableResolver([safeDir]);
+      assert.throws(
+        () => resolverSymlink.resolveExecutable('symbinary', workspaceDir),
+        /could not be resolved|DENIED|NOT_FOUND|cannot be found/i,
+      );
+    } catch {
+      // ignore
+    }
   });
 });

@@ -67,7 +67,7 @@ export class ExecutableResolver implements IExecutableResolver {
     this.trustedDirs = customTrustedDirs || ['/usr/bin', '/bin', '/usr/local/bin'];
   }
 
-  public resolveExecutable(name: string, _workspaceRoot?: string): string {
+  public resolveExecutable(name: string, workspaceRoot?: string): string {
     if (!name || typeof name !== 'string' || name.trim().length === 0) {
       throw ArcError.invalidRequestSchema('Executable name must be a non-empty string.');
     }
@@ -81,15 +81,80 @@ export class ExecutableResolver implements IExecutableResolver {
       );
     }
 
+    // Never trust workspace, HOME, current directory, or node_modules
+    const untrustedRoots: string[] = [];
+    if (workspaceRoot) untrustedRoots.push(resolve(workspaceRoot));
+    if (process.env.HOME) untrustedRoots.push(resolve(process.env.HOME));
+    untrustedRoots.push(resolve(process.cwd()));
+
     // 1. Search Fixed Trusted System Locations ONLY
     for (const dir of this.trustedDirs) {
+      if (!existsSync(dir)) continue;
+
+      let dirStat;
+      try {
+        dirStat = statSync(dir);
+      } catch {
+        continue;
+      }
+      if (!dirStat.isDirectory()) continue;
+
+      // On POSIX, reject directory if world-writable or group-writable by non-root
+      if (process.platform !== 'win32') {
+        if ((dirStat.mode & 0o002) !== 0) {
+          // World writable directory is untrusted
+          continue;
+        }
+        if ((dirStat.mode & 0o020) !== 0 && dirStat.uid !== 0) {
+          // Group writable by non-root is untrusted
+          continue;
+        }
+      }
+
       const candidate = resolve(dir, trimmed);
       if (existsSync(candidate)) {
         try {
           const stat = statSync(candidate);
-          if (stat.isFile() && (stat.mode & 0o111) !== 0) {
-            return realpathSync(candidate);
+          if (!stat.isFile() || (stat.mode & 0o111) === 0) {
+            continue;
           }
+
+          // On POSIX, reject candidate if world-writable or group-writable by non-root
+          if (process.platform !== 'win32') {
+            if ((stat.mode & 0o002) !== 0) {
+              continue;
+            }
+            if ((stat.mode & 0o020) !== 0 && stat.uid !== 0) {
+              continue;
+            }
+          }
+
+          const real = realpathSync(candidate);
+
+          // Verify realpath does not resolve into untrusted roots or node_modules
+          const isUntrusted = untrustedRoots.some(
+            (root) => real === root || real.startsWith(root + sep),
+          );
+          if (
+            isUntrusted ||
+            real.includes(`${sep}node_modules${sep}`) ||
+            real.endsWith(`${sep}node_modules`)
+          ) {
+            continue;
+          }
+
+          // Verify target realpath file permissions as well
+          const realStat = statSync(real);
+          if (process.platform !== 'win32') {
+            if (
+              (realStat.mode & 0o002) !== 0 ||
+              ((realStat.mode & 0o020) !== 0 && realStat.uid !== 0)
+            ) {
+              continue;
+            }
+          }
+
+          return real;
         } catch {
           // ignore unresolvable
         }
@@ -115,7 +180,16 @@ export interface ITerminalSubsystem {
   ): ProcessStatusResponse;
   getProcessOutput(
     processId: string,
-    offset: number | undefined,
+    optionsOrOffset:
+      | number
+      | {
+          offset?: number;
+          stdoutCursor?: number;
+          stderrCursor?: number;
+          maxBytes?: number;
+          workspaceId?: string;
+        }
+      | undefined,
     maxBytes: number | undefined,
     actor: PolicyEvaluationContext['actor'],
     targetWorkspace?: PolicyEvaluationContext['targetWorkspace'],
@@ -214,7 +288,9 @@ export class ControlledProcessRunner implements ITerminalSubsystem {
       workspaceId: targetWorkspace.workspaceId,
       actor: {
         clientId: actor.clientId,
+        clientType: actor.clientType,
         sessionId: actor.sessionId || 'default-session',
+        deviceId: actor.deviceId,
       },
       executable: request.executable,
       sanitizedArgs: args,
@@ -281,9 +357,7 @@ export class ControlledProcessRunner implements ITerminalSubsystem {
     record._timeoutTimer.unref();
 
     child.on('close', (code, signal) => {
-      if (!record.timedOut && record.state !== 'TERMINATED') {
-        this.processRegistry.markCompleted(record.processId, code, signal);
-      }
+      this.processRegistry.markCompleted(record.processId, code, signal);
     });
 
     child.on('error', (err) => {
@@ -354,12 +428,21 @@ export class ControlledProcessRunner implements ITerminalSubsystem {
 
   public getProcessOutput(
     processId: string,
-    offset: number | undefined,
+    optionsOrOffset:
+      | number
+      | {
+          offset?: number;
+          stdoutCursor?: number;
+          stderrCursor?: number;
+          maxBytes?: number;
+          workspaceId?: string;
+        }
+      | undefined,
     maxBytes: number | undefined,
     actor: PolicyEvaluationContext['actor'],
     targetWorkspace?: PolicyEvaluationContext['targetWorkspace'],
   ): ProcessOutputResponse {
-    return this.processRegistry.getProcessOutput(processId, offset, maxBytes, {
+    return this.processRegistry.getProcessOutput(processId, optionsOrOffset, maxBytes, {
       clientId: actor.clientId,
       sessionId: actor.sessionId || '',
       workspaceId: targetWorkspace?.workspaceId,

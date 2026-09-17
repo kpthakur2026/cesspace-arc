@@ -158,6 +158,7 @@ export interface RunCommandResponse {
 
 export interface ProcessStatusRequest {
   processId: string;
+  workspaceId?: string;
 }
 
 export interface ProcessStatusResponse {
@@ -175,7 +176,10 @@ export interface ProcessStatusResponse {
 export interface ProcessOutputRequest {
   processId: string;
   offset?: number;
+  stdoutCursor?: number;
+  stderrCursor?: number;
   maxBytes?: number;
+  workspaceId?: string;
 }
 
 export interface ProcessOutputResponse {
@@ -183,6 +187,8 @@ export interface ProcessOutputResponse {
   stdoutChunk: string;
   stderrChunk: string;
   nextOffset: number;
+  stdoutCursor: number;
+  stderrCursor: number;
   complete: boolean;
   truncated: boolean;
 }
@@ -190,6 +196,7 @@ export interface ProcessOutputResponse {
 export interface TerminateProcessRequest {
   processId: string;
   signal?: 'SIGTERM' | 'SIGKILL';
+  workspaceId?: string;
 }
 
 export interface TerminateProcessResponse {

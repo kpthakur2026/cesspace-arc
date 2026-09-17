@@ -227,22 +227,41 @@ export class SecurityKernel implements IPolicyEngine {
         };
       }
 
-      if (this.processVerifier) {
-        try {
-          this.processVerifier.assertOwnership(processId, {
-            clientId: actor.clientId,
-            sessionId: actor.sessionId || '',
-            workspaceId: targetWorkspace.workspaceId,
-          });
-        } catch (err: unknown) {
-          const errMsg = err instanceof Error ? err.message : String(err);
-          return {
-            outcome: PolicyOutcome.DENY,
-            effect: 'DENY',
-            matchingRuleId: 'deny-process-ownership-mismatch',
-            reason: errMsg,
-          };
-        }
+      if (!this.processVerifier) {
+        return {
+          outcome: PolicyOutcome.DENY,
+          effect: 'DENY',
+          matchingRuleId: 'deny-missing-process-verifier',
+          reason: 'Process ownership verifier is unavailable.',
+        };
+      }
+
+      if (
+        request.parameters.workspaceId &&
+        request.parameters.workspaceId !== targetWorkspace.workspaceId
+      ) {
+        return {
+          outcome: PolicyOutcome.DENY,
+          effect: 'DENY',
+          matchingRuleId: 'deny-process-ownership-mismatch',
+          reason: 'Access denied: Requested workspaceId does not match process workspace.',
+        };
+      }
+
+      try {
+        this.processVerifier.assertOwnership(processId, {
+          clientId: actor.clientId,
+          sessionId: actor.sessionId || '',
+          workspaceId: targetWorkspace.workspaceId,
+        });
+      } catch (err: unknown) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        return {
+          outcome: PolicyOutcome.DENY,
+          effect: 'DENY',
+          matchingRuleId: 'deny-process-ownership-mismatch',
+          reason: errMsg,
+        };
       }
 
       return {

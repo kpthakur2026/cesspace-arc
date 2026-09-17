@@ -116,7 +116,7 @@ All 9 quality gates passed cleanly:
 | **Gate 2** | Code Formatting         | `pnpm run check:format`                   | Clean (zero Prettier issues)               |
 | **Gate 3** | Lint & Static Analysis  | `pnpm run lint`                           | Clean (zero ESLint errors/warnings)        |
 | **Gate 4** | TypeScript Build        | `pnpm run typecheck && pnpm -r run build` | Clean across all 11 packages               |
-| **Gate 5** | Test Suite              | `pnpm run test`                           | **119/119 passing** (0 failures)           |
+| **Gate 5** | Test Suite              | `pnpm run test`                           | **130/130 passing** (0 failures)           |
 | **Gate 6** | Documentation Integrity | `bash scripts/check-docs.sh`              | Clean (all docs & internal links verified) |
 | **Gate 7** | Secret Scanning         | `bash scripts/check-secrets.sh`           | Clean (zero secrets, zero private IPs)     |
 | **Gate 8** | Git Diff Cleanliness    | `git diff --check`                        | Clean (zero whitespace errors)             |
@@ -126,35 +126,42 @@ All 9 quality gates passed cleanly:
 
 ## 4. Test Suite Metrics
 
-- **Total Test Cases:** 119
+- **Total Test Cases:** 130
   - RC-00 Protocol & Architecture: 5 tests
   - RC-01 Read-Only Negative & Positive Controls: 49 tests
   - RC-02 Controlled Terminal & Process Controls: 41 tests
-  - RC-02 Independent Security Review Regressions: 24 tests
+  - RC-02 Independent Security Review Regressions: 35 tests
 - **Negative Controls & Invariants Verified:**
   - Denied executables (bash, sh, sudo, rm, curl, wget, dd, docker, cat, npx)
   - Denied script executions (`node script.js`, `node -e "..."`, `npm run`, `npm test`, `npm start`, `npm exec`, `pnpm run`, `pnpm exec`, `pnpm dlx`)
   - Argument injection (-c, $(), backticks, newlines)
   - Git mutation blocking (git commit, git push via run_command)
+  - General Git command denial via `run_command` (only `git --version` permitted)
+  - Hostile `diff.external` execution blocked
   - Package manager mutation blocking (npm install)
   - Environment variable override restrictions (PATH, HOME, non-allowlisted keys)
   - Strict schema validation (missing required fields, extra properties, oversized inputs)
+  - Pre-schema validation error audit redaction (sensitive args and env scrubbed before schema audit logging)
   - Process lifecycle errors (non-existent processId)
   - Audit logging of denied/failed operations and raw argument redaction
   - Working directory containment and traversal rejection
   - Executable path separator and local binary rejection
+  - Untrusted executable rejection (world/group-writable binary or directory, untrusted symlinks)
   - Multi-part process ownership validation (missing, mismatched client, session, or workspace)
+  - Real two-workspace process isolation and audit target binding
+  - Timeout state machine transitions (`TERMINATING` during grace period, concurrency held, `TIMED_OUT` on death)
+  - Real 3-level process tree termination (parent -> child -> grandchild)
 - **Positive Controls Verified:**
   - Foreground short-lived command execution (`node --version`)
   - Git status execution within authorized workspace
   - Background execution with immediate opaque process ID return
   - Process status query
-  - Bounded process output retrieval with UTF-8 safe boundary pagination
+  - Bounded process output retrieval with independent UTF-8 safe `stdoutCursor` and `stderrCursor` pagination
   - Clean process termination signal dispatch with process group escalation
   - Allowlisted environment variable forwarding (`NODE_ENV`)
-  - Audit logging of allowed operations and all asynchronous lifecycle states
+  - Audit logging of allowed operations and all asynchronous lifecycle states with real caller identity
 
-### 4.1. Security Review Regression Tests (RC02-REG-01 to RC02-REG-24)
+### 4.1. Security Review Regression Tests (RC02-REG-01 to RC02-REG-35)
 
 | Test ID       | Description                                                                                                 |
 | :------------ | :---------------------------------------------------------------------------------------------------------- |
@@ -178,10 +185,21 @@ All 9 quality gates passed cleanly:
 | `RC02-REG-18` | `PROCESS_EXITED` lifecycle event is recorded in audit logger                                                |
 | `RC02-REG-19` | `PROCESS_TIMEOUT` lifecycle event is recorded in audit logger                                               |
 | `RC02-REG-20` | `PROCESS_TERMINATION_REQUESTED`, `PROCESS_SIGTERM_SENT`, and `PROCESS_TERMINATED` lifecycle events recorded |
-| `RC02-REG-21` | Process group termination targets process hierarchy                                                         |
+| `RC02-REG-21` | Process group termination targets process hierarchy (parent -> child -> grandchild)                         |
 | `RC02-REG-22` | `TERMINATING` process state counts toward concurrency limit                                                 |
 | `RC02-REG-23` | Multi-byte UTF-8 pagination does not split characters                                                       |
 | `RC02-REG-24` | Raw arguments are omitted from audit records and error messages do not leak raw arguments                   |
+| `RC02-REG-25` | `git branch new-branch` is denied by `run_command` and branch is not created                                |
+| `RC02-REG-26` | `git` inspect/write/help subcommands are strictly denied through `run_command`                              |
+| `RC02-REG-27` | Dedicated git tools continue to work for repository inspection (`git_status`, `git_diff`, `git_log`)        |
+| `RC02-REG-28` | Hostile `diff.external` cannot execute via `run_command`                                                    |
+| `RC02-REG-29` | Real two-workspace binding verifies process isolation and audit target                                      |
+| `RC02-REG-30` | Timeout state machine sets `TERMINATING`, holds concurrency, then `TIMED_OUT` on exit                       |
+| `RC02-REG-31` | Malformed `run_command` failing schema redacts args and env in audit log                                    |
+| `RC02-REG-32` | Real process actor identity is preserved in audit records                                                   |
+| `RC02-REG-33` | Audit sink rejection is handled safely without unhandled rejection and `flushAudit` works                   |
+| `RC02-REG-34` | Independent stdout and stderr cursors reconstruct full output across multi-byte UTF-8 boundaries            |
+| `RC02-REG-35` | `ExecutableResolver` rejects world/group-writable binaries and symlinks into untrusted roots                |
 
 ---
 

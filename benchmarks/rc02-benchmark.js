@@ -210,8 +210,8 @@ async function runBenchmarkForServer(server, fixtureName, iterations = 20) {
     for (let i = 0; i < iterations; i++) {
       server.terminalSubsystem.processRegistry.clear();
       const bgProc = await server.dispatchToolCall('run_command', {
-        executable: 'git',
-        args: ['log', '--oneline', '-100'],
+        executable: 'node',
+        args: ['--version'],
         runInBackground: true,
       });
       const bgParsed = JSON.parse(bgProc.content[0].text);
@@ -276,11 +276,11 @@ async function main() {
       process.stdout.write(`2. Benchmarking ${f.name} (${f.iterations} iterations per tool)...\n`);
       const registry = new WorkspaceRegistry();
       registry.registerWorkspace('bench-ws', f.dir);
-      const kernel = new SecurityKernel(registry);
+      const processRegistry = new ProcessRegistry();
+      const kernel = new SecurityKernel(registry, processRegistry);
       const audit = new AuditLogger();
       const fsSub = new FilesystemSubsystem();
       const gitSub = new GitSubsystem();
-      const processRegistry = new ProcessRegistry();
       const terminalSub = new ControlledProcessRunner(processRegistry);
       const server = new ArcMcpServer(
         registry,
@@ -292,6 +292,7 @@ async function main() {
           defaultWorkspaceId: 'bench-ws',
         },
         terminalSub,
+        processRegistry,
       );
 
       const res = await runBenchmarkForServer(server, f.name, f.iterations);

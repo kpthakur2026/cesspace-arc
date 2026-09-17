@@ -24,38 +24,8 @@ export interface ExecutableProfile {
 export const RC02_EXECUTABLE_PROFILES: Readonly<Record<string, ExecutableProfile>> = {
   git: {
     executable: 'git',
-    allowedOperations: [
-      'status',
-      'diff',
-      'log',
-      'rev-parse',
-      'show',
-      'describe',
-      'branch',
-      'version',
-      '--version',
-      'help',
-      '--help',
-    ],
-    allowedArgumentShapes: [
-      /^(status|diff|log|rev-parse|show|describe|branch|version|--version|help|--help)$/i,
-      /^--porcelain(=v[12])?$/,
-      /^--oneline$/,
-      /^--name-only$/,
-      /^--name-status$/,
-      /^--stat$/,
-      /^--short$/,
-      /^--branch$/,
-      /^--show-toplevel$/,
-      /^(--cached|--staged)$/,
-      /^--$/,
-      /^-[0-9]+$/,
-      /^--max-count=[0-9]+$/,
-      /^-n$/,
-      /^--format=[a-zA-Z0-9_%: -]+$/,
-      /^-[a-zA-Z0-9_./@^~-]+$/,
-      /^[a-zA-Z0-9_./@^~-]+$/,
-    ],
+    allowedOperations: ['--version', '-v', 'version'],
+    allowedArgumentShapes: [/^(-v|--version|version)$/],
     mayExecuteProjectCode: false,
     mayWriteWorkspace: false,
     mayUseNetwork: false,
@@ -410,73 +380,22 @@ export function validateCommandRequest(
       };
     }
 
-    const deniedGitSubcommands = [
-      'commit',
-      'push',
-      'pull',
-      'fetch',
-      'checkout',
-      'switch',
-      'reset',
-      'clean',
-      'stash',
-      'config',
-      'tag',
-      'remote',
-      'merge',
-      'rebase',
-      'cherry-pick',
-      'clone',
-      'init',
-      'apply',
-    ];
-
-    const firstNonFlag = args.find((a) => !a.startsWith('-'));
-    if (firstNonFlag) {
-      const lower = firstNonFlag.toLowerCase();
-      if (!profile.allowedOperations.includes(lower) || deniedGitSubcommands.includes(lower)) {
-        return {
-          valid: false,
-          ruleId: 'deny-git-mutation',
-          reason: 'Git mutating or unapproved operation is strictly forbidden in RC-02.',
-        };
-      }
-    } else {
-      // Flags only - ensure only informational operations like --version or --help
-      const hasSafeFlag = args.some(
-        (a) => a === '--version' || a === '-v' || a === '--help' || a === '-h',
-      );
-      if (!hasSafeFlag) {
-        return {
-          valid: false,
-          ruleId: 'deny-git-mutation',
-          reason: 'Git requires an approved read-only subcommand or --version/--help.',
-        };
-      }
+    if (args.length === 0) {
+      return {
+        valid: false,
+        ruleId: 'deny-git-operation',
+        reason:
+          "Git through run_command permits only '--version'. Repository inspection must use dedicated tools (git_status, git_diff, git_log).",
+      };
     }
 
-    // Check forbidden git flags
     for (const arg of args) {
-      if (
-        arg.startsWith('--config') ||
-        arg.startsWith('-c') ||
-        arg.startsWith('--exec-path') ||
-        arg.startsWith('--upload-pack') ||
-        arg.startsWith('--receive-pack')
-      ) {
+      if (arg !== '--version' && arg !== '-v' && arg !== 'version') {
         return {
           valid: false,
-          ruleId: 'deny-git-config-flag',
-          reason: 'Git configuration or execution override flag is forbidden by policy.',
-        };
-      }
-
-      const matchesShape = profile.allowedArgumentShapes.some((r) => r.test(arg));
-      if (!matchesShape) {
-        return {
-          valid: false,
-          ruleId: 'deny-argument-shape',
-          reason: 'Argument does not conform to allowed git argument shapes.',
+          ruleId: 'deny-git-operation',
+          reason:
+            "Git operation is forbidden through run_command. Only '--version' is permitted. Repository inspection must use dedicated tools (git_status, git_diff, git_log).",
         };
       }
     }
