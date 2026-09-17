@@ -1383,7 +1383,36 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
     }
   });
 
-  test('RC02-REG-36: exact process.execPath Node binary can execute node --version via default resolver', async () => {
+  test('RC02-REG-36: exact active Node runtime executes successfully and binds to /proc/self/exe on Linux', async () => {
+    if (process.platform === 'linux') {
+      assert.ok(fs.existsSync('/proc/self/exe'), '/proc/self/exe must exist on Linux');
+      const procStat = fs.statSync('/proc/self/exe');
+      const execStat = fs.statSync(process.execPath);
+      assert.equal(
+        procStat.dev,
+        execStat.dev,
+        'Kernel /proc/self/exe dev must match process.execPath dev',
+      );
+      assert.equal(
+        procStat.ino,
+        execStat.ino,
+        'Kernel /proc/self/exe ino must match process.execPath ino',
+      );
+      assert.equal(
+        fs.realpathSync('/proc/self/exe'),
+        fs.realpathSync(process.execPath),
+        'Kernel /proc/self/exe realpath must match process.execPath realpath',
+      );
+
+      const resolver = new ExecutableResolver();
+      const resolved = resolver.resolveExecutable('node', workspaceDir);
+      assert.equal(
+        resolved,
+        '/proc/self/exe',
+        'Resolver must prefer kernel /proc/self/exe on Linux',
+      );
+    }
+
     const res = await server.dispatchToolCall('run_command', {
       executable: 'node',
       args: ['--version'],
@@ -1475,7 +1504,7 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
     );
   });
 
-  test('RC02-REG-43: unsafe or world-writable Node candidate is rejected', () => {
+  test('RC02-REG-43: generic toolcache sibling and unsafe or world-writable Node candidates are rejected', () => {
     const safeDir = path.join(tempDir, 'test-bin-dir');
     fs.mkdirSync(safeDir, { recursive: true });
     const writableNode = path.join(safeDir, 'node');
@@ -1485,6 +1514,13 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
     const resolver = new ExecutableResolver([], true, writableNode);
     assert.throws(
       () => resolver.resolveExecutable('node', workspaceDir),
+      /could not be resolved|DENIED|NOT_FOUND|cannot be found/i,
+    );
+
+    // Generic toolcache sibling cannot execute
+    const defaultResolver = new ExecutableResolver();
+    assert.throws(
+      () => defaultResolver.resolveExecutable('toolcache_sibling', workspaceDir),
       /could not be resolved|DENIED|NOT_FOUND|cannot be found/i,
     );
   });

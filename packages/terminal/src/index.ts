@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, realpathSync, statSync } from 'node:fs';
-import { resolve, basename, dirname, sep } from 'node:path';
+import { resolve, basename, sep } from 'node:path';
 import {
   ArcError,
   type RunCommandRequest,
@@ -76,60 +76,63 @@ export class ExecutableResolver implements IExecutableResolver {
     this.nodeCandidate = customNodeCandidate || process.execPath;
   }
 
-  private validateExactNodeCandidate(candidate: string, untrustedRoots: string[]): string | null {
-    if (!candidate || typeof candidate !== 'string') return null;
+  private validateKernelBoundNodeLinux(untrustedRoots: string[]): string | null {
+    if (process.platform !== 'linux') return null;
 
+    const procExe = '/proc/self/exe';
     try {
-      if (!existsSync(candidate)) return null;
+      if (!existsSync(procExe)) return null;
 
-      const stat = statSync(candidate);
-      if (!stat.isFile() || (stat.mode & 0o111) === 0) return null;
+      const procStat = statSync(procExe);
+      if (!procStat.isFile() || (procStat.mode & 0o111) === 0) return null;
 
-      // Check candidate permissions on POSIX
-      if (process.platform !== 'win32') {
-        if ((stat.mode & 0o002) !== 0) return null; // world-writable
-        if ((stat.mode & 0o020) !== 0 && stat.uid !== 0) return null; // group-writable by non-root
+      // Ensure not world-writable
+      if ((procStat.mode & 0o002) !== 0) return null;
+
+      // Identify candidate (defaults to process.execPath)
+      const candidate = this.nodeCandidate;
+      if (!candidate || typeof candidate !== 'string' || !existsSync(candidate)) return null;
+
+      const candidateStat = statSync(candidate);
+      if (!candidateStat.isFile() || (candidateStat.mode & 0o111) === 0) return null;
+      if ((candidateStat.mode & 0o002) !== 0) return null;
+
+      // Identify candidate and realpath as Node
+      const candidateBase = basename(candidate).toLowerCase();
+      if (candidateBase !== 'node') return null;
+
+      const realCandidate = realpathSync(candidate);
+      const realCandidateBase = basename(realCandidate).toLowerCase();
+      if (realCandidateBase !== 'node') return null;
+
+      const realProcExe = realpathSync(procExe);
+      const realProcBase = basename(realProcExe).toLowerCase();
+      if (realProcBase !== 'node') return null;
+
+      // Compare executable identity using stat identity (dev & ino)
+      if (procStat.dev !== candidateStat.dev || procStat.ino !== candidateStat.ino) {
+        return null;
       }
 
-      const real = realpathSync(candidate);
-      const realStat = statSync(real);
-      if (!realStat.isFile() || (realStat.mode & 0o111) === 0) return null;
-
-      // Check realpath permissions on POSIX
-      if (process.platform !== 'win32') {
-        if ((realStat.mode & 0o002) !== 0) return null;
-        if ((realStat.mode & 0o020) !== 0 && realStat.uid !== 0) return null;
+      // Ensure it represents the SAME active runtime
+      if (realProcExe !== realCandidate) {
+        return null;
       }
 
-      // Check parent directory permissions on POSIX
-      const parentDir = dirname(real);
-      if (!existsSync(parentDir)) return null;
-      const parentStat = statSync(parentDir);
-      if (!parentStat.isDirectory()) return null;
-      if (process.platform !== 'win32') {
-        if ((parentStat.mode & 0o002) !== 0) return null;
-        if ((parentStat.mode & 0o020) !== 0 && parentStat.uid !== 0) return null;
-      }
-
-      // Must NOT resolve under workspace, HOME, current directory, or node_modules
+      // Verify realpath does not resolve into untrusted roots (workspace, HOME, cwd, node_modules)
       const isUntrusted = untrustedRoots.some(
-        (root) => real === root || real.startsWith(root + sep),
+        (root) => realProcExe === root || realProcExe.startsWith(root + sep),
       );
       if (
         isUntrusted ||
-        real.includes(`${sep}node_modules${sep}`) ||
-        real.endsWith(`${sep}node_modules`)
+        realProcExe.includes(`${sep}node_modules${sep}`) ||
+        realProcExe.endsWith(`${sep}node_modules`)
       ) {
         return null;
       }
 
-      // Preserve exact executable identity (must be 'node' or 'node.exe')
-      const base = basename(real).toLowerCase();
-      if (base !== 'node' && base !== 'node.exe') {
-        return null;
-      }
-
-      return real;
+      // Never derive or trust its parent directory; return /proc/self/exe directly
+      return procExe;
     } catch {
       return null;
     }
@@ -155,7 +158,15 @@ export class ExecutableResolver implements IExecutableResolver {
     if (process.env.HOME) untrustedRoots.push(resolve(process.env.HOME));
     untrustedRoots.push(resolve(process.cwd()));
 
-    // 1. Search Fixed Trusted System Locations ONLY
+    // 1. On Linux, prefer kernel-bound current Node runtime identity (/proc/self/exe)
+    if (trimmed === 'node' && this.allowCurrentNodeRuntime && process.platform === 'linux') {
+      const kernelNode = this.validateKernelBoundNodeLinux(untrustedRoots);
+      if (kernelNode) {
+        return kernelNode;
+      }
+    }
+
+    // 2. Search Fixed Trusted System Locations ONLY
     for (const dir of this.trustedDirs) {
       if (!existsSync(dir)) continue;
 
@@ -226,14 +237,6 @@ export class ExecutableResolver implements IExecutableResolver {
         } catch {
           // ignore unresolvable
         }
-      }
-    }
-
-    // 2. Exact current Node runtime fallback (for 'node' executable only)
-    if (trimmed === 'node' && this.allowCurrentNodeRuntime) {
-      const validatedNode = this.validateExactNodeCandidate(this.nodeCandidate, untrustedRoots);
-      if (validatedNode) {
-        return validatedNode;
       }
     }
 

@@ -71,7 +71,7 @@ MCP Request (over stdio)
    - Strictly prohibited raw shells (`bash`, `sh`, `zsh`), privilege escalation (`sudo`, `su`), mutating commands (`rm`, `mkfs`), network tools (`curl`, `wget`), and cloud CLIs (`docker`, `aws`, `kubectl`).
    - Blocked argument injection (`-c`, command substitution `$()`, backticks, newlines).
    - Enforced environment variable key allowlist (`CI`, `FORCE_COLOR`, `NO_COLOR`, `DEBUG`, `NODE_ENV`).
-   - Implemented `ExecutableResolver` strictly searching system directories (`/usr/bin`, `/bin`, `/usr/local/bin`) without shell resolution, rejecting `node_modules/.bin` and runtime-relative directories.
+   - Implemented `ExecutableResolver` strictly searching system directories (`/usr/bin`, `/bin`, `/usr/local/bin`) without shell resolution, preferring kernel-bound `/proc/self/exe` on Linux for active Node runtime identity, rejecting `node_modules/.bin` and generic toolcache/sibling directories.
 
 4. **`@cesspace-arc/policy` (`packages/policy`):**
    - Added `RC02_ALLOWED_TOOLS` (13 tools).
@@ -201,7 +201,7 @@ All 9 quality gates passed cleanly:
 | `RC02-REG-33` | Audit sink rejection is handled safely without unhandled rejection and `flushAudit` works                   |
 | `RC02-REG-34` | Independent stdout and stderr cursors reconstruct full output across multi-byte UTF-8 boundaries            |
 | `RC02-REG-35` | `ExecutableResolver` rejects world/group-writable binaries and symlinks into untrusted roots                |
-| `RC02-REG-36` | Exact `process.execPath` Node binary can execute `node --version` via default resolver                      |
+| `RC02-REG-36` | Exact active Node runtime executes successfully and binds to /proc/self/exe on Linux                        |
 | `RC02-REG-37` | Arbitrary executable beside `process.execPath` is NOT trusted                                               |
 | `RC02-REG-38` | `process.execPath` dirname is NOT treated as generic trusted search path                                    |
 | `RC02-REG-39` | Malicious `PATH` cannot replace Node                                                                        |
