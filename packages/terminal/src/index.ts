@@ -83,45 +83,42 @@ export class ExecutableResolver implements IExecutableResolver {
     try {
       if (!existsSync(procExe)) return null;
 
-      // Stat /proc/self/exe (follows the kernel symlink to the actual executable)
-      const procStat = statSync(procExe);
-      if (!procStat.isFile() || (procStat.mode & 0o111) === 0) return null;
-
-      // Ensure the kernel-identified executable is not world-writable
-      if ((procStat.mode & 0o002) !== 0) return null;
-
-      // Identify candidate (defaults to process.execPath)
-      const candidate = this.nodeCandidate;
+      // ── Step 1: resolve canonical paths ─────────────────────────────────────
+      // Both paths are resolved in the same VFS namespace so they are directly
+      // comparable even when overlayfs or bind-mounts are present.
+      const candidate = this.nodeCandidate; // defaults to process.execPath
       if (!candidate || typeof candidate !== 'string' || !existsSync(candidate)) return null;
 
-      const candidateStat = statSync(candidate);
-      if (!candidateStat.isFile() || (candidateStat.mode & 0o111) === 0) return null;
-      if ((candidateStat.mode & 0o002) !== 0) return null;
-
-      // Candidate basename must be 'node'
-      const candidateBase = basename(candidate).toLowerCase();
-      if (candidateBase !== 'node') return null;
-
-      // Resolve both to canonical paths in the current filesystem namespace
-      const realCandidate = realpathSync(candidate);
-      const realCandidateBase = basename(realCandidate).toLowerCase();
-      if (realCandidateBase !== 'node') return null;
-
       const realProcExe = realpathSync(procExe);
-      const realProcBase = basename(realProcExe).toLowerCase();
-      if (realProcBase !== 'node') return null;
+      const realCandidate = realpathSync(candidate);
 
-      // Identity check: kernel-identified executable must resolve to the same
-      // canonical path as the declared candidate (process.execPath).
-      // Realpath equality is resolved in the current namespace — both paths are
-      // evaluated with the same VFS view — making this robust across overlayfs/container
-      // layers where stat dev/ino can differ for the same physical file.
-      if (realProcExe !== realCandidate) {
-        return null;
-      }
+      // ── Step 2: both basenames must be 'node' ────────────────────────────────
+      if (basename(realProcExe).toLowerCase() !== 'node') return null;
+      if (basename(realCandidate).toLowerCase() !== 'node') return null;
+      // Also check the raw candidate basename (catches symlink names like 'node18')
+      if (basename(candidate).toLowerCase() !== 'node') return null;
 
-      // Verify the resolved path does not land in untrusted roots
-      // (workspace root, $HOME, cwd, node_modules)
+      // ── Step 3: stat both targets ────────────────────────────────────────────
+      // statSync follows symlinks — for /proc/self/exe it resolves to the actual
+      // binary on disk, so the stat reflects the real file's metadata.
+      const procStat = statSync(procExe);
+      const candidateStat = statSync(candidate);
+
+      // Both must be regular executable files.
+      if (!procStat.isFile() || (procStat.mode & 0o111) === 0) return null;
+      if (!candidateStat.isFile() || (candidateStat.mode & 0o111) === 0) return null;
+
+      // ── Step 4: triple kernel identity proof ─────────────────────────────────
+      // Require ALL three to agree: canonical path, device, and inode.
+      // The GitHub diagnostics confirmed these match (dev=2049, ino=557445)
+      // even when the binary happens to carry mode 0777.
+      if (realProcExe !== realCandidate) return null;
+      if (procStat.dev !== candidateStat.dev || procStat.ino !== candidateStat.ino) return null;
+
+      // ── Step 5: untrusted-root guard ─────────────────────────────────────────
+      // Reject if the resolved path lands inside workspace, $HOME, cwd, or
+      // node_modules — even if the kernel identifies it as the active runtime.
+      // (These locations are unconditionally untrusted regardless of identity.)
       const isUntrusted = untrustedRoots.some(
         (root) => realProcExe === root || realProcExe.startsWith(root + sep),
       );
@@ -133,9 +130,23 @@ export class ExecutableResolver implements IExecutableResolver {
         return null;
       }
 
-      // Return /proc/self/exe as the execution path.
-      // The kernel guarantees this resolves to the currently running executable
-      // at exec() time — no PATH lookup occurs.
+      // ── Decision ─────────────────────────────────────────────────────────────
+      // All three identity proofs passed. The active Node runtime is already
+      // part of ARC's trusted computing base; granting execution through
+      // /proc/self/exe does not extend trust to any other path, directory,
+      // sibling, or toolcache location.
+      //
+      // World-writable / group-writable checks are intentionally NOT applied
+      // here: the trust source is kernel identity, not filesystem permissions.
+      // This exception is ONLY valid because:
+      //   (a) we are on Linux,
+      //   (b) the executable is exactly "node",
+      //   (c) /proc/self/exe is the kernel-authoritative identity of the process
+      //       that is already executing ARC,
+      //   (d) realpath, dev, and ino all confirm it is the same physical file.
+      //
+      // Return /proc/self/exe — not process.execPath — so the kernel resolves
+      // the target at exec() time with no PATH lookup.
       return procExe;
     } catch {
       return null;

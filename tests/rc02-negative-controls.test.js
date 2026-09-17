@@ -1383,233 +1383,44 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
     }
   });
 
-  // ─────────────────────────────────────────────────────────────────────────────
-  // RC02-DIAG-01: Node runtime identity diagnostics for clean-runner debugging.
-  // Emits [RC02-NODE-DIAG] prefixed lines so they are easy to locate in CI logs.
-  // Does NOT alter any security decisions or test outcomes.
-  // ─────────────────────────────────────────────────────────────────────────────
-  test('RC02-DIAG-01: emit node runtime identity diagnostics', () => {
-    const DIAG = '[RC02-NODE-DIAG]';
-
-    function statSummary(label, p) {
-      try {
-        const s = fs.statSync(p);
-        console.error(
-          `${DIAG}   stat(${label}): isFile=${s.isFile()} mode=${s.mode.toString(8)} uid=${s.uid} gid=${s.gid} dev=${s.dev} ino=${s.ino}`,
-        );
-      } catch (e) {
-        console.error(`${DIAG}   stat(${label}): ERROR ${e.message}`);
-      }
-    }
-
-    function lstatSummary(label, p) {
-      try {
-        const s = fs.lstatSync(p);
-        console.error(
-          `${DIAG}   lstat(${label}): isFile=${s.isFile()} isSymlink=${s.isSymbolicLink()} mode=${s.mode.toString(8)} uid=${s.uid} gid=${s.gid} dev=${s.dev} ino=${s.ino}`,
-        );
-      } catch (e) {
-        console.error(`${DIAG}   lstat(${label}): ERROR ${e.message}`);
-      }
-    }
-
-    console.error(`${DIAG} === Begin Node Runtime Identity Diagnostics ===`);
-
-    // 1. process.execPath
-    console.error(`${DIAG} process.execPath = ${process.execPath}`);
-    console.error(`${DIAG} process.platform = ${process.platform}`);
-    console.error(`${DIAG} process.version  = ${process.version}`);
-
-    // 2. realpath(process.execPath)
-    let realExecPath = null;
-    try {
-      realExecPath = fs.realpathSync(process.execPath);
-      console.error(`${DIAG} realpathSync(process.execPath) = ${realExecPath}`);
-    } catch (e) {
-      console.error(`${DIAG} realpathSync(process.execPath): ERROR ${e.message}`);
-    }
-
-    console.error(
-      `${DIAG} process.execPath === realExecPath: ${process.execPath === realExecPath}`,
-    );
-    console.error(`${DIAG} basename(process.execPath) = ${path.basename(process.execPath)}`);
-    if (realExecPath) {
-      console.error(`${DIAG} basename(realExecPath)     = ${path.basename(realExecPath)}`);
-    }
-
-    // 3. /proc/self/exe (Linux only)
-    const procExe = '/proc/self/exe';
-    const procExists = fs.existsSync(procExe);
-    console.error(`${DIAG} /proc/self/exe exists = ${procExists}`);
-
-    if (procExists) {
-      lstatSummary('/proc/self/exe', procExe);
-
-      let procLink;
-      try {
-        procLink = fs.readlinkSync(procExe);
-      } catch (e) {
-        procLink = `ERROR: ${e.message}`;
-      }
-      console.error(`${DIAG} readlinkSync(/proc/self/exe) = ${procLink}`);
-
-      let realProcExe = null;
-      try {
-        realProcExe = fs.realpathSync(procExe);
-        console.error(`${DIAG} realpathSync(/proc/self/exe) = ${realProcExe}`);
-      } catch (e) {
-        console.error(`${DIAG} realpathSync(/proc/self/exe): ERROR ${e.message}`);
-      }
-
-      if (realProcExe) {
-        console.error(`${DIAG} basename(realpath(/proc/self/exe)) = ${path.basename(realProcExe)}`);
-        console.error(
-          `${DIAG} realpath(process.execPath) === realpath(/proc/self/exe): ${realExecPath === realProcExe}`,
-        );
-      }
-
-      // 4. stat each candidate
-      statSummary('process.execPath', process.execPath);
-      if (realExecPath && realExecPath !== process.execPath) {
-        statSummary('realpath(process.execPath)', realExecPath);
-      }
-      statSummary('/proc/self/exe', procExe);
-      if (realProcExe && realProcExe !== procExe) {
-        statSummary('realpath(/proc/self/exe)', realProcExe);
-      }
-
-      // 5. dev/ino cross-comparison
-      try {
-        const sProcExe = fs.statSync(procExe);
-        const sExecPath = fs.statSync(process.execPath);
-        console.error(
-          `${DIAG} dev match (stat(/proc/self/exe) vs stat(execPath)): ${sProcExe.dev === sExecPath.dev}`,
-        );
-        console.error(
-          `${DIAG} ino match (stat(/proc/self/exe) vs stat(execPath)): ${sProcExe.ino === sExecPath.ino}`,
-        );
-        console.error(`${DIAG} stat(/proc/self/exe).dev=${sProcExe.dev} ino=${sProcExe.ino}`);
-        console.error(`${DIAG} stat(execPath).dev=${sExecPath.dev} ino=${sExecPath.ino}`);
-      } catch (e) {
-        console.error(`${DIAG} dev/ino comparison: ERROR ${e.message}`);
-      }
-
-      // 6. Safety decision simulation (mirrors validateKernelBoundNodeLinux logic)
-      console.error(`${DIAG} --- Safety decision trace ---`);
-      try {
-        const procStat = fs.statSync(procExe);
-        console.error(`${DIAG} procStat.isFile()       = ${procStat.isFile()}`);
-        console.error(`${DIAG} procStat executable bit = ${(procStat.mode & 0o111) !== 0}`);
-        console.error(`${DIAG} procStat world-writable = ${(procStat.mode & 0o002) !== 0}`);
-
-        const candidateStat = fs.statSync(process.execPath);
-        console.error(`${DIAG} candidateStat.isFile()       = ${candidateStat.isFile()}`);
-        console.error(
-          `${DIAG} candidateStat executable bit = ${(candidateStat.mode & 0o111) !== 0}`,
-        );
-        console.error(
-          `${DIAG} candidateStat world-writable = ${(candidateStat.mode & 0o002) !== 0}`,
-        );
-
-        const candidateBase = path.basename(process.execPath).toLowerCase();
-        console.error(
-          `${DIAG} candidateBase === 'node' = ${candidateBase === 'node'} (value: ${candidateBase})`,
-        );
-
-        if (realExecPath) {
-          const realCandidateBase = path.basename(realExecPath).toLowerCase();
-          console.error(
-            `${DIAG} realCandidateBase === 'node' = ${realCandidateBase === 'node'} (value: ${realCandidateBase})`,
-          );
-        }
-
-        let realProcExeForTrace = null;
-        try {
-          realProcExeForTrace = fs.realpathSync(procExe);
-        } catch {
-          // handled below
-        }
-        if (realProcExeForTrace) {
-          const realProcBase = path.basename(realProcExeForTrace).toLowerCase();
-          console.error(
-            `${DIAG} realProcBase === 'node' = ${realProcBase === 'node'} (value: ${realProcBase})`,
-          );
-          console.error(
-            `${DIAG} realProcExe === realExecPath = ${realProcExeForTrace === realExecPath}`,
-          );
-        }
-
-        // Untrusted roots (as built by resolveExecutable with workspaceDir)
-        const untrustedRoots = [
-          path.resolve(workspaceDir),
-          process.env.HOME ? path.resolve(process.env.HOME) : null,
-          path.resolve(process.cwd()),
-        ].filter(Boolean);
-
-        if (realProcExeForTrace) {
-          const isUntrusted = untrustedRoots.some(
-            (r) => realProcExeForTrace === r || realProcExeForTrace.startsWith(r + path.sep),
-          );
-          const hasNodeModules =
-            realProcExeForTrace.includes(`${path.sep}node_modules${path.sep}`) ||
-            realProcExeForTrace.endsWith(`${path.sep}node_modules`);
-          console.error(`${DIAG} realProcExe in untrustedRoots    = ${isUntrusted}`);
-          console.error(`${DIAG} realProcExe contains node_modules = ${hasNodeModules}`);
-        }
-      } catch (e) {
-        console.error(`${DIAG} Safety decision trace ERROR: ${e.message}`);
-      }
-
-      // 7. Parent-directory permission walk (from node binary up to /)
-      console.error(`${DIAG} --- Parent directory permission walk ---`);
-      const walkTarget = realExecPath || process.execPath;
-      let current = path.dirname(walkTarget);
-      const visited = new Set();
-      while (current && !visited.has(current)) {
-        visited.add(current);
-        try {
-          const ds = fs.statSync(current);
-          const groupWritable = (ds.mode & 0o020) !== 0;
-          const worldWritable = (ds.mode & 0o002) !== 0;
-          console.error(
-            `${DIAG}   dir=${current} mode=${ds.mode.toString(8)} uid=${ds.uid} gid=${ds.gid} group-writable=${groupWritable} world-writable=${worldWritable}`,
-          );
-        } catch (e) {
-          console.error(`${DIAG}   dir=${current} stat ERROR: ${e.message}`);
-        }
-        const parent = path.dirname(current);
-        if (parent === current) break;
-        current = parent;
-      }
-    }
-
-    console.error(`${DIAG} === End Node Runtime Identity Diagnostics ===`);
-
-    // This test always passes — it only emits diagnostic information.
-    assert.ok(true);
-  });
-
   test('RC02-REG-36: exact active Node runtime executes successfully and binds to /proc/self/exe on Linux', async () => {
     if (process.platform === 'linux') {
       assert.ok(fs.existsSync('/proc/self/exe'), '/proc/self/exe must exist on Linux');
 
-      // The kernel-authoritative identity invariant:
-      // realpath(/proc/self/exe) must equal realpath(process.execPath)
-      // This is the correct cross-filesystem-layer identity check.
-      // (dev/ino may differ across overlayfs layers even for the same binary.)
+      // Triple kernel identity proof — all three must agree for the resolver to
+      // return /proc/self/exe. The GitHub diagnostics (run #23) confirmed that
+      // dev=2049 ino=557445 match on the ubuntu-24.04 hosted runner, even when
+      // the toolcache Node binary carries mode 0777.
       const realProcExe = fs.realpathSync('/proc/self/exe');
       const realExecPath = fs.realpathSync(process.execPath);
+      const procStat = fs.statSync('/proc/self/exe');
+      const execStat = fs.statSync(process.execPath);
+
+      // 1. Canonical path must be the same file
       assert.equal(
         realProcExe,
         realExecPath,
         'realpath(/proc/self/exe) must equal realpath(process.execPath)',
       );
+      // 2. Basename must be 'node'
       assert.equal(
         path.basename(realProcExe).toLowerCase(),
         'node',
         'Kernel-identified active runtime must be named node',
       );
+      // 3. Device and inode must match (same physical file, proven by diagnostics)
+      assert.equal(
+        procStat.dev,
+        execStat.dev,
+        'stat(/proc/self/exe).dev must equal stat(process.execPath).dev',
+      );
+      assert.equal(
+        procStat.ino,
+        execStat.ino,
+        'stat(/proc/self/exe).ino must equal stat(process.execPath).ino',
+      );
 
+      // Resolver must bind to /proc/self/exe, not return process.execPath directly
       const resolver = new ExecutableResolver();
       const resolved = resolver.resolveExecutable('node', workspaceDir);
       assert.equal(
@@ -1619,6 +1430,7 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
       );
     }
 
+    // End-to-end: node --version must execute and return a semver string
     const res = await server.dispatchToolCall('run_command', {
       executable: 'node',
       args: ['--version'],
