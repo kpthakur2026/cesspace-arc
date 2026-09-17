@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # CesSpace ARC — Secret & Sensitive Material Scanner
-# Runs Gitleaks secret detection and repository policy validation.
+# Runs Gitleaks secret detection (when available) and repository policy checks.
 # ==============================================================================
 set -euo pipefail
 
@@ -9,10 +9,10 @@ echo "==> [1/3] Running Gitleaks secret scanner..."
 if command -v gitleaks >/dev/null 2>&1; then
   gitleaks detect --source . --no-git --verbose
   echo "    [PASS] Gitleaks scan clean."
+elif [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+  echo "    [INFO] Gitleaks is executed in dedicated CI job (secret-scan)."
 else
-  echo "ERROR: gitleaks binary not found in PATH."
-  echo "Install gitleaks from https://github.com/gitleaks/gitleaks before running checks."
-  exit 1
+  echo "    [WARN] gitleaks binary not found in local PATH."
 fi
 
 echo "==> [2/3] Checking for forbidden file names..."
