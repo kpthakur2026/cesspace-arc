@@ -3,6 +3,7 @@
   "version": "0.0.0-rc00",
   "description": "Secure, vendor-neutral agent-to-machine control plane for AI agents, development environments, and remote systems using MCP",
   "license": "Apache-2.0",
+  "author": "P Thakur",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@12.4.2",

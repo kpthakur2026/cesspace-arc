@@ -6,7 +6,7 @@
 **Repository visibility:** Public
 **Status:** Architecture / security foundation only
 **Current stage:** `RC-00`
-**Primary implementation agent:** AGY / Antigravity
+**Lead Developer & Architect:** P Thakur
 **Primary target:** Linux development VMs
 **Protocol direction:** MCP-based, vendor-neutral
 **Document purpose:** This file applies only to the `cesspace-arc` project.
@@ -526,13 +526,13 @@ RC-00 is complete only when:
 
 ---
 
-## 11. AGY Operating Rules
+## 11. Core Operating Rules
 
 For this repository:
 
-- use one primary implementation agent initially
+- use single-branch development initially
 - use separate branches/worktrees for independent tasks
-- never allow two writable agents in the same worktree
+- never allow two writable processes in the same worktree
 - `accept-edits` may be used for normal repository file edits
 - do not enable unrestricted terminal permissions
 - do not deploy
@@ -547,9 +547,9 @@ For this repository:
 
 ---
 
-## 12. First AGY Prompt — RC-00 Only
+## 12. Initial Prompt Specification — RC-00 Only
 
-Copy the following prompt into AGY after cloning the repository:
+Copy the following prompt after cloning the repository:
 
 ```text
 You are working only in the kpthakur2026/cesspace-arc repository.
@@ -653,7 +653,7 @@ Recommended initial branch:
 git switch -c feat/rc-00-architecture
 ```
 
-AGY must stay on this branch for RC-00.
+Development must stay on this branch for RC-00.
 
 ---
 

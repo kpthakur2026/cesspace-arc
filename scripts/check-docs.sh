@@ -9,7 +9,7 @@ echo "==> [1/2] Verifying presence of required RC-00 documentation..."
 
 REQUIRED_DOCS=(
   "README.md"
-  "AGENTS.md"
+  "docs/governance/engineering-governance.md"
   "SECURITY.md"
   "CONTRIBUTING.md"
   "CODE_OF_CONDUCT.md"
@@ -61,7 +61,7 @@ const path = require("path");
 
 const files = [
   "README.md",
-  "AGENTS.md",
+  "docs/governance/engineering-governance.md",
   "SECURITY.md",
   "CONTRIBUTING.md",
   "docs/adr/README.md"

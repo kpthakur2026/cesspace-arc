@@ -3,11 +3,12 @@
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Stage](https://img.shields.io/badge/Stage-RC--00%20Proposed%20Baseline%20%28Pending%20Review%29-orange.svg)](#roadmap)
 [![Security Policy](https://img.shields.io/badge/Security-Default%20Deny-red.svg)](SECURITY.md)
-[![Agent Guidelines](https://img.shields.io/badge/Agents-AGENTS.md-brightgreen.svg)](AGENTS.md)
+[![Engineering Governance](https://img.shields.io/badge/Governance-Engineering%20Rules-brightgreen.svg)](docs/governance/engineering-governance.md)
 [![Node](https://img.shields.io/badge/Node-24-green.svg)](#toolchain)
 [![pnpm](https://img.shields.io/badge/pnpm-12.4.2-orange.svg)](#toolchain)
 
 > **CesSpace ARC (Agent Remote Control)** is a secure, vendor-neutral control plane providing policy-enforced, audited access to development machines, virtual machines, repositories, terminals, and processes for authorized AI coding agents.
+> **Lead Developer & Architect:** P Thakur
 
 ---
 
@@ -106,7 +107,7 @@ The complete architecture and security foundation of CesSpace ARC is documented 
 | [**Package Ownership**](docs/architecture/package-ownership.md)            | Monorepo package layout, component boundaries, and dependency DAG.                                         |
 | [**Architecture Decision Records**](docs/adr/README.md)                    | Formal ADRs capturing key design and security decisions.                                                   |
 | [**RC-01 Scope & Acceptance**](docs/architecture/rc01-scope-acceptance.md) | Detailed scope, Minimal Security Kernel, tool list, and negative control criteria for RC-01.               |
-| [**Agent Guidelines**](AGENTS.md)                                          | Mandatory operating directives for autonomous coding agents.                                               |
+| [**Engineering Governance**](docs/governance/engineering-governance.md)    | Mandatory project engineering, stage-gate, and security governance rules.                                  |
 | [**Security Policy**](SECURITY.md)                                         | Vulnerability disclosure, responsible reporting, and safety invariants.                                    |
 | [**Contributing Guide**](CONTRIBUTING.md)                                  | Guidelines for contributing code, tests, and security negative controls.                                   |
 
