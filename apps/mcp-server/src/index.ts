@@ -30,53 +30,57 @@ export interface ArcServerConfig {
 
 const WorkspaceIdSchema = z
   .string()
+  .max(128, 'workspaceId exceeds maximum allowed length of 128 characters')
   .trim()
-  .min(1, 'workspaceId must not be empty or whitespace-only')
-  .max(128);
+  .min(1, 'workspaceId must not be empty or whitespace-only');
 
 const WorkspaceRootSchema = z
   .string()
+  .max(1024, 'workspaceRoot exceeds maximum allowed length of 1024 characters')
   .trim()
-  .min(1, 'workspaceRoot must not be empty or whitespace-only')
-  .max(1024);
+  .min(1, 'workspaceRoot must not be empty or whitespace-only');
 
 const RelativePathSchema = z
   .string()
+  .max(1024, 'path exceeds maximum allowed length of 1024 characters')
   .trim()
-  .min(1, 'path must not be empty or whitespace-only')
-  .max(1024);
+  .min(1, 'path must not be empty or whitespace-only');
 
 const OptionalPathSchema = z
   .string()
+  .max(1024, 'path exceeds maximum allowed length of 1024 characters')
   .trim()
-  .min(1, 'path must not be empty or whitespace-only')
-  .max(1024);
+  .min(1, 'path must not be empty or whitespace-only');
 
 const SubPathSchema = z
   .string()
+  .max(1024, 'subPath exceeds maximum allowed length of 1024 characters')
   .trim()
-  .min(1, 'subPath must not be empty or whitespace-only')
-  .max(1024);
+  .min(1, 'subPath must not be empty or whitespace-only');
 
-const QuerySchema = z.string().trim().min(1, 'query must not be empty or whitespace-only').max(500);
+const QuerySchema = z
+  .string()
+  .max(500, 'query exceeds maximum allowed length of 500 characters')
+  .trim()
+  .min(1, 'query must not be empty or whitespace-only');
 
 const PatternSchema = z
   .string()
+  .max(256, 'pattern exceeds maximum allowed length of 256 characters')
   .trim()
-  .min(1, 'pattern must not be empty or whitespace-only')
-  .max(256);
+  .min(1, 'pattern must not be empty or whitespace-only');
 
 const FilePatternSchema = z
   .string()
+  .max(256, 'filePattern exceeds maximum allowed length of 256 characters')
   .trim()
-  .min(1, 'filePattern must not be empty or whitespace-only')
-  .max(256);
+  .min(1, 'filePattern must not be empty or whitespace-only');
 
 const RevisionTargetSchema = z
   .string()
+  .max(128, 'revision or target exceeds maximum allowed length of 128 characters')
   .trim()
-  .min(1, 'revision or target must not be empty or whitespace-only')
-  .max(128);
+  .min(1, 'revision or target must not be empty or whitespace-only');
 
 /**
  * Strict Zod validation schemas for all 9 permitted RC-01 tools.
@@ -540,11 +544,13 @@ export class ArcMcpServer implements IArcMcpServer {
       };
     }
 
+    const validatedParams = parseResult.data as Record<string, unknown>;
+
     // Defense-in-depth: explicit whitespace-only workspaceId/workspaceRoot must fail closed
-    if (parameters.workspaceId !== undefined) {
+    if (validatedParams.workspaceId !== undefined) {
       if (
-        typeof parameters.workspaceId !== 'string' ||
-        parameters.workspaceId.trim().length === 0
+        typeof validatedParams.workspaceId !== 'string' ||
+        validatedParams.workspaceId.trim().length === 0
       ) {
         const arcErr = ArcError.invalidRequestSchema(
           'Parameter workspaceId must be a non-empty string.',
@@ -555,10 +561,10 @@ export class ArcMcpServer implements IArcMcpServer {
         };
       }
     }
-    if (parameters.workspaceRoot !== undefined) {
+    if (validatedParams.workspaceRoot !== undefined) {
       if (
-        typeof parameters.workspaceRoot !== 'string' ||
-        parameters.workspaceRoot.trim().length === 0
+        typeof validatedParams.workspaceRoot !== 'string' ||
+        validatedParams.workspaceRoot.trim().length === 0
       ) {
         const arcErr = ArcError.invalidRequestSchema(
           'Parameter workspaceRoot must be a non-empty string.',
@@ -572,9 +578,11 @@ export class ArcMcpServer implements IArcMcpServer {
 
     // 3. Workspace Binding Gate (P1-01)
     const hasExplicitId =
-      typeof parameters.workspaceId === 'string' && parameters.workspaceId.trim().length > 0;
+      typeof validatedParams.workspaceId === 'string' &&
+      validatedParams.workspaceId.trim().length > 0;
     const hasExplicitRoot =
-      typeof parameters.workspaceRoot === 'string' && parameters.workspaceRoot.trim().length > 0;
+      typeof validatedParams.workspaceRoot === 'string' &&
+      validatedParams.workspaceRoot.trim().length > 0;
 
     let targetWorkspaceRecord: WorkspaceRecord | undefined;
     let workspaceConflict = false;
@@ -586,10 +594,10 @@ export class ArcMcpServer implements IArcMcpServer {
         : undefined;
     } else {
       if (hasExplicitId && hasExplicitRoot) {
-        const wsById = this.workspaceRegistry.getWorkspace(parameters.workspaceId as string);
+        const wsById = this.workspaceRegistry.getWorkspace(validatedParams.workspaceId as string);
         const wsByPath =
-          this.workspaceRegistry.findWorkspaceForPath(parameters.workspaceRoot as string) ||
-          this.workspaceRegistry.getWorkspace(parameters.workspaceRoot as string);
+          this.workspaceRegistry.findWorkspaceForPath(validatedParams.workspaceRoot as string) ||
+          this.workspaceRegistry.getWorkspace(validatedParams.workspaceRoot as string);
 
         if (!wsById || !wsByPath) {
           workspaceUnregistered = true;
@@ -599,7 +607,7 @@ export class ArcMcpServer implements IArcMcpServer {
           targetWorkspaceRecord = wsById;
         }
       } else if (hasExplicitId) {
-        const ws = this.workspaceRegistry.getWorkspace(parameters.workspaceId as string);
+        const ws = this.workspaceRegistry.getWorkspace(validatedParams.workspaceId as string);
         if (!ws) {
           workspaceUnregistered = true;
         } else {
@@ -607,8 +615,8 @@ export class ArcMcpServer implements IArcMcpServer {
         }
       } else if (hasExplicitRoot) {
         const ws =
-          this.workspaceRegistry.findWorkspaceForPath(parameters.workspaceRoot as string) ||
-          this.workspaceRegistry.getWorkspace(parameters.workspaceRoot as string);
+          this.workspaceRegistry.findWorkspaceForPath(validatedParams.workspaceRoot as string) ||
+          this.workspaceRegistry.getWorkspace(validatedParams.workspaceRoot as string);
         if (!ws) {
           workspaceUnregistered = true;
         } else {
@@ -642,7 +650,7 @@ export class ArcMcpServer implements IArcMcpServer {
       targetWorkspace,
       request: {
         toolName,
-        parameters,
+        parameters: validatedParams,
       },
       environment: {
         timestamp: startTime,
@@ -667,8 +675,8 @@ export class ArcMcpServer implements IArcMcpServer {
         },
         invocation: {
           toolName,
-          parametersRedacted: parameters,
-          payloadHash: computeSha256(canonicalJson(parameters)),
+          parametersRedacted: validatedParams,
+          payloadHash: computeSha256(canonicalJson(validatedParams)),
         },
         policy: {
           decision: decision.effect,
@@ -745,19 +753,19 @@ export class ArcMcpServer implements IArcMcpServer {
         case 'list_directory': {
           const listRes = await this.filesystemSubsystem.listDirectory(
             targetWorkspace.rootPath,
-            parameters,
+            validatedParams,
           );
           result = listRes;
           break;
         }
 
         case 'read_file': {
-          if (!parameters.path) {
+          if (!validatedParams.path) {
             throw ArcError.invalidRequestSchema('Path parameter is required for read_file.');
           }
           const readRes = await this.filesystemSubsystem.readFile(
             targetWorkspace.rootPath,
-            parameters as { path: string; offset?: number; length?: number },
+            validatedParams as { path: string; offset?: number; length?: number },
           );
           bytesRead = readRes.bytesRead;
           result = readRes;
@@ -765,24 +773,24 @@ export class ArcMcpServer implements IArcMcpServer {
         }
 
         case 'search_files': {
-          if (!parameters.pattern) {
+          if (!validatedParams.pattern) {
             throw ArcError.invalidRequestSchema('Pattern parameter is required for search_files.');
           }
           const searchRes = await this.filesystemSubsystem.searchFiles(
             targetWorkspace.rootPath,
-            parameters as { pattern: string; subPath?: string; maxResults?: number },
+            validatedParams as { pattern: string; subPath?: string; maxResults?: number },
           );
           result = searchRes;
           break;
         }
 
         case 'search_text': {
-          if (!parameters.query) {
+          if (!validatedParams.query) {
             throw ArcError.invalidRequestSchema('Query parameter is required for search_text.');
           }
           const textRes = await this.filesystemSubsystem.searchText(
             targetWorkspace.rootPath,
-            parameters as {
+            validatedParams as {
               query: string;
               isRegex?: boolean;
               filePattern?: string;
@@ -794,19 +802,25 @@ export class ArcMcpServer implements IArcMcpServer {
         }
 
         case 'git_status': {
-          const statusRes = await this.gitSubsystem.getStatus(targetWorkspace.rootPath, parameters);
+          const statusRes = await this.gitSubsystem.getStatus(
+            targetWorkspace.rootPath,
+            validatedParams,
+          );
           result = statusRes;
           break;
         }
 
         case 'git_diff': {
-          const diffRes = await this.gitSubsystem.getDiff(targetWorkspace.rootPath, parameters);
+          const diffRes = await this.gitSubsystem.getDiff(
+            targetWorkspace.rootPath,
+            validatedParams,
+          );
           result = diffRes;
           break;
         }
 
         case 'git_log': {
-          const logRes = await this.gitSubsystem.getLog(targetWorkspace.rootPath, parameters);
+          const logRes = await this.gitSubsystem.getLog(targetWorkspace.rootPath, validatedParams);
           result = logRes;
           break;
         }
@@ -836,8 +850,8 @@ export class ArcMcpServer implements IArcMcpServer {
       },
       invocation: {
         toolName,
-        parametersRedacted: parameters,
-        payloadHash: computeSha256(canonicalJson(parameters)),
+        parametersRedacted: validatedParams,
+        payloadHash: computeSha256(canonicalJson(validatedParams)),
       },
       policy: {
         decision: 'ALLOW',

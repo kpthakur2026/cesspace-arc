@@ -755,6 +755,68 @@ describe('CesSpace ARC — RC-01 Mandatory Security Negative & Positive Controls
     assert.equal(JSON.parse(resRev.content[0].text).code, 'INVALID_REQUEST_SCHEMA');
   });
 
+  test('Hardening: Oversized padded selectors fail closed (max length enforced on original input)', async () => {
+    // 10,000 spaces + "x" for query
+    const resQuery = await server.dispatchToolCall('search_text', {
+      query: ' '.repeat(10000) + 'x',
+    });
+    assert.equal(resQuery.isError, true);
+    assert.equal(JSON.parse(resQuery.content[0].text).code, 'INVALID_REQUEST_SCHEMA');
+
+    // 10,000 spaces + workspaceId
+    const resWsId = await server.dispatchToolCall('read_file', {
+      workspaceId: ' '.repeat(10000) + 'test-ws',
+      path: 'README.md',
+    });
+    assert.equal(resWsId.isError, true);
+    assert.equal(JSON.parse(resWsId.content[0].text).code, 'INVALID_REQUEST_SCHEMA');
+
+    // oversized padded path
+    const resPath = await server.dispatchToolCall('read_file', {
+      path: ' '.repeat(10000) + 'README.md',
+    });
+    assert.equal(resPath.isError, true);
+    assert.equal(JSON.parse(resPath.content[0].text).code, 'INVALID_REQUEST_SCHEMA');
+
+    // oversized padded revision
+    const resRev = await server.dispatchToolCall('git_log', {
+      revision: ' '.repeat(10000) + 'HEAD',
+    });
+    assert.equal(resRev.isError, true);
+    assert.equal(JSON.parse(resRev.content[0].text).code, 'INVALID_REQUEST_SCHEMA');
+
+    // oversized padded target
+    const resTarget = await server.dispatchToolCall('git_diff', {
+      target: ' '.repeat(10000) + 'HEAD',
+    });
+    assert.equal(resTarget.isError, true);
+    assert.equal(JSON.parse(resTarget.content[0].text).code, 'INVALID_REQUEST_SCHEMA');
+
+    // oversized padded pattern
+    const resPattern = await server.dispatchToolCall('search_files', {
+      pattern: ' '.repeat(10000) + '*.js',
+    });
+    assert.equal(resPattern.isError, true);
+    assert.equal(JSON.parse(resPattern.content[0].text).code, 'INVALID_REQUEST_SCHEMA');
+  });
+
+  test('Hardening: Valid bounded inputs are normalized by Zod and passed to execution', async () => {
+    // path with leading/trailing spaces within bounds is trimmed and read successfully
+    const res = await server.dispatchToolCall('read_file', {
+      path: '  README.md  ',
+    });
+    assert.equal(res.isError, undefined);
+    const content = JSON.parse(res.content[0].text);
+    assert.ok(content.content.includes('# Fixture Workspace'));
+    assert.ok(content.bytesRead > 0);
+
+    // workspaceId with leading/trailing spaces within bounds is trimmed and bound successfully
+    const resDir = await server.dispatchToolCall('list_directory', {
+      workspaceId: '  test-ws  ',
+    });
+    assert.equal(resDir.isError, undefined);
+  });
+
   test('Hardening: Host paths and usernames are absent from returned client errors', async () => {
     const errorScenarios = [
       await server.dispatchToolCall('read_file', { path: 'nonexistent-file.txt' }),
