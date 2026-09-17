@@ -7,7 +7,8 @@ import {
   type TerminateProcessResponse,
 } from '@cesspace-arc/protocol';
 
-export type ProcessState = 'RUNNING' | 'COMPLETED' | 'FAILED' | 'TIMED_OUT' | 'TERMINATED';
+export type ProcessState =
+  'RUNNING' | 'TERMINATING' | 'COMPLETED' | 'FAILED' | 'TIMED_OUT' | 'TERMINATED';
 
 /**
  * Maximum buffer retention per process in bytes (512 KiB).
@@ -33,6 +34,12 @@ export const CONCURRENCY_LIMITS = {
   maxPerSessionRunning: 4,
   maxPerWorkspaceRunning: 4,
 } as const;
+
+export interface ProcessOwnerIdentity {
+  clientId: string;
+  sessionId: string;
+  workspaceId?: string;
+}
 
 export interface ProcessRecord {
   processId: string;
@@ -63,6 +70,36 @@ export interface ProcessRecord {
   _stderrChunks: Buffer[];
 }
 
+export type ProcessLifecycleEventType =
+  | 'PROCESS_SPAWN_SUCCEEDED'
+  | 'PROCESS_SPAWN_FAILED'
+  | 'PROCESS_EXITED'
+  | 'PROCESS_TIMEOUT'
+  | 'PROCESS_TERMINATION_REQUESTED'
+  | 'PROCESS_SIGTERM_SENT'
+  | 'PROCESS_SIGKILL_ESCALATED'
+  | 'PROCESS_TERMINATED';
+
+export interface ProcessLifecycleEvent {
+  eventType: ProcessLifecycleEventType;
+  timestamp: string;
+  processId: string;
+  workspaceId: string;
+  actor: {
+    clientId: string;
+    sessionId: string;
+  };
+  executable: string;
+  exitCode?: number | null;
+  signal?: string | null;
+  durationMs?: number;
+  error?: string;
+}
+
+export interface IProcessLifecycleSink {
+  onProcessEvent(event: ProcessLifecycleEvent): Promise<void> | void;
+}
+
 export interface IProcessRegistry {
   registerProcess(
     record: Omit<
@@ -78,25 +115,28 @@ export interface IProcessRegistry {
   ): ProcessRecord;
   getProcess(processId: string): ProcessRecord | undefined;
   listProcesses(filter?: {
+    clientId?: string;
     sessionId?: string;
     workspaceId?: string;
     state?: ProcessState;
   }): ProcessRecord[];
   appendOutput(processId: string, stream: 'stdout' | 'stderr', chunk: Buffer): void;
-  getProcessStatus(processId: string, sessionId?: string): ProcessStatusResponse;
+  getProcessStatus(processId: string, owner?: ProcessOwnerIdentity): ProcessStatusResponse;
   getProcessOutput(
     processId: string,
     offset?: number,
     maxBytes?: number,
-    sessionId?: string,
+    owner?: ProcessOwnerIdentity,
   ): ProcessOutputResponse;
   terminateProcess(
     processId: string,
     signal?: 'SIGTERM' | 'SIGKILL',
-    sessionId?: string,
+    owner?: ProcessOwnerIdentity,
   ): Promise<TerminateProcessResponse>;
   markCompleted(processId: string, exitCode: number | null, signal: string | null): void;
   markTimedOut(processId: string): void;
+  notifySpawnSuccess(processId: string): void;
+  markSpawnFailed(processId: string, error?: string): void;
   checkConcurrency(sessionId: string, workspaceId: string): void;
   clear(): void;
 }
@@ -122,11 +162,72 @@ export function scrubOutput(text: string): string {
 }
 
 /**
+ * Safely slice a Buffer to ensure it does not split a multi-byte UTF-8 character sequence at the end.
+ */
+export function sliceUtf8Safe(
+  buf: Buffer,
+  start: number,
+  end: number,
+): { slice: Buffer; adjustedEnd: number } {
+  const boundedEnd = Math.min(end, buf.length);
+  const boundedStart = Math.min(start, boundedEnd);
+  if (boundedStart >= boundedEnd) {
+    return { slice: Buffer.alloc(0), adjustedEnd: boundedStart };
+  }
+
+  // If the byte at boundedEnd is a continuation byte, back up to find the start of the UTF-8 sequence
+  let cut = boundedEnd;
+  while (cut > boundedStart && (buf[cut] & 0xc0) === 0x80) {
+    cut--;
+  }
+
+  // Check if character starting at `cut` completes before boundedEnd
+  if (cut > boundedStart) {
+    const lead = buf[cut];
+    let charLen = 1;
+    if ((lead & 0xe0) === 0xc0) charLen = 2;
+    else if ((lead & 0xf0) === 0xe0) charLen = 3;
+    else if ((lead & 0xf8) === 0xf0) charLen = 4;
+
+    if (cut + charLen <= boundedEnd) {
+      // It fits completely
+      return { slice: buf.subarray(boundedStart, boundedEnd), adjustedEnd: boundedEnd };
+    } else {
+      // Multi-byte sequence is truncated at boundedEnd, so back up to `cut`
+      return { slice: buf.subarray(boundedStart, cut), adjustedEnd: cut };
+    }
+  }
+
+  return { slice: buf.subarray(boundedStart, cut), adjustedEnd: cut };
+}
+
+/**
  * In-memory thread-safe Process Registry.
- * Enforces opaque IDs, session ownership, output bounds, and concurrency limits.
+ * Enforces opaque IDs, strict client/session/workspace ownership, output bounds, and concurrency limits.
  */
 export class ProcessRegistry implements IProcessRegistry {
   private processes = new Map<string, ProcessRecord>();
+  private lifecycleSinks: IProcessLifecycleSink[] = [];
+
+  constructor(sinks?: IProcessLifecycleSink[]) {
+    if (sinks) {
+      this.lifecycleSinks = [...sinks];
+    }
+  }
+
+  public registerLifecycleSink(sink: IProcessLifecycleSink): void {
+    this.lifecycleSinks.push(sink);
+  }
+
+  private emitLifecycleEvent(event: ProcessLifecycleEvent): void {
+    for (const sink of this.lifecycleSinks) {
+      try {
+        void sink.onProcessEvent(event);
+      } catch {
+        // Sink failure must not throw in registry
+      }
+    }
+  }
 
   public registerProcess(
     init: Omit<
@@ -158,16 +259,49 @@ export class ProcessRegistry implements IProcessRegistry {
     return record;
   }
 
+  public notifySpawnSuccess(processId: string): void {
+    const record = this.processes.get(processId);
+    if (!record) return;
+    this.emitLifecycleEvent({
+      eventType: 'PROCESS_SPAWN_SUCCEEDED',
+      timestamp: record.startedAt,
+      processId: record.processId,
+      workspaceId: record.workspaceId,
+      actor: record.actor,
+      executable: record.executable,
+    });
+  }
+
+  public markSpawnFailed(processId: string, error?: string): void {
+    const record = this.processes.get(processId);
+    if (!record) return;
+    record.state = 'FAILED';
+    record.completedAt = new Date().toISOString();
+    this.emitLifecycleEvent({
+      eventType: 'PROCESS_SPAWN_FAILED',
+      timestamp: record.completedAt,
+      processId: record.processId,
+      workspaceId: record.workspaceId,
+      actor: record.actor,
+      executable: record.executable,
+      error,
+    });
+  }
+
   public getProcess(processId: string): ProcessRecord | undefined {
     return this.processes.get(processId);
   }
 
   public listProcesses(filter?: {
+    clientId?: string;
     sessionId?: string;
     workspaceId?: string;
     state?: ProcessState;
   }): ProcessRecord[] {
     let result = Array.from(this.processes.values());
+    if (filter?.clientId) {
+      result = result.filter((p) => p.actor.clientId === filter.clientId);
+    }
     if (filter?.sessionId) {
       result = result.filter((p) => p.actor.sessionId === filter.sessionId);
     }
@@ -181,10 +315,12 @@ export class ProcessRegistry implements IProcessRegistry {
   }
 
   public countRunning(filter?: { sessionId?: string; workspaceId?: string }): number {
-    return this.listProcesses({
-      state: 'RUNNING',
-      sessionId: filter?.sessionId,
-      workspaceId: filter?.workspaceId,
+    return Array.from(this.processes.values()).filter((p) => {
+      const isAlive = p.state === 'RUNNING' || p.state === 'TERMINATING';
+      if (!isAlive) return false;
+      if (filter?.sessionId && p.actor.sessionId !== filter.sessionId) return false;
+      if (filter?.workspaceId && p.workspaceId !== filter.workspaceId) return false;
+      return true;
     }).length;
   }
 
@@ -237,7 +373,7 @@ export class ProcessRegistry implements IProcessRegistry {
     }
   }
 
-  public assertOwnership(processId: string, sessionId?: string): ProcessRecord {
+  public assertOwnership(processId: string, owner?: ProcessOwnerIdentity): ProcessRecord {
     // Validate format: must be an opaque ARC processId
     if (!processId || typeof processId !== 'string' || !processId.startsWith('arc-proc-')) {
       throw ArcError.processNotFound('Process not found: Invalid process identifier.');
@@ -248,25 +384,49 @@ export class ProcessRegistry implements IProcessRegistry {
       throw ArcError.processNotFound(`Process not found: '${processId}'.`);
     }
 
-    if (sessionId && record.actor.sessionId !== sessionId) {
+    if (!owner || !owner.clientId || !owner.sessionId) {
       throw ArcError.policyDenied(
-        'Access denied: Caller is not authorized to access or control this process.',
+        'Access denied: Process control requires verified caller identity (clientId and sessionId).',
+      );
+    }
+
+    if (record.actor.clientId !== owner.clientId) {
+      throw ArcError.policyDenied('Access denied: Caller clientId does not match process owner.');
+    }
+
+    if (record.actor.sessionId !== owner.sessionId) {
+      throw ArcError.policyDenied(
+        'Access denied: Caller sessionId does not match process owner session.',
+      );
+    }
+
+    if (
+      owner.workspaceId &&
+      owner.workspaceId !== 'unbound' &&
+      record.workspaceId !== owner.workspaceId
+    ) {
+      throw ArcError.policyDenied(
+        'Access denied: Caller workspace does not match process workspace.',
       );
     }
 
     return record;
   }
 
-  public getProcessStatus(processId: string, sessionId?: string): ProcessStatusResponse {
-    const record = this.assertOwnership(processId, sessionId);
+  public getProcessStatus(processId: string, owner?: ProcessOwnerIdentity): ProcessStatusResponse {
+    const record = this.assertOwnership(processId, owner);
 
     const now = Date.now();
     const start = new Date(record.startedAt).getTime();
     const durationMs = record.completedAt ? record.durationMs : Math.max(0, now - start);
 
+    // Map TERMINATING to RUNNING in external response contract if needed, or return state
+    const externalState: ProcessStatusResponse['state'] =
+      record.state === 'TERMINATING' ? 'RUNNING' : record.state;
+
     return {
       processId: record.processId,
-      state: record.state,
+      state: externalState,
       startedAt: record.startedAt,
       durationMs,
       exitCode: record.exitCode,
@@ -281,9 +441,9 @@ export class ProcessRegistry implements IProcessRegistry {
     processId: string,
     offset = 0,
     maxBytes = DEFAULT_OUTPUT_READ_BYTES,
-    sessionId?: string,
+    owner?: ProcessOwnerIdentity,
   ): ProcessOutputResponse {
-    const record = this.assertOwnership(processId, sessionId);
+    const record = this.assertOwnership(processId, owner);
 
     const boundedMaxBytes = Math.min(Math.max(1, maxBytes), MAX_OUTPUT_READ_BYTES);
     const startOffset = Math.max(0, offset);
@@ -291,19 +451,26 @@ export class ProcessRegistry implements IProcessRegistry {
     const stdoutFull = Buffer.concat(record._stdoutChunks);
     const stderrFull = Buffer.concat(record._stderrChunks);
 
-    const stdoutSlice = stdoutFull.subarray(startOffset, startOffset + boundedMaxBytes);
-    const stderrSlice = stderrFull.subarray(startOffset, startOffset + boundedMaxBytes);
+    const stdoutResult = sliceUtf8Safe(stdoutFull, startOffset, startOffset + boundedMaxBytes);
+    const stderrResult = sliceUtf8Safe(stderrFull, startOffset, startOffset + boundedMaxBytes);
 
-    const bytesRead = Math.max(stdoutSlice.length, stderrSlice.length);
-    const nextOffset = startOffset + bytesRead;
+    const bytesRead = Math.max(stdoutResult.slice.length, stderrResult.slice.length);
+    const nextOffset =
+      startOffset +
+      Math.max(
+        stdoutResult.adjustedEnd - startOffset,
+        stderrResult.adjustedEnd - startOffset,
+        bytesRead,
+      );
 
     const maxTotalBytes = Math.max(record.totalStdoutBytes, record.totalStderrBytes);
-    const complete = record.state !== 'RUNNING' && nextOffset >= maxTotalBytes;
+    const isStillActive = record.state === 'RUNNING' || record.state === 'TERMINATING';
+    const complete = !isStillActive && nextOffset >= maxTotalBytes;
 
     return {
       processId: record.processId,
-      stdoutChunk: scrubOutput(stdoutSlice.toString('utf8')),
-      stderrChunk: scrubOutput(stderrSlice.toString('utf8')),
+      stdoutChunk: scrubOutput(stdoutResult.slice.toString('utf8')),
+      stderrChunk: scrubOutput(stderrResult.slice.toString('utf8')),
       nextOffset,
       complete,
       truncated: record.truncated,
@@ -313,11 +480,12 @@ export class ProcessRegistry implements IProcessRegistry {
   public async terminateProcess(
     processId: string,
     signal: 'SIGTERM' | 'SIGKILL' = 'SIGTERM',
-    sessionId?: string,
+    owner?: ProcessOwnerIdentity,
   ): Promise<TerminateProcessResponse> {
-    const record = this.assertOwnership(processId, sessionId);
+    const record = this.assertOwnership(processId, owner);
 
-    if (record.state !== 'RUNNING' || !record._child) {
+    const isAlive = record.state === 'RUNNING' || record.state === 'TERMINATING';
+    if (!isAlive || !record._child) {
       return {
         processId: record.processId,
         terminated: false,
@@ -331,17 +499,64 @@ export class ProcessRegistry implements IProcessRegistry {
     }
 
     const child = record._child;
-    try {
-      child.kill(signal);
-    } catch {
-      // Child may have already exited
-    }
+    const pid = child.pid;
+
+    this.emitLifecycleEvent({
+      eventType: 'PROCESS_TERMINATION_REQUESTED',
+      timestamp: new Date().toISOString(),
+      processId: record.processId,
+      workspaceId: record.workspaceId,
+      actor: record.actor,
+      executable: record.executable,
+      signal,
+    });
+
+    // Mark as TERMINATING while termination grace period is active
+    record.state = 'TERMINATING';
+
+    // Terminate process tree using process group if available (-pid), else child.kill
+    const killTarget = (sig: 'SIGTERM' | 'SIGKILL') => {
+      try {
+        if (pid && process.platform !== 'win32') {
+          process.kill(-pid, sig);
+        } else {
+          child.kill(sig);
+        }
+      } catch {
+        try {
+          child.kill(sig);
+        } catch {
+          // Child may have already exited
+        }
+      }
+    };
+
+    killTarget(signal);
+
+    this.emitLifecycleEvent({
+      eventType: signal === 'SIGKILL' ? 'PROCESS_SIGKILL_ESCALATED' : 'PROCESS_SIGTERM_SENT',
+      timestamp: new Date().toISOString(),
+      processId: record.processId,
+      workspaceId: record.workspaceId,
+      actor: record.actor,
+      executable: record.executable,
+      signal,
+    });
 
     if (signal === 'SIGTERM') {
       record._killTimer = setTimeout(() => {
         try {
           if (child.exitCode === null && child.signalCode === null) {
-            child.kill('SIGKILL');
+            this.emitLifecycleEvent({
+              eventType: 'PROCESS_SIGKILL_ESCALATED',
+              timestamp: new Date().toISOString(),
+              processId: record.processId,
+              workspaceId: record.workspaceId,
+              actor: record.actor,
+              executable: record.executable,
+              signal: 'SIGKILL',
+            });
+            killTarget('SIGKILL');
           }
         } catch {
           // ignore
@@ -349,14 +564,6 @@ export class ProcessRegistry implements IProcessRegistry {
       }, 1000);
       record._killTimer.unref();
     }
-
-    record.state = 'TERMINATED';
-    record.signal = signal;
-    record.completedAt = new Date().toISOString();
-    record.durationMs = Math.max(
-      0,
-      new Date(record.completedAt).getTime() - new Date(record.startedAt).getTime(),
-    );
 
     return {
       processId: record.processId,
@@ -378,7 +585,8 @@ export class ProcessRegistry implements IProcessRegistry {
       record._killTimer = undefined;
     }
 
-    record.state = exitCode === 0 ? 'COMPLETED' : 'FAILED';
+    const wasTerminating = record.state === 'TERMINATING';
+    record.state = wasTerminating ? 'TERMINATED' : exitCode === 0 ? 'COMPLETED' : 'FAILED';
     record.exitCode = exitCode;
     record.signal = signal;
     record.completedAt = new Date().toISOString();
@@ -386,6 +594,18 @@ export class ProcessRegistry implements IProcessRegistry {
       0,
       new Date(record.completedAt).getTime() - new Date(record.startedAt).getTime(),
     );
+
+    this.emitLifecycleEvent({
+      eventType: wasTerminating ? 'PROCESS_TERMINATED' : 'PROCESS_EXITED',
+      timestamp: record.completedAt,
+      processId: record.processId,
+      workspaceId: record.workspaceId,
+      actor: record.actor,
+      executable: record.executable,
+      exitCode,
+      signal,
+      durationMs: record.durationMs,
+    });
   }
 
   public markTimedOut(processId: string): void {
@@ -408,15 +628,30 @@ export class ProcessRegistry implements IProcessRegistry {
       0,
       new Date(record.completedAt).getTime() - new Date(record.startedAt).getTime(),
     );
+
+    this.emitLifecycleEvent({
+      eventType: 'PROCESS_TIMEOUT',
+      timestamp: record.completedAt,
+      processId: record.processId,
+      workspaceId: record.workspaceId,
+      actor: record.actor,
+      executable: record.executable,
+      durationMs: record.durationMs,
+    });
   }
 
   public clear(): void {
     for (const record of this.processes.values()) {
       if (record._timeoutTimer) clearTimeout(record._timeoutTimer);
       if (record._killTimer) clearTimeout(record._killTimer);
-      if (record.state === 'RUNNING' && record._child) {
+      const isAlive = record.state === 'RUNNING' || record.state === 'TERMINATING';
+      if (isAlive && record._child) {
         try {
-          record._child.kill('SIGKILL');
+          if (record._child.pid && process.platform !== 'win32') {
+            process.kill(-record._child.pid, 'SIGKILL');
+          } else {
+            record._child.kill('SIGKILL');
+          }
         } catch {
           // ignore
         }

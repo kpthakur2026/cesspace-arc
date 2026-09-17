@@ -1,6 +1,6 @@
 {
   "name": "@cesspace-arc/processes",
-  "version": "0.0.0-rc00",
+  "version": "0.2.0-rc02",
   "description": "Process inspection and tree supervision for CesSpace ARC",
   "license": "Apache-2.0",
   "private": true,

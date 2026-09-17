@@ -10,7 +10,7 @@ import { WorkspaceRegistry, SecurityKernel } from '../packages/policy/dist/index
 import { AuditLogger } from '../packages/audit/dist/index.js';
 import { FilesystemSubsystem } from '../packages/filesystem/dist/index.js';
 import { GitSubsystem } from '../packages/git/dist/index.js';
-import { ProcessRegistry } from '../packages/processes/dist/index.js';
+import { ProcessRegistry, sliceUtf8Safe } from '../packages/processes/dist/index.js';
 import { ControlledProcessRunner } from '../packages/terminal/dist/index.js';
 
 describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls', () => {
@@ -42,11 +42,11 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
     const registry = new WorkspaceRegistry();
     registry.registerWorkspace('test-ws', workspaceDir);
 
-    const kernel = new SecurityKernel(registry);
     auditLogger = new AuditLogger();
+    processRegistry = new ProcessRegistry();
+    const kernel = new SecurityKernel(registry, processRegistry);
     const filesystem = new FilesystemSubsystem();
     const git = new GitSubsystem();
-    processRegistry = new ProcessRegistry();
     const terminal = new ControlledProcessRunner(processRegistry);
 
     server = new ArcMcpServer(
@@ -59,6 +59,7 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
         defaultWorkspaceId: 'test-ws',
       },
       terminal,
+      processRegistry,
     );
   });
 
@@ -555,11 +556,11 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
       executable: 'node',
       args: ['--version'],
     }));
-    const postCount = auditLogger.getRecords().length;
-    assert.equal(postCount, preCount + 1, 'Must produce exactly 1 audit record');
-    const rec = auditLogger.getRecords()[postCount - 1];
-    assert.equal(rec.policy.decision, 'ALLOW');
-    assert.equal(rec.invocation.toolName, 'run_command');
+    const newRecords = auditLogger.getRecords().slice(preCount);
+    const runCmdRec = newRecords.find((r) => r.invocation.toolName === 'run_command');
+    assert.ok(runCmdRec, 'Must produce a run_command audit record');
+    assert.equal(runCmdRec.policy.decision, 'ALLOW');
+    assert.equal(runCmdRec.execution.status, 'SUCCESS');
   });
 
   // ==========================================================================
@@ -597,6 +598,392 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
         parsed.code === 'INVALID_REQUEST_SCHEMA' ||
         parsed.code === 'FORBIDDEN_COMMAND',
       `Expected POLICY_DENIED, INVALID_REQUEST_SCHEMA, or FORBIDDEN_COMMAND, got ${parsed.code}`,
+    );
+  });
+
+  // ==========================================================================
+  // SECTION 9: INDEPENDENT REVIEW SECURITY REGRESSIONS (P0 & P1)
+  // ==========================================================================
+
+  // P0-02: Code execution bypasses forbidden
+  test('RC02-REG-01: node <script> is denied by policy', async () => {
+    const res = await server.dispatchToolCall('run_command', {
+      executable: 'node',
+      args: ['index.js'],
+    });
+    assert.equal(res.isError, true);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.equal(parsed.code, 'POLICY_DENIED');
+  });
+
+  test('RC02-REG-02: node -e / --eval is denied by policy', async () => {
+    const res = await server.dispatchToolCall('run_command', {
+      executable: 'node',
+      args: ['-e', 'console.log(1)'],
+    });
+    assert.equal(res.isError, true);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.equal(parsed.code, 'POLICY_DENIED');
+  });
+
+  test('RC02-REG-03: npx is explicitly forbidden', async () => {
+    const res = await server.dispatchToolCall('run_command', {
+      executable: 'npx',
+      args: ['vitest'],
+    });
+    assert.equal(res.isError, true);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.equal(parsed.code, 'POLICY_DENIED');
+  });
+
+  test('RC02-REG-04: npm run is denied by policy', async () => {
+    const res = await server.dispatchToolCall('run_command', {
+      executable: 'npm',
+      args: ['run', 'build'],
+    });
+    assert.equal(res.isError, true);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.equal(parsed.code, 'POLICY_DENIED');
+  });
+
+  test('RC02-REG-05: npm start is denied by policy', async () => {
+    const res = await server.dispatchToolCall('run_command', {
+      executable: 'npm',
+      args: ['start'],
+    });
+    assert.equal(res.isError, true);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.equal(parsed.code, 'POLICY_DENIED');
+  });
+
+  test('RC02-REG-06: npm test is denied by policy', async () => {
+    const res = await server.dispatchToolCall('run_command', {
+      executable: 'npm',
+      args: ['test'],
+    });
+    assert.equal(res.isError, true);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.equal(parsed.code, 'POLICY_DENIED');
+  });
+
+  test('RC02-REG-07: npm exec is denied by policy', async () => {
+    const res = await server.dispatchToolCall('run_command', {
+      executable: 'npm',
+      args: ['exec', 'vitest'],
+    });
+    assert.equal(res.isError, true);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.equal(parsed.code, 'POLICY_DENIED');
+  });
+
+  test('RC02-REG-08: pnpm run is denied by policy', async () => {
+    const res = await server.dispatchToolCall('run_command', {
+      executable: 'pnpm',
+      args: ['run', 'build'],
+    });
+    assert.equal(res.isError, true);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.equal(parsed.code, 'POLICY_DENIED');
+  });
+
+  test('RC02-REG-09: pnpm exec is denied by policy', async () => {
+    const res = await server.dispatchToolCall('run_command', {
+      executable: 'pnpm',
+      args: ['exec', 'vitest'],
+    });
+    assert.equal(res.isError, true);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.equal(parsed.code, 'POLICY_DENIED');
+  });
+
+  test('RC02-REG-10: pnpm dlx is denied by policy', async () => {
+    const res = await server.dispatchToolCall('run_command', {
+      executable: 'pnpm',
+      args: ['dlx', 'vitest'],
+    });
+    assert.equal(res.isError, true);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.equal(parsed.code, 'POLICY_DENIED');
+  });
+
+  // P1-02: Trusted executable resolution strictly refuses user-controlled directories
+  test('RC02-REG-11: node_modules/.bin resolution is strictly forbidden', async () => {
+    const binDir = path.join(workspaceDir, 'node_modules', '.bin');
+    fs.mkdirSync(binDir, { recursive: true });
+    const fakeBin = path.join(binDir, 'fake-tool');
+    fs.writeFileSync(fakeBin, '#!/bin/sh\necho "exploit"\n', { mode: 0o755 });
+
+    const res = await server.dispatchToolCall('run_command', {
+      executable: 'fake-tool',
+      args: ['--version'],
+    });
+    assert.equal(res.isError, true);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.equal(parsed.code, 'POLICY_DENIED');
+  });
+
+  // P0-04: Process ownership bound to clientId, sessionId, workspaceId
+  test('RC02-REG-12: process supervision fails closed when caller identity is missing', async () => {
+    processRegistry.clear();
+    const startRes = await server.dispatchToolCall('run_command', {
+      executable: 'git',
+      args: ['status'],
+      runInBackground: true,
+    });
+    const pid = JSON.parse(startRes.content[0].text).processId;
+
+    const res = await server.dispatchToolCall(
+      'process_status',
+      { processId: pid },
+      { clientId: '', sessionId: '' },
+    );
+    assert.equal(res.isError, true);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.equal(parsed.code, 'POLICY_DENIED');
+  });
+
+  test('RC02-REG-13: process supervision fails closed when clientId is mismatched', async () => {
+    processRegistry.clear();
+    const startRes = await server.dispatchToolCall('run_command', {
+      executable: 'git',
+      args: ['status'],
+      runInBackground: true,
+    });
+    const pid = JSON.parse(startRes.content[0].text).processId;
+
+    const res = await server.dispatchToolCall(
+      'process_status',
+      { processId: pid },
+      { clientId: 'attacker-client-id' },
+    );
+    assert.equal(res.isError, true);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.equal(parsed.code, 'POLICY_DENIED');
+  });
+
+  test('RC02-REG-14: process supervision fails closed when sessionId is mismatched', async () => {
+    processRegistry.clear();
+    const startRes = await server.dispatchToolCall('run_command', {
+      executable: 'git',
+      args: ['status'],
+      runInBackground: true,
+    });
+    const pid = JSON.parse(startRes.content[0].text).processId;
+
+    const res = await server.dispatchToolCall(
+      'process_output',
+      { processId: pid },
+      { sessionId: 'attacker-session-id' },
+    );
+    assert.equal(res.isError, true);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.equal(parsed.code, 'POLICY_DENIED');
+  });
+
+  test('RC02-REG-15: process supervision fails closed when workspaceId is mismatched', async () => {
+    processRegistry.clear();
+    const startRes = await server.dispatchToolCall('run_command', {
+      executable: 'git',
+      args: ['status'],
+      runInBackground: true,
+    });
+    const pid = JSON.parse(startRes.content[0].text).processId;
+
+    assert.throws(() => {
+      processRegistry.assertOwnership(pid, {
+        clientId: 'local-stdio-caller',
+        sessionId: 'stdio-session-01',
+        workspaceId: 'other-ws',
+      });
+    }, /does not match process workspace/i);
+  });
+
+  // P0-05: Asynchronous lifecycle events audited
+  test('RC02-REG-16: PROCESS_SPAWN_SUCCEEDED lifecycle event is recorded in audit logger', async () => {
+    processRegistry.clear();
+    const startRes = await server.dispatchToolCall('run_command', {
+      executable: 'git',
+      args: ['status'],
+      runInBackground: true,
+    });
+    const pid = JSON.parse(startRes.content[0].text).processId;
+
+    const records = auditLogger.getRecords();
+    const spawnRec = records.find(
+      (r) =>
+        r.invocation.toolName === 'PROCESS_SPAWN_SUCCEEDED' &&
+        r.invocation.parametersRedacted.processId === pid,
+    );
+    assert.ok(spawnRec, 'Must log PROCESS_SPAWN_SUCCEEDED');
+    assert.equal(spawnRec.target.workspaceId, 'test-ws');
+  });
+
+  test('RC02-REG-17: PROCESS_SPAWN_FAILED lifecycle event is recorded in audit logger', async () => {
+    processRegistry.clear();
+    const dummyRecord = processRegistry.registerProcess({
+      workspaceId: 'test-ws',
+      actor: { clientId: 'test-client', sessionId: 'test-session' },
+      executable: 'nonexistent-binary',
+      sanitizedArgs: [],
+      cwd: workspaceDir,
+      startedAt: new Date().toISOString(),
+      state: 'RUNNING',
+      timedOut: false,
+    });
+    processRegistry.markSpawnFailed(dummyRecord.processId, 'ENOENT spawn failure');
+
+    const records = auditLogger.getRecords();
+    const failRec = records.find(
+      (r) =>
+        r.invocation.toolName === 'PROCESS_SPAWN_FAILED' &&
+        r.invocation.parametersRedacted.processId === dummyRecord.processId,
+    );
+    assert.ok(failRec, 'Must log PROCESS_SPAWN_FAILED');
+    assert.equal(failRec.execution.status, 'ERROR');
+  });
+
+  test('RC02-REG-18: PROCESS_EXITED lifecycle event is recorded in audit logger', async () => {
+    processRegistry.clear();
+    const res = await server.dispatchToolCall('run_command', {
+      executable: 'node',
+      args: ['--version'],
+    });
+    const pid = JSON.parse(res.content[0].text).processId;
+
+    const records = auditLogger.getRecords();
+    const exitRec = records.find(
+      (r) =>
+        r.invocation.toolName === 'PROCESS_EXITED' &&
+        r.invocation.parametersRedacted.processId === pid,
+    );
+    assert.ok(exitRec, 'Must log PROCESS_EXITED');
+    assert.equal(exitRec.execution.exitCode, 0);
+  });
+
+  test('RC02-REG-19: PROCESS_TIMEOUT lifecycle event is recorded in audit logger', async () => {
+    processRegistry.clear();
+    const dummyRecord = processRegistry.registerProcess({
+      workspaceId: 'test-ws',
+      actor: { clientId: 'test-client', sessionId: 'test-session' },
+      executable: 'git',
+      sanitizedArgs: ['status'],
+      cwd: workspaceDir,
+      startedAt: new Date().toISOString(),
+      state: 'RUNNING',
+      timedOut: false,
+    });
+    processRegistry.markTimedOut(dummyRecord.processId);
+
+    const records = auditLogger.getRecords();
+    const timeoutRec = records.find(
+      (r) =>
+        r.invocation.toolName === 'PROCESS_TIMEOUT' &&
+        r.invocation.parametersRedacted.processId === dummyRecord.processId,
+    );
+    assert.ok(timeoutRec, 'Must log PROCESS_TIMEOUT');
+    assert.equal(timeoutRec.execution.status, 'TIMEOUT');
+  });
+
+  test('RC02-REG-20: PROCESS_TERMINATION_REQUESTED, PROCESS_SIGTERM_SENT, and PROCESS_TERMINATED lifecycle events are recorded', async () => {
+    processRegistry.clear();
+    const startRes = await server.dispatchToolCall('run_command', {
+      executable: 'git',
+      args: ['log', '--oneline', '-100'],
+      runInBackground: true,
+    });
+    const pid = JSON.parse(startRes.content[0].text).processId;
+
+    await server.dispatchToolCall('terminate_process', {
+      processId: pid,
+      signal: 'SIGTERM',
+    });
+
+    const records = auditLogger.getRecords();
+    const reqRec = records.find(
+      (r) =>
+        r.invocation.toolName === 'PROCESS_TERMINATION_REQUESTED' &&
+        r.invocation.parametersRedacted.processId === pid,
+    );
+    const sigRec = records.find(
+      (r) =>
+        r.invocation.toolName === 'PROCESS_SIGTERM_SENT' &&
+        r.invocation.parametersRedacted.processId === pid,
+    );
+    assert.ok(reqRec, 'Must log PROCESS_TERMINATION_REQUESTED');
+    assert.ok(sigRec, 'Must log PROCESS_SIGTERM_SENT');
+  });
+
+  // P1-03: Process group kill and grace period
+  test('RC02-REG-21: process group termination targets process hierarchy', async () => {
+    processRegistry.clear();
+    const startRes = await server.dispatchToolCall('run_command', {
+      executable: 'git',
+      args: ['log', '--oneline', '-100'],
+      runInBackground: true,
+    });
+    const pid = JSON.parse(startRes.content[0].text).processId;
+    const termRes = await server.dispatchToolCall('terminate_process', {
+      processId: pid,
+      signal: 'SIGTERM',
+    });
+    assert.equal(termRes.isError, undefined);
+  });
+
+  test('RC02-REG-22: TERMINATING process state counts toward concurrency limit', () => {
+    const reg = new ProcessRegistry();
+    const p1 = reg.registerProcess({
+      workspaceId: 'ws-1',
+      actor: { clientId: 'c1', sessionId: 's1' },
+      executable: 'git',
+      sanitizedArgs: ['status'],
+      cwd: workspaceDir,
+      startedAt: new Date().toISOString(),
+      state: 'RUNNING',
+      timedOut: false,
+    });
+    p1.state = 'TERMINATING';
+    assert.equal(reg.countRunning(), 1, 'TERMINATING process must be counted as active');
+  });
+
+  // P1-04: UTF-8 safe bounded output pagination
+  test('RC02-REG-23: multi-byte UTF-8 pagination does not split characters', () => {
+    const buf = Buffer.from('こんにちは世界', 'utf8');
+    const res1 = sliceUtf8Safe(buf, 0, 2);
+    assert.equal(res1.slice.length, 0, 'Must back up to 0 rather than splitting character');
+    assert.equal(res1.adjustedEnd, 0);
+
+    const res2 = sliceUtf8Safe(buf, 0, 4);
+    assert.equal(res2.slice.length, 3, 'Must adjust cut to end of complete char');
+    assert.equal(res2.slice.toString('utf8'), 'こ');
+    assert.equal(res2.adjustedEnd, 3);
+  });
+
+  // P1-01: Argument audit data minimization and error message sanitization
+  test('RC02-REG-24: raw arguments are omitted from audit records and error messages do not leak raw arguments', async () => {
+    const preCount = auditLogger.getRecords().length;
+    await server.dispatchToolCall('run_command', {
+      executable: 'node',
+      args: ['--version', '-v'],
+    });
+
+    const newRecords = auditLogger.getRecords().slice(preCount);
+    const runRec = newRecords.find((r) => r.invocation.toolName === 'run_command');
+    assert.ok(runRec, 'Must log run_command');
+    assert.ok(runRec.invocation.parametersRedacted.args, 'Must have redacted args');
+    assert.equal(typeof runRec.invocation.parametersRedacted.args, 'object');
+    assert.equal(runRec.invocation.parametersRedacted.args.argCount, 2);
+    assert.deepEqual(runRec.invocation.parametersRedacted.args.safeFlags, ['--version', '-v']);
+
+    const secretArg = 'sensitivedata_xyz987';
+    const failRes = await server.dispatchToolCall('run_command', {
+      executable: 'node',
+      args: [secretArg],
+    });
+    assert.equal(failRes.isError, true);
+    const failParsed = JSON.parse(failRes.content[0].text);
+    assert.ok(
+      !failParsed.message.includes(secretArg),
+      'Error message must not leak raw argument string',
     );
   });
 });

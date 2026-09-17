@@ -208,6 +208,7 @@ async function runBenchmarkForServer(server, fixtureName, iterations = 20) {
     const termBenchStart = performance.now();
 
     for (let i = 0; i < iterations; i++) {
+      server.terminalSubsystem.processRegistry.clear();
       const bgProc = await server.dispatchToolCall('run_command', {
         executable: 'git',
         args: ['log', '--oneline', '-100'],

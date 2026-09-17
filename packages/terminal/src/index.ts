@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, realpathSync, statSync } from 'node:fs';
-import { resolve, dirname, basename, sep } from 'node:path';
+import { resolve, basename, sep } from 'node:path';
 import {
   ArcError,
   type RunCommandRequest,
@@ -9,110 +9,20 @@ import {
   type ProcessOutputResponse,
   type TerminateProcessResponse,
   type PolicyEvaluationContext,
+  validateCommandRequest,
+  RC02_PERMITTED_EXECUTABLES,
+  RC02_FORBIDDEN_EXECUTABLES,
+  ALLOWED_ENV_KEYS,
+  FORBIDDEN_ENV_PATTERNS,
 } from '@cesspace-arc/protocol';
 import { ProcessRegistry, MAX_OUTPUT_READ_BYTES } from '@cesspace-arc/processes';
 
-/**
- * Approved development executables for RC-02.
- */
-export const ALLOWED_EXECUTABLES = [
-  'node',
-  'npm',
-  'pnpm',
-  'npx',
-  'git',
-  'tsc',
-  'eslint',
-  'prettier',
-  'vitest',
-  'pytest',
-] as const;
-
-/**
- * Explicitly denied commands and command classes.
- */
-export const DENIED_EXECUTABLES = [
-  'sudo',
-  'su',
-  'doas',
-  'pkexec',
-  'bash',
-  'sh',
-  'zsh',
-  'fish',
-  'dash',
-  'cmd',
-  'cmd.exe',
-  'powershell',
-  'powershell.exe',
-  'pwsh',
-  'rm',
-  'rmdir',
-  'mkfs',
-  'fdisk',
-  'parted',
-  'mount',
-  'umount',
-  'dd',
-  'shutdown',
-  'reboot',
-  'poweroff',
-  'halt',
-  'curl',
-  'wget',
-  'ssh',
-  'scp',
-  'sftp',
-  'nc',
-  'netcat',
-  'socat',
-  'docker',
-  'kubectl',
-  'terraform',
-  'aws',
-  'gcloud',
-  'az',
-  'systemctl',
-  'service',
-  'crontab',
-  'python',
-  'python3',
-  'perl',
-  'ruby',
-  'php',
-] as const;
-
-/**
- * Permitted environment override keys.
- */
-export const ALLOWED_ENV_KEYS = ['CI', 'FORCE_COLOR', 'NO_COLOR', 'DEBUG', 'NODE_ENV'] as const;
-
-/**
- * Forbidden environment variable patterns (credentials, tokens, hijacking).
- */
-export const FORBIDDEN_ENV_PATTERNS = [
-  /^AWS_/i,
-  /^GOOGLE_/i,
-  /^GCP_/i,
-  /^AZURE_/i,
-  /^ANTHROPIC_/i,
-  /^OPENAI_/i,
-  /.*TOKEN$/i,
-  /.*KEY$/i,
-  /.*SECRET$/i,
-  /.*AUTH/i,
-  /DATABASE_URL/i,
-  /SSH_AUTH_SOCK/i,
-  /LD_PRELOAD/i,
-  /LD_LIBRARY_PATH/i,
-  /NODE_OPTIONS/i,
-  /^PATH$/i,
-  /^HOME$/i,
-  /^PYTHONPATH$/i,
-  /^SHELL$/i,
-  /^USER$/i,
-  /^SUDO_USER$/i,
-];
+export {
+  RC02_PERMITTED_EXECUTABLES as ALLOWED_EXECUTABLES,
+  RC02_FORBIDDEN_EXECUTABLES as DENIED_EXECUTABLES,
+  ALLOWED_ENV_KEYS,
+  FORBIDDEN_ENV_PATTERNS,
+};
 
 export interface ICommandPolicy {
   validateCommand(
@@ -129,223 +39,35 @@ export class CommandPolicy implements ICommandPolicy {
     executable: string,
     args: string[] = [],
     env: Record<string, string> | undefined,
-    _cwd: string | undefined,
-    _workspaceRoot: string,
+    cwd: string | undefined,
+    workspaceRoot: string,
   ): void {
-    const rawName = basename(executable).toLowerCase();
-
-    // 1. Explicitly Denied Commands
-    if ((DENIED_EXECUTABLES as readonly string[]).includes(rawName)) {
-      throw ArcError.forbiddenCommand(
-        `Command '${rawName}' is explicitly forbidden by security policy (privilege escalation, raw shell, or destructive operation).`,
-      );
-    }
-
-    // 2. Allowlist Enforcement (Default-Deny)
-    if (!(ALLOWED_EXECUTABLES as readonly string[]).includes(rawName)) {
-      throw ArcError.policyDenied(
-        `Executable '${rawName}' is not in the approved RC-02 development tool allowlist.`,
-      );
-    }
-
-    // 3. Shell and Metacharacter Injection Guard
-    for (const arg of args) {
-      if (typeof arg !== 'string') {
-        throw ArcError.invalidRequestSchema('Command arguments must be strings.');
-      }
-      // Check for command substitution or shell execution flags
+    const result = validateCommandRequest(executable, args, env, cwd, workspaceRoot);
+    if (!result.valid) {
       if (
-        arg === '-c' ||
-        arg === '/c' ||
-        arg.startsWith('--command') ||
-        arg.includes('`') ||
-        arg.includes('$(') ||
-        arg.includes('\n') ||
-        arg.includes('\r')
+        result.ruleId === 'deny-invalid-argument' ||
+        result.ruleId === 'deny-invalid-env-value' ||
+        result.ruleId === 'deny-invalid-executable'
       ) {
-        throw ArcError.forbiddenCommand(
-          `Argument '${arg}' contains forbidden shell execution or command substitution syntax.`,
-        );
+        throw ArcError.invalidRequestSchema(result.reason || 'Invalid command request schema.');
       }
-      // Check for host escape paths in configuration or output flags
-      if (
-        (arg.startsWith('--config=') ||
-          arg.startsWith('--output=') ||
-          arg.startsWith('--project=') ||
-          arg.startsWith('-p=')) &&
-        (arg.includes('/etc/') ||
-          arg.includes('/root/') ||
-          arg.includes('/tmp/') ||
-          arg.includes('/var/') ||
-          arg.includes('..'))
-      ) {
-        throw ArcError.forbiddenCommand(
-          `Argument '${arg}' attempts to target a path outside the authorized workspace.`,
-        );
-      }
-    }
-
-    // 4. Per-Executable Specific Argument Policies
-    if (rawName === 'git') {
-      const allowedGitSubcommands = [
-        'status',
-        'diff',
-        'log',
-        'rev-parse',
-        'show',
-        'describe',
-        'branch',
-      ];
-      const deniedGitSubcommands = [
-        'commit',
-        'push',
-        'pull',
-        'fetch',
-        'checkout',
-        'switch',
-        'reset',
-        'clean',
-        'stash',
-        'config',
-        'tag',
-        'remote',
-        'merge',
-        'rebase',
-        'cherry-pick',
-        'clone',
-        'init',
-        'apply',
-      ];
-
-      const firstNonFlag = args.find((a) => !a.startsWith('-'));
-      if (!firstNonFlag || !allowedGitSubcommands.includes(firstNonFlag.toLowerCase())) {
-        throw ArcError.forbiddenCommand(
-          `Git subcommand '${firstNonFlag || 'unknown'}' is not allowed in RC-02 (read-only Git inspection only).`,
-        );
-      }
-
-      if (deniedGitSubcommands.includes(firstNonFlag.toLowerCase())) {
-        throw ArcError.forbiddenCommand(
-          `Git mutating subcommand '${firstNonFlag}' is strictly forbidden in RC-02.`,
-        );
-      }
-
-      for (const arg of args) {
-        if (
-          arg.startsWith('--config') ||
-          arg.startsWith('-c') ||
-          arg.startsWith('--exec-path') ||
-          arg.startsWith('--upload-pack') ||
-          arg.startsWith('--receive-pack')
-        ) {
-          throw ArcError.forbiddenCommand(
-            `Git configuration or execution flag '${arg}' is forbidden by policy.`,
-          );
-        }
-      }
-    } else if (rawName === 'node') {
-      // Forbid inline code evaluation and remote debuggers
-      const forbiddenNodeFlags = [
-        '-e',
-        '--eval',
-        '-p',
-        '--print',
-        '--inspect',
-        '--inspect-brk',
-        '--inspect-port',
-        '--expose-internals',
-        '-r',
-        '--require',
-        '--import',
-        '--loader',
-      ];
-
-      for (const arg of args) {
-        const flagName = arg.split('=')[0];
-        if (forbiddenNodeFlags.includes(flagName)) {
-          throw ArcError.forbiddenCommand(
-            `Node flag '${arg}' is forbidden by policy (arbitrary code execution or debugging forbidden).`,
-          );
-        }
-      }
-    } else if (rawName === 'npm' || rawName === 'pnpm') {
-      const deniedNpmSubcommands = [
-        'install',
-        'i',
-        'add',
-        'update',
-        'upgrade',
-        'audit',
-        'publish',
-        'login',
-        'logout',
-        'token',
-        'config',
-        'link',
-        'init',
-        'create',
-        'uninstall',
-        'rm',
-      ];
-
-      const firstNonFlag = args.find((a) => !a.startsWith('-'));
-      if (firstNonFlag && deniedNpmSubcommands.includes(firstNonFlag.toLowerCase())) {
-        throw ArcError.forbiddenCommand(
-          `Package manager command '${firstNonFlag}' is forbidden in RC-02 (package installation or mutation forbidden).`,
-        );
-      }
-
-      for (const arg of args) {
-        if (arg === '-g' || arg === '--global' || arg.startsWith('--prefix')) {
-          throw ArcError.forbiddenCommand(
-            `Package manager global flag '${arg}' is forbidden by policy.`,
-          );
-        }
-      }
-    }
-
-    // 5. Environment Overrides Policy (Default-Deny)
-    if (env) {
-      for (const [key, value] of Object.entries(env)) {
-        if (!(ALLOWED_ENV_KEYS as readonly string[]).includes(key)) {
-          throw ArcError.forbiddenCommand(
-            `Environment variable override '${key}' is forbidden by security policy.`,
-          );
-        }
-        for (const pattern of FORBIDDEN_ENV_PATTERNS) {
-          if (pattern.test(key)) {
-            throw ArcError.forbiddenCommand(
-              `Environment variable '${key}' matches forbidden credential or system pattern.`,
-            );
-          }
-        }
-        if (typeof value !== 'string' || value.length > 512) {
-          throw ArcError.invalidRequestSchema(
-            `Environment variable value for '${key}' must be a string <= 512 characters.`,
-          );
-        }
-      }
+      throw ArcError.forbiddenCommand(result.reason || 'Command violates security policy.');
     }
   }
 }
 
 export interface IExecutableResolver {
-  resolveExecutable(name: string, workspaceRoot: string): string;
+  resolveExecutable(name: string, workspaceRoot?: string): string;
 }
 
 export class ExecutableResolver implements IExecutableResolver {
   private trustedDirs: string[];
 
   constructor(customTrustedDirs?: string[]) {
-    this.trustedDirs = customTrustedDirs || [
-      '/usr/bin',
-      '/bin',
-      '/usr/local/bin',
-      dirname(process.execPath),
-    ];
+    this.trustedDirs = customTrustedDirs || ['/usr/bin', '/bin', '/usr/local/bin'];
   }
 
-  public resolveExecutable(name: string, workspaceRoot: string): string {
+  public resolveExecutable(name: string, _workspaceRoot?: string): string {
     if (!name || typeof name !== 'string' || name.trim().length === 0) {
       throw ArcError.invalidRequestSchema('Executable name must be a non-empty string.');
     }
@@ -359,7 +81,7 @@ export class ExecutableResolver implements IExecutableResolver {
       );
     }
 
-    // 1. Search Fixed Trusted System Locations
+    // 1. Search Fixed Trusted System Locations ONLY
     for (const dir of this.trustedDirs) {
       const candidate = resolve(dir, trimmed);
       if (existsSync(candidate)) {
@@ -374,24 +96,8 @@ export class ExecutableResolver implements IExecutableResolver {
       }
     }
 
-    // 2. Check Project-Local node_modules/.bin (Strictly Contained)
-    const localBin = resolve(workspaceRoot, 'node_modules', '.bin', trimmed);
-    if (existsSync(localBin)) {
-      try {
-        const canonicalLocal = realpathSync(localBin);
-        if (canonicalLocal === workspaceRoot || canonicalLocal.startsWith(workspaceRoot + sep)) {
-          const stat = statSync(canonicalLocal);
-          if (stat.isFile() && (stat.mode & 0o111) !== 0) {
-            return canonicalLocal;
-          }
-        }
-      } catch {
-        // ignore
-      }
-    }
-
     throw ArcError.forbiddenCommand(
-      `Executable '${trimmed}' could not be resolved from trusted system locations or authorized workspace bin.`,
+      `Executable '${trimmed}' could not be resolved from trusted system locations.`,
     );
   }
 }
@@ -405,17 +111,20 @@ export interface ITerminalSubsystem {
   getProcessStatus(
     processId: string,
     actor: PolicyEvaluationContext['actor'],
+    targetWorkspace?: PolicyEvaluationContext['targetWorkspace'],
   ): ProcessStatusResponse;
   getProcessOutput(
     processId: string,
     offset: number | undefined,
     maxBytes: number | undefined,
     actor: PolicyEvaluationContext['actor'],
+    targetWorkspace?: PolicyEvaluationContext['targetWorkspace'],
   ): ProcessOutputResponse;
   terminateProcess(
     processId: string,
     signal: 'SIGTERM' | 'SIGKILL' | undefined,
     actor: PolicyEvaluationContext['actor'],
+    targetWorkspace?: PolicyEvaluationContext['targetWorkspace'],
   ): Promise<TerminateProcessResponse>;
 }
 
@@ -515,19 +224,21 @@ export class ControlledProcessRunner implements ITerminalSubsystem {
       timedOut: false,
     });
 
-    // 6. Spawn Child Process (shell: false)
+    // 6. Spawn Child Process (shell: false, detached: true on POSIX for process group kill)
     let child: ChildProcess;
     try {
       child = spawn(resolvedExecutable, args, {
         cwd: executionCwd,
         env: sanitizedEnv,
         shell: false,
+        detached: process.platform !== 'win32',
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       record._child = child;
+      this.processRegistry.notifySpawnSuccess(record.processId);
     } catch (err: unknown) {
-      this.processRegistry.markCompleted(record.processId, 1, null);
       const errMsg = err instanceof Error ? err.message : String(err);
+      this.processRegistry.markSpawnFailed(record.processId, errMsg);
       throw ArcError.internalError(`Failed to spawn process: ${errMsg}`);
     }
 
@@ -544,14 +255,22 @@ export class ControlledProcessRunner implements ITerminalSubsystem {
     record._timeoutTimer = setTimeout(() => {
       this.processRegistry.markTimedOut(record.processId);
       try {
-        child.kill('SIGTERM');
+        if (child.pid && process.platform !== 'win32') {
+          process.kill(-child.pid, 'SIGTERM');
+        } else {
+          child.kill('SIGTERM');
+        }
       } catch {
         // ignore
       }
       record._killTimer = setTimeout(() => {
         try {
           if (child.exitCode === null && child.signalCode === null) {
-            child.kill('SIGKILL');
+            if (child.pid && process.platform !== 'win32') {
+              process.kill(-child.pid, 'SIGKILL');
+            } else {
+              child.kill('SIGKILL');
+            }
           }
         } catch {
           // ignore
@@ -567,8 +286,12 @@ export class ControlledProcessRunner implements ITerminalSubsystem {
       }
     });
 
-    child.on('error', () => {
-      this.processRegistry.markCompleted(record.processId, 1, null);
+    child.on('error', (err) => {
+      if (record.state === 'RUNNING' && !child.pid) {
+        this.processRegistry.markSpawnFailed(record.processId, err.message);
+      } else {
+        this.processRegistry.markCompleted(record.processId, 1, null);
+      }
     });
 
     // 9. Synchronous vs Background Return
@@ -589,12 +312,20 @@ export class ControlledProcessRunner implements ITerminalSubsystem {
       child.on('error', () => resolvePromise());
     });
 
-    const status = this.processRegistry.getProcessStatus(record.processId, actor.sessionId);
+    const status = this.processRegistry.getProcessStatus(record.processId, {
+      clientId: actor.clientId,
+      sessionId: actor.sessionId || '',
+      workspaceId: targetWorkspace.workspaceId,
+    });
     const output = this.processRegistry.getProcessOutput(
       record.processId,
       0,
       MAX_OUTPUT_READ_BYTES,
-      actor.sessionId,
+      {
+        clientId: actor.clientId,
+        sessionId: actor.sessionId || '',
+        workspaceId: targetWorkspace.workspaceId,
+      },
     );
 
     return {
@@ -612,8 +343,13 @@ export class ControlledProcessRunner implements ITerminalSubsystem {
   public getProcessStatus(
     processId: string,
     actor: PolicyEvaluationContext['actor'],
+    targetWorkspace?: PolicyEvaluationContext['targetWorkspace'],
   ): ProcessStatusResponse {
-    return this.processRegistry.getProcessStatus(processId, actor.sessionId);
+    return this.processRegistry.getProcessStatus(processId, {
+      clientId: actor.clientId,
+      sessionId: actor.sessionId || '',
+      workspaceId: targetWorkspace?.workspaceId,
+    });
   }
 
   public getProcessOutput(
@@ -621,15 +357,25 @@ export class ControlledProcessRunner implements ITerminalSubsystem {
     offset: number | undefined,
     maxBytes: number | undefined,
     actor: PolicyEvaluationContext['actor'],
+    targetWorkspace?: PolicyEvaluationContext['targetWorkspace'],
   ): ProcessOutputResponse {
-    return this.processRegistry.getProcessOutput(processId, offset, maxBytes, actor.sessionId);
+    return this.processRegistry.getProcessOutput(processId, offset, maxBytes, {
+      clientId: actor.clientId,
+      sessionId: actor.sessionId || '',
+      workspaceId: targetWorkspace?.workspaceId,
+    });
   }
 
   public async terminateProcess(
     processId: string,
     signal: 'SIGTERM' | 'SIGKILL' | undefined,
     actor: PolicyEvaluationContext['actor'],
+    targetWorkspace?: PolicyEvaluationContext['targetWorkspace'],
   ): Promise<TerminateProcessResponse> {
-    return this.processRegistry.terminateProcess(processId, signal, actor.sessionId);
+    return this.processRegistry.terminateProcess(processId, signal, {
+      clientId: actor.clientId,
+      sessionId: actor.sessionId || '',
+      workspaceId: targetWorkspace?.workspaceId,
+    });
   }
 }
