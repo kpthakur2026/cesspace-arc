@@ -211,7 +211,7 @@ async function main() {
 - **Generated:** ${new Date().toISOString()}
 - **Environment:** Linux x86_64, Node.js ${process.version}, v8 Engine
 - **Total Process Memory:** RSS ${(memUsage.rss / 1024 / 1024).toFixed(1)} MB, Heap ${(memUsage.heapUsed / 1024 / 1024).toFixed(1)} MB
-- **Status:** Approved RC-01 Baseline
+- **Status:** Measured RC-01 Baseline — Pending Independent Review
 
 ---
 
@@ -257,7 +257,10 @@ ${allResults.map((r) => `| ${r.fixture} | \`${r.tool}\` | ${r.p50} | ${r.p95} | 
 - Measurement sample: 50 iterations (Small), 30 iterations (Medium), 20 iterations (Large).
 - Metrics captured: High-resolution timer (\`performance.now()\`), V8 process memory delta.
 - All requests passed through the full production pipeline:
-  \`JSON-RPC MCP -> Zod strict schema validation -> WorkspaceRegistry binding -> SecurityKernel evaluate -> Subsystem sandbox -> SHA-256 AuditLogger chain -> Sanitized response\`.
+  \`dispatchToolCall -> Zod strict schema validation -> WorkspaceRegistry binding -> SecurityKernel evaluate -> Subsystem sandbox -> SHA-256 AuditLogger chain -> Sanitized response\`.
+
+### Methodology Note
+The benchmark harness calls \`dispatchToolCall\` directly in-process to measure the ARC dispatch, strict Zod schema validation, WorkspaceRegistry binding, SecurityKernel evaluation, subsystem sandboxing, SHA-256 AuditLogger chain, and response sanitization pipeline. It measures the internal ARC control and security pipeline directly, not stdio JSON-RPC transport latency or external process IPC overhead. Comparative claims against third-party servers require dedicated comparative benchmarks and are not asserted here.
 
 ---
 

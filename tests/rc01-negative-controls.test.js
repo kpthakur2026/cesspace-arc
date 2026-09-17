@@ -632,4 +632,181 @@ describe('CesSpace ARC — RC-01 Mandatory Security Negative & Positive Controls
     const isValid = await auditLogger.verifyIntegrity();
     assert.equal(isValid, true, 'Audit log sequential hash chain must be valid and intact');
   });
+
+  // ==========================================================================
+  // FINAL PRE-PR HARDENING REGRESSION TESTS
+  // ==========================================================================
+
+  test('Hardening: Hostile core.worktree pointing outside workspace is rejected with ACCESS_DENIED', async () => {
+    // Configure core.worktree in workspaceDir to point to externalDir
+    execFileSync('git', ['config', 'core.worktree', externalDir], { cwd: workspaceDir });
+    try {
+      const res = await server.dispatchToolCall('git_status', {});
+      assert.equal(res.isError, true);
+      const parsed = JSON.parse(res.content[0].text);
+      assert.equal(parsed.code, 'ACCESS_DENIED');
+    } finally {
+      // Revert core.worktree configuration
+      execFileSync('git', ['config', '--unset', 'core.worktree'], { cwd: workspaceDir });
+    }
+  });
+
+  test('Hardening: External .git gitdir redirection is rejected with ACCESS_DENIED', async () => {
+    const maliciousWsDir = path.join(tempDir, 'malicious-gitdir-ws');
+    fs.mkdirSync(maliciousWsDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(maliciousWsDir, '.git'),
+      `gitdir: ${path.join(workspaceDir, '.git')}\n`,
+    );
+
+    const reg = new WorkspaceRegistry();
+    reg.registerWorkspace('malicious-ws', maliciousWsDir);
+    const kernel = new SecurityKernel(reg);
+    const malServer = new ArcMcpServer(
+      reg,
+      kernel,
+      auditLogger,
+      new FilesystemSubsystem(),
+      new GitSubsystem(),
+      { defaultWorkspaceId: 'malicious-ws' },
+    );
+
+    const res = await malServer.dispatchToolCall('git_status', {});
+    assert.equal(res.isError, true);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.equal(parsed.code, 'ACCESS_DENIED');
+  });
+
+  test('Hardening: git_status, git_diff, and git_log do not create optional lock/index writes (GIT_OPTIONAL_LOCKS=0)', async () => {
+    const indexPath = path.join(workspaceDir, '.git', 'index');
+
+    // Make .git/index read-only
+    fs.chmodSync(indexPath, 0o444);
+
+    try {
+      const resStatus = await server.dispatchToolCall('git_status', {});
+      assert.equal(resStatus.isError, undefined, 'git_status must succeed with read-only index');
+
+      const resDiff = await server.dispatchToolCall('git_diff', {});
+      assert.equal(resDiff.isError, undefined, 'git_diff must succeed with read-only index');
+
+      const resLog = await server.dispatchToolCall('git_log', { maxCount: 5 });
+      assert.equal(resLog.isError, undefined, 'git_log must succeed with read-only index');
+
+      // Verify no lock file remains
+      assert.equal(fs.existsSync(path.join(workspaceDir, '.git', 'index.lock')), false);
+    } finally {
+      // Restore write permissions to index
+      fs.chmodSync(indexPath, 0o644);
+    }
+  });
+
+  test('Hardening: Whitespace-only workspaceId and workspaceRoot fail closed with INVALID_REQUEST_SCHEMA', async () => {
+    const resWsId = await server.dispatchToolCall('list_directory', {
+      workspaceId: '   ',
+    });
+    assert.equal(resWsId.isError, true);
+    const parsedWsId = JSON.parse(resWsId.content[0].text);
+    assert.equal(parsedWsId.code, 'INVALID_REQUEST_SCHEMA');
+
+    const resWsRoot = await server.dispatchToolCall('git_status', {
+      workspaceRoot: '   \t  ',
+    });
+    assert.equal(resWsRoot.isError, true);
+    const parsedWsRoot = JSON.parse(resWsRoot.content[0].text);
+    assert.equal(parsedWsRoot.code, 'INVALID_REQUEST_SCHEMA');
+  });
+
+  test('Hardening: Input bounds enforcement rejects oversized string selectors', async () => {
+    // workspaceId > 128 chars
+    const resId = await server.dispatchToolCall('read_file', {
+      workspaceId: 'w'.repeat(129),
+      path: 'README.md',
+    });
+    assert.equal(resId.isError, true);
+    assert.equal(JSON.parse(resId.content[0].text).code, 'INVALID_REQUEST_SCHEMA');
+
+    // path > 1024 chars
+    const resPath = await server.dispatchToolCall('read_file', {
+      path: 'p'.repeat(1025),
+    });
+    assert.equal(resPath.isError, true);
+    assert.equal(JSON.parse(resPath.content[0].text).code, 'INVALID_REQUEST_SCHEMA');
+
+    // query > 500 chars
+    const resQuery = await server.dispatchToolCall('search_text', {
+      query: 'q'.repeat(501),
+    });
+    assert.equal(resQuery.isError, true);
+    assert.equal(JSON.parse(resQuery.content[0].text).code, 'INVALID_REQUEST_SCHEMA');
+
+    // pattern > 256 chars
+    const resPattern = await server.dispatchToolCall('search_files', {
+      pattern: 'x'.repeat(257),
+    });
+    assert.equal(resPattern.isError, true);
+    assert.equal(JSON.parse(resPattern.content[0].text).code, 'INVALID_REQUEST_SCHEMA');
+
+    // revision > 128 chars
+    const resRev = await server.dispatchToolCall('git_log', {
+      revision: 'r'.repeat(129),
+    });
+    assert.equal(resRev.isError, true);
+    assert.equal(JSON.parse(resRev.content[0].text).code, 'INVALID_REQUEST_SCHEMA');
+  });
+
+  test('Hardening: Host paths and usernames are absent from returned client errors', async () => {
+    const errorScenarios = [
+      await server.dispatchToolCall('read_file', { path: 'nonexistent-file.txt' }),
+      await server.dispatchToolCall('read_file', { path: '../../../../etc/shadow' }),
+      await server.dispatchToolCall('read_file', { path: 'src' }),
+      await server.dispatchToolCall('git_status', { workspaceRoot: externalDir }),
+    ];
+
+    const currentUsername = process.env.USER || process.env.USERNAME || '';
+
+    for (const res of errorScenarios) {
+      assert.equal(res.isError, true);
+      const text = res.content[0].text;
+
+      // Must not leak host paths
+      assert.ok(!text.includes('/home/'), `Error must not contain /home/ host path: ${text}`);
+      assert.ok(!text.includes('/tmp/'), `Error must not contain /tmp/ host path: ${text}`);
+
+      // Must not leak active username
+      if (currentUsername.length > 2) {
+        assert.ok(!text.includes(currentUsername), `Error must not leak username: ${text}`);
+      }
+    }
+  });
+
+  test('Hardening: Dedicated tracked .env fake secret is never disclosed in git_diff without path', async () => {
+    // Commit a tracked .env fixture into workspace
+    const trackedEnv = path.join(workspaceDir, '.env.production');
+    fs.writeFileSync(trackedEnv, 'APP_SECRET_TOKEN=initial_seed_unmodified_secret_xyz789\n');
+    execFileSync('git', ['add', '.env.production'], { cwd: workspaceDir });
+    execFileSync('git', ['commit', '-m', 'chore: commit tracked production env'], {
+      cwd: workspaceDir,
+    });
+
+    // Modify the tracked secret
+    fs.writeFileSync(
+      trackedEnv,
+      'APP_SECRET_TOKEN=TOP_SECRET_MODIFIED_PAYLOAD_DO_NOT_DISCLOSE_9999\n',
+    );
+
+    // Invoke git_diff without path parameter
+    const res = await server.dispatchToolCall('git_diff', {});
+    assert.equal(res.isError, undefined);
+    const parsed = JSON.parse(res.content[0].text);
+
+    assert.ok(
+      !parsed.diff.includes('TOP_SECRET_MODIFIED_PAYLOAD_DO_NOT_DISCLOSE_9999'),
+      'git_diff without path must NEVER disclose modified secret in .env file',
+    );
+    assert.ok(
+      !parsed.diff.includes('initial_seed_unmodified_secret_xyz789'),
+      'git_diff without path must NEVER disclose original secret in .env file',
+    );
+  });
 });

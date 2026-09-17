@@ -35,7 +35,7 @@ MCP Request (over stdio)
                                       └─► Sanitized MCP Response
 ```
 
-All 9 designated read-only tools, all 16 initial negative security controls, and 13 independent review regression controls (44 tests total across the suite) have been implemented, tested, and verified. A performance benchmark harness was established, providing an official baseline in `docs/performance/rc01-baseline.md`. Zero mutating capabilities, remote network listeners, or execution tools were implemented.
+All 9 designated read-only tools, all 16 initial negative security controls, and 20 hardening and review regression controls (51 tests total across the suite) have been implemented, tested, and verified. A performance benchmark harness was established, providing an official baseline in `docs/performance/rc01-baseline.md`. Zero mutating capabilities, remote network listeners, or execution tools were implemented.
 
 ---
 
@@ -81,6 +81,14 @@ All 9 designated read-only tools, all 16 initial negative security controls, and
 - **ReDoS & Search Bounding:** Constrained search queries to <= 100 chars, rejected dangerous nested quantifiers, added 5,000 ms execution time bounds, and architected search behind the `ISearchBackend` interface.
 - **`filePattern` Filter:** Supported glob-based file filtering in `search_text`.
 
+### 2.7. Pre-PR Hardening Controls
+
+- **Read-Only Git Environment & Verification:** Injected `GIT_OPTIONAL_LOCKS=0`, `GIT_CONFIG_GLOBAL=/dev/null`, and `GIT_CONFIG_NOSYSTEM=1`. Before any Git operation, `verifyRepositoryBoundary()` verifies that `git rev-parse --show-toplevel` resolves exactly to the authorized canonical workspace root, and that `--git-dir` / `--git-common-dir` cannot escape the workspace boundary. Hostile `core.worktree` or external `.git/gitdir` redirections are rejected with `ACCESS_DENIED`.
+- **Zero Optional Lock Writes:** Proved that `git_status`, `git_diff`, and `git_log` execute cleanly against read-only `.git/index` (`0444`) without creating index locks.
+- **Strict Input Bounds & Whitespace Rejection:** Explicit selector/string inputs are strictly bounded across schemas (`workspaceId` max 128, `workspaceRoot`/`path`/`subPath` max 1024, `query` max 500, `pattern`/`filePattern` max 256, `revision`/`target` max 128). Explicit whitespace-only selectors fail closed immediately with `INVALID_REQUEST_SCHEMA`.
+- **Client-Facing Error Sanitization:** Absolute host paths (`/home/...`, `/tmp/...`), usernames, and raw internal Node/Git error messages are stripped and sanitized to prevent system reconnaissance.
+- **Exact Tracked Secret Diff Purge:** Proved that modifications to tracked `.env` fixtures never disclose secrets in `git_diff` output.
+
 ---
 
 ## 3. Implementation Scope
@@ -90,11 +98,11 @@ All 9 designated read-only tools, all 16 initial negative security controls, and
 - **Local MCP Transport:** Built on `@modelcontextprotocol/sdk` using standard UNIX stdio transport.
 - **Minimal Security Kernel:** Central admission controller in `packages/policy` providing default-deny gating, an explicit 9-tool allowlist, and an authorized workspace registry.
 - **Jailed Filesystem Subsystem:** Canonical `realpathSync` resolution, prefix enclosure verification, and sensitive path blacklist filtering in `packages/filesystem`.
-- **Sandboxed Git Subsystem:** Safe read-only Git operations via argument arrays (`execFile` with `shell: false`), argument injection prevention, and buffer truncation in `packages/git`.
+- **Sandboxed Git Subsystem:** Safe read-only Git operations via argument arrays (`execFile` with `shell: false`), topology verification, argument injection prevention, and buffer truncation in `packages/git`.
 - **Structured Audit Sink:** In-memory / stream audit sink with data minimization, credential redaction, and sequential SHA-256 hash chaining in `packages/audit`.
 - **Canonical Structured Errors:** Machine-readable `ArcError` schema and factories in `packages/protocol`.
 - **Performance Benchmark Harness:** Automated synthetic fixture benchmark in `benchmarks/rc01-benchmark.js` and report in `docs/performance/rc01-baseline.md`.
-- **Automated Verification Suite:** 44 deterministic tests covering contracts, positive tool execution, mandatory negative security failure scenarios, and review regressions.
+- **Automated Verification Suite:** 51 deterministic tests covering contracts, positive tool execution, mandatory negative security failure scenarios, and hardening regressions.
 
 ### 3.2. Explicitly Forbidden & NOT Implemented (RC-02+ Boundary)
 
@@ -211,7 +219,7 @@ Executed via `bash scripts/verify-rc01.sh`:
 | **Gate 2** | Code Formatting           | `pnpm run check:format` (Prettier)         | **PASS** (Zero formatting issues)                     |
 | **Gate 3** | Static Analysis & Lint    | `pnpm run lint` (ESLint)                   | **PASS** (Zero warnings, zero errors)                 |
 | **Gate 4** | TypeScript Build          | `pnpm run typecheck` (`tsc --build`)       | **PASS** (Clean compilation across all packages/apps) |
-| **Gate 5** | Contract & Security Tests | `pnpm run test` (Node 24 test runner)      | **PASS** (44/44 passed in ~1,100 ms)                  |
+| **Gate 5** | Contract & Security Tests | `pnpm run test` (Node 24 test runner)      | **PASS** (51/51 passed in ~1,400 ms)                  |
 | **Gate 6** | Documentation Integrity   | `bash scripts/check-docs.sh`               | **PASS** (All docs verified, internal links valid)    |
 | **Gate 7** | Secret & Safety Check     | `bash scripts/check-secrets.sh` (Gitleaks) | **PASS** (Scanned 972 KB, zero leaks found)           |
 | **Gate 8** | Git Diff Cleanliness      | `git diff --check`                         | **PASS** (Zero whitespace or conflict markers)        |

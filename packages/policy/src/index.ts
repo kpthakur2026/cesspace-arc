@@ -220,7 +220,7 @@ export class SecurityKernel implements IPolicyEngine {
         outcome: PolicyOutcome.DENY,
         effect: 'DENY',
         matchingRuleId: 'deny-unregistered-workspace',
-        reason: `Workspace '${rootPath}' is not registered in authorized workspaces.`,
+        reason: 'Target workspace is not registered in authorized workspaces.',
       };
     }
 
@@ -234,7 +234,7 @@ export class SecurityKernel implements IPolicyEngine {
           outcome: PolicyOutcome.DENY,
           effect: 'DENY',
           matchingRuleId: 'deny-unregistered-workspace',
-          reason: `Requested workspaceRoot '${request.parameters.workspaceRoot}' is not authorized.`,
+          reason: 'Requested workspaceRoot is not authorized.',
         };
       }
     }
@@ -247,7 +247,7 @@ export class SecurityKernel implements IPolicyEngine {
           outcome: PolicyOutcome.DENY,
           effect: 'DENY',
           matchingRuleId: 'deny-unregistered-workspace',
-          reason: `Requested workspaceId '${request.parameters.workspaceId}' is not authorized.`,
+          reason: 'Requested workspaceId is not authorized.',
         };
       }
     }
@@ -291,7 +291,7 @@ export class SecurityKernel implements IPolicyEngine {
           outcome: PolicyOutcome.DENY,
           effect: 'DENY',
           matchingRuleId: 'deny-not-git-repository',
-          reason: `Workspace '${registeredWs.rootPath}' is not a Git repository.`,
+          reason: 'Target workspace is not a Git repository.',
         };
       }
 
@@ -304,7 +304,7 @@ export class SecurityKernel implements IPolicyEngine {
             outcome: PolicyOutcome.DENY,
             effect: 'DENY',
             matchingRuleId: 'deny-git-argument-injection',
-            reason: `Flag injection detected in git parameter: '${arg}'.`,
+            reason: 'Flag injection detected in git parameter.',
           };
         }
       }

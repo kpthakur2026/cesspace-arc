@@ -156,7 +156,7 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
     try {
       canonicalRoot = realpathSync(resolve(workspaceRoot));
     } catch {
-      throw ArcError.noWorkspaceConfigured(`Workspace root '${workspaceRoot}' does not exist.`);
+      throw ArcError.noWorkspaceConfigured('Workspace root directory does not exist.');
     }
 
     // 3. Workspace Root Join & Pre-Check
@@ -189,9 +189,9 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
         if (norm !== canonicalRoot && !norm.startsWith(canonicalRoot + sep)) {
           throw ArcError.pathEscapesRoot();
         }
-        throw ArcError.fileNotFound(`Target path '${requestedPath}' does not exist in workspace.`);
+        throw ArcError.fileNotFound('Target path does not exist in workspace.');
       }
-      throw ArcError.internalError(`Filesystem resolution error: ${nodeErr.message}`);
+      throw ArcError.internalError('Filesystem path resolution failed.');
     }
 
     // 5. Prefix Enclosure Check (Symlink escape & traversal guard)
@@ -224,7 +224,7 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
 
     const st = statSync(canonicalPath);
     if (!st.isDirectory()) {
-      throw ArcError.notADirectory(`Path '${rawPath}' is not a directory.`);
+      throw ArcError.notADirectory('Requested path is not a directory.');
     }
 
     const recursive = Boolean(request.recursive);
@@ -336,7 +336,7 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
 
     const st = statSync(canonicalPath);
     if (st.isDirectory()) {
-      throw ArcError.isADirectory(`Target path '${request.path}' is a directory, not a file.`);
+      throw ArcError.isADirectory('Requested path is a directory, not a file.');
     }
 
     const totalSize = st.size;
@@ -356,7 +356,7 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
 
     if (requestedLength > MAX_READ_BYTES) {
       throw ArcError.payloadTooLarge(
-        `Requested read length (${requestedLength} bytes) exceeds maximum limit of 1 MiB (${MAX_READ_BYTES} bytes).`,
+        'Requested read length exceeds maximum allowed limit of 1 MiB.',
       );
     }
 

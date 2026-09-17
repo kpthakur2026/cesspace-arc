@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { realpathSync, existsSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { resolve, sep } from 'node:path';
 import {
   ArcError,
   type GitStatusRequest,
@@ -168,24 +168,17 @@ export interface IGitSubsystem {
  * Guarantees read-only subprocess invocation via argument arrays and shell=false.
  */
 export class GitSubsystem implements IGitSubsystem {
-  private async runGit(
-    workspaceRoot: string,
+  private async runRawGit(
+    cwd: string,
     args: string[],
     maxBuffer: number = 1024 * 1024,
   ): Promise<{ stdout: string; stderr: string }> {
-    const canonicalRoot = realpathSync(resolve(workspaceRoot));
-
-    const isGit =
-      existsSync(resolve(canonicalRoot, '.git')) || existsSync(resolve(canonicalRoot, 'HEAD'));
-
-    if (!isGit) {
-      throw ArcError.fileNotFound(`Directory '${workspaceRoot}' is not a valid Git repository.`);
-    }
-
     const safeEnv: NodeJS.ProcessEnv = {
       PATH: process.env.PATH || '/usr/bin:/bin',
-      HOME: process.env.HOME || '/tmp',
+      HOME: '/dev/null',
       LC_ALL: 'C',
+      GIT_OPTIONAL_LOCKS: '0',
+      GIT_CONFIG_GLOBAL: '/dev/null',
       GIT_CONFIG_NOSYSTEM: '1',
       GIT_TERMINAL_PROMPT: '0',
       GIT_EXTERNAL_DIFF: '',
@@ -210,7 +203,7 @@ export class GitSubsystem implements IGitSubsystem {
 
     try {
       const result = await execFileAsync('git', [...safeGlobalArgs, ...args], {
-        cwd: canonicalRoot,
+        cwd,
         shell: false,
         timeout: 10000,
         maxBuffer,
@@ -222,10 +215,96 @@ export class GitSubsystem implements IGitSubsystem {
       if (execErr.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
         throw ArcError.payloadTooLarge('Git command output exceeded maximum buffer limit.');
       }
-      throw ArcError.internalError(
-        `Git command failed: ${execErr.stderr || execErr.message || 'Unknown error'}`,
-      );
+      throw ArcError.internalError('Git command execution failed.');
     }
+  }
+
+  private async verifyRepositoryBoundary(canonicalRoot: string): Promise<void> {
+    const isGit =
+      existsSync(resolve(canonicalRoot, '.git')) || existsSync(resolve(canonicalRoot, 'HEAD'));
+
+    if (!isGit) {
+      throw ArcError.fileNotFound('Directory is not a valid Git repository.');
+    }
+
+    try {
+      const { stdout } = await this.runRawGit(canonicalRoot, [
+        'rev-parse',
+        '--show-toplevel',
+        '--git-dir',
+        '--git-common-dir',
+      ]);
+      const lines = stdout
+        .split('\n')
+        .map((l) => l.trim())
+        .filter((l) => l.length > 0);
+
+      if (lines.length < 3) {
+        throw ArcError.accessDenied('Git repository topology could not be verified.');
+      }
+
+      const [topLevelRaw, gitDirRaw, gitCommonDirRaw] = lines;
+
+      let resolvedTopLevel = '';
+      try {
+        resolvedTopLevel = realpathSync(resolve(canonicalRoot, topLevelRaw));
+      } catch {
+        throw ArcError.accessDenied('Git repository toplevel path could not be resolved.');
+      }
+
+      if (resolvedTopLevel !== canonicalRoot) {
+        throw ArcError.accessDenied(
+          'Git repository toplevel does not match canonical authorized workspace root.',
+        );
+      }
+
+      let resolvedGitDir = '';
+      try {
+        resolvedGitDir = realpathSync(resolve(canonicalRoot, gitDirRaw));
+      } catch {
+        throw ArcError.accessDenied('Git directory path could not be resolved.');
+      }
+
+      if (resolvedGitDir !== canonicalRoot && !resolvedGitDir.startsWith(canonicalRoot + sep)) {
+        throw ArcError.accessDenied('Git directory is outside authorized workspace boundary.');
+      }
+
+      let resolvedGitCommonDir = '';
+      try {
+        resolvedGitCommonDir = realpathSync(resolve(canonicalRoot, gitCommonDirRaw));
+      } catch {
+        throw ArcError.accessDenied('Git common directory path could not be resolved.');
+      }
+
+      if (
+        resolvedGitCommonDir !== canonicalRoot &&
+        !resolvedGitCommonDir.startsWith(canonicalRoot + sep)
+      ) {
+        throw ArcError.accessDenied(
+          'Git common directory is outside authorized workspace boundary.',
+        );
+      }
+    } catch (err: unknown) {
+      if (err instanceof ArcError) {
+        throw err;
+      }
+      throw ArcError.fileNotFound('Directory is not a valid Git repository.');
+    }
+  }
+
+  private async runGit(
+    workspaceRoot: string,
+    args: string[],
+    maxBuffer: number = 1024 * 1024,
+  ): Promise<{ stdout: string; stderr: string }> {
+    let canonicalRoot: string;
+    try {
+      canonicalRoot = realpathSync(resolve(workspaceRoot));
+    } catch {
+      throw ArcError.fileNotFound('Workspace directory not found.');
+    }
+    await this.verifyRepositoryBoundary(canonicalRoot);
+    return this.runRawGit(canonicalRoot, args, maxBuffer);
   }
 
   public async getStatus(

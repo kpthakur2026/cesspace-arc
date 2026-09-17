@@ -28,6 +28,56 @@ export interface ArcServerConfig {
   defaultWorkspaceId?: string;
 }
 
+const WorkspaceIdSchema = z
+  .string()
+  .trim()
+  .min(1, 'workspaceId must not be empty or whitespace-only')
+  .max(128);
+
+const WorkspaceRootSchema = z
+  .string()
+  .trim()
+  .min(1, 'workspaceRoot must not be empty or whitespace-only')
+  .max(1024);
+
+const RelativePathSchema = z
+  .string()
+  .trim()
+  .min(1, 'path must not be empty or whitespace-only')
+  .max(1024);
+
+const OptionalPathSchema = z
+  .string()
+  .trim()
+  .min(1, 'path must not be empty or whitespace-only')
+  .max(1024);
+
+const SubPathSchema = z
+  .string()
+  .trim()
+  .min(1, 'subPath must not be empty or whitespace-only')
+  .max(1024);
+
+const QuerySchema = z.string().trim().min(1, 'query must not be empty or whitespace-only').max(500);
+
+const PatternSchema = z
+  .string()
+  .trim()
+  .min(1, 'pattern must not be empty or whitespace-only')
+  .max(256);
+
+const FilePatternSchema = z
+  .string()
+  .trim()
+  .min(1, 'filePattern must not be empty or whitespace-only')
+  .max(256);
+
+const RevisionTargetSchema = z
+  .string()
+  .trim()
+  .min(1, 'revision or target must not be empty or whitespace-only')
+  .max(128);
+
 /**
  * Strict Zod validation schemas for all 9 permitted RC-01 tools.
  * Enforces runtime schema pre-admission rejection and audit logging.
@@ -37,58 +87,58 @@ export const TOOL_SCHEMAS = {
   system_status: z.object({}).strict(),
   list_directory: z
     .object({
-      path: z.string().optional(),
+      path: OptionalPathSchema.optional(),
       recursive: z.boolean().optional(),
       maxDepth: z.number().int().min(1).max(5).optional(),
       includeHidden: z.boolean().optional(),
-      workspaceId: z.string().optional(),
+      workspaceId: WorkspaceIdSchema.optional(),
     })
     .strict(),
   read_file: z
     .object({
-      path: z.string().min(1),
+      path: RelativePathSchema,
       offset: z.number().int().min(0).optional(),
-      length: z.number().int().min(0).optional(),
-      workspaceId: z.string().optional(),
+      length: z.number().int().min(0).max(1048576).optional(),
+      workspaceId: WorkspaceIdSchema.optional(),
     })
     .strict(),
   search_files: z
     .object({
-      pattern: z.string().min(1),
-      subPath: z.string().optional(),
+      pattern: PatternSchema,
+      subPath: SubPathSchema.optional(),
       maxResults: z.number().int().min(1).max(200).optional(),
-      workspaceId: z.string().optional(),
+      workspaceId: WorkspaceIdSchema.optional(),
     })
     .strict(),
   search_text: z
     .object({
-      query: z.string().min(1),
+      query: QuerySchema,
       isRegex: z.boolean().optional(),
-      filePattern: z.string().optional(),
+      filePattern: FilePatternSchema.optional(),
       maxMatches: z.number().int().min(1).max(200).optional(),
-      workspaceId: z.string().optional(),
+      workspaceId: WorkspaceIdSchema.optional(),
     })
     .strict(),
   git_status: z
     .object({
-      workspaceRoot: z.string().optional(),
-      workspaceId: z.string().optional(),
+      workspaceRoot: WorkspaceRootSchema.optional(),
+      workspaceId: WorkspaceIdSchema.optional(),
     })
     .strict(),
   git_diff: z
     .object({
-      target: z.string().optional(),
-      path: z.string().optional(),
+      target: RevisionTargetSchema.optional(),
+      path: OptionalPathSchema.optional(),
       cached: z.boolean().optional(),
-      workspaceId: z.string().optional(),
+      workspaceId: WorkspaceIdSchema.optional(),
     })
     .strict(),
   git_log: z
     .object({
       maxCount: z.number().int().min(1).max(100).optional(),
-      revision: z.string().optional(),
-      path: z.string().optional(),
-      workspaceId: z.string().optional(),
+      revision: RevisionTargetSchema.optional(),
+      path: OptionalPathSchema.optional(),
+      workspaceId: WorkspaceIdSchema.optional(),
     })
     .strict(),
 } as const;
@@ -445,12 +495,20 @@ export class ArcMcpServer implements IArcMcpServer {
 
     const parseResult = schema.safeParse(parameters);
     if (!parseResult.success) {
+      const isReadLengthTooLarge =
+        toolName === 'read_file' &&
+        parseResult.error.issues.some(
+          (iss) => iss.path.includes('length') && iss.code === 'too_big',
+        );
+
       const issueMessages = parseResult.error.issues
         .map((iss) => `${iss.path.join('.') || 'root'}: ${iss.message}`)
         .join('; ');
-      const arcErr = ArcError.invalidRequestSchema(
-        `Invalid parameters for tool '${toolName}': ${issueMessages}`,
-      );
+      const arcErr = isReadLengthTooLarge
+        ? ArcError.payloadTooLarge('Requested read length exceeds maximum allowed limit of 1 MiB.')
+        : ArcError.invalidRequestSchema(
+            `Invalid parameters for tool '${toolName}': ${issueMessages}`,
+          );
       await this.auditLogger.log({
         timestamp: startTime,
         actor: auditActor,
@@ -462,7 +520,7 @@ export class ArcMcpServer implements IArcMcpServer {
         },
         policy: {
           decision: 'DENY',
-          ruleId: 'schema-validation-failure',
+          ruleId: isReadLengthTooLarge ? 'schema-payload-too-large' : 'schema-validation-failure',
           evaluationDurationMs: 0,
         },
         execution: {
@@ -472,7 +530,7 @@ export class ArcMcpServer implements IArcMcpServer {
           durationMs: Date.now() - startMs,
         },
         error: {
-          code: 'INVALID_REQUEST_SCHEMA',
+          code: arcErr.code,
           message: arcErr.message,
         },
       });
@@ -480,6 +538,36 @@ export class ArcMcpServer implements IArcMcpServer {
         isError: true,
         content: [{ type: 'text', text: JSON.stringify(arcErr.toJSON(), null, 2) }],
       };
+    }
+
+    // Defense-in-depth: explicit whitespace-only workspaceId/workspaceRoot must fail closed
+    if (parameters.workspaceId !== undefined) {
+      if (
+        typeof parameters.workspaceId !== 'string' ||
+        parameters.workspaceId.trim().length === 0
+      ) {
+        const arcErr = ArcError.invalidRequestSchema(
+          'Parameter workspaceId must be a non-empty string.',
+        );
+        return {
+          isError: true,
+          content: [{ type: 'text', text: JSON.stringify(arcErr.toJSON(), null, 2) }],
+        };
+      }
+    }
+    if (parameters.workspaceRoot !== undefined) {
+      if (
+        typeof parameters.workspaceRoot !== 'string' ||
+        parameters.workspaceRoot.trim().length === 0
+      ) {
+        const arcErr = ArcError.invalidRequestSchema(
+          'Parameter workspaceRoot must be a non-empty string.',
+        );
+        return {
+          isError: true,
+          content: [{ type: 'text', text: JSON.stringify(arcErr.toJSON(), null, 2) }],
+        };
+      }
     }
 
     // 3. Workspace Binding Gate (P1-01)
@@ -731,7 +819,7 @@ export class ArcMcpServer implements IArcMcpServer {
       if (err instanceof ArcError) {
         arcError = err;
       } else {
-        arcError = ArcError.internalError((err as Error).message);
+        arcError = ArcError.internalError('An internal error occurred during tool execution.');
       }
     }
 
@@ -766,19 +854,29 @@ export class ArcMcpServer implements IArcMcpServer {
       error: arcError
         ? {
             code: arcError.code,
-            message: arcError.message,
+            message: sanitizeClientErrorMessage(arcError.message),
           }
         : undefined,
     });
 
     // 6. Sanitized Response Formatting
     if (arcError) {
+      const sanitizedError = new ArcError({
+        code: arcError.code,
+        category: arcError.category,
+        message: sanitizeClientErrorMessage(arcError.message),
+        retryable: arcError.retryable,
+        remediationHint: arcError.remediationHint
+          ? sanitizeClientErrorMessage(arcError.remediationHint)
+          : undefined,
+      });
+
       return {
         isError: true,
         content: [
           {
             type: 'text',
-            text: JSON.stringify(arcError.toJSON(), null, 2),
+            text: JSON.stringify(sanitizedError.toJSON(), null, 2),
           },
         ],
       };
@@ -804,6 +902,28 @@ export class ArcMcpServer implements IArcMcpServer {
       await this.transport.close();
     }
   }
+}
+
+/**
+ * Sanitizes client-facing error messages by stripping host paths, usernames, and raw internal traces.
+ */
+export function sanitizeClientErrorMessage(msg: string): string {
+  if (!msg) return msg;
+  let sanitized = msg;
+  // Redact absolute host paths
+  sanitized = sanitized.replace(
+    /(?:\/(?:home|tmp|root|Users|var|private|opt|etc|usr|bin|lib)[^\s'",;:]*)/gi,
+    '[REDACTED_PATH]',
+  );
+  sanitized = sanitized.replace(/[a-zA-Z]:\\[^\s'",;:]*/g, '[REDACTED_PATH]');
+
+  // Redact active username
+  const user = process.env.USER || process.env.USERNAME;
+  if (user && user.length > 1) {
+    const userRegex = new RegExp(`\\b${user}\\b`, 'g');
+    sanitized = sanitized.replace(userRegex, '[USER]');
+  }
+  return sanitized;
 }
 
 /**
