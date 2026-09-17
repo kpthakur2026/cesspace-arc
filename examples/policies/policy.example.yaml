@@ -1,0 +1,124 @@
+# CesSpace ARC — Example Policy Configuration
+#
+# This is a sanitized reference policy demonstrating the three policy outcomes:
+# 1. DENY (Precedence 0 - Highest)
+# 2. REQUIRE_APPROVAL (Precedence 1 - Medium)
+# 3. ALLOW (Precedence 2 - Lowest)
+#
+# Precedence Rule: DENY > REQUIRE APPROVAL > ALLOW
+# Default Fallback: DENY
+
+version: '1.0'
+metadata:
+  name: 'example-development-policy'
+  description: 'Standard sanitized development VM sandbox policy'
+
+# Authorized workspace roots for this policy context
+workspaces:
+  - id: 'primary-workspace'
+    path: '/home/example-user/workspace/example-repo'
+    allowSymlinksOutside: false
+
+rules:
+  # ============================================================================
+  # 1. DENY RULES (Highest precedence - evaluated first, cannot be overridden)
+  # ============================================================================
+  - id: 'deny-secret-credential-files'
+    effect: 'DENY'
+    description: 'Permanently block access to all credentials, keys, and secret stores'
+    paths:
+      patterns:
+        - '**/.ssh/**'
+        - '**/.aws/**'
+        - '**/.gnupg/**'
+        - '**/.kube/**'
+        - '**/.env*'
+        - '**/id_rsa*'
+        - '**/id_ed25519*'
+        - '**/credentials'
+        - '**/.git/config'
+        - '**/.git/hooks/**'
+
+  - id: 'deny-root-and-destructive-binaries'
+    effect: 'DENY'
+    description: 'Permanently block root escalation, administrative, and disk-destroying commands'
+    commands:
+      blockedBinaries:
+        - 'sudo'
+        - 'su'
+        - 'pkexec'
+        - 'doas'
+        - 'shutdown'
+        - 'reboot'
+        - 'poweroff'
+        - 'mkfs'
+        - 'dd'
+        - 'fdisk'
+        - 'chown'
+        - 'chmod'
+
+  - id: 'deny-protected-git-branches'
+    effect: 'DENY'
+    description: 'Prevent direct mutation or force-pushing to protected branches'
+    git:
+      protectedBranches:
+        - 'main'
+        - 'master'
+        - 'release/*'
+        - 'production'
+
+  - id: 'deny-system-directories'
+    effect: 'DENY'
+    description: 'Block access to OS system trees'
+    paths:
+      patterns:
+        - '/etc/**'
+        - '/proc/**'
+        - '/sys/**'
+        - '/root/**'
+        - '/dev/**'
+
+  # ============================================================================
+  # 2. REQUIRE APPROVAL RULES (Requires operator confirmation before execution)
+  # ============================================================================
+  - id: 'approval-source-mutations'
+    effect: 'REQUIRE_APPROVAL'
+    description: 'Modifying repository files or applying patches requires operator approval'
+    tools:
+      - 'write_file'
+      - 'create_file'
+      - 'apply_patch'
+
+  - id: 'approval-command-execution'
+    effect: 'REQUIRE_APPROVAL'
+    description: 'Executing builds, tests, or compiler commands requires operator approval'
+    tools:
+      - 'run_command'
+    approvalConfig:
+      ttlSeconds: 300
+      notifyChannels: ['cli', 'ui']
+
+  - id: 'approval-git-commits'
+    effect: 'REQUIRE_APPROVAL'
+    description: 'Creating commits or branching requires operator approval'
+    git:
+      actions:
+        - 'commit'
+        - 'checkout_new_branch'
+
+  # ============================================================================
+  # 3. ALLOW RULES (Lowest precedence - safe read-only operations)
+  # ============================================================================
+  - id: 'allow-safe-read-only-tools'
+    effect: 'ALLOW'
+    description: 'Permit safe inspection tools within authorized workspace roots'
+    tools:
+      - 'health'
+      - 'list_directory'
+      - 'read_file'
+      - 'search_files'
+      - 'search_text'
+      - 'git_status'
+      - 'git_diff'
+      - 'git_log'
+      - 'system_status'
