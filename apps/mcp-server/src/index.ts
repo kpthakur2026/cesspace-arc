@@ -957,6 +957,50 @@ export class ArcMcpServer implements IArcMcpServer {
     let workspaceConflict = false;
     let workspaceUnregistered = false;
 
+    // Caller Identity Gate (P1): run_command must fail closed before execution unless clientId and sessionId are non-empty
+    if (toolName === 'run_command') {
+      if (
+        !actor.clientId ||
+        !actor.sessionId ||
+        actor.clientId.trim().length === 0 ||
+        actor.sessionId.trim().length === 0
+      ) {
+        const arcErr = ArcError.policyDenied(
+          'Access denied: run_command requires verified caller identity (clientId and sessionId).',
+        );
+        const preAuditParams = sanitizePreValidationParameters(toolName, parameters);
+        await this.auditLogger.log({
+          timestamp: startTime,
+          actor: auditActor,
+          target: { workspaceId: 'unbound', workspacePath: '' },
+          invocation: {
+            toolName,
+            parametersRedacted: preAuditParams,
+            payloadHash: computeSha256(canonicalJson(preAuditParams)),
+          },
+          policy: {
+            decision: 'DENY',
+            ruleId: 'deny-incomplete-caller-identity',
+            evaluationDurationMs: 0,
+          },
+          execution: {
+            status: 'DENIED',
+            startTime,
+            endTime: new Date().toISOString(),
+            durationMs: Date.now() - startMs,
+          },
+          error: {
+            code: arcErr.code,
+            message: arcErr.message,
+          },
+        });
+        return {
+          isError: true,
+          content: [{ type: 'text', text: JSON.stringify(arcErr.toJSON(), null, 2) }],
+        };
+      }
+    }
+
     const isProcessLifecycleTool =
       toolName === 'process_status' ||
       toolName === 'process_output' ||

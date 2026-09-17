@@ -375,14 +375,6 @@ export function validateCommandRequest(
     if (args.length === 0) {
       return {
         valid: false,
-        ruleId: 'deny-git-mutation',
-        reason: 'Git requires an approved read-only subcommand or --version/--help.',
-      };
-    }
-
-    if (args.length === 0) {
-      return {
-        valid: false,
         ruleId: 'deny-git-operation',
         reason:
           "Git through run_command permits only '--version'. Repository inspection must use dedicated tools (git_status, git_diff, git_log).",

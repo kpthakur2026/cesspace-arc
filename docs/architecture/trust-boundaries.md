@@ -108,6 +108,7 @@ CesSpace ARC partitions the system into **four distinct security zones separated
   4. **Non-Root Execution:** Subprocesses run strictly under the unprivileged user account. Invocation of `sudo`, `su`, `pkexec`, or setuid binaries is filtered and denied.
   5. **Direct Execution Without Shell:** Terminal commands are executed using direct `execve`-style argument vectors (`argv[]`) rather than passing raw strings to `/bin/sh -c`, completely eliminating shell injection vulnerabilities.
   6. **Resource Sandboxing:** Commands are executed under supervision with aggressive timeouts (e.g., 30s default), maximum memory limits, and strict process tree tracking to eliminate fork bombs and zombie processes.
+  7. **Trusted Executable Identity & Runtime TCB:** Executables are resolved strictly from fixed trusted system directories (`/usr/bin`, `/bin`, `/usr/local/bin`) or, for the active `node` binary on Linux, via kernel-bound `/proc/self/exe`. The exact active Node runtime is explicitly part of the local Trusted Computing Base (TCB) when its canonical path, device (`dev`), and inode (`ino`) match `process.execPath` exactly. This guarantees identity without ambient PATH resolution or generic toolcache trust, while keeping arbitrary world/group-writable binary and directory rejections strictly intact.
 
 ---
 

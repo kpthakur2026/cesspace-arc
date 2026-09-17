@@ -504,8 +504,15 @@ export class ProcessRegistry implements IProcessRegistry {
     const stdoutFull = Buffer.concat(record._stdoutChunks);
     const stderrFull = Buffer.concat(record._stderrChunks);
 
+    // Total response budget enforcement (P2): Combined stdout + stderr returned bytes must not exceed maxBytes
     const stdoutResult = sliceUtf8Safe(stdoutFull, startStdout, startStdout + boundedMaxBytes);
-    const stderrResult = sliceUtf8Safe(stderrFull, startStderr, startStderr + boundedMaxBytes);
+    const usedStdoutBytes = stdoutResult.slice.length;
+    const remainingStderrBudget = Math.max(0, boundedMaxBytes - usedStdoutBytes);
+    const stderrResult = sliceUtf8Safe(
+      stderrFull,
+      startStderr,
+      startStderr + remainingStderrBudget,
+    );
 
     const nextStdoutCursor = stdoutResult.adjustedEnd;
     const nextStderrCursor = stderrResult.adjustedEnd;
@@ -545,12 +552,46 @@ export class ProcessRegistry implements IProcessRegistry {
       };
     }
 
+    const child = record._child;
+
+    // Harden terminateProcess against already-exited/stale child PID races (P2):
+    // Check actual child state before sending a process-group signal and fail safely if the child already exited.
+    // If exitCode or signalCode is already set, or killed is true with no active pid, child has exited.
+    if (child.exitCode !== null || child.signalCode !== null || !child.pid) {
+      if (record.state === 'RUNNING' || record.state === 'TERMINATING') {
+        this.markCompleted(record.processId, child.exitCode ?? 0, child.signalCode);
+      }
+      return {
+        processId: record.processId,
+        terminated: false,
+        signal: 'NONE',
+      };
+    }
+
+    // Double check via kill(0) on POSIX to ensure the PID is still alive and belongs to our process group
+    if (process.platform !== 'win32') {
+      try {
+        process.kill(child.pid, 0);
+      } catch (e: unknown) {
+        // ESRCH indicates process has already exited
+        if ((e as NodeJS.ErrnoException).code === 'ESRCH') {
+          if (record.state === 'RUNNING' || record.state === 'TERMINATING') {
+            this.markCompleted(record.processId, child.exitCode ?? 0, child.signalCode);
+          }
+          return {
+            processId: record.processId,
+            terminated: false,
+            signal: 'NONE',
+          };
+        }
+      }
+    }
+
     if (record._timeoutTimer) {
       clearTimeout(record._timeoutTimer);
       record._timeoutTimer = undefined;
     }
 
-    const child = record._child;
     const pid = child.pid;
 
     this.emitLifecycleEvent({

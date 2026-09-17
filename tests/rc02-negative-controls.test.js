@@ -1307,7 +1307,7 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
     let stdoutCursor = 0;
     let stderrCursor = 0;
 
-    for (let i = 0; i < 50; i++) {
+    for (let i = 0; i < 100; i++) {
       const page = reg.getProcessOutput(
         rec.processId,
         {
@@ -1541,5 +1541,169 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
       () => defaultResolver.resolveExecutable('toolcache_sibling', workspaceDir),
       /could not be resolved|DENIED|NOT_FOUND|cannot be found/i,
     );
+  });
+
+  test('RC02-REG-44: run_command fails closed when caller identity (clientId or sessionId) is empty', async () => {
+    // 1. Missing clientId (foreground)
+    const resNoClient = await server.dispatchToolCall(
+      'run_command',
+      {
+        executable: 'git',
+        args: ['--version'],
+      },
+      { clientId: '', sessionId: 'session-valid' },
+    );
+    assert.equal(resNoClient.isError, true, 'run_command without clientId must be denied');
+    const parsedNoClient = JSON.parse(resNoClient.content[0].text);
+    assert.equal(parsedNoClient.code, 'POLICY_DENIED');
+
+    // 2. Missing sessionId (foreground)
+    const resNoSession = await server.dispatchToolCall(
+      'run_command',
+      {
+        executable: 'git',
+        args: ['--version'],
+      },
+      { clientId: 'client-valid', sessionId: '' },
+    );
+    assert.equal(resNoSession.isError, true, 'run_command without sessionId must be denied');
+    const parsedNoSession = JSON.parse(resNoSession.content[0].text);
+    assert.equal(parsedNoSession.code, 'POLICY_DENIED');
+
+    // 3. Missing clientId (background)
+    const resBgNoClient = await server.dispatchToolCall(
+      'run_command',
+      {
+        executable: 'git',
+        args: ['--version'],
+        runInBackground: true,
+      },
+      { clientId: '', sessionId: 'session-valid' },
+    );
+    assert.equal(
+      resBgNoClient.isError,
+      true,
+      'Background run_command without clientId must be denied',
+    );
+    const parsedBgNoClient = JSON.parse(resBgNoClient.content[0].text);
+    assert.equal(parsedBgNoClient.code, 'POLICY_DENIED');
+
+    // 4. Missing sessionId (background)
+    const resBgNoSession = await server.dispatchToolCall(
+      'run_command',
+      {
+        executable: 'git',
+        args: ['--version'],
+        runInBackground: true,
+      },
+      { clientId: 'client-valid', sessionId: '' },
+    );
+    assert.equal(
+      resBgNoSession.isError,
+      true,
+      'Background run_command without sessionId must be denied',
+    );
+    const parsedBgNoSession = JSON.parse(resBgNoSession.content[0].text);
+    assert.equal(parsedBgNoSession.code, 'POLICY_DENIED');
+  });
+
+  test('RC02-REG-45: process_output enforces maxBytes as combined total budget for stdout and stderr', () => {
+    const reg = new ProcessRegistry();
+    const rec = reg.registerProcess({
+      workspaceId: 'test-ws',
+      actor: { clientId: 'c1', sessionId: 's1' },
+      executable: 'node',
+      sanitizedArgs: ['--version'],
+      cwd: workspaceDir,
+      startedAt: new Date().toISOString(),
+      state: 'RUNNING',
+      timedOut: false,
+    });
+
+    const stdoutData = Buffer.from('AAAAABBBBBCCCCCDDDDD', 'utf8'); // 20 bytes
+    const stderrData = Buffer.from('11111222223333344444', 'utf8'); // 20 bytes
+    reg.appendOutput(rec.processId, 'stdout', stdoutData);
+    reg.appendOutput(rec.processId, 'stderr', stderrData);
+
+    // Request with maxBytes = 10
+    const out = reg.getProcessOutput(
+      rec.processId,
+      {
+        stdoutCursor: 0,
+        stderrCursor: 0,
+        maxBytes: 10,
+      },
+      undefined,
+      { clientId: 'c1', sessionId: 's1' },
+    );
+
+    const stdoutLen = Buffer.byteLength(out.stdoutChunk, 'utf8');
+    const stderrLen = Buffer.byteLength(out.stderrChunk, 'utf8');
+    assert.ok(
+      stdoutLen + stderrLen <= 10,
+      `Combined bytes (${stdoutLen} + ${stderrLen}) must not exceed maxBytes (10)`,
+    );
+    assert.equal(stdoutLen, 10, 'stdout consumes full 10 bytes budget');
+    assert.equal(stderrLen, 0, 'stderr receives 0 bytes because budget was exhausted by stdout');
+
+    // Next page reading remaining output
+    const out2 = reg.getProcessOutput(
+      rec.processId,
+      {
+        stdoutCursor: out.stdoutCursor,
+        stderrCursor: out.stderrCursor,
+        maxBytes: 15,
+      },
+      undefined,
+      { clientId: 'c1', sessionId: 's1' },
+    );
+    const stdoutLen2 = Buffer.byteLength(out2.stdoutChunk, 'utf8');
+    const stderrLen2 = Buffer.byteLength(out2.stderrChunk, 'utf8');
+    assert.ok(
+      stdoutLen2 + stderrLen2 <= 15,
+      `Combined bytes (${stdoutLen2} + ${stderrLen2}) must not exceed maxBytes (15)`,
+    );
+    assert.equal(stdoutLen2, 10, 'Remaining 10 bytes of stdout read');
+    assert.equal(stderrLen2, 5, 'Remaining 5 bytes of budget used for stderr');
+  });
+
+  test('RC02-REG-46: PROCESS_SPAWN_SUCCEEDED is emitted only after child actually emits spawn event', async () => {
+    processRegistry.clear();
+    const startRes = await server.dispatchToolCall('run_command', {
+      executable: 'git',
+      args: ['--version'],
+      runInBackground: true,
+    });
+    assert.equal(startRes.isError, undefined);
+    const pid = JSON.parse(startRes.content[0].text).processId;
+
+    await server.flushAudit();
+    const records = auditLogger.getRecords();
+    const spawnRec = records.find(
+      (r) =>
+        r.invocation.toolName === 'PROCESS_SPAWN_SUCCEEDED' &&
+        r.invocation.parametersRedacted.processId === pid,
+    );
+    assert.ok(spawnRec, 'PROCESS_SPAWN_SUCCEEDED must be emitted once spawn occurs');
+  });
+
+  test('RC02-REG-47: terminateProcess hardens against already-exited/stale child PID races safely', async () => {
+    processRegistry.clear();
+    const startRes = await server.dispatchToolCall('run_command', {
+      executable: 'git',
+      args: ['--version'],
+    });
+    assert.equal(startRes.isError, undefined);
+    const pid = JSON.parse(startRes.content[0].text).processId;
+
+    // Process is already completed and child has exited
+    const termRes = await server.dispatchToolCall('terminate_process', {
+      processId: pid,
+      signal: 'SIGTERM',
+    });
+    assert.equal(termRes.isError, undefined);
+    const parsed = JSON.parse(termRes.content[0].text);
+    assert.equal(parsed.terminated, false, 'Already-exited process returns terminated: false');
+    assert.equal(parsed.signal, 'NONE');
   });
 });

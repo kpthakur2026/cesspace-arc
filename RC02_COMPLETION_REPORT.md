@@ -4,7 +4,7 @@
 >
 > **Stage:** `RC-02` — Controlled Terminal & Process Execution
 >
-> **Status:** Completed — Pending Independent Review
+> **Status:** Under Independent Review — Remediations Active
 >
 > **Repository:** `kpthakur2026/cesspace-arc`
 >
@@ -71,7 +71,7 @@ MCP Request (over stdio)
    - Strictly prohibited raw shells (`bash`, `sh`, `zsh`), privilege escalation (`sudo`, `su`), mutating commands (`rm`, `mkfs`), network tools (`curl`, `wget`), and cloud CLIs (`docker`, `aws`, `kubectl`).
    - Blocked argument injection (`-c`, command substitution `$()`, backticks, newlines).
    - Enforced environment variable key allowlist (`CI`, `FORCE_COLOR`, `NO_COLOR`, `DEBUG`, `NODE_ENV`).
-   - Implemented `ExecutableResolver` strictly searching system directories (`/usr/bin`, `/bin`, `/usr/local/bin`) without shell resolution, preferring kernel-bound `/proc/self/exe` on Linux for active Node runtime identity, rejecting `node_modules/.bin` and generic toolcache/sibling directories.
+   - Implemented `ExecutableResolver` strictly searching system directories (`/usr/bin`, `/bin`, `/usr/local/bin`) without shell resolution. On Linux, `/proc/self/exe` is recognized as an explicit part of the local TCB for the active Node runtime when canonical path, device, and inode strictly match `process.execPath`, while arbitrary world/group-writable binaries and directories, `node_modules/.bin`, and generic toolcache directories remain rejected.
 
 4. **`@cesspace-arc/policy` (`packages/policy`):**
    - Added `RC02_ALLOWED_TOOLS` (13 tools).
@@ -110,27 +110,27 @@ All findings from the RC-02 independent security review were remediated:
 
 All 9 quality gates passed cleanly:
 
-| Gate       | Description             | Command                                   | Result                                                                     |
-| :--------- | :---------------------- | :---------------------------------------- | :------------------------------------------------------------------------- |
-| **Gate 1** | Git Branch Check        | `git rev-parse --abbrev-ref HEAD`         | `feat/rc-02-controlled-terminal-processes`                                 |
-| **Gate 2** | Code Formatting         | `pnpm run check:format`                   | Clean (zero Prettier issues)                                               |
-| **Gate 3** | Lint & Static Analysis  | `pnpm run lint`                           | Clean (zero ESLint errors/warnings)                                        |
-| **Gate 4** | TypeScript Build        | `pnpm run typecheck && pnpm -r run build` | Clean across all 11 packages                                               |
-| **Gate 5** | Test Suite              | `pnpm run test`                           | **138/138 passing** (local test suite; CI run pending remote verification) |
-| **Gate 6** | Documentation Integrity | `bash scripts/check-docs.sh`              | Clean (all docs & internal links verified)                                 |
-| **Gate 7** | Secret Scanning         | `bash scripts/check-secrets.sh`           | Clean (zero secrets, zero private IPs)                                     |
-| **Gate 8** | Git Diff Cleanliness    | `git diff --check`                        | Clean (zero whitespace errors)                                             |
-| **Gate 9** | Dependency Security     | `pnpm audit`                              | Clean (zero vulnerabilities)                                               |
+| Gate       | Description             | Command                                   | Result                                     |
+| :--------- | :---------------------- | :---------------------------------------- | :----------------------------------------- |
+| **Gate 1** | Git Branch Check        | `git rev-parse --abbrev-ref HEAD`         | `feat/rc-02-controlled-terminal-processes` |
+| **Gate 2** | Code Formatting         | `pnpm run check:format`                   | Clean (zero Prettier issues)               |
+| **Gate 3** | Lint & Static Analysis  | `pnpm run lint`                           | Clean (zero ESLint errors/warnings)        |
+| **Gate 4** | TypeScript Build        | `pnpm run typecheck && pnpm -r run build` | Clean across all 11 packages               |
+| **Gate 5** | Test Suite              | `pnpm run test`                           | **142/142 passing**                        |
+| **Gate 6** | Documentation Integrity | `bash scripts/check-docs.sh`              | Clean (all docs & internal links verified) |
+| **Gate 7** | Secret Scanning         | `bash scripts/check-secrets.sh`           | Clean (zero secrets, zero private IPs)     |
+| **Gate 8** | Git Diff Cleanliness    | `git diff --check`                        | Clean (zero whitespace errors)             |
+| **Gate 9** | Dependency Security     | `pnpm audit`                              | Clean (zero vulnerabilities)               |
 
 ---
 
 ## 4. Test Suite Metrics
 
-- **Total Test Cases:** 138 (local verification; pending GitHub CI run)
+- **Total Test Cases:** 142
   - RC-00 Protocol & Architecture: 5 tests
   - RC-01 Read-Only Negative & Positive Controls: 49 tests
   - RC-02 Controlled Terminal & Process Controls: 41 tests
-  - RC-02 Independent Security Review Regressions: 43 tests
+  - RC-02 Independent Security Review Regressions: 47 tests
 - **Negative Controls & Invariants Verified:**
   - Denied executables (bash, sh, sudo, rm, curl, wget, dd, docker, cat, npx)
   - Denied script executions (`node script.js`, `node -e "..."`, `npm run`, `npm test`, `npm start`, `npm exec`, `pnpm run`, `pnpm exec`, `pnpm dlx`)
@@ -209,6 +209,10 @@ All 9 quality gates passed cleanly:
 | `RC02-REG-41` | HOME fake `node` cannot execute                                                                             |
 | `RC02-REG-42` | `node_modules/.bin` fake `node` cannot execute                                                              |
 | `RC02-REG-43` | Unsafe or world-writable Node candidate is rejected                                                         |
+| `RC02-REG-44` | `run_command` fails closed when caller identity (`clientId` or `sessionId`) is empty                        |
+| `RC02-REG-45` | `process_output` enforces `maxBytes` as combined total budget for stdout and stderr                         |
+| `RC02-REG-46` | `PROCESS_SPAWN_SUCCEEDED` is emitted only after child actually emits spawn event                            |
+| `RC02-REG-47` | `terminateProcess` hardens against already-exited/stale child PID races safely                              |
 
 ---
 

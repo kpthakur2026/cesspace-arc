@@ -311,6 +311,17 @@ export class ControlledProcessRunner implements ITerminalSubsystem {
     const startTime = Date.now();
     const workspaceRoot = targetWorkspace.rootPath;
 
+    if (
+      !actor.clientId ||
+      !actor.sessionId ||
+      actor.clientId.trim().length === 0 ||
+      actor.sessionId.trim().length === 0
+    ) {
+      throw ArcError.policyDenied(
+        'Access denied: run_command requires verified caller identity (clientId and sessionId).',
+      );
+    }
+
     if (!workspaceRoot || !existsSync(workspaceRoot)) {
       throw ArcError.noWorkspaceConfigured('Authorized workspace root is required for execution.');
     }
@@ -383,7 +394,7 @@ export class ControlledProcessRunner implements ITerminalSubsystem {
       actor: {
         clientId: actor.clientId,
         clientType: actor.clientType,
-        sessionId: actor.sessionId || 'default-session',
+        sessionId: actor.sessionId,
         deviceId: actor.deviceId,
       },
       executable: request.executable,
@@ -396,6 +407,7 @@ export class ControlledProcessRunner implements ITerminalSubsystem {
 
     // 6. Spawn Child Process (shell: false, detached: true on POSIX for process group kill)
     let child: ChildProcess;
+    let spawnSucceeded = false;
     try {
       child = spawn(resolvedExecutable, args, {
         cwd: executionCwd,
@@ -405,7 +417,14 @@ export class ControlledProcessRunner implements ITerminalSubsystem {
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       record._child = child;
-      this.processRegistry.notifySpawnSuccess(record.processId);
+
+      // Asynchronous spawn event handling (P2):
+      // Only emit PROCESS_SPAWN_SUCCEEDED after the child process actually emits the Node 'spawn' event.
+      // An asynchronous spawn failure must never produce a false success event.
+      child.once('spawn', () => {
+        spawnSucceeded = true;
+        this.processRegistry.notifySpawnSuccess(record.processId);
+      });
     } catch (err: unknown) {
       const errMsg = err instanceof Error ? err.message : String(err);
       this.processRegistry.markSpawnFailed(record.processId, errMsg);
@@ -455,7 +474,7 @@ export class ControlledProcessRunner implements ITerminalSubsystem {
     });
 
     child.on('error', (err) => {
-      if (record.state === 'RUNNING' && !child.pid) {
+      if (!spawnSucceeded) {
         this.processRegistry.markSpawnFailed(record.processId, err.message);
       } else {
         this.processRegistry.markCompleted(record.processId, 1, null);
@@ -464,6 +483,27 @@ export class ControlledProcessRunner implements ITerminalSubsystem {
 
     // 9. Synchronous vs Background Return
     if (request.runInBackground) {
+      // Ensure the spawn event or spawn error has been emitted before returning
+      // so PROCESS_SPAWN_SUCCEEDED is reliably emitted and available in audit sinks.
+      if (!spawnSucceeded && !child.killed && child.exitCode === null) {
+        await new Promise<void>((resolvePromise) => {
+          const onSpawn = () => {
+            cleanup();
+            resolvePromise();
+          };
+          const onError = () => {
+            cleanup();
+            resolvePromise();
+          };
+          const cleanup = () => {
+            child.removeListener('spawn', onSpawn);
+            child.removeListener('error', onError);
+          };
+          child.once('spawn', onSpawn);
+          child.once('error', onError);
+        });
+      }
+
       return {
         processId: record.processId,
         state: 'RUNNING',

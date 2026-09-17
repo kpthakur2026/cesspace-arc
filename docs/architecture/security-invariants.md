@@ -73,8 +73,8 @@ Every invariant is assigned an invariant identifier (`INV-01` through `INV-20`),
 ### INV-10: Terminal Execution Must Be Policy-Controlled
 
 - **Statement:** Subprocess execution must strictly validate binary names, argument vectors, working directories, and resource limits against an approved command policy.
-- **Enforcement:** Command supervisor dispatches directly via `execve` using strict tokenization without shell evaluation (`/bin/sh -c`).
-- **Verification:** Test attempting shell metacharacter injection (`|`, `;`, `&&`, `$()`) verifying that they are treated as literal arguments and rejected by policy.
+- **Enforcement:** Command supervisor dispatches directly via `execve` using strict tokenization without shell evaluation (`/bin/sh -c`). Executables resolve strictly from trusted system directories or kernel-authoritative `/proc/self/exe` for the active Node runtime (TCB identity match via canonical path, dev, and inode), rejecting user-controlled paths, untrusted symlinks, and writable executables.
+- **Verification:** Test attempting shell metacharacter injection (`|`, `;`, `&&`, `$()`) verifying that they are treated as literal arguments and rejected by policy, alongside negative controls verifying rejection of world-writable binaries, fake nodes, and unverified executables.
 
 ### INV-11: Destructive Operations Denied by Default
 
