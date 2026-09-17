@@ -151,7 +151,7 @@ cesspace-arc/
 ├── .github/
 │   └── workflows/
 │
-├── AGENTS.md
+├── docs/governance/engineering-governance.md
 ├── SECURITY.md
 ├── CONTRIBUTING.md
 ├── CODE_OF_CONDUCT.md
@@ -588,7 +588,7 @@ Required RC-00 outputs:
 10. Proposed repository/package ownership model.
 11. Architecture Decision Records for important decisions.
 12. Explicit RC-01 scope and acceptance criteria.
-13. AGENTS.md with project-specific agent rules.
+13. docs/governance/engineering-governance.md with project-specific engineering and security governance rules.
 14. SECURITY.md appropriate for an open-source security-sensitive project.
 15. CONTRIBUTING.md with security-conscious contribution rules.
 
