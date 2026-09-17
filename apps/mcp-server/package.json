@@ -1,0 +1,20 @@
+{
+  "name": "@cesspace-arc/mcp-server",
+  "version": "0.0.0-rc00",
+  "description": "Model Context Protocol server daemon for CesSpace ARC",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@cesspace-arc/protocol": "*",
+    "@cesspace-arc/policy": "*",
+    "@cesspace-arc/audit": "*",
+    "@cesspace-arc/filesystem": "*",
+    "@cesspace-arc/git": "*"
+  }
+}

@@ -1,0 +1,42 @@
+# CesSpace ARC — Example Server Configuration
+#
+# This is a sanitized reference configuration for the CesSpace ARC daemon.
+# Never commit real host secrets, private IPs, or internal production settings.
+
+server:
+  # Transport mode: "stdio" for local agent execution, "http" for remote gateway
+  transport: "stdio"
+
+  # Network binding (applies only when transport is "http" / RC-05)
+  host: "127.0.0.1"
+  port: 8443
+  tls:
+    enabled: false
+    certFile: "/path/to/example-cert.pem"
+    keyFile: "/path/to/example-key.pem"
+
+workspace:
+  # Explicit authorized workspace roots
+  authorizedRoots:
+    - id: "primary"
+      path: "/home/example-user/workspace/example-repo"
+      readOnly: false
+
+limits:
+  maxPayloadSizeBytes: 4194304    # 4 MB max message size
+  maxFileReadSizeBytes: 1048576   # 1 MB max single file read
+  maxCommandTimeoutSeconds: 60    # 60s command execution timeout
+  maxSearchResults: 200           # Max search items returned
+
+policy:
+  policyFilePath: "examples/policies/policy.example.yaml"
+  defaultOutcome: "DENY"
+  cacheDurationSeconds: 60
+
+audit:
+  enabled: true
+  logDirectory: "/home/example-user/.cesspace-arc/audit"
+  format: "jsonl"
+  redactSecrets: true
+  hashChaining: true
+  rotationMaxSizeBytes: 52428800  # 50 MB

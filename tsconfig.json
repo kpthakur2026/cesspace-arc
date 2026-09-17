@@ -1,0 +1,15 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/protocol" },
+    { "path": "packages/policy" },
+    { "path": "packages/audit" },
+    { "path": "packages/auth" },
+    { "path": "packages/filesystem" },
+    { "path": "packages/git" },
+    { "path": "packages/terminal" },
+    { "path": "packages/processes" },
+    { "path": "apps/mcp-server" },
+    { "path": "apps/cli" }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "name": "@cesspace-arc/audit",
+  "version": "0.0.0-rc00",
+  "description": "Append-only structured audit logger and secret redaction for CesSpace ARC",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@cesspace-arc/protocol": "*"
+  }
+}

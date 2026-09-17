@@ -1,0 +1,35 @@
+name: CesSpace ARC CI Quality Gates
+
+on:
+  push:
+    branches:
+      - feat/*
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  quality-gates:
+    name: Architecture & Security Verification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Git Diff Cleanliness Check
+        run: git diff --check
+
+      - name: Documentation Integrity & Link Check
+        run: bash scripts/check-docs.sh
+
+      - name: Secret & Credential Scanning
+        run: bash scripts/check-secrets.sh
+
+      - name: Contract & Invariant Tests
+        run: node --test tests/**/*.test.js
