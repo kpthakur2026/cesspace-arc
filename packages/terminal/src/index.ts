@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, realpathSync, statSync } from 'node:fs';
-import { resolve, basename, sep } from 'node:path';
+import { resolve, basename, dirname, sep } from 'node:path';
 import {
   ArcError,
   type RunCommandRequest,
@@ -51,7 +51,7 @@ export class CommandPolicy implements ICommandPolicy {
       ) {
         throw ArcError.invalidRequestSchema(result.reason || 'Invalid command request schema.');
       }
-      throw ArcError.forbiddenCommand(result.reason || 'Command violates security policy.');
+      throw ArcError.policyDenied(result.reason || 'Command violates security policy.');
     }
   }
 }
@@ -62,9 +62,77 @@ export interface IExecutableResolver {
 
 export class ExecutableResolver implements IExecutableResolver {
   private trustedDirs: string[];
+  private allowCurrentNodeRuntime: boolean;
+  private nodeCandidate: string;
 
-  constructor(customTrustedDirs?: string[]) {
+  constructor(
+    customTrustedDirs?: string[],
+    allowCurrentNodeRuntime?: boolean,
+    customNodeCandidate?: string,
+  ) {
     this.trustedDirs = customTrustedDirs || ['/usr/bin', '/bin', '/usr/local/bin'];
+    this.allowCurrentNodeRuntime =
+      allowCurrentNodeRuntime !== undefined ? allowCurrentNodeRuntime : !customTrustedDirs;
+    this.nodeCandidate = customNodeCandidate || process.execPath;
+  }
+
+  private validateExactNodeCandidate(candidate: string, untrustedRoots: string[]): string | null {
+    if (!candidate || typeof candidate !== 'string') return null;
+
+    try {
+      if (!existsSync(candidate)) return null;
+
+      const stat = statSync(candidate);
+      if (!stat.isFile() || (stat.mode & 0o111) === 0) return null;
+
+      // Check candidate permissions on POSIX
+      if (process.platform !== 'win32') {
+        if ((stat.mode & 0o002) !== 0) return null; // world-writable
+        if ((stat.mode & 0o020) !== 0 && stat.uid !== 0) return null; // group-writable by non-root
+      }
+
+      const real = realpathSync(candidate);
+      const realStat = statSync(real);
+      if (!realStat.isFile() || (realStat.mode & 0o111) === 0) return null;
+
+      // Check realpath permissions on POSIX
+      if (process.platform !== 'win32') {
+        if ((realStat.mode & 0o002) !== 0) return null;
+        if ((realStat.mode & 0o020) !== 0 && realStat.uid !== 0) return null;
+      }
+
+      // Check parent directory permissions on POSIX
+      const parentDir = dirname(real);
+      if (!existsSync(parentDir)) return null;
+      const parentStat = statSync(parentDir);
+      if (!parentStat.isDirectory()) return null;
+      if (process.platform !== 'win32') {
+        if ((parentStat.mode & 0o002) !== 0) return null;
+        if ((parentStat.mode & 0o020) !== 0 && parentStat.uid !== 0) return null;
+      }
+
+      // Must NOT resolve under workspace, HOME, current directory, or node_modules
+      const isUntrusted = untrustedRoots.some(
+        (root) => real === root || real.startsWith(root + sep),
+      );
+      if (
+        isUntrusted ||
+        real.includes(`${sep}node_modules${sep}`) ||
+        real.endsWith(`${sep}node_modules`)
+      ) {
+        return null;
+      }
+
+      // Preserve exact executable identity (must be 'node' or 'node.exe')
+      const base = basename(real).toLowerCase();
+      if (base !== 'node' && base !== 'node.exe') {
+        return null;
+      }
+
+      return real;
+    } catch {
+      return null;
+    }
   }
 
   public resolveExecutable(name: string, workspaceRoot?: string): string {
@@ -158,6 +226,14 @@ export class ExecutableResolver implements IExecutableResolver {
         } catch {
           // ignore unresolvable
         }
+      }
+    }
+
+    // 2. Exact current Node runtime fallback (for 'node' executable only)
+    if (trimmed === 'node' && this.allowCurrentNodeRuntime) {
+      const validatedNode = this.validateExactNodeCandidate(this.nodeCandidate, untrustedRoots);
+      if (validatedNode) {
+        return validatedNode;
       }
     }
 

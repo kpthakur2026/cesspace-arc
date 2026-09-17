@@ -456,10 +456,10 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
   test('RC02-P-04: process_status returns valid state for a completed process', async () => {
     // Run a quick command to completion
     const runRes = await server.dispatchToolCall('run_command', {
-      executable: 'node',
+      executable: 'git',
       args: ['--version'],
     });
-    assert.equal(runRes.isError, undefined);
+    assert.equal(runRes.isError, undefined, `Setup failed: ${runRes.content?.[0]?.text}`);
     const runParsed = JSON.parse(runRes.content[0].text);
     const pid = runParsed.processId;
     assert.ok(pid, 'Must return a processId');
@@ -479,53 +479,45 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
 
   test('RC02-P-05: process_output returns buffered stdoutChunk for completed process', async () => {
     const runRes = await server.dispatchToolCall('run_command', {
-      executable: 'node',
+      executable: 'git',
       args: ['--version'],
     });
-    assert.equal(runRes.isError, undefined);
+    assert.equal(runRes.isError, undefined, `Setup failed: ${runRes.content?.[0]?.text}`);
     const pid = JSON.parse(runRes.content[0].text).processId;
-    assert.ok(pid);
+    assert.ok(pid, 'Process ID must be returned');
 
     const outputRes = await server.dispatchToolCall('process_output', {
       processId: pid,
     });
     assert.equal(outputRes.isError, undefined);
     const outputParsed = JSON.parse(outputRes.content[0].text);
-    // process_output returns stdoutChunk and stderrChunk
     assert.ok(typeof outputParsed.stdoutChunk === 'string', 'stdoutChunk must be string');
-    // node --version outputs version string like v24.x.x
-    assert.ok(outputParsed.stdoutChunk.includes('v'), 'stdoutChunk should contain version string');
+    assert.match(outputParsed.stdoutChunk, /git version/i);
   });
 
   test('RC02-P-06: terminate_process returns valid response for a background process', async () => {
     // Start a background process
     const runRes = await server.dispatchToolCall('run_command', {
-      executable: 'node',
+      executable: 'git',
       args: ['--version'],
       runInBackground: true,
     });
-    if (runRes.isError) {
-      // If run_command errored for some reason, skip
-      return;
-    }
+    assert.equal(runRes.isError, undefined, `Setup failed: ${runRes.content?.[0]?.text}`);
     const pid = JSON.parse(runRes.content[0].text).processId;
-    assert.ok(pid);
+    assert.ok(pid, 'Process ID must be returned');
 
     const termRes = await server.dispatchToolCall('terminate_process', {
       processId: pid,
       signal: 'SIGTERM',
     });
-    // terminate_process must not error — either it sends the signal or process already completed
     assert.equal(
       termRes.isError,
       undefined,
       `terminate_process must not error: ${termRes.content[0].text}`,
     );
     const termParsed = JSON.parse(termRes.content[0].text);
-    // Response shape: { processId, terminated: boolean, signal: string }
     assert.equal(termParsed.processId, pid, 'processId must match');
     assert.ok(typeof termParsed.terminated === 'boolean', 'terminated must be boolean');
-    // signal is 'SIGTERM' if sent, 'NONE' if process already ended
     assert.ok(
       termParsed.signal === 'SIGTERM' || termParsed.signal === 'NONE',
       `signal must be SIGTERM or NONE, got ${termParsed.signal}`,
@@ -552,10 +544,12 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
 
   test('RC02-P-08: run_command produces audit record with ALLOW on success', async () => {
     const preCount = auditLogger.getRecords().length;
-    void (await server.dispatchToolCall('run_command', {
-      executable: 'node',
+    const runRes = await server.dispatchToolCall('run_command', {
+      executable: 'git',
       args: ['--version'],
-    }));
+    });
+    assert.equal(runRes.isError, undefined, `Setup failed: ${runRes.content?.[0]?.text}`);
+    await server.flushAudit();
     const newRecords = auditLogger.getRecords().slice(preCount);
     const runCmdRec = newRecords.find((r) => r.invocation.toolName === 'run_command');
     assert.ok(runCmdRec, 'Must produce a run_command audit record');
@@ -726,11 +720,13 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
   test('RC02-REG-12: process supervision fails closed when caller identity is missing', async () => {
     processRegistry.clear();
     const startRes = await server.dispatchToolCall('run_command', {
-      executable: 'node',
+      executable: 'git',
       args: ['--version'],
       runInBackground: true,
     });
+    assert.equal(startRes.isError, undefined, `Setup failed: ${startRes.content?.[0]?.text}`);
     const pid = JSON.parse(startRes.content[0].text).processId;
+    assert.ok(pid, 'Process ID must be returned');
 
     const res = await server.dispatchToolCall(
       'process_status',
@@ -745,11 +741,13 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
   test('RC02-REG-13: process supervision fails closed when clientId is mismatched', async () => {
     processRegistry.clear();
     const startRes = await server.dispatchToolCall('run_command', {
-      executable: 'node',
+      executable: 'git',
       args: ['--version'],
       runInBackground: true,
     });
+    assert.equal(startRes.isError, undefined, `Setup failed: ${startRes.content?.[0]?.text}`);
     const pid = JSON.parse(startRes.content[0].text).processId;
+    assert.ok(pid, 'Process ID must be returned');
 
     const res = await server.dispatchToolCall(
       'process_status',
@@ -764,11 +762,13 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
   test('RC02-REG-14: process supervision fails closed when sessionId is mismatched', async () => {
     processRegistry.clear();
     const startRes = await server.dispatchToolCall('run_command', {
-      executable: 'node',
+      executable: 'git',
       args: ['--version'],
       runInBackground: true,
     });
+    assert.equal(startRes.isError, undefined, `Setup failed: ${startRes.content?.[0]?.text}`);
     const pid = JSON.parse(startRes.content[0].text).processId;
+    assert.ok(pid, 'Process ID must be returned');
 
     const res = await server.dispatchToolCall(
       'process_output',
@@ -783,11 +783,13 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
   test('RC02-REG-15: process supervision fails closed when workspaceId is mismatched', async () => {
     processRegistry.clear();
     const startRes = await server.dispatchToolCall('run_command', {
-      executable: 'node',
+      executable: 'git',
       args: ['--version'],
       runInBackground: true,
     });
+    assert.equal(startRes.isError, undefined, `Setup failed: ${startRes.content?.[0]?.text}`);
     const pid = JSON.parse(startRes.content[0].text).processId;
+    assert.ok(pid, 'Process ID must be returned');
 
     assert.throws(() => {
       processRegistry.assertOwnership(pid, {
@@ -802,11 +804,13 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
   test('RC02-REG-16: PROCESS_SPAWN_SUCCEEDED lifecycle event is recorded in audit logger', async () => {
     processRegistry.clear();
     const startRes = await server.dispatchToolCall('run_command', {
-      executable: 'node',
+      executable: 'git',
       args: ['--version'],
       runInBackground: true,
     });
+    assert.equal(startRes.isError, undefined, `Setup failed: ${startRes.content?.[0]?.text}`);
     const pid = JSON.parse(startRes.content[0].text).processId;
+    assert.ok(pid, 'Process ID must be returned');
 
     await server.flushAudit();
     const records = auditLogger.getRecords();
@@ -846,11 +850,14 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
   test('RC02-REG-18: PROCESS_EXITED lifecycle event is recorded in audit logger', async () => {
     processRegistry.clear();
     const res = await server.dispatchToolCall('run_command', {
-      executable: 'node',
+      executable: 'git',
       args: ['--version'],
     });
+    assert.equal(res.isError, undefined, `Setup failed: ${res.content?.[0]?.text}`);
     const pid = JSON.parse(res.content[0].text).processId;
+    assert.ok(pid, 'Process ID must be returned');
 
+    await server.flushAudit();
     const records = auditLogger.getRecords();
     const exitRec = records.find(
       (r) =>
@@ -1110,7 +1117,7 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
     const startRes = await server.dispatchToolCall(
       'run_command',
       {
-        executable: 'node',
+        executable: 'git',
         args: ['--version'],
         workspaceId: 'test-ws-b',
         runInBackground: true,
@@ -1122,8 +1129,9 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
         deviceId: 'device-b',
       },
     );
-    assert.equal(startRes.isError, undefined);
+    assert.equal(startRes.isError, undefined, `Setup failed: ${startRes.content?.[0]?.text}`);
     const pid = JSON.parse(startRes.content[0].text).processId;
+    assert.ok(pid, 'Process ID must be returned');
 
     await server.flushAudit();
     const records = auditLogger.getRecords();
@@ -1219,7 +1227,7 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
     const startRes = await server.dispatchToolCall(
       'run_command',
       {
-        executable: 'node',
+        executable: 'git',
         args: ['--version'],
         runInBackground: true,
       },
@@ -1230,8 +1238,9 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
         deviceId: 'macbook-pro-m3',
       },
     );
-    assert.equal(startRes.isError, undefined);
+    assert.equal(startRes.isError, undefined, `Setup failed: ${startRes.content?.[0]?.text}`);
     const pid = JSON.parse(startRes.content[0].text).processId;
+    assert.ok(pid, 'Process ID must be returned');
 
     await server.flushAudit();
     const records = auditLogger.getRecords();
@@ -1372,5 +1381,111 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
     } catch {
       // ignore
     }
+  });
+
+  test('RC02-REG-36: exact process.execPath Node binary can execute node --version via default resolver', async () => {
+    const res = await server.dispatchToolCall('run_command', {
+      executable: 'node',
+      args: ['--version'],
+    });
+    assert.equal(res.isError, undefined, `node --version failed: ${res.content?.[0]?.text}`);
+    const parsed = JSON.parse(res.content[0].text);
+    assert.ok(parsed.processId);
+    assert.match(parsed.stdout, /^v\d+\.\d+\.\d+/);
+  });
+
+  test('RC02-REG-37: arbitrary executable beside process.execPath is NOT trusted', () => {
+    const defaultResolver = new ExecutableResolver();
+    assert.throws(
+      () => defaultResolver.resolveExecutable('nonexistent_tool_beside_node', workspaceDir),
+      /could not be resolved|DENIED|NOT_FOUND|cannot be found/i,
+    );
+  });
+
+  test('RC02-REG-38: process.execPath dirname is NOT treated as generic trusted search path', () => {
+    const resolver = new ExecutableResolver();
+    assert.throws(
+      () => resolver.resolveExecutable('arbitrary_beside_exe', workspaceDir),
+      /could not be resolved|DENIED|NOT_FOUND|cannot be found/i,
+    );
+  });
+
+  test('RC02-REG-39: malicious PATH cannot replace Node', () => {
+    const attackerDir = path.join(tempDir, 'attacker-path');
+    fs.mkdirSync(attackerDir, { recursive: true });
+    const fakeNode = path.join(attackerDir, 'node');
+    fs.writeFileSync(fakeNode, '#!/bin/sh\necho evil\n');
+    fs.chmodSync(fakeNode, 0o755);
+
+    const origPath = process.env.PATH;
+    try {
+      process.env.PATH = `${attackerDir}:${origPath}`;
+      const resolver = new ExecutableResolver();
+      const resolved = resolver.resolveExecutable('node', workspaceDir);
+      assert.notEqual(resolved, fakeNode, 'Must NOT resolve to fake node from PATH');
+      assert.notEqual(path.resolve(resolved), path.resolve(fakeNode));
+    } finally {
+      process.env.PATH = origPath;
+    }
+  });
+
+  test('RC02-REG-40: workspace fake node cannot execute', () => {
+    const wsNode = path.join(workspaceDir, 'node');
+    fs.writeFileSync(wsNode, '#!/bin/sh\necho ws-evil-node\n');
+    fs.chmodSync(wsNode, 0o755);
+
+    const resolver = new ExecutableResolver([], true, wsNode);
+    assert.throws(
+      () => resolver.resolveExecutable('node', workspaceDir),
+      /could not be resolved|DENIED|NOT_FOUND|cannot be found/i,
+    );
+  });
+
+  test('RC02-REG-41: HOME fake node cannot execute', () => {
+    const fakeHome = path.join(tempDir, 'fake-home');
+    fs.mkdirSync(fakeHome, { recursive: true });
+    const homeNode = path.join(fakeHome, 'node');
+    fs.writeFileSync(homeNode, '#!/bin/sh\necho home-evil-node\n');
+    fs.chmodSync(homeNode, 0o755);
+
+    const origHome = process.env.HOME;
+    try {
+      process.env.HOME = fakeHome;
+      const resolver = new ExecutableResolver([], true, homeNode);
+      assert.throws(
+        () => resolver.resolveExecutable('node', workspaceDir),
+        /could not be resolved|DENIED|NOT_FOUND|cannot be found/i,
+      );
+    } finally {
+      process.env.HOME = origHome;
+    }
+  });
+
+  test('RC02-REG-42: node_modules/.bin fake node cannot execute', () => {
+    const nmBinDir = path.join(tempDir, 'node_modules', '.bin');
+    fs.mkdirSync(nmBinDir, { recursive: true });
+    const nmNode = path.join(nmBinDir, 'node');
+    fs.writeFileSync(nmNode, '#!/bin/sh\necho nm-evil-node\n');
+    fs.chmodSync(nmNode, 0o755);
+
+    const resolver = new ExecutableResolver([], true, nmNode);
+    assert.throws(
+      () => resolver.resolveExecutable('node', workspaceDir),
+      /could not be resolved|DENIED|NOT_FOUND|cannot be found/i,
+    );
+  });
+
+  test('RC02-REG-43: unsafe or world-writable Node candidate is rejected', () => {
+    const safeDir = path.join(tempDir, 'test-bin-dir');
+    fs.mkdirSync(safeDir, { recursive: true });
+    const writableNode = path.join(safeDir, 'node');
+    fs.writeFileSync(writableNode, '#!/bin/sh\necho writable-node\n');
+    fs.chmodSync(writableNode, 0o777);
+
+    const resolver = new ExecutableResolver([], true, writableNode);
+    assert.throws(
+      () => resolver.resolveExecutable('node', workspaceDir),
+      /could not be resolved|DENIED|NOT_FOUND|cannot be found/i,
+    );
   });
 });

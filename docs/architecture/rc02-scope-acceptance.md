@@ -69,8 +69,8 @@ Every operation in RC-02 continues to pass through the **Security Kernel** and t
 
 ## 3. Acceptance Verification Summary
 
-- **Total Test Cases:** 130/130 passing (54 RC-00/RC-01 + 76 RC-02 tests including 35 independent review regressions).
-- **RC-02 Negative Controls:** 68 mandatory negative controls verified (denied commands, code execution bypasses, argument injection, shell metacharacters, env allowlist, strict schema, process ownership isolation, cwd containment, path traversal, git command denial, pre-schema parameter redaction, world/group-writable binary denial, untrusted symlink denial).
-- **RC-02 Positive Controls:** 8 positive controls verified (`run_command` foreground/background, `process_status`, `process_output`, `terminate_process`, allowlisted env keys, audit logging).
+- **Total Test Cases:** 138/138 passing (54 RC-00/RC-01 + 84 RC-02 tests including 43 independent review regressions).
+- **RC-02 Negative Controls:** 75 mandatory negative controls verified (denied commands, code execution bypasses, argument injection, shell metacharacters, env allowlist, strict schema, process ownership isolation, cwd containment, path traversal, git command denial, pre-schema parameter redaction, world/group-writable binary denial, untrusted symlink denial, unsafe/untrusted Node candidate denial).
+- **RC-02 Positive Controls:** 9 positive controls verified (`run_command` foreground/background, `process_status`, `process_output`, `terminate_process`, allowlisted env keys, exact Node binary resolution, audit logging).
 - **Code Quality:** Zero Prettier issues, zero ESLint warnings/errors, clean TypeScript compilation across all 11 workspace packages.
 - **Supply Chain Security:** Zero Gitleaks detections, zero forbidden credential files, zero private IPs in source, zero `pnpm audit` vulnerabilities.

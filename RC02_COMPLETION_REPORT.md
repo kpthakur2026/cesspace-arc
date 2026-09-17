@@ -110,27 +110,27 @@ All findings from the RC-02 independent security review were remediated:
 
 All 9 quality gates passed cleanly:
 
-| Gate       | Description             | Command                                   | Result                                     |
-| :--------- | :---------------------- | :---------------------------------------- | :----------------------------------------- |
-| **Gate 1** | Git Branch Check        | `git rev-parse --abbrev-ref HEAD`         | `feat/rc-02-controlled-terminal-processes` |
-| **Gate 2** | Code Formatting         | `pnpm run check:format`                   | Clean (zero Prettier issues)               |
-| **Gate 3** | Lint & Static Analysis  | `pnpm run lint`                           | Clean (zero ESLint errors/warnings)        |
-| **Gate 4** | TypeScript Build        | `pnpm run typecheck && pnpm -r run build` | Clean across all 11 packages               |
-| **Gate 5** | Test Suite              | `pnpm run test`                           | **130/130 passing** (0 failures)           |
-| **Gate 6** | Documentation Integrity | `bash scripts/check-docs.sh`              | Clean (all docs & internal links verified) |
-| **Gate 7** | Secret Scanning         | `bash scripts/check-secrets.sh`           | Clean (zero secrets, zero private IPs)     |
-| **Gate 8** | Git Diff Cleanliness    | `git diff --check`                        | Clean (zero whitespace errors)             |
-| **Gate 9** | Dependency Security     | `pnpm audit`                              | Clean (zero vulnerabilities)               |
+| Gate       | Description             | Command                                   | Result                                                                     |
+| :--------- | :---------------------- | :---------------------------------------- | :------------------------------------------------------------------------- |
+| **Gate 1** | Git Branch Check        | `git rev-parse --abbrev-ref HEAD`         | `feat/rc-02-controlled-terminal-processes`                                 |
+| **Gate 2** | Code Formatting         | `pnpm run check:format`                   | Clean (zero Prettier issues)                                               |
+| **Gate 3** | Lint & Static Analysis  | `pnpm run lint`                           | Clean (zero ESLint errors/warnings)                                        |
+| **Gate 4** | TypeScript Build        | `pnpm run typecheck && pnpm -r run build` | Clean across all 11 packages                                               |
+| **Gate 5** | Test Suite              | `pnpm run test`                           | **138/138 passing** (local test suite; CI run pending remote verification) |
+| **Gate 6** | Documentation Integrity | `bash scripts/check-docs.sh`              | Clean (all docs & internal links verified)                                 |
+| **Gate 7** | Secret Scanning         | `bash scripts/check-secrets.sh`           | Clean (zero secrets, zero private IPs)                                     |
+| **Gate 8** | Git Diff Cleanliness    | `git diff --check`                        | Clean (zero whitespace errors)                                             |
+| **Gate 9** | Dependency Security     | `pnpm audit`                              | Clean (zero vulnerabilities)                                               |
 
 ---
 
 ## 4. Test Suite Metrics
 
-- **Total Test Cases:** 130
+- **Total Test Cases:** 138 (local verification; pending GitHub CI run)
   - RC-00 Protocol & Architecture: 5 tests
   - RC-01 Read-Only Negative & Positive Controls: 49 tests
   - RC-02 Controlled Terminal & Process Controls: 41 tests
-  - RC-02 Independent Security Review Regressions: 35 tests
+  - RC-02 Independent Security Review Regressions: 43 tests
 - **Negative Controls & Invariants Verified:**
   - Denied executables (bash, sh, sudo, rm, curl, wget, dd, docker, cat, npx)
   - Denied script executions (`node script.js`, `node -e "..."`, `npm run`, `npm test`, `npm start`, `npm exec`, `pnpm run`, `pnpm exec`, `pnpm dlx`)
@@ -147,12 +147,13 @@ All 9 quality gates passed cleanly:
   - Working directory containment and traversal rejection
   - Executable path separator and local binary rejection
   - Untrusted executable rejection (world/group-writable binary or directory, untrusted symlinks)
+  - Exact Node runtime isolation (rejects workspace/HOME/node_modules fake node, rejects writable candidates, denies arbitrary executables beside node runtime)
   - Multi-part process ownership validation (missing, mismatched client, session, or workspace)
   - Real two-workspace process isolation and audit target binding
   - Timeout state machine transitions (`TERMINATING` during grace period, concurrency held, `TIMED_OUT` on death)
   - Real 3-level process tree termination (parent -> child -> grandchild)
 - **Positive Controls Verified:**
-  - Foreground short-lived command execution (`node --version`)
+  - Foreground short-lived command execution (`node --version`) via exact validated runtime
   - Git status execution within authorized workspace
   - Background execution with immediate opaque process ID return
   - Process status query
@@ -161,7 +162,7 @@ All 9 quality gates passed cleanly:
   - Allowlisted environment variable forwarding (`NODE_ENV`)
   - Audit logging of allowed operations and all asynchronous lifecycle states with real caller identity
 
-### 4.1. Security Review Regression Tests (RC02-REG-01 to RC02-REG-35)
+### 4.1. Security Review Regression Tests (RC02-REG-01 to RC02-REG-43)
 
 | Test ID       | Description                                                                                                 |
 | :------------ | :---------------------------------------------------------------------------------------------------------- |
@@ -200,6 +201,14 @@ All 9 quality gates passed cleanly:
 | `RC02-REG-33` | Audit sink rejection is handled safely without unhandled rejection and `flushAudit` works                   |
 | `RC02-REG-34` | Independent stdout and stderr cursors reconstruct full output across multi-byte UTF-8 boundaries            |
 | `RC02-REG-35` | `ExecutableResolver` rejects world/group-writable binaries and symlinks into untrusted roots                |
+| `RC02-REG-36` | Exact `process.execPath` Node binary can execute `node --version` via default resolver                      |
+| `RC02-REG-37` | Arbitrary executable beside `process.execPath` is NOT trusted                                               |
+| `RC02-REG-38` | `process.execPath` dirname is NOT treated as generic trusted search path                                    |
+| `RC02-REG-39` | Malicious `PATH` cannot replace Node                                                                        |
+| `RC02-REG-40` | Workspace fake `node` cannot execute                                                                        |
+| `RC02-REG-41` | HOME fake `node` cannot execute                                                                             |
+| `RC02-REG-42` | `node_modules/.bin` fake `node` cannot execute                                                              |
+| `RC02-REG-43` | Unsafe or world-writable Node candidate is rejected                                                         |
 
 ---
 
