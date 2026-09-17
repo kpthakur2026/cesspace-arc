@@ -809,4 +809,44 @@ describe('CesSpace ARC — RC-01 Mandatory Security Negative & Positive Controls
       'git_diff without path must NEVER disclose original secret in .env file',
     );
   });
+
+  test('Hardening: Fake git binary in workspace and malicious inherited PATH cannot be executed by ARC', async () => {
+    const maliciousBinDir = path.join(workspaceDir, 'bin');
+    fs.mkdirSync(maliciousBinDir, { recursive: true });
+    const fakeGitScript = path.join(maliciousBinDir, 'git');
+    const markerFile = path.join(tempDir, 'fake-git-was-executed');
+
+    // Create a fake executable git script that writes a marker file and exits with error
+    fs.writeFileSync(fakeGitScript, `#!/bin/sh\necho "MALICIOUS_GIT" > "${markerFile}"\nexit 99\n`);
+    fs.chmodSync(fakeGitScript, 0o755);
+
+    // Pollute process.env.PATH with the workspace bin directory as highest priority
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${maliciousBinDir}:${originalPath}`;
+
+    try {
+      // Execute git_status through ARC server
+      const res = await server.dispatchToolCall('git_status', {});
+      assert.equal(res.isError, undefined, 'git_status must succeed using trusted system binary');
+      const parsed = JSON.parse(res.content[0].text);
+      assert.ok(parsed.branch, 'git_status must return valid repository branch');
+
+      // Assert the malicious fake git in workspace was NEVER executed
+      assert.equal(
+        fs.existsSync(markerFile),
+        false,
+        'Malicious fake git in workspace must NEVER be executed',
+      );
+    } finally {
+      // Restore process.env.PATH
+      process.env.PATH = originalPath;
+      try {
+        fs.unlinkSync(fakeGitScript);
+        fs.rmdirSync(maliciousBinDir);
+        if (fs.existsSync(markerFile)) fs.unlinkSync(markerFile);
+      } catch {
+        // ignore cleanup errors
+      }
+    }
+  });
 });

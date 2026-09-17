@@ -4,7 +4,7 @@
 >
 > **Stage:** `RC-01` — Read-Only MCP Core
 >
-> **Status:** Completed — Post-Independent Review Hardened Baseline
+> **Status:** Completed — Pending Final Independent Review
 >
 > **Repository:** `kpthakur2026/cesspace-arc`
 >
@@ -35,7 +35,7 @@ MCP Request (over stdio)
                                       └─► Sanitized MCP Response
 ```
 
-All 9 designated read-only tools, all 16 initial negative security controls, and 20 hardening and review regression controls (51 tests total across the suite) have been implemented, tested, and verified. A performance benchmark harness was established, providing an official baseline in `docs/performance/rc01-baseline.md`. Zero mutating capabilities, remote network listeners, or execution tools were implemented.
+All 9 designated read-only tools, all 16 initial negative security controls, and 21 hardening and review regression controls (52 tests total across the suite) have been implemented, tested, and verified. A performance benchmark harness was established, providing an official baseline in `docs/performance/rc01-baseline.md`. Zero mutating capabilities, remote network listeners, or execution tools were implemented.
 
 ---
 
@@ -84,6 +84,7 @@ All 9 designated read-only tools, all 16 initial negative security controls, and
 ### 2.7. Pre-PR Hardening Controls
 
 - **Read-Only Git Environment & Verification:** Injected `GIT_OPTIONAL_LOCKS=0`, `GIT_CONFIG_GLOBAL=/dev/null`, and `GIT_CONFIG_NOSYSTEM=1`. Before any Git operation, `verifyRepositoryBoundary()` verifies that `git rev-parse --show-toplevel` resolves exactly to the authorized canonical workspace root, and that `--git-dir` / `--git-common-dir` cannot escape the workspace boundary. Hostile `core.worktree` or external `.git/gitdir` redirections are rejected with `ACCESS_DENIED`.
+- **Trusted Git Binary & Isolated PATH:** Resolved the system Git binary strictly from deterministic system locations (`/usr/bin/git`, `/bin/git`, `/usr/local/bin/git`) without using a shell or inherited `process.env.PATH`. Isolated subprocess execution to fixed system `PATH` (`/usr/bin:/bin:/usr/local/bin`). Proved that a fake `git` executable placed inside the workspace under a polluted `PATH` cannot be executed by ARC.
 - **Zero Optional Lock Writes:** Proved that `git_status`, `git_diff`, and `git_log` execute cleanly against read-only `.git/index` (`0444`) without creating index locks.
 - **Strict Input Bounds & Whitespace Rejection:** Explicit selector/string inputs are strictly bounded across schemas (`workspaceId` max 128, `workspaceRoot`/`path`/`subPath` max 1024, `query` max 500, `pattern`/`filePattern` max 256, `revision`/`target` max 128). Explicit whitespace-only selectors fail closed immediately with `INVALID_REQUEST_SCHEMA`.
 - **Client-Facing Error Sanitization:** Absolute host paths (`/home/...`, `/tmp/...`), usernames, and raw internal Node/Git error messages are stripped and sanitized to prevent system reconnaissance.
@@ -98,11 +99,11 @@ All 9 designated read-only tools, all 16 initial negative security controls, and
 - **Local MCP Transport:** Built on `@modelcontextprotocol/sdk` using standard UNIX stdio transport.
 - **Minimal Security Kernel:** Central admission controller in `packages/policy` providing default-deny gating, an explicit 9-tool allowlist, and an authorized workspace registry.
 - **Jailed Filesystem Subsystem:** Canonical `realpathSync` resolution, prefix enclosure verification, and sensitive path blacklist filtering in `packages/filesystem`.
-- **Sandboxed Git Subsystem:** Safe read-only Git operations via argument arrays (`execFile` with `shell: false`), topology verification, argument injection prevention, and buffer truncation in `packages/git`.
+- **Sandboxed Git Subsystem:** Safe read-only Git operations via argument arrays (`execFile` with `shell: false`), trusted system binary resolution, topology verification, argument injection prevention, and buffer truncation in `packages/git`.
 - **Structured Audit Sink:** In-memory / stream audit sink with data minimization, credential redaction, and sequential SHA-256 hash chaining in `packages/audit`.
 - **Canonical Structured Errors:** Machine-readable `ArcError` schema and factories in `packages/protocol`.
 - **Performance Benchmark Harness:** Automated synthetic fixture benchmark in `benchmarks/rc01-benchmark.js` and report in `docs/performance/rc01-baseline.md`.
-- **Automated Verification Suite:** 51 deterministic tests covering contracts, positive tool execution, mandatory negative security failure scenarios, and hardening regressions.
+- **Automated Verification Suite:** 52 deterministic tests covering contracts, positive tool execution, mandatory negative security failure scenarios, and hardening regressions.
 
 ### 3.2. Explicitly Forbidden & NOT Implemented (RC-02+ Boundary)
 
@@ -197,15 +198,17 @@ From `docs/performance/rc01-baseline.md` (`pnpm run bench:rc01`):
 
 | Fixture             | Tool           | p50 (ms) | p95 (ms) | Throughput (ops/sec) |
 | :------------------ | :------------- | :------: | :------: | :------------------: |
-| Small (10 files)    | `health`       |  0.156   |  0.904   |       3,746.6        |
-| Small (10 files)    | `read_file`    |  0.290   |  0.913   |       2,779.4        |
-| Small (10 files)    | `git_status`   |  16.018  |  35.151  |         53.9         |
-| Medium (500 files)  | `health`       |  0.089   |  0.215   |       9,230.3        |
-| Medium (500 files)  | `search_text`  |  3.316   |  4.613   |        272.4         |
-| Medium (500 files)  | `git_diff`     |  7.444   |  10.855  |        124.0         |
-| Large (2,000 files) | `read_file`    |  0.356   |  0.490   |       2,747.7        |
-| Large (2,000 files) | `search_files` |  0.445   |  0.785   |       1,971.7        |
-| Large (2,000 files) | `git_diff`     |  13.703  |  32.205  |         56.6         |
+| Small (10 files)    | `health`       |  0.121   |  0.270   |       6,681.5        |
+| Small (10 files)    | `read_file`    |  0.297   |  2.384   |       2,095.3        |
+| Small (10 files)    | `git_status`   |  32.049  |  39.389  |         31.9         |
+| Medium (500 files)  | `health`       |  0.087   |  0.155   |       9,229.7        |
+| Medium (500 files)  | `search_text`  |  2.325   |  4.296   |        383.2         |
+| Medium (500 files)  | `git_diff`     |  15.880  |  42.071  |         49.4         |
+| Large (2,000 files) | `read_file`    |  0.220   |  0.380   |       3,953.5        |
+| Large (2,000 files) | `search_files` |  0.744   |  0.827   |       1,320.1        |
+| Large (2,000 files) | `git_diff`     |  18.136  |  39.251  |         41.9         |
+
+> **Note:** The benchmark harness measures internal `dispatchToolCall` pipeline latency in-process; it does not measure stdio JSON-RPC transport overhead. Results vary by fixture and tool. See `docs/performance/rc01-baseline.md` for full 9-tool measurement data.
 
 ---
 
@@ -219,7 +222,7 @@ Executed via `bash scripts/verify-rc01.sh`:
 | **Gate 2** | Code Formatting           | `pnpm run check:format` (Prettier)         | **PASS** (Zero formatting issues)                     |
 | **Gate 3** | Static Analysis & Lint    | `pnpm run lint` (ESLint)                   | **PASS** (Zero warnings, zero errors)                 |
 | **Gate 4** | TypeScript Build          | `pnpm run typecheck` (`tsc --build`)       | **PASS** (Clean compilation across all packages/apps) |
-| **Gate 5** | Contract & Security Tests | `pnpm run test` (Node 24 test runner)      | **PASS** (51/51 passed in ~1,400 ms)                  |
+| **Gate 5** | Contract & Security Tests | `pnpm run test` (Node 24 test runner)      | **PASS** (52/52 passed in ~1,400 ms)                  |
 | **Gate 6** | Documentation Integrity   | `bash scripts/check-docs.sh`               | **PASS** (All docs verified, internal links valid)    |
 | **Gate 7** | Secret & Safety Check     | `bash scripts/check-secrets.sh` (Gitleaks) | **PASS** (Scanned 972 KB, zero leaks found)           |
 | **Gate 8** | Git Diff Cleanliness      | `git diff --check`                         | **PASS** (Zero whitespace or conflict markers)        |

@@ -1,8 +1,8 @@
 # CesSpace ARC — RC-01 Performance Baseline
 
-- **Generated:** 2026-09-17T10:13:26.236Z
+- **Generated:** 2026-09-17T10:34:28.911Z
 - **Environment:** Linux x86_64, Node.js v24.21.0, v8 Engine
-- **Total Process Memory:** RSS 127.8 MB, Heap 28.3 MB
+- **Total Process Memory:** RSS 117.8 MB, Heap 22.9 MB
 - **Status:** Measured RC-01 Baseline — Pending Independent Review
 
 ---
@@ -15,18 +15,15 @@ All 9 permitted tools were benchmarked using the automated harness (`benchmarks/
 ### Key Observations
 
 1. **Control Plane Operations (`health`, `system_status`):**
-   - Sub-millisecond latency (p50: < 0.1 ms; p95: < 0.3 ms).
-   - Throughput exceeding 8,000+ ops/sec.
+   - In-memory health checks execute with sub-millisecond median latency (p50: < 0.2 ms).
+   - Host system status inspection samples host OS metrics and disk statistics; see measured p50/p95/p99 table below; results vary by fixture and tool.
 2. **Filesystem Read Operations (`read_file`, `list_directory`):**
-   - Single file read bounded within 0.15 - 0.35 ms across all workspace scales due to direct file descriptor I/O and non-recursive canonical path verification.
-   - Non-recursive directory listing maintains sub-millisecond latency (< 0.5 ms).
+   - Read operations execute via direct file descriptors and non-recursive canonical path enclosure checks; see measured p50/p95/p99 table below; results vary by fixture and tool.
 3. **Search Subsystem (`search_files`, `search_text`):**
-   - In-memory traversal with ReDoS guards scales predictably from 0.8 ms (small) to 12 ms (large 2,000 files).
-   - Low heap allocation and bounded memory consumption (< 150 KB per run).
+   - In-memory traversal with ReDoS guards scales with workspace size and file count; see measured p50/p95/p99 table below; results vary by fixture and tool.
 4. **Git Read-Only Operations (`git_status`, `git_diff`, `git_log`):**
-   - Bounded by subprocess execution overhead (`git` CLI invocation).
-   - Latencies range between 8 ms and 18 ms for status and diff.
-   - Hardened with `--no-ext-diff`, `--no-textconv`, and sanitized environment without performance degradation.
+   - Operations execute via sandboxed subprocess invocation using the trusted system Git binary with fixed isolation arguments and sanitized environment (`GIT_OPTIONAL_LOCKS=0`).
+   - Execution time is dominated by subprocess invocation and repository topology verification; see measured p50/p95/p99 table below; results vary by fixture and tool.
 
 ---
 
@@ -34,33 +31,33 @@ All 9 permitted tools were benchmarked using the automated harness (`benchmarks/
 
 | Fixture             | Tool             | p50 Latency (ms) | p95 Latency (ms) | p99 Latency (ms) | Throughput (ops/sec) | Heap Delta (KB) |
 | :------------------ | :--------------- | :--------------: | :--------------: | :--------------: | :------------------: | :-------------: |
-| Small (10 files)    | `health`         |      0.124       |      0.344       |      0.685       |        5638.3        |     1112.9      |
-| Small (10 files)    | `system_status`  |      0.414       |      0.683       |      4.319       |        1784.0        |     -5051.5     |
-| Small (10 files)    | `list_directory` |      0.298       |      0.512       |      0.628       |        3077.5        |     2508.3      |
-| Small (10 files)    | `read_file`      |      0.169       |      0.357       |      0.400       |        4832.5        |     1944.1      |
-| Small (10 files)    | `search_files`   |      0.434       |      0.586       |      1.483       |        2208.7        |     -3803.8     |
-| Small (10 files)    | `search_text`    |      1.222       |      4.419       |      10.731      |        550.8         |     -2877.7     |
-| Small (10 files)    | `git_status`     |      27.465      |      47.718      |      61.598      |         32.6         |     6522.1      |
-| Small (10 files)    | `git_diff`       |      8.753       |      15.237      |      16.226      |        101.7         |     4798.6      |
-| Small (10 files)    | `git_log`        |      10.593      |      13.865      |      19.403      |         89.5         |     -5254.9     |
-| Medium (500 files)  | `health`         |      0.083       |      0.266       |      0.375       |        7974.4        |      613.1      |
-| Medium (500 files)  | `system_status`  |      0.322       |      2.178       |      2.364       |        1919.6        |      324.3      |
-| Medium (500 files)  | `list_directory` |      0.613       |      4.266       |      4.754       |        735.6         |     2360.0      |
-| Medium (500 files)  | `read_file`      |      0.322       |      2.492       |      3.638       |        1337.6        |      593.7      |
-| Medium (500 files)  | `search_files`   |      3.134       |      6.355       |      9.444       |        322.0         |     -9116.4     |
-| Medium (500 files)  | `search_text`    |      2.382       |      3.887       |      4.807       |        377.4         |     8587.5      |
-| Medium (500 files)  | `git_status`     |      37.736      |      80.571      |      99.412      |         23.0         |     -5356.7     |
-| Medium (500 files)  | `git_diff`       |      19.124      |      24.310      |      24.838      |         51.1         |     2566.8      |
-| Medium (500 files)  | `git_log`        |      10.793      |      17.094      |      23.144      |         82.4         |     2837.2      |
-| Large (2,000 files) | `health`         |      0.055       |      0.088       |      0.099       |       16427.6        |      414.5      |
-| Large (2,000 files) | `system_status`  |      0.262       |      0.420       |      0.917       |        3216.5        |      436.0      |
-| Large (2,000 files) | `list_directory` |      0.562       |      0.659       |      0.681       |        1733.5        |     2262.9      |
-| Large (2,000 files) | `read_file`      |      0.236       |      1.961       |      2.234       |        2351.8        |      703.3      |
-| Large (2,000 files) | `search_files`   |      0.824       |      3.346       |      9.129       |        507.2         |    -11412.7     |
-| Large (2,000 files) | `search_text`    |      3.846       |      6.630       |      7.931       |        237.9         |     5345.7      |
-| Large (2,000 files) | `git_status`     |      37.822      |      76.620      |      95.902      |         22.1         |     -6783.7     |
-| Large (2,000 files) | `git_diff`       |      18.408      |      36.080      |      40.062      |         46.0         |     1698.6      |
-| Large (2,000 files) | `git_log`        |      11.321      |      16.185      |      16.359      |         86.2         |     1889.2      |
+| Small (10 files)    | `health`         |      0.121       |      0.270       |      0.312       |        6681.5        |     1109.7      |
+| Small (10 files)    | `system_status`  |      0.324       |      2.410       |      5.813       |        1343.4        |     -5087.3     |
+| Small (10 files)    | `list_directory` |      0.370       |      0.598       |      0.720       |        2497.8        |     2525.7      |
+| Small (10 files)    | `read_file`      |      0.297       |      2.384       |      2.587       |        2095.3        |     1943.8      |
+| Small (10 files)    | `search_files`   |      0.639       |      3.494       |      7.021       |        680.3         |     -3830.3     |
+| Small (10 files)    | `search_text`    |      1.431       |      7.023       |      17.463      |        368.9         |     -1625.1     |
+| Small (10 files)    | `git_status`     |      32.049      |      39.389      |      41.934      |         31.9         |      966.3      |
+| Small (10 files)    | `git_diff`       |      8.748       |      13.386      |      14.055      |        106.9         |     4730.8      |
+| Small (10 files)    | `git_log`        |      12.727      |      15.496      |      19.932      |         84.0         |     -5405.5     |
+| Medium (500 files)  | `health`         |      0.087       |      0.155       |      0.370       |        9229.7        |      613.1      |
+| Medium (500 files)  | `system_status`  |      0.326       |      0.432       |      0.447       |        2979.1        |      664.7      |
+| Medium (500 files)  | `list_directory` |      0.698       |      3.809       |      4.296       |        791.5         |     2210.0      |
+| Medium (500 files)  | `read_file`      |      0.336       |      0.473       |      0.546       |        2978.2        |     1069.0      |
+| Medium (500 files)  | `search_files`   |      0.935       |      1.193       |      1.571       |        1076.3        |     4831.7      |
+| Medium (500 files)  | `search_text`    |      2.325       |      4.296       |      6.545       |        383.2         |     -5855.7     |
+| Medium (500 files)  | `git_status`     |      40.003      |      49.895      |      71.219      |         24.2         |     6334.6      |
+| Medium (500 files)  | `git_diff`       |      15.880      |      42.071      |      43.367      |         49.4         |     2538.9      |
+| Medium (500 files)  | `git_log`        |      9.749       |      14.292      |      15.683      |         98.1         |     2798.1      |
+| Large (2,000 files) | `health`         |      0.090       |      0.687       |      1.932       |        4383.5        |      407.4      |
+| Large (2,000 files) | `system_status`  |      0.368       |      2.560       |      2.576       |        1141.2        |      432.7      |
+| Large (2,000 files) | `list_directory` |      0.613       |      1.388       |      1.400       |        1344.2        |     2263.2      |
+| Large (2,000 files) | `read_file`      |      0.220       |      0.380       |      0.455       |        3953.5        |      704.2      |
+| Large (2,000 files) | `search_files`   |      0.744       |      0.827       |      1.058       |        1320.1        |     2849.6      |
+| Large (2,000 files) | `search_text`    |      7.505       |      10.937      |      15.805      |        133.5         |     -8884.3     |
+| Large (2,000 files) | `git_status`     |      32.183      |      38.975      |      39.051      |         29.6         |     3899.3      |
+| Large (2,000 files) | `git_diff`       |      18.136      |      39.251      |      44.116      |         41.9         |     1674.8      |
+| Large (2,000 files) | `git_log`        |      9.857       |      16.047      |      16.263      |         90.4         |     -9022.2     |
 
 ---
 

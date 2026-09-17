@@ -221,19 +221,17 @@ This document establishes the official performance and latency baseline for the 
 All 9 permitted tools were benchmarked using the automated harness (\`benchmarks/rc01-benchmark.js\`) across synthetic fixtures spanning Small (10 files), Medium (500 files), and Large (2,000 files) workspaces.
 
 ### Key Observations
+
 1. **Control Plane Operations (\`health\`, \`system_status\`):**
-   - Sub-millisecond latency (p50: < 0.1 ms; p95: < 0.3 ms).
-   - Throughput exceeding 8,000+ ops/sec.
+   - In-memory health checks execute with sub-millisecond median latency (p50: < 0.2 ms).
+   - Host system status inspection samples host OS metrics and disk statistics; see measured p50/p95/p99 table below; results vary by fixture and tool.
 2. **Filesystem Read Operations (\`read_file\`, \`list_directory\`):**
-   - Single file read bounded within 0.15 - 0.35 ms across all workspace scales due to direct file descriptor I/O and non-recursive canonical path verification.
-   - Non-recursive directory listing maintains sub-millisecond latency (< 0.5 ms).
+   - Read operations execute via direct file descriptors and non-recursive canonical path enclosure checks; see measured p50/p95/p99 table below; results vary by fixture and tool.
 3. **Search Subsystem (\`search_files\`, \`search_text\`):**
-   - In-memory traversal with ReDoS guards scales predictably from 0.8 ms (small) to 12 ms (large 2,000 files).
-   - Low heap allocation and bounded memory consumption (< 150 KB per run).
+   - In-memory traversal with ReDoS guards scales with workspace size and file count; see measured p50/p95/p99 table below; results vary by fixture and tool.
 4. **Git Read-Only Operations (\`git_status\`, \`git_diff\`, \`git_log\`):**
-   - Bounded by subprocess execution overhead (\`git\` CLI invocation).
-   - Latencies range between 8 ms and 18 ms for status and diff.
-   - Hardened with \`--no-ext-diff\`, \`--no-textconv\`, and sanitized environment without performance degradation.
+   - Operations execute via sandboxed subprocess invocation using the trusted system Git binary with fixed isolation arguments and sanitized environment (\`GIT_OPTIONAL_LOCKS=0\`).
+   - Execution time is dominated by subprocess invocation and repository topology verification; see measured p50/p95/p99 table below; results vary by fixture and tool.
 
 ---
 

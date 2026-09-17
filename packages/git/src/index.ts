@@ -154,6 +154,47 @@ export function truncateUtf8ToByteLimit(
 }
 
 /**
+ * Trusted system locations for the Git binary in supported Linux environments.
+ * Fixed deterministic paths that cannot resolve into user-controlled directories,
+ * workspace paths, or HOME.
+ */
+export const TRUSTED_GIT_LOCATIONS = ['/usr/bin/git', '/bin/git', '/usr/local/bin/git'] as const;
+
+/**
+ * Fixed trusted system PATH for subprocess execution.
+ * Prevents execution of user-controlled binaries from workspace, cwd, or HOME.
+ */
+export const TRUSTED_SYSTEM_PATH = '/usr/bin:/bin:/usr/local/bin';
+
+/**
+ * Resolves a trusted system Git executable without using a shell or inherited PATH.
+ */
+export function resolveTrustedGitBinary(): string {
+  for (const candidate of TRUSTED_GIT_LOCATIONS) {
+    if (existsSync(candidate)) {
+      try {
+        const canonical = realpathSync(candidate);
+        // Verify canonical path resides strictly in an approved system binary directory
+        if (
+          canonical === '/usr/bin/git' ||
+          canonical === '/bin/git' ||
+          canonical === '/usr/local/bin/git' ||
+          canonical.startsWith('/usr/bin/') ||
+          canonical.startsWith('/bin/')
+        ) {
+          return canonical;
+        }
+      } catch {
+        // continue
+      }
+    }
+  }
+  throw ArcError.internalError(
+    'Trusted system Git executable not found in approved system locations.',
+  );
+}
+
+/**
  * Interface definition for Sandboxed Git Subsystem.
  */
 export interface IGitSubsystem {
@@ -165,16 +206,23 @@ export interface IGitSubsystem {
 
 /**
  * Sandboxed Git Subsystem implementation.
- * Guarantees read-only subprocess invocation via argument arrays and shell=false.
+ * Guarantees read-only subprocess invocation via argument arrays, shell=false,
+ * and a trusted system Git executable.
  */
 export class GitSubsystem implements IGitSubsystem {
+  private readonly trustedGitBinary: string;
+
+  constructor(customGitBinary?: string) {
+    this.trustedGitBinary = customGitBinary || resolveTrustedGitBinary();
+  }
+
   private async runRawGit(
     cwd: string,
     args: string[],
     maxBuffer: number = 1024 * 1024,
   ): Promise<{ stdout: string; stderr: string }> {
     const safeEnv: NodeJS.ProcessEnv = {
-      PATH: process.env.PATH || '/usr/bin:/bin',
+      PATH: TRUSTED_SYSTEM_PATH,
       HOME: '/dev/null',
       LC_ALL: 'C',
       GIT_OPTIONAL_LOCKS: '0',
@@ -202,7 +250,7 @@ export class GitSubsystem implements IGitSubsystem {
     ];
 
     try {
-      const result = await execFileAsync('git', [...safeGlobalArgs, ...args], {
+      const result = await execFileAsync(this.trustedGitBinary, [...safeGlobalArgs, ...args], {
         cwd,
         shell: false,
         timeout: 10000,
