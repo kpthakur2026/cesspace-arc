@@ -1,7 +1,7 @@
 # Package Ownership & Dependency Architecture — CesSpace ARC
 
 > **Document:** Repository Structure Specification
-> **Status:** RC-00 Proposed Baseline — Pending Independent Review
+> **Status:** RC-00 Approved Baseline — RC-01 Active
 > **Classification:** Architectural Governance
 
 ---

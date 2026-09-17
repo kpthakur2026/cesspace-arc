@@ -1,7 +1,7 @@
 # Permanent Security Invariants — CesSpace ARC
 
 > **Document:** Invariant Specification
-> **Status:** RC-00 Proposed Baseline — Pending Independent Review
+> **Status:** RC-00 Approved Baseline — RC-01 Active
 > **Rule:** Inviolable across all development stages
 
 ---
