@@ -77,10 +77,11 @@ The following actions are strictly forbidden within this repository:
 
 ## 4. Current Repository State & Context
 
-- **Current Stage:** `RC-00` (Architecture & Security Foundation).
-- **Active Branch:** `feat/rc-00-architecture`.
-- **Allowed Scope:** Documentation, architectural specifications, threat modeling, ADRs, schema definitions, repository scaffolding, and quality gate verification.
-- **Forbidden Scope for RC-00:** Any implementation of terminal execution, remote networking, authentication services, host file writes, or VM connectivity.
+- **Current Stage:** `RC-01` (Read-Only MCP Core — Pending Independent Review).
+- **Active Branch:** `feat/rc-01-readonly-mcp-core`.
+- **Base:** `main` (Approved RC-00 Baseline).
+- **Allowed Scope:** Read-only inspection tools (health, list_directory, read_file, search_files, search_text, git_status, git_diff, git_log, system_status), Minimal Security Kernel (`packages/policy`, `packages/audit`), local stdio MCP server (`apps/mcp-server`), and unit/negative security tests.
+- **Forbidden Scope for RC-01:** Terminal command execution (`run_command`), host file writes (`write_file`, `apply_patch`), mutating git operations (`commit`, `push`, `checkout -b`), remote network listeners, authentication services, device enrollment, or cloud deployments.
 
 ---
 

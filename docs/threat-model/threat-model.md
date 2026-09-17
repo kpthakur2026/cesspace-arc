@@ -1,7 +1,7 @@
 # Threat Model — CesSpace ARC
 
 > **Document:** Threat Modeling Specification
-> **Status:** RC-00 Proposed Baseline — Pending Independent Review
+> **Status:** RC-00 Approved Baseline — RC-01 Active
 > **Classification:** Security Architecture & Threat Analysis
 > **Methodology:** STRIDE + AI-Agent Threat Matrix
 

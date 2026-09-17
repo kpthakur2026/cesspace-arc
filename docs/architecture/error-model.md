@@ -1,7 +1,7 @@
 # Structured Error Model — CesSpace ARC
 
 > **Document:** Error Handling Specification
-> **Status:** RC-00 Proposed Baseline — Pending Independent Review
+> **Status:** RC-00 Approved Baseline — RC-01 Active
 > **Classification:** Architecture & Protocol Specification
 
 ---

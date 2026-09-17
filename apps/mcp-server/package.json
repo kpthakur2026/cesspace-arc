@@ -16,6 +16,8 @@
     "@cesspace-arc/filesystem": "workspace:*",
     "@cesspace-arc/git": "workspace:*",
     "@cesspace-arc/policy": "workspace:*",
-    "@cesspace-arc/protocol": "workspace:*"
+    "@cesspace-arc/protocol": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.6.5"
   }
 }
