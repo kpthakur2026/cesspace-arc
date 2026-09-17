@@ -83,10 +83,11 @@ export class ExecutableResolver implements IExecutableResolver {
     try {
       if (!existsSync(procExe)) return null;
 
+      // Stat /proc/self/exe (follows the kernel symlink to the actual executable)
       const procStat = statSync(procExe);
       if (!procStat.isFile() || (procStat.mode & 0o111) === 0) return null;
 
-      // Ensure not world-writable
+      // Ensure the kernel-identified executable is not world-writable
       if ((procStat.mode & 0o002) !== 0) return null;
 
       // Identify candidate (defaults to process.execPath)
@@ -97,10 +98,11 @@ export class ExecutableResolver implements IExecutableResolver {
       if (!candidateStat.isFile() || (candidateStat.mode & 0o111) === 0) return null;
       if ((candidateStat.mode & 0o002) !== 0) return null;
 
-      // Identify candidate and realpath as Node
+      // Candidate basename must be 'node'
       const candidateBase = basename(candidate).toLowerCase();
       if (candidateBase !== 'node') return null;
 
+      // Resolve both to canonical paths in the current filesystem namespace
       const realCandidate = realpathSync(candidate);
       const realCandidateBase = basename(realCandidate).toLowerCase();
       if (realCandidateBase !== 'node') return null;
@@ -109,17 +111,17 @@ export class ExecutableResolver implements IExecutableResolver {
       const realProcBase = basename(realProcExe).toLowerCase();
       if (realProcBase !== 'node') return null;
 
-      // Compare executable identity using stat identity (dev & ino)
-      if (procStat.dev !== candidateStat.dev || procStat.ino !== candidateStat.ino) {
-        return null;
-      }
-
-      // Ensure it represents the SAME active runtime
+      // Identity check: kernel-identified executable must resolve to the same
+      // canonical path as the declared candidate (process.execPath).
+      // Realpath equality is resolved in the current namespace — both paths are
+      // evaluated with the same VFS view — making this robust across overlayfs/container
+      // layers where stat dev/ino can differ for the same physical file.
       if (realProcExe !== realCandidate) {
         return null;
       }
 
-      // Verify realpath does not resolve into untrusted roots (workspace, HOME, cwd, node_modules)
+      // Verify the resolved path does not land in untrusted roots
+      // (workspace root, $HOME, cwd, node_modules)
       const isUntrusted = untrustedRoots.some(
         (root) => realProcExe === root || realProcExe.startsWith(root + sep),
       );
@@ -131,7 +133,9 @@ export class ExecutableResolver implements IExecutableResolver {
         return null;
       }
 
-      // Never derive or trust its parent directory; return /proc/self/exe directly
+      // Return /proc/self/exe as the execution path.
+      // The kernel guarantees this resolves to the currently running executable
+      // at exec() time — no PATH lookup occurs.
       return procExe;
     } catch {
       return null;

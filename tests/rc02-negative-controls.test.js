@@ -1386,22 +1386,22 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
   test('RC02-REG-36: exact active Node runtime executes successfully and binds to /proc/self/exe on Linux', async () => {
     if (process.platform === 'linux') {
       assert.ok(fs.existsSync('/proc/self/exe'), '/proc/self/exe must exist on Linux');
-      const procStat = fs.statSync('/proc/self/exe');
-      const execStat = fs.statSync(process.execPath);
+
+      // The kernel-authoritative identity invariant:
+      // realpath(/proc/self/exe) must equal realpath(process.execPath)
+      // This is the correct cross-filesystem-layer identity check.
+      // (dev/ino may differ across overlayfs layers even for the same binary.)
+      const realProcExe = fs.realpathSync('/proc/self/exe');
+      const realExecPath = fs.realpathSync(process.execPath);
       assert.equal(
-        procStat.dev,
-        execStat.dev,
-        'Kernel /proc/self/exe dev must match process.execPath dev',
+        realProcExe,
+        realExecPath,
+        'realpath(/proc/self/exe) must equal realpath(process.execPath)',
       );
       assert.equal(
-        procStat.ino,
-        execStat.ino,
-        'Kernel /proc/self/exe ino must match process.execPath ino',
-      );
-      assert.equal(
-        fs.realpathSync('/proc/self/exe'),
-        fs.realpathSync(process.execPath),
-        'Kernel /proc/self/exe realpath must match process.execPath realpath',
+        path.basename(realProcExe).toLowerCase(),
+        'node',
+        'Kernel-identified active runtime must be named node',
       );
 
       const resolver = new ExecutableResolver();
