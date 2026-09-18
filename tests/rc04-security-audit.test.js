@@ -5,7 +5,11 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
-import { ArcMcpServer, createArcMcpServer } from '../apps/mcp-server/dist/index.js';
+import {
+  ArcMcpServer,
+  ProcessAuditSink,
+  createArcMcpServer,
+} from '../apps/mcp-server/dist/index.js';
 import {
   ApprovalAuditSink,
   MAX_PENDING_LIFECYCLE_EVENTS,
@@ -1017,24 +1021,48 @@ describe('CesSpace ARC — RC-04 Task 5: Security Hardening & Approval Audit Lif
       await server.flushAudit();
       assert.equal(await audit.verifyIntegrity(), true);
 
-      // Proving tamper detection without adding production mutation surface:
-      // rebuild an equivalent chain from a snapshot and mutate the copy.
       const snapshot = audit.getRecords();
-      const clone = new AuditLogger();
-      const mutable = new Map();
-      for (const record of snapshot) {
-        mutable.set(record.sequenceNumber, record);
+      assert.ok(snapshot.length >= 1);
+
+      for (const index of [0, snapshot.length - 1]) {
+        const original = snapshot[index];
+        const forged = structuredClone(original);
+
+        // Change a field that participates in the record hash.
+        forged.policy.ruleId = 'FORGED_RULE';
+        assert.notEqual(forged.policy.ruleId, original.policy.ruleId, 'copy must diverge');
+
+        // Recompute the canonical hash EXACTLY as the logger does, using the
+        // record's own previousRecordHash, and prove the stored digest no longer
+        // matches the tampered content. This is what makes the copy detectably
+        // forged rather than merely different.
+        const recomputed = computeSha256(
+          canonicalJson({
+            ...forged,
+            integrity: { previousRecordHash: forged.integrity.previousRecordHash },
+          }),
+        );
+        assert.notEqual(
+          recomputed,
+          forged.integrity.recordHash,
+          'tampered content must not reproduce the stored hash',
+        );
+
+        // The pristine snapshot still reproduces its own stored hash, so the
+        // mismatch above comes from the tampering and not from a hashing quirk.
+        assert.equal(
+          computeSha256(
+            canonicalJson({
+              ...original,
+              integrity: { previousRecordHash: original.integrity.previousRecordHash },
+            }),
+          ),
+          original.integrity.recordHash,
+        );
       }
-      const forged = structuredClone(snapshot[0]);
-      forged.policy.ruleId = 'FORGED';
-      assert.notEqual(
-        forged.policy.ruleId,
-        snapshot[0].policy.ruleId,
-        'copy diverges from original',
-      );
-      assert.equal(await audit.verifyIntegrity(), true, 'authoritative chain is unaffected');
-      void clone;
-      void mutable;
+
+      // The authoritative chain is untouched by any of the above.
+      assert.equal(await audit.verifyIntegrity(), true);
     });
   });
 
@@ -1114,7 +1142,7 @@ describe('CesSpace ARC — RC-04 Task 5: Security Hardening & Approval Audit Lif
     });
 
     test('RC04-S-31: review memory is released on every terminal state', () => {
-      for (const terminal of ['APPROVED', 'REJECTED', 'EXPIRED', 'CONSUMED', 'INVALIDATED']) {
+      for (const terminal of ['APPROVED', 'REJECTED', 'CONSUMED', 'INVALIDATED']) {
         const manager = new ApprovalStateManager({ maxReviewBytesPerActor: 2048 });
         const binding = {
           actor: { clientId: 'c', clientType: 't' },
@@ -1142,7 +1170,7 @@ describe('CesSpace ARC — RC-04 Task 5: Security Hardening & Approval Audit Lif
             workspace: binding.workspace,
             policyHash: binding.policyHash,
           });
-        } else if (terminal === 'INVALIDATED') {
+        } else {
           const token = manager.approve(request.requestId).token;
           assert.throws(() =>
             manager.redeemAndConsume({
@@ -1154,23 +1182,6 @@ describe('CesSpace ARC — RC-04 Task 5: Security Hardening & Approval Audit Lif
               policyHash: 'f'.repeat(64),
             }),
           );
-        } else {
-          manager.clear();
-          const fresh = new ApprovalStateManager({ maxReviewBytesPerActor: 2048 });
-          fresh.createOrReusePending({
-            toolName: 'create_file',
-            executionPayloadHash: '1'.repeat(64),
-            binding,
-            reviewMaterial: 'B'.repeat(1024),
-          });
-          // Refill capacity proves the released bytes are usable.
-          fresh.createOrReusePending({
-            toolName: 'create_file',
-            executionPayloadHash: '2'.repeat(64),
-            binding,
-            reviewMaterial: 'B'.repeat(1024),
-          });
-          continue;
         }
 
         // Capacity was released: a fresh request of the same size is admitted.
@@ -1181,6 +1192,60 @@ describe('CesSpace ARC — RC-04 Task 5: Security Hardening & Approval Audit Lif
           reviewMaterial: 'B'.repeat(1024),
         });
       }
+    });
+
+    test('RC04-S-31b: a real expiry releases review quota on the SAME manager', () => {
+      let mono = 1_000_000n;
+      // 1024 bytes of review per request against a 2048-byte actor cap: the
+      // first request fits, and a second cannot be admitted until it expires.
+      const manager = new ApprovalStateManager({
+        getMonotonicTime: () => mono,
+        maxReviewBytesPerActor: 2048,
+      });
+      const binding = {
+        actor: { clientId: 'c', clientType: 't' },
+        workspace: { workspaceId: 'ws', workspaceRootHash: 'b'.repeat(64) },
+        policyHash: 'c'.repeat(64),
+      };
+
+      const first = manager.createOrReusePending({
+        toolName: 'create_file',
+        executionPayloadHash: '1'.repeat(64),
+        binding,
+        reviewMaterial: 'E'.repeat(1024),
+      });
+      assert.equal(manager.getRequest(first.requestId).state, 'PENDING');
+
+      // The quota is genuinely held: a second request that would exceed it is
+      // refused while the first is still live.
+      assert.throws(() =>
+        manager.createOrReusePending({
+          toolName: 'create_file',
+          executionPayloadHash: '2'.repeat(64),
+          binding,
+          reviewMaterial: 'E'.repeat(1536),
+        }),
+      );
+      assert.equal(manager.getRequest(first.requestId).state, 'PENDING');
+
+      // Advance past the exact deadline and let a real API drive the expiry.
+      mono += 301_000n * 1_000_000n;
+      manager.purgeExpired();
+      assert.equal(
+        manager.getRequest(first.requestId).state,
+        'EXPIRED',
+        'the same record must really be EXPIRED',
+      );
+
+      // No clear(), no second manager: the released bytes must be reusable here.
+      const second = manager.createOrReusePending({
+        toolName: 'create_file',
+        executionPayloadHash: '3'.repeat(64),
+        binding,
+        reviewMaterial: 'E'.repeat(1536),
+      });
+      assert.equal(manager.getRequest(second.requestId).state, 'PENDING');
+      assert.equal(manager.listActive().length, 1);
     });
   });
 
@@ -1395,6 +1460,114 @@ describe('CesSpace ARC — RC-04 Task 5: Security Hardening & Approval Audit Lif
       assert.equal(await audit.verifyIntegrity(), true);
     });
 
+    test('RC04-S-40: a stored error message is redacted centrally, for every caller', async () => {
+      const logger = new AuditLogger();
+      const marker = `rc0428-${crypto.randomBytes(8).toString('hex')}`;
+      const secret = `ghp_${'A'.repeat(36)}`;
+      const posixPath = `/tmp/${marker}/file.txt`;
+      const windowsPath = `C:\\Users\\${marker}\\file.txt`;
+
+      const baseRecord = (message, code) => ({
+        timestamp: new Date().toISOString(),
+        actor: { clientId: 'c', clientType: 't', deviceId: 'd', sessionId: 's' },
+        target: { workspaceId: 'ws', workspacePath: '' },
+        invocation: { toolName: 'read_file', parametersRedacted: {}, payloadHash: 'h' },
+        policy: { decision: 'ALLOW', ruleId: 'r', evaluationDurationMs: 0 },
+        execution: {
+          status: 'ERROR',
+          startTime: new Date().toISOString(),
+          endTime: new Date().toISOString(),
+          durationMs: 0,
+        },
+        error: { code, message },
+      });
+
+      await logger.log(baseRecord(`failure at ${posixPath} and ${secret}`, 'TEST'));
+      await logger.log(baseRecord(`windows failure at ${windowsPath}`, 'TEST'));
+
+      const stored = logger.getRecords();
+      const serialized = JSON.stringify(stored);
+      assert.ok(!serialized.includes(marker), 'no raw path fragment may be stored');
+      assert.ok(!serialized.includes(posixPath));
+      assert.ok(!serialized.includes(windowsPath));
+      assert.ok(!serialized.includes(secret), 'high-confidence secret must not be stored');
+      assert.ok(serialized.includes('[REDACTED_PATH]'));
+      assert.ok(serialized.includes('[REDACTED_SECRET]'));
+      // The bounded code is retained; only the message is redacted.
+      assert.equal(stored[0].error.code, 'TEST');
+      assert.equal(await logger.verifyIntegrity(), true);
+    });
+
+    test('RC04-S-41: a process lifecycle event cannot leak a host path', async () => {
+      const root = makeWorkspace('proc-redact');
+      const registry = new WorkspaceRegistry();
+      registry.registerWorkspace('ws', root);
+      const audit = new AuditLogger();
+      const sink = new ProcessAuditSink(audit, registry);
+
+      const marker = `rc0429-${crypto.randomBytes(8).toString('hex')}`;
+      const hostPath = `/home/${marker}/bin/exec`;
+
+      await sink.onProcessEvent({
+        eventType: 'PROCESS_SPAWN_FAILED',
+        timestamp: new Date().toISOString(),
+        processId: 'proc-1',
+        workspaceId: 'ws',
+        actor: { clientId: 'c', clientType: 't', deviceId: 'd', sessionId: 's' },
+        executable: hostPath,
+        durationMs: 5,
+        error: `spawn failed for ${hostPath}`,
+      });
+
+      const records = audit.getRecords();
+      assert.equal(records.length, 1);
+      const record = records[0];
+
+      // Every surface: the parameter projection, the top-level error message,
+      // the target, and the whole serialized record.
+      assert.ok(!JSON.stringify(record.invocation.parametersRedacted).includes(marker));
+      assert.ok(!record.error.message.includes(marker));
+      assert.ok(!JSON.stringify(record).includes(marker));
+      assert.ok(!JSON.stringify(record).includes(hostPath));
+      assert.ok(!JSON.stringify(record).includes(root));
+      assert.equal(record.target.workspacePath, '', 'raw workspace root is dropped');
+      assert.match(record.target.workspaceRootHash, /^[0-9a-f]{64}$/);
+      assert.equal(await audit.verifyIntegrity(), true);
+    });
+
+    test('RC04-S-38b: logger.log returns a defensive snapshot, not the stored object', async () => {
+      const logger = new AuditLogger();
+      const returned = await logger.log({
+        timestamp: new Date().toISOString(),
+        actor: { clientId: 'orig', clientType: 't', deviceId: 'd', sessionId: 's' },
+        target: { workspaceId: 'ws', workspacePath: '' },
+        invocation: { toolName: 'read_file', parametersRedacted: { a: 1 }, payloadHash: 'h' },
+        policy: { decision: 'ALLOW', ruleId: 'orig-rule', evaluationDurationMs: 0 },
+        execution: {
+          status: 'SUCCESS',
+          startTime: new Date().toISOString(),
+          endTime: new Date().toISOString(),
+          durationMs: 0,
+        },
+      });
+
+      // The returned object must be a SNAPSHOT. Mutating it (including nested
+      // objects) must not rewrite stored, hash-chained evidence.
+      returned.policy.ruleId = 'TAMPERED';
+      returned.actor.clientId = 'TAMPERED';
+      returned.invocation.parametersRedacted.a = 999;
+      returned.target.workspaceId = 'TAMPERED';
+      returned.integrity.recordHash = 'f'.repeat(64);
+
+      const stored = logger.getRecords()[0];
+      assert.equal(stored.policy.ruleId, 'orig-rule');
+      assert.equal(stored.actor.clientId, 'orig');
+      assert.equal(stored.invocation.parametersRedacted.a, 1);
+      assert.equal(stored.target.workspaceId, 'ws');
+      assert.notEqual(stored.integrity.recordHash, 'f'.repeat(64));
+      assert.equal(await logger.verifyIntegrity(), true, 'stored chain is untouched');
+    });
+
     test('RC04-S-38: a returned audit snapshot recomputes to the stored hash', async () => {
       const { server, approvals, audit } = makeServer({ label: 'hash-faithful' });
       const params = { path: 'hf.txt', content: 'x', workspaceId: 'ws' };
@@ -1415,6 +1588,129 @@ describe('CesSpace ARC — RC-04 Task 5: Security Hardening & Approval Audit Lif
         prevHash = record.integrity.recordHash;
       }
       assert.equal(await audit.verifyIntegrity(), true);
+    });
+
+    test('RC04-S-42: expiry evidence that cannot be written fails closed, state preserved', async () => {
+      let mono = 1_000_000n;
+      const manager = new ApprovalStateManager({ getMonotonicTime: () => mono });
+      const { server, approvals, audit, dir } = makeServer({ label: 'expiry-dup', manager });
+      const params = { path: 'exp.txt', content: 'x', workspaceId: 'ws' };
+
+      const first = await server.dispatchToolCall('create_file', { ...params });
+      const requestId = body(first).details.approvalRequestId;
+      const token = approvals.approve(requestId).token;
+      await server.flushAudit();
+
+      // Only the expiry lifecycle write is refused.
+      const realLog = audit.log.bind(audit);
+      audit.log = async (record) => {
+        if (record.approval?.eventType === 'APPROVAL_EXPIRED') {
+          throw new Error('chain unavailable');
+        }
+        return realLog(record);
+      };
+
+      mono += 301_000n * 1_000_000n;
+      const second = await server.dispatchToolCall('create_file', {
+        ...params,
+        _arcApproval: { requestId, token },
+      });
+      const secondBody = body(second);
+
+      // The semantic APPROVAL_EXPIRED outcome must NOT be reported while its
+      // required lifecycle evidence is missing.
+      assert.equal(second.isError, true);
+      assert.equal(secondBody.code, 'INTERNAL_ERROR');
+      assert.notEqual(secondBody.code, 'APPROVAL_EXPIRED');
+      // State is committed and NOT rolled back, and nothing executed.
+      assert.equal(approvals.getRequest(requestId).state, 'EXPIRED');
+      assert.equal(fs.existsSync(path.join(dir, 'exp.txt')), false);
+      assert.equal(eventsOf(audit).includes('APPROVAL_EXPIRED'), false);
+
+      // The evidence was retained, not dropped: a later flush commits it.
+      audit.log = realLog;
+      await server.flushAudit();
+      const expired = eventsOf(audit).filter((e) => e === 'APPROVAL_EXPIRED');
+      assert.equal(expired.length, 1);
+      assert.equal(approvals.getRequest(requestId).state, 'EXPIRED');
+      assert.equal(await audit.verifyIntegrity(), true);
+    });
+
+    test('RC04-S-43: invalidation evidence that cannot be written fails closed, state preserved', async () => {
+      const { server, approvals, audit, dir } = makeServer({ label: 'inval-dup' });
+      const params = { path: 'inv.txt', content: 'x', workspaceId: 'ws' };
+
+      // A record bound to a policy hash the live policy can never match.
+      const seeded = approvals.createOrReusePending({
+        toolName: 'create_file',
+        executionPayloadHash: 'a'.repeat(64),
+        binding: {
+          actor: { clientId: 'c', clientType: 't' },
+          workspace: { workspaceId: 'ws', workspaceRootHash: 'b'.repeat(64) },
+          policyHash: 'f'.repeat(64),
+        },
+        reviewMaterial: 'x',
+      });
+      const token = approvals.approve(seeded.requestId).token;
+      await server.flushAudit();
+
+      const realLog = audit.log.bind(audit);
+      audit.log = async (record) => {
+        if (record.approval?.eventType === 'APPROVAL_INVALIDATED') {
+          throw new Error('chain unavailable');
+        }
+        return realLog(record);
+      };
+
+      const second = await server.dispatchToolCall('create_file', {
+        ...params,
+        _arcApproval: { requestId: seeded.requestId, token },
+      });
+      const secondBody = body(second);
+
+      assert.equal(second.isError, true);
+      assert.equal(secondBody.code, 'INTERNAL_ERROR');
+      assert.notEqual(secondBody.code, 'APPROVAL_REJECTED');
+      // A policy-binding mismatch is permanent: the record stays INVALIDATED.
+      assert.equal(approvals.getRequest(seeded.requestId).state, 'INVALIDATED');
+      assert.equal(fs.existsSync(path.join(dir, 'inv.txt')), false);
+      assert.equal(eventsOf(audit).includes('APPROVAL_INVALIDATED'), false);
+
+      audit.log = realLog;
+      await server.flushAudit();
+      assert.equal(
+        eventsOf(audit).filter((e) => e === 'APPROVAL_INVALIDATED').length,
+        1,
+        'the retained invalidation evidence is committed exactly once',
+      );
+      assert.equal(await audit.verifyIntegrity(), true);
+    });
+
+    test('RC04-S-44: an ordinary invalid redemption keeps the generic rejection', async () => {
+      const { server, approvals, audit } = makeServer({ label: 'ordinary-deny' });
+      const params = { path: 'ord.txt', content: 'x', workspaceId: 'ws' };
+
+      const first = await server.dispatchToolCall('create_file', { ...params });
+      const requestId = body(first).details.approvalRequestId;
+      approvals.approve(requestId);
+      await server.flushAudit();
+
+      const before = eventsOf(audit).length;
+      // Wrong token: NO lifecycle transition is caused, so the generic
+      // rejection remains correct and no lifecycle event is owed.
+      const second = await server.dispatchToolCall('create_file', {
+        ...params,
+        _arcApproval: { requestId, token: '0'.repeat(64) },
+      });
+      assert.equal(body(second).code, 'APPROVAL_REJECTED');
+      assert.equal(body(second).code !== 'INTERNAL_ERROR', true);
+      assert.equal(eventsOf(audit).length, before, 'no lifecycle transition was caused');
+      assert.equal(approvals.getRequest(requestId).state, 'APPROVED');
+
+      // The internal reason stays on the ordinary record only.
+      const ordinary = invocations(audit).at(-1);
+      assert.equal(ordinary.approval.reasonCode, 'TOKEN_MISMATCH');
+      assert.equal(JSON.stringify(second).includes('TOKEN_MISMATCH'), false);
     });
   });
 });

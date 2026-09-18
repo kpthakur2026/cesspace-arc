@@ -71,12 +71,16 @@ export interface AdminIpcServerOptions {
   /** Injectable monotonic clock in milliseconds. Defaults to performance.now(). */
   getMonotonicTimeMs?: () => number;
   /**
-   * Audit logger used to commit approval lifecycle evidence. When supplied, the
-   * sink is flushed BEFORE an admin response is returned, so
-   * APPROVAL_GRANTED/REJECTED/EXPIRED evidence is durable before the operator
-   * observes the outcome. No raw token ever enters the sink.
+   * Audit logger used to commit approval lifecycle evidence. REQUIRED.
+   *
+   * There is deliberately no "no audit" mode. An admin channel can drive real
+   * state transitions (PENDING -> APPROVED and back out a raw token) and every
+   * one of them must be durable in an audit chain BEFORE the operator observes
+   * the result. A channel that could be constructed without audit capability
+   * would be an unaudited approval authority, so construction fails closed
+   * instead. No raw token ever enters the sink.
    */
-  auditLogger?: AuditLogger;
+  auditLogger: AuditLogger;
 }
 
 /** Machine-readable startup/socket failures. */
@@ -170,7 +174,7 @@ export class AdminIpcServer {
   private readonly approvalStateManager: ApprovalStateManager;
   private readonly getMonotonicTimeMs: () => number;
 
-  private readonly approvalAuditSink?: ApprovalAuditSink;
+  private readonly approvalAuditSink: ApprovalAuditSink;
   private server?: net.Server;
   private socketIdentity?: SocketIdentity;
   private started = false;
@@ -207,6 +211,23 @@ export class AdminIpcServer {
     }
     this.approvalStateManager = options.approvalStateManager;
 
+    // Fail closed: an admin channel that cannot commit lifecycle evidence would
+    // be an unaudited approval authority. There is no fallback and no "no sink"
+    // success path.
+    const auditLogger = options.auditLogger;
+    if (auditLogger === null || typeof auditLogger !== 'object') {
+      throw new AdminIpcError(
+        'Admin IPC requires an audit logger for approval lifecycle evidence.',
+        'AUDIT_LOGGER_MISSING',
+      );
+    }
+    if (typeof auditLogger.log !== 'function') {
+      throw new AdminIpcError(
+        'Admin IPC requires an audit logger for approval lifecycle evidence.',
+        'AUDIT_LOGGER_INVALID',
+      );
+    }
+
     const currentUid = typeof process.getuid === 'function' ? process.getuid() : undefined;
     this.endpoint = assertSafeEndpoint(options.endpoint, currentUid);
 
@@ -220,10 +241,8 @@ export class AdminIpcServer {
     // same logger would register a second lifecycle observer on the same
     // manager, and the manager emits one event per observer, so every
     // transition would be written to the chain twice.
-    if (options.auditLogger !== undefined) {
-      this.approvalAuditSink = getApprovalAuditSink(options.auditLogger);
-      this.approvalStateManager.registerLifecycleSink(this.approvalAuditSink);
-    }
+    this.approvalAuditSink = getApprovalAuditSink(auditLogger);
+    this.approvalStateManager.registerLifecycleSink(this.approvalAuditSink);
   }
 
   /** Starts listening. Rejects if the endpoint already exists for any reason. */
@@ -674,7 +693,7 @@ export class AdminIpcServer {
           return errorResponse('INVALID_ADMIN_REQUEST');
         }
       }
-      return await this.handleReject(params.requestId);
+      return await this.handleReject(params.requestId, params.reason);
     }
 
     return errorResponse('INVALID_ADMIN_REQUEST');
@@ -687,9 +706,8 @@ export class AdminIpcServer {
    * token or confirming a transition the audit chain does not record.
    */
   private async flushLifecycleAudit(): Promise<boolean> {
-    if (this.approvalAuditSink === undefined) {
-      return true;
-    }
+    // No "no sink" shortcut exists: the sink is mandatory, so a true result
+    // always means the evidence was actually committed.
     try {
       await this.approvalAuditSink.flush();
       return true;
@@ -784,25 +802,36 @@ export class AdminIpcServer {
       };
     } catch (err: unknown) {
       // A failure is not a reason to skip evidence: approve() runs lazy expiry
-      // first, so this path can have queued a real APPROVAL_EXPIRED. The action
-      // is already denied; commit what it discovered before answering.
-      await this.flushLifecycleAudit();
+      // first, so this path can have queued a real APPROVAL_EXPIRED.
+      //
+      // When that evidence cannot be committed, the semantic error (for example
+      // APPROVAL_EXPIRED) is NOT returned: the operator must not be told a
+      // definitive outcome the audit chain does not record. The state machine's
+      // truth is already committed and is NOT rolled back; the queued evidence
+      // is retained for a later retry.
+      if (!(await this.flushLifecycleAudit())) {
+        return errorResponse('INTERNAL_ERROR');
+      }
       return errorResponse(this.mapApprovalError(err));
     }
   }
 
-  private async handleReject(requestId: string): Promise<AdminResponse> {
+  private async handleReject(requestId: string, reason?: string): Promise<AdminResponse> {
     try {
-      // The operator-supplied reason is validated by the caller but is NOT
-      // persisted: only its presence is recorded. The text itself never enters
-      // the audit chain.
-      const snapshot = this.approvalStateManager.reject(requestId);
+      // The operator-supplied reason is validated by the caller but is NEVER
+      // persisted, audited, or logged: it can contain secrets or host paths.
+      // Only its PRESENCE is recorded, as a bounded boolean.
+      const snapshot = this.approvalStateManager.reject(requestId, reason);
       if (!(await this.flushLifecycleAudit())) {
         return errorResponse('INTERNAL_ERROR');
       }
       return { ok: true, result: { requestId: snapshot.requestId, state: snapshot.state } };
     } catch (err: unknown) {
-      await this.flushLifecycleAudit();
+      // See handleApprove: evidence that cannot be committed must not be
+      // papered over with a semantic outcome. State is preserved, not rolled back.
+      if (!(await this.flushLifecycleAudit())) {
+        return errorResponse('INTERNAL_ERROR');
+      }
       return errorResponse(this.mapApprovalError(err));
     }
   }

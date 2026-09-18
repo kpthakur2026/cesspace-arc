@@ -2313,10 +2313,33 @@ export class ArcMcpServer implements IArcMcpServer {
 
         // Expiry/invalidation discovered during redemption is lifecycle
         // evidence too, and must be committed before the rejection is returned.
+        //
+        // Which failure this was matters: POLICY_BINDING_MISMATCH permanently
+        // INVALIDATES the record, and APPROVAL_EXPIRED is a real EXPIRED
+        // transition. Both were committed to the state machine; only their
+        // evidence is at stake here.
+        let lifecycleEvidenceCommitted = true;
         try {
           await this.approvalAuditSink.flush();
         } catch {
-          // Evidence could not be written: still fail closed, still generic.
+          lifecycleEvidenceCommitted = false;
+        }
+
+        const causedLifecycleTransition =
+          internalReason === 'POLICY_BINDING_MISMATCH' || code === 'APPROVAL_EXPIRED';
+
+        if (!lifecycleEvidenceCommitted && causedLifecycleTransition) {
+          // The record is permanently EXPIRED/INVALIDATED and is NOT rolled
+          // back, but a semantic outcome (APPROVAL_EXPIRED / APPROVAL_REJECTED)
+          // must not be reported as though its required lifecycle evidence were
+          // durable. The queued evidence is retained for a later retry.
+          const auditError = ArcError.internalError(
+            'Required approval audit evidence could not be recorded.',
+          );
+          return {
+            isError: true,
+            content: [{ type: 'text', text: JSON.stringify(auditError.toJSON(), null, 2) }],
+          };
         }
 
         return {

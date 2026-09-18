@@ -278,6 +278,7 @@ describe('CesSpace ARC — RC-04 Task 3: Authenticated Local Admin Channel', () 
       const operator = generateOperator();
       const manager = new ApprovalStateManager();
       const server = new AdminIpcServer({
+        auditLogger: new AuditLogger(),
         endpoint,
         operatorPublicKeyB64: operator.publicKeyB64,
         approvalStateManager: manager,
@@ -321,6 +322,7 @@ describe('CesSpace ARC — RC-04 Task 3: Authenticated Local Admin Channel', () 
       operator = generateOperator();
       manager = new ApprovalStateManager();
       server = new AdminIpcServer({
+        auditLogger: new AuditLogger(),
         endpoint,
         operatorPublicKeyB64: operator.publicKeyB64,
         approvalStateManager: manager,
@@ -463,6 +465,7 @@ describe('CesSpace ARC — RC-04 Task 3: Authenticated Local Admin Channel', () 
       const clockDir = makeSecureDir('clock');
       const clockEndpoint = socketPathIn(clockDir);
       const clockServer = new AdminIpcServer({
+        auditLogger: new AuditLogger(),
         endpoint: clockEndpoint,
         operatorPublicKeyB64: operator.publicKeyB64,
         approvalStateManager: clockManager,
@@ -555,6 +558,7 @@ describe('CesSpace ARC — RC-04 Task 3: Authenticated Local Admin Channel', () 
       operator = generateOperator();
       manager = new ApprovalStateManager();
       server = new AdminIpcServer({
+        auditLogger: new AuditLogger(),
         endpoint,
         operatorPublicKeyB64: operator.publicKeyB64,
         approvalStateManager: manager,
@@ -746,6 +750,7 @@ describe('CesSpace ARC — RC-04 Task 3: Authenticated Local Admin Channel', () 
       operator = generateOperator();
       manager = new ApprovalStateManager();
       server = new AdminIpcServer({
+        auditLogger: new AuditLogger(),
         endpoint,
         operatorPublicKeyB64: operator.publicKeyB64,
         approvalStateManager: manager,
@@ -865,6 +870,7 @@ describe('CesSpace ARC — RC-04 Task 3: Authenticated Local Admin Channel', () 
       const clockDir = makeSecureDir('expire');
       const clockEndpoint = socketPathIn(clockDir);
       const clockServer = new AdminIpcServer({
+        auditLogger: new AuditLogger(),
         endpoint: clockEndpoint,
         operatorPublicKeyB64: operator.publicKeyB64,
         approvalStateManager: clockManager,
@@ -1107,6 +1113,153 @@ describe('CesSpace ARC — RC-04 Task 3: Authenticated Local Admin Channel', () 
       assert.equal(response.result.token, undefined);
       assert.ok(!JSON.stringify(response).includes('"token"'));
     });
+
+    test('RC04-A-56: an admin result whose evidence cannot be committed fails closed', async () => {
+      for (const method of ['approval.approve', 'approval.reject']) {
+        let nowMs = 1_000_000;
+        const audit = new AuditLogger();
+        const clockManager = new ApprovalStateManager({
+          getMonotonicTime: () => BigInt(nowMs) * 1_000_000n,
+        });
+        const clockDir = makeSecureDir(`auditfail-${method.replace('.', '-')}`);
+        const clockEndpoint = socketPathIn(clockDir);
+        const clockServer = new AdminIpcServer({
+          auditLogger: audit,
+          endpoint: clockEndpoint,
+          operatorPublicKeyB64: operator.publicKeyB64,
+          approvalStateManager: clockManager,
+        });
+        await clockServer.start();
+        try {
+          const seeded = seedPending(clockManager);
+          nowMs += 301_000;
+
+          // Only the expiry lifecycle write is refused: the operator's action
+          // discovers a REAL transition that cannot be recorded.
+          const realLog = audit.log.bind(audit);
+          audit.log = async (record) => {
+            if (record.approval?.eventType === 'APPROVAL_EXPIRED') {
+              throw new Error('chain unavailable');
+            }
+            return realLog(record);
+          };
+
+          const response = await adminRequest(clockEndpoint, operator.privateKey, method, {
+            requestId: seeded.requestId,
+          });
+
+          // The semantic outcome must NOT be reported while its evidence is
+          // missing, and no token may escape.
+          assert.equal(response.ok, false);
+          assert.equal(response.error.code, 'INTERNAL_ERROR', `${method} must fail closed`);
+          assert.notEqual(response.error.code, 'APPROVAL_EXPIRED');
+          assert.ok(!JSON.stringify(response).includes('"token"'));
+          // The state machine's truth is preserved, never rolled back.
+          assert.equal(clockManager.getRequest(seeded.requestId).state, 'EXPIRED');
+
+          // The evidence was retained, not dropped: a later flush commits it.
+          audit.log = realLog;
+          await clockServer.stop();
+          const events = audit
+            .getRecords()
+            .filter((r) => r.approval?.eventType)
+            .map((r) => r.approval.eventType);
+          assert.deepEqual(events, ['APPROVAL_REQUESTED', 'APPROVAL_EXPIRED']);
+          assert.equal(await audit.verifyIntegrity(), true);
+        } finally {
+          await clockServer.stop();
+          fs.rmSync(clockDir, { recursive: true, force: true });
+        }
+      }
+    });
+
+    test('RC04-A-57: an admin channel cannot exist without audit capability', async () => {
+      const auditDir = makeSecureDir('no-audit');
+      const noAuditEndpoint = socketPathIn(auditDir);
+      const base = {
+        endpoint: noAuditEndpoint,
+        operatorPublicKeyB64: operator.publicKeyB64,
+        approvalStateManager: manager,
+      };
+
+      // No mode exists in which administrative transitions are permitted while
+      // lifecycle evidence is treated as committed.
+      assert.throws(
+        () => new AdminIpcServer({ ...base }),
+        (err) => err instanceof AdminIpcError && err.reason === 'AUDIT_LOGGER_MISSING',
+      );
+      assert.throws(
+        () => new AdminIpcServer({ ...base, auditLogger: undefined }),
+        (err) => err instanceof AdminIpcError && err.reason === 'AUDIT_LOGGER_MISSING',
+      );
+      assert.throws(
+        () => new AdminIpcServer({ ...base, auditLogger: null }),
+        (err) => err instanceof AdminIpcError && err.reason === 'AUDIT_LOGGER_MISSING',
+      );
+      assert.throws(
+        () => new AdminIpcServer({ ...base, auditLogger: {} }),
+        (err) => err instanceof AdminIpcError && err.reason === 'AUDIT_LOGGER_INVALID',
+      );
+
+      // Every rejected construction failed before touching the filesystem.
+      assert.equal(fs.existsSync(noAuditEndpoint), false);
+      fs.rmSync(auditDir, { recursive: true, force: true });
+    });
+
+    test('RC04-A-58: an operator reason is recorded only as its presence', async () => {
+      const reasonAudit = new AuditLogger();
+      const reasonDir = makeSecureDir('reason');
+      const reasonEndpoint = socketPathIn(reasonDir);
+      const reasonServer = new AdminIpcServer({
+        auditLogger: reasonAudit,
+        endpoint: reasonEndpoint,
+        operatorPublicKeyB64: operator.publicKeyB64,
+        approvalStateManager: manager,
+      });
+      await reasonServer.start();
+      try {
+        const marker = `RC04_ADMIN_REASON_MARKER_${crypto.randomBytes(6).toString('hex')}`;
+        const withReason = seedPending(manager);
+        const response = await adminRequest(
+          reasonEndpoint,
+          operator.privateKey,
+          'approval.reject',
+          {
+            requestId: withReason.requestId,
+            reason: marker,
+          },
+        );
+        assert.equal(response.ok, true);
+        assert.equal(response.result.state, 'REJECTED');
+
+        const rejected = reasonAudit
+          .getRecords()
+          .filter((r) => r.approval?.eventType === 'APPROVAL_REJECTED');
+        assert.equal(rejected.length, 1);
+        assert.equal(rejected[0].approval.operatorReasonProvided, true);
+        assert.equal(
+          JSON.stringify(reasonAudit.getRecords()).includes(marker),
+          false,
+          'the reason text is never persisted or audited',
+        );
+
+        // Without a reason the boolean is truthfully false, not merely absent.
+        const withoutReason = seedPending(manager);
+        const plain = await adminRequest(reasonEndpoint, operator.privateKey, 'approval.reject', {
+          requestId: withoutReason.requestId,
+        });
+        assert.equal(plain.ok, true);
+        const all = reasonAudit
+          .getRecords()
+          .filter((r) => r.approval?.eventType === 'APPROVAL_REJECTED');
+        assert.equal(all.length, 2);
+        assert.equal(all[1].approval.operatorReasonProvided, false);
+        assert.equal(await reasonAudit.verifyIntegrity(), true);
+      } finally {
+        await reasonServer.stop();
+        fs.rmSync(reasonDir, { recursive: true, force: true });
+      }
+    });
   });
 
   // =========================================================================
@@ -1120,6 +1273,7 @@ describe('CesSpace ARC — RC-04 Task 3: Authenticated Local Admin Channel', () 
       const operator = generateOperator();
       const manager = new ApprovalStateManager();
       const server = new AdminIpcServer({
+        auditLogger: new AuditLogger(),
         endpoint,
         operatorPublicKeyB64: operator.publicKeyB64,
         approvalStateManager: manager,
@@ -1168,6 +1322,7 @@ describe('CesSpace ARC — RC-04 Task 3: Authenticated Local Admin Channel', () 
       const operator = generateOperator();
       const manager = new ApprovalStateManager();
       const server = new AdminIpcServer({
+        auditLogger: new AuditLogger(),
         endpoint,
         operatorPublicKeyB64: operator.publicKeyB64,
         approvalStateManager: manager,
@@ -1199,6 +1354,7 @@ describe('CesSpace ARC — RC-04 Task 3: Authenticated Local Admin Channel', () 
       const operator = generateOperator();
       const manager = new ApprovalStateManager();
       const server = new AdminIpcServer({
+        auditLogger: new AuditLogger(),
         endpoint,
         operatorPublicKeyB64: operator.publicKeyB64,
         approvalStateManager: manager,
@@ -1228,6 +1384,7 @@ describe('CesSpace ARC — RC-04 Task 3: Authenticated Local Admin Channel', () 
       const operator = generateOperator();
       const manager = new ApprovalStateManager();
       const server = new AdminIpcServer({
+        auditLogger: new AuditLogger(),
         endpoint,
         operatorPublicKeyB64: operator.publicKeyB64,
         approvalStateManager: manager,
@@ -1262,6 +1419,7 @@ describe('CesSpace ARC — RC-04 Task 3: Authenticated Local Admin Channel', () 
         const operator = generateOperator();
         const manager = new ApprovalStateManager();
         const server = new AdminIpcServer({
+          auditLogger: new AuditLogger(),
           endpoint,
           operatorPublicKeyB64: operator.publicKeyB64,
           approvalStateManager: manager,
@@ -1288,6 +1446,7 @@ describe('CesSpace ARC — RC-04 Task 3: Authenticated Local Admin Channel', () 
         assert.throws(
           () =>
             new AdminIpcServer({
+              auditLogger: new AuditLogger(),
               endpoint: socketPathIn(permissive),
               operatorPublicKeyB64: operator.publicKeyB64,
               approvalStateManager: manager,
@@ -1308,6 +1467,7 @@ describe('CesSpace ARC — RC-04 Task 3: Authenticated Local Admin Channel', () 
       assert.throws(
         () =>
           new AdminIpcServer({
+            auditLogger: new AuditLogger(),
             endpoint: socketPathIn(linkParent),
             operatorPublicKeyB64: operator.publicKeyB64,
             approvalStateManager: manager,
@@ -1328,6 +1488,7 @@ describe('CesSpace ARC — RC-04 Task 3: Authenticated Local Admin Channel', () 
         assert.throws(
           () =>
             new AdminIpcServer({
+              auditLogger: new AuditLogger(),
               endpoint: 'relative/admin.sock',
               operatorPublicKeyB64: operator.publicKeyB64,
               approvalStateManager: manager,
@@ -1340,6 +1501,7 @@ describe('CesSpace ARC — RC-04 Task 3: Authenticated Local Admin Channel', () 
         assert.throws(
           () =>
             new AdminIpcServer({
+              auditLogger: new AuditLogger(),
               endpoint: longEndpoint,
               operatorPublicKeyB64: operator.publicKeyB64,
               approvalStateManager: manager,
@@ -1360,6 +1522,7 @@ describe('CesSpace ARC — RC-04 Task 3: Authenticated Local Admin Channel', () 
         const operator = generateOperator();
         const manager = new ApprovalStateManager();
         const server = new AdminIpcServer({
+          auditLogger: new AuditLogger(),
           endpoint,
           operatorPublicKeyB64: operator.publicKeyB64,
           approvalStateManager: manager,
@@ -1383,6 +1546,7 @@ describe('CesSpace ARC — RC-04 Task 3: Authenticated Local Admin Channel', () 
         const operator = generateOperator();
 
         const first = new AdminIpcServer({
+          auditLogger: new AuditLogger(),
           endpoint,
           operatorPublicKeyB64: operator.publicKeyB64,
           approvalStateManager: new ApprovalStateManager(),
@@ -1390,6 +1554,7 @@ describe('CesSpace ARC — RC-04 Task 3: Authenticated Local Admin Channel', () 
         await first.start();
 
         const second = new AdminIpcServer({
+          auditLogger: new AuditLogger(),
           endpoint,
           operatorPublicKeyB64: operator.publicKeyB64,
           approvalStateManager: new ApprovalStateManager(),
@@ -1422,6 +1587,7 @@ describe('CesSpace ARC — RC-04 Task 3: Authenticated Local Admin Channel', () 
         const endpoint = socketPathIn(dir);
         const operator = generateOperator();
         const server = new AdminIpcServer({
+          auditLogger: new AuditLogger(),
           endpoint,
           operatorPublicKeyB64: operator.publicKeyB64,
           approvalStateManager: new ApprovalStateManager(),
@@ -1442,6 +1608,7 @@ describe('CesSpace ARC — RC-04 Task 3: Authenticated Local Admin Channel', () 
         const endpoint = socketPathIn(dir);
         const operator = generateOperator();
         const server = new AdminIpcServer({
+          auditLogger: new AuditLogger(),
           endpoint,
           operatorPublicKeyB64: operator.publicKeyB64,
           approvalStateManager: new ApprovalStateManager(),
@@ -1466,6 +1633,7 @@ describe('CesSpace ARC — RC-04 Task 3: Authenticated Local Admin Channel', () 
       assert.throws(
         () =>
           new AdminIpcServer({
+            auditLogger: new AuditLogger(),
             endpoint: path.join(tempRoot, 'does-not-exist', 'admin.sock'),
             operatorPublicKeyB64: operator.publicKeyB64,
             approvalStateManager: new ApprovalStateManager(),
@@ -1480,6 +1648,7 @@ describe('CesSpace ARC — RC-04 Task 3: Authenticated Local Admin Channel', () 
         assert.throws(
           () =>
             new AdminIpcServer({
+              auditLogger: new AuditLogger(),
               endpoint: socketPathIn(dir),
               operatorPublicKeyB64: key,
               approvalStateManager: new ApprovalStateManager(),
@@ -1497,6 +1666,7 @@ describe('CesSpace ARC — RC-04 Task 3: Authenticated Local Admin Channel', () 
       assert.throws(
         () =>
           new AdminIpcServer({
+            auditLogger: new AuditLogger(),
             endpoint: socketPathIn(dir),
             operatorPublicKeyB64: rsaPublic,
             approvalStateManager: new ApprovalStateManager(),
@@ -1580,6 +1750,7 @@ describe('CesSpace ARC — RC-04 Task 3: Authenticated Local Admin Channel', () 
       const targetPath = path.join(workspaceDir, 'should-not-exist.txt');
 
       const server = new AdminIpcServer({
+        auditLogger: new AuditLogger(),
         endpoint,
         operatorPublicKeyB64: operator.publicKeyB64,
         approvalStateManager: manager,
@@ -1622,6 +1793,7 @@ describe('CesSpace ARC — RC-04 Task 3: Authenticated Local Admin Channel', () 
 
       const approvals = new ApprovalStateManager();
       const adminServer = new AdminIpcServer({
+        auditLogger: new AuditLogger(),
         endpoint,
         operatorPublicKeyB64: operator.publicKeyB64,
         approvalStateManager: approvals,

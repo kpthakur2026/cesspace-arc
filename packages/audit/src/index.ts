@@ -72,6 +72,17 @@ export function redactValue(value: unknown): unknown {
 }
 
 /**
+ * Central string redaction for free-text fields that reach a stored record.
+ *
+ * Applies the same absolute-path and secret-pattern redaction used for
+ * parameter values, so any string a caller supplies is sanitized in one place.
+ */
+export function redactString(value: string): string {
+  const redacted = redactValue(value);
+  return typeof redacted === 'string' ? redacted : value;
+}
+
+/**
  * Copies a bounded, known record shape so a caller mutating its input object
  * after log() cannot alter historical chain content (rc04 §64).
  *
@@ -209,6 +220,15 @@ export class AuditLogger implements IAuditLogger {
     const parametersRedacted = this.redact(recordData.invocation.parametersRedacted);
     const fallbackPayloadHash = computeSha256(canonicalJson(parametersRedacted));
 
+    // Central defense-in-depth for the top-level error message. Redaction is
+    // applied HERE, for every caller, so a writer that forgets cannot leak an
+    // absolute host path or a high-confidence secret into a stored record. This
+    // covers ProcessAuditSink and any future writer, not only ArcMcpServer.
+    const errorRecord = recordData.error ? copyBounded(recordData.error) : undefined;
+    if (errorRecord !== undefined) {
+      errorRecord.message = redactString(errorRecord.message);
+    }
+
     const baseRecord: AuditRecord = {
       eventId,
       timestamp: recordData.timestamp,
@@ -222,7 +242,7 @@ export class AuditLogger implements IAuditLogger {
       },
       policy: copyBounded(recordData.policy),
       execution: copyBounded(recordData.execution),
-      error: recordData.error ? copyBounded(recordData.error) : undefined,
+      error: errorRecord,
       approval: recordData.approval ? copyBounded(recordData.approval) : undefined,
       integrity: {
         previousRecordHash,
@@ -241,7 +261,13 @@ export class AuditLogger implements IAuditLogger {
     this.lastRecordHash = currentHash;
 
     this.records.push(baseRecord);
-    return baseRecord;
+    // The AUTHORITATIVE record is retained internally; the caller receives a
+    // defensive, hash-faithful snapshot. Returning `baseRecord` itself would
+    // hand out a live reference into the hash chain, so a caller could mutate
+    // `returned.policy.ruleId` (or any nested object) and silently rewrite
+    // stored evidence while `verifyIntegrity()` still reported the tampered
+    // content as valid.
+    return copyBounded(baseRecord);
   }
 
   public redact(payload: Record<string, unknown>): Record<string, unknown> {
