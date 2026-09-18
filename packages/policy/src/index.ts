@@ -522,3 +522,5 @@ export {
 };
 
 export * from './approval-state.js';
+export * from './restricted-glob.js';
+export * from './declarative-policy.js';
