@@ -260,9 +260,7 @@ export class ApprovalStateManager {
     record: InternalApprovalRecord,
     terminalState: 'REJECTED' | 'EXPIRED' | 'CONSUMED' | 'INVALIDATED',
   ): void {
-    const previousState = record.state;
-    if (previousState !== 'PENDING' && previousState !== 'APPROVED') {
-      record.state = terminalState;
+    if (record.state !== 'PENDING' && record.state !== 'APPROVED') {
       return;
     }
 

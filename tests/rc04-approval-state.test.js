@@ -1704,4 +1704,270 @@ describe('CesSpace ARC — RC-04 Task 1: Approval State Machine Core', () => {
       (err) => err.code === 'RESOURCE_EXHAUSTED',
     );
   });
+
+  test('Group 3: Terminal states (REJECTED, CONSUMED, INVALIDATED, EXPIRED) have ZERO transitions out and maintain accounting invariants', () => {
+    let fakeNowMono = 10_000_000_000n;
+    let fakeNowWall = 1_700_000_000_000;
+    const manager = new ApprovalStateManager({
+      maxActiveApprovalsGlobal: 1,
+      getMonotonicTime: () => fakeNowMono,
+      getWallTime: () => fakeNowWall,
+    });
+
+    // 1. REJECTED
+    {
+      const snap = manager.createOrReusePending(
+        createSampleInput({ executionPayloadHash: '1'.repeat(64) }),
+      );
+      manager.reject(snap.requestId);
+      assert.equal(manager.getRequest(snap.requestId).state, 'REJECTED');
+
+      // Attempt approve -> throws APPROVAL_REJECTED
+      assert.throws(
+        () => manager.approve(snap.requestId),
+        (err) => err.code === 'APPROVAL_REJECTED',
+      );
+      assert.equal(manager.getRequest(snap.requestId).state, 'REJECTED');
+
+      // Attempt reject again -> throws APPROVAL_REJECTED
+      assert.throws(
+        () => manager.reject(snap.requestId),
+        (err) => err.code === 'APPROVAL_REJECTED',
+      );
+      assert.equal(manager.getRequest(snap.requestId).state, 'REJECTED');
+
+      // Attempt redeemAndConsume -> throws APPROVAL_REJECTED
+      assert.throws(
+        () =>
+          manager.redeemAndConsume({
+            requestId: snap.requestId,
+            token: 'a'.repeat(64),
+            executionPayloadHash: snap.executionPayloadHash,
+            actor: snap.binding.actor,
+            workspace: snap.binding.workspace,
+            policyHash: snap.binding.policyHash,
+          }),
+        (err) => err.code === 'APPROVAL_REJECTED',
+      );
+      assert.equal(manager.getRequest(snap.requestId).state, 'REJECTED');
+
+      // Advance clock past TTL and run purgeExpired
+      fakeNowMono += 400_000_000_000n;
+      fakeNowWall += 400_000;
+      const purged = manager.purgeExpired();
+      assert.equal(purged, 0);
+      assert.equal(manager.getRequest(snap.requestId).state, 'REJECTED');
+
+      // Verify active accounting quota is not corrupted or double-decremented
+      // Max global is 1, so exactly 1 new request can be admitted
+      const nextSnap = manager.createOrReusePending(
+        createSampleInput({ executionPayloadHash: '2'.repeat(64) }),
+      );
+      assert.ok(nextSnap);
+      assert.throws(
+        () =>
+          manager.createOrReusePending(createSampleInput({ executionPayloadHash: '3'.repeat(64) })),
+        (err) => err.code === 'RESOURCE_EXHAUSTED',
+      );
+      manager.clear();
+    }
+
+    // 2. CONSUMED
+    {
+      const snap = manager.createOrReusePending(
+        createSampleInput({ executionPayloadHash: '1'.repeat(64) }),
+      );
+      const grant = manager.approve(snap.requestId);
+      const result = manager.redeemAndConsume({
+        requestId: snap.requestId,
+        token: grant.token,
+        executionPayloadHash: snap.executionPayloadHash,
+        actor: snap.binding.actor,
+        workspace: snap.binding.workspace,
+        policyHash: snap.binding.policyHash,
+      });
+      assert.equal(result.consumed, true);
+      assert.equal(manager.getRequest(snap.requestId).state, 'CONSUMED');
+
+      // Attempt approve -> throws APPROVAL_REJECTED
+      assert.throws(
+        () => manager.approve(snap.requestId),
+        (err) => err.code === 'APPROVAL_REJECTED',
+      );
+      assert.equal(manager.getRequest(snap.requestId).state, 'CONSUMED');
+
+      // Attempt reject -> throws APPROVAL_REJECTED
+      assert.throws(
+        () => manager.reject(snap.requestId),
+        (err) => err.code === 'APPROVAL_REJECTED',
+      );
+      assert.equal(manager.getRequest(snap.requestId).state, 'CONSUMED');
+
+      // Replay redemption -> throws APPROVAL_REJECTED
+      assert.throws(
+        () =>
+          manager.redeemAndConsume({
+            requestId: snap.requestId,
+            token: grant.token,
+            executionPayloadHash: snap.executionPayloadHash,
+            actor: snap.binding.actor,
+            workspace: snap.binding.workspace,
+            policyHash: snap.binding.policyHash,
+          }),
+        (err) => err.code === 'APPROVAL_REJECTED',
+      );
+      assert.equal(manager.getRequest(snap.requestId).state, 'CONSUMED');
+
+      // Advance clock past TTL and run purgeExpired
+      fakeNowMono += 400_000_000_000n;
+      fakeNowWall += 400_000;
+      const purged = manager.purgeExpired();
+      assert.equal(purged, 0);
+      assert.equal(manager.getRequest(snap.requestId).state, 'CONSUMED');
+
+      // Accounting check: exactly 1 request can be admitted
+      const nextSnap = manager.createOrReusePending(
+        createSampleInput({ executionPayloadHash: '2'.repeat(64) }),
+      );
+      assert.ok(nextSnap);
+      assert.throws(
+        () =>
+          manager.createOrReusePending(createSampleInput({ executionPayloadHash: '3'.repeat(64) })),
+        (err) => err.code === 'RESOURCE_EXHAUSTED',
+      );
+      manager.clear();
+    }
+
+    // 3. INVALIDATED
+    {
+      const snap = manager.createOrReusePending(
+        createSampleInput({ executionPayloadHash: '1'.repeat(64) }),
+      );
+      const grant = manager.approve(snap.requestId);
+
+      // Trigger INVALIDATED via policyHash mismatch
+      assert.throws(
+        () =>
+          manager.redeemAndConsume({
+            requestId: snap.requestId,
+            token: grant.token,
+            executionPayloadHash: snap.executionPayloadHash,
+            actor: snap.binding.actor,
+            workspace: snap.binding.workspace,
+            policyHash: 'f'.repeat(64), // Mismatch
+          }),
+        (err) => err.code === 'APPROVAL_REJECTED',
+      );
+      assert.equal(manager.getRequest(snap.requestId).state, 'INVALIDATED');
+
+      // Attempt approve -> throws APPROVAL_REJECTED
+      assert.throws(
+        () => manager.approve(snap.requestId),
+        (err) => err.code === 'APPROVAL_REJECTED',
+      );
+      assert.equal(manager.getRequest(snap.requestId).state, 'INVALIDATED');
+
+      // Attempt reject -> throws APPROVAL_REJECTED
+      assert.throws(
+        () => manager.reject(snap.requestId),
+        (err) => err.code === 'APPROVAL_REJECTED',
+      );
+      assert.equal(manager.getRequest(snap.requestId).state, 'INVALIDATED');
+
+      // Attempt redemption under original policy -> throws APPROVAL_REJECTED
+      assert.throws(
+        () =>
+          manager.redeemAndConsume({
+            requestId: snap.requestId,
+            token: grant.token,
+            executionPayloadHash: snap.executionPayloadHash,
+            actor: snap.binding.actor,
+            workspace: snap.binding.workspace,
+            policyHash: snap.binding.policyHash, // Original policy
+          }),
+        (err) => err.code === 'APPROVAL_REJECTED',
+      );
+      assert.equal(manager.getRequest(snap.requestId).state, 'INVALIDATED');
+
+      // Advance clock past TTL and run purgeExpired
+      fakeNowMono += 400_000_000_000n;
+      fakeNowWall += 400_000;
+      const purged = manager.purgeExpired();
+      assert.equal(purged, 0);
+      assert.equal(manager.getRequest(snap.requestId).state, 'INVALIDATED');
+
+      // Accounting check: exactly 1 request can be admitted
+      const nextSnap = manager.createOrReusePending(
+        createSampleInput({ executionPayloadHash: '2'.repeat(64) }),
+      );
+      assert.ok(nextSnap);
+      assert.throws(
+        () =>
+          manager.createOrReusePending(createSampleInput({ executionPayloadHash: '3'.repeat(64) })),
+        (err) => err.code === 'RESOURCE_EXHAUSTED',
+      );
+      manager.clear();
+    }
+
+    // 4. EXPIRED
+    {
+      const snap = manager.createOrReusePending(
+        createSampleInput({ executionPayloadHash: '1'.repeat(64) }),
+      );
+
+      // Advance clock past TTL (300 seconds)
+      fakeNowMono += 300_000_000_000n;
+      fakeNowWall += 300_000;
+
+      // Lazy check triggers EXPIRED
+      assert.equal(manager.getRequest(snap.requestId).state, 'EXPIRED');
+
+      // Attempt approve -> throws APPROVAL_EXPIRED
+      assert.throws(
+        () => manager.approve(snap.requestId),
+        (err) => err.code === 'APPROVAL_EXPIRED',
+      );
+      assert.equal(manager.getRequest(snap.requestId).state, 'EXPIRED');
+
+      // Attempt reject -> throws APPROVAL_EXPIRED
+      assert.throws(
+        () => manager.reject(snap.requestId),
+        (err) => err.code === 'APPROVAL_EXPIRED',
+      );
+      assert.equal(manager.getRequest(snap.requestId).state, 'EXPIRED');
+
+      // Attempt redemption -> throws APPROVAL_EXPIRED
+      assert.throws(
+        () =>
+          manager.redeemAndConsume({
+            requestId: snap.requestId,
+            token: 'a'.repeat(64),
+            executionPayloadHash: snap.executionPayloadHash,
+            actor: snap.binding.actor,
+            workspace: snap.binding.workspace,
+            policyHash: snap.binding.policyHash,
+          }),
+        (err) => err.code === 'APPROVAL_EXPIRED',
+      );
+      assert.equal(manager.getRequest(snap.requestId).state, 'EXPIRED');
+
+      // Advance clock further and run purgeExpired
+      fakeNowMono += 200_000_000_000n;
+      fakeNowWall += 200_000;
+      const purged = manager.purgeExpired();
+      assert.equal(purged, 0);
+      assert.equal(manager.getRequest(snap.requestId).state, 'EXPIRED');
+
+      // Accounting check: exactly 1 request can be admitted
+      const nextSnap = manager.createOrReusePending(
+        createSampleInput({ executionPayloadHash: '2'.repeat(64) }),
+      );
+      assert.ok(nextSnap);
+      assert.throws(
+        () =>
+          manager.createOrReusePending(createSampleInput({ executionPayloadHash: '3'.repeat(64) })),
+        (err) => err.code === 'RESOURCE_EXHAUSTED',
+      );
+    }
+  });
 });
