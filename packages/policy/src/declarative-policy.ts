@@ -298,15 +298,23 @@ const YAML_PARSE_OPTIONS = {
 
 /**
  * Checks node-level structures that are forbidden by rc04 §8.1.
- * Operates on parser AST nodes only — never on raw source text — so quoted
- * scalar text and comments can never be mistaken for anchor/alias syntax.
+ *
+ * Accepts any value so it can be applied at EVERY AST position that can carry
+ * node properties — mapping keys included, not only values, sequence items, and
+ * collection nodes. Operates on parser AST nodes only, never on raw source
+ * text, so quoted scalar text and comments can never be mistaken for
+ * anchor/alias syntax.
  */
-function assertNodePermitted(node: { anchor?: unknown; tag?: unknown; type?: string }): void {
-  if (typeof node.anchor === 'string' && node.anchor.length > 0) {
+function assertNodePermitted(node: unknown): void {
+  if (node === null || typeof node !== 'object') {
+    return;
+  }
+  const candidate = node as { anchor?: unknown; tag?: unknown };
+  if (typeof candidate.anchor === 'string' && candidate.anchor.length > 0) {
     throw parseError('FORBIDDEN_YAML_ANCHOR');
   }
-  if (typeof node.tag === 'string' && node.tag.length > 0) {
-    if (!ALLOWED_EXPLICIT_TAGS.has(node.tag)) {
+  if (typeof candidate.tag === 'string' && candidate.tag.length > 0) {
+    if (!ALLOWED_EXPLICIT_TAGS.has(candidate.tag)) {
       throw parseError('FORBIDDEN_YAML_TAG');
     }
   }
@@ -362,10 +370,22 @@ function astToJsonValue(node: unknown, depth: number): PolicyJsonValue {
       if (!isPair(item)) {
         throw parseError('MALFORMED_DOCUMENT');
       }
-      if (!isScalar(item.key) || typeof item.key.value !== 'string') {
+
+      // A mapping key is a YAML node in its own right and must receive exactly
+      // the same fail-closed inspection as a mapping value. An anchor or a
+      // forbidden tag attached to a key is rejected here, and is never accepted
+      // merely because the key's resolved text happens to be an otherwise-valid
+      // schema key such as `version`, `rules`, `id`, or `effect`.
+      const keyNode = item.key;
+      if (isAlias(keyNode)) {
+        // Rejected without expanding the alias.
+        throw parseError('FORBIDDEN_YAML_ALIAS');
+      }
+      assertNodePermitted(keyNode);
+      if (!isScalar(keyNode) || typeof keyNode.value !== 'string') {
         throw parseError('MALFORMED_DOCUMENT');
       }
-      const key = item.key.value;
+      const key = keyNode.value;
       if (FORBIDDEN_MAPPING_KEYS.has(key)) {
         throw parseError(key === '<<' ? 'FORBIDDEN_YAML_MERGE_KEY' : 'FORBIDDEN_MAPPING_KEY');
       }

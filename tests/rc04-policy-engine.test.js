@@ -430,6 +430,189 @@ rules: []
   });
 
   // =========================================================================
+  // 3b. Mapping KEY node hardening (RC-04 Task 2.1)
+  //
+  // A mapping key is a YAML node in its own right. Node-level anchor/tag
+  // validation must apply to keys exactly as it applies to values, sequence
+  // items, and collection nodes — an otherwise-valid resolved key name such as
+  // `version`, `rules`, `id`, or `effect` must not launder a forbidden node.
+  // =========================================================================
+
+  describe('Mapping key node hardening', () => {
+    test('RC04-K-01: anchor on a top-level mapping key is rejected', () => {
+      expectParseError(
+        () => engineFromYaml("&keyAnchor version: '1.0'\nrules: []\n"),
+        'FORBIDDEN_YAML_ANCHOR',
+      );
+    });
+
+    test('RC04-K-02: an anchored key does not bypass via its valid resolved name', () => {
+      // Each of these resolves to a legitimate schema key after parsing.
+      const anchoredKeys = [
+        "&k version: '1.0'\nrules: []\n",
+        "version: '1.0'\n&k rules: []\n",
+        "version: '1.0'\n&k metadata:\n  name: x\nrules: []\n",
+      ];
+      for (const source of anchoredKeys) {
+        expectParseError(() => engineFromYaml(source), 'FORBIDDEN_YAML_ANCHOR');
+      }
+    });
+
+    test('RC04-K-03: anchor on a nested mapping key inside a rule is rejected', () => {
+      expectParseError(
+        () => engineFromYaml("version: '1.0'\nrules:\n  - id: r\n    &e effect: 'ALLOW'\n"),
+        'FORBIDDEN_YAML_ANCHOR',
+      );
+      expectParseError(
+        () =>
+          engineFromYaml(
+            "version: '1.0'\nrules:\n  - id: r\n    effect: 'ALLOW'\n    &t tools: ['read_file']\n",
+          ),
+        'FORBIDDEN_YAML_ANCHOR',
+      );
+    });
+
+    test('RC04-K-04: anchor on a nested mapping key inside metadata is rejected', () => {
+      expectParseError(
+        () => engineFromYaml("version: '1.0'\nmetadata:\n  &n name: 'x'\nrules: []\n"),
+        'FORBIDDEN_YAML_ANCHOR',
+      );
+    });
+
+    test('RC04-K-05: anchor on a mapping key in explicit-key form is rejected', () => {
+      expectParseError(
+        () => engineFromYaml("? &a version\n: '1.0'\nrules: []\n"),
+        'FORBIDDEN_YAML_ANCHOR',
+      );
+    });
+
+    test('RC04-K-06: anchor on a flow-mapping key is rejected', () => {
+      expectParseError(
+        () => engineFromYaml("version: '1.0'\nmetadata: {&n name: x}\nrules: []\n"),
+        'FORBIDDEN_YAML_ANCHOR',
+      );
+    });
+
+    test('RC04-K-07: an alias used as a mapping key is rejected without expansion', () => {
+      // Explicit-key form: the parser accepts it cleanly and the alias node
+      // reaches the AST walk, so this genuinely exercises the key-level check.
+      expectParseError(
+        () => engineFromYaml("version: '1.0'\n? *ghost\n: 2\nrules: []\n"),
+        'FORBIDDEN_YAML_ALIAS',
+      );
+      expectParseError(
+        () => engineFromYaml("version: '1.0'\n? *a\n: 2\nx: &a 1\nrules: []\n"),
+        'FORBIDDEN_YAML_ALIAS',
+      );
+    });
+
+    test('RC04-K-08: a custom tag on a mapping key is rejected', () => {
+      expectParseError(
+        () => engineFromYaml("version: '1.0'\n!custom rules: []\n"),
+        'FORBIDDEN_YAML_TAG',
+      );
+      expectParseError(
+        () => engineFromYaml("version: '1.0'\n!env rules: []\n"),
+        'FORBIDDEN_YAML_TAG',
+      );
+      expectParseError(
+        () => engineFromYaml("? !custom version\n: '1.0'\nrules: []\n"),
+        'FORBIDDEN_YAML_TAG',
+      );
+    });
+
+    test('RC04-K-09: the value-node tag policy is unchanged for keys (core tags still allowed)', () => {
+      // Not broadened, not relaxed: explicitly-tagged core keys still parse.
+      const engine = engineFromYaml("!!str version: '1.0'\n!!str rules: []\n");
+      assert.equal(engine.getSourceMode(), 'EXTERNAL');
+      assert.equal(evaluate(engine, 'read_file').effect, 'DENY');
+    });
+
+    test('RC04-K-10: non-scalar mapping keys are rejected', () => {
+      for (const source of [
+        "version: '1.0'\n? [a, b]\n: value\nrules: []\n",
+        "version: '1.0'\n? {a: 1}\n: value\nrules: []\n",
+      ]) {
+        expectParseError(() => engineFromYaml(source));
+      }
+    });
+
+    test('RC04-K-11: forbidden literal mapping keys remain rejected', () => {
+      expectParseError(
+        () => engineFromYaml("version: '1.0'\nrules: []\n<<: {}\n"),
+        'FORBIDDEN_YAML_MERGE_KEY',
+      );
+      expectParseError(
+        () => engineFromYaml("version: '1.0'\nrules: []\n__proto__: {}\n"),
+        'FORBIDDEN_MAPPING_KEY',
+      );
+      expectParseError(
+        () => engineFromYaml("version: '1.0'\nrules: []\nconstructor: 1\n"),
+        'FORBIDDEN_MAPPING_KEY',
+      );
+    });
+
+    test('RC04-K-12: ordinary untagged keys continue to parse and evaluate', () => {
+      const engine = engineFromYaml(
+        yamlPolicy([{ id: 'plain-key-rule', effect: 'DENY', tools: ['read_file'] }]),
+      );
+      assert.equal(evaluate(engine, 'read_file').effect, 'DENY');
+      assert.equal(evaluate(engine, 'read_file').matchingRuleId, 'plain-key-rule');
+      assert.equal(engine.getNormalizedPolicy().rules[0].id, 'plain-key-rule');
+    });
+
+    test('RC04-K-13: anchor-like characters in quoted values and comments still do not false-positive', () => {
+      const engine = engineFromYaml(
+        [
+          "version: '1.0'",
+          'metadata:',
+          "  name: '&foo'",
+          "  description: '*bar'",
+          '# &ref *ref << !tag',
+          'rules:',
+          "  - id: 'r'",
+          "    effect: 'ALLOW'",
+          "    description: '<< !notatag *notalias &notanchor'",
+          "    tools: ['read_file']",
+        ].join('\n') + '\n',
+      );
+      assert.equal(evaluate(engine, 'read_file').effect, 'ALLOW');
+    });
+
+    test('RC04-K-14: duplicate-key detection still works after key-node hardening', () => {
+      expectParseError(
+        () => engineFromYaml("version: '1.0'\nrules: []\nrules: []\n"),
+        'DUPLICATE_MAPPING_KEY',
+      );
+      expectParseError(
+        () => engineFromJson('{"version": "1.0", "rules": [], "rules": []}'),
+        'DUPLICATE_MAPPING_KEY',
+      );
+    });
+
+    test('RC04-K-15: JSON parsing behavior is unchanged', () => {
+      const engine = engineFromJson(
+        jsonPolicy([{ id: 'json-rule', effect: 'DENY', tools: ['read_file'] }]),
+      );
+      assert.equal(engine.getSourceMode(), 'EXTERNAL');
+      assert.equal(evaluate(engine, 'read_file').effect, 'DENY');
+      // JSON has no anchors, aliases, or tags: none of these are JSON syntax.
+      expectParseError(() => engineFromJson('{"version": "1.0", "&k rules": []}'));
+    });
+
+    test('RC04-K-16: equivalent YAML and JSON policies still hash identically', () => {
+      const rules = [
+        { id: 'k-alpha', effect: 'DENY', tools: ['write_file'], paths: { patterns: ['src/**'] } },
+        { id: 'k-beta', effect: 'ALLOW', tools: ['read_file'] },
+      ];
+      assert.equal(
+        engineFromYaml(yamlPolicy(rules)).getPolicyHash(),
+        engineFromJson(jsonPolicy(rules)).getPolicyHash(),
+      );
+    });
+  });
+
+  // =========================================================================
   // 4. Resource bounds
   // =========================================================================
 
