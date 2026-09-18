@@ -18,7 +18,7 @@ export const MAX_MUTATION_BYTES = 1024 * 1024;
  */
 export const MUTATION_BLACKLIST_PATTERNS: RegExp[] = [
   /(^|[/\\])\.git([/\\]|$)/i,
-  /(^|[/\\])\.env($|\..*)/i,
+  /(^|[/\\])\.env[^/\\]*([/\\]|$)/i,
   /(^|[/\\])\.ssh([/\\]|$)/i,
   /(^|[/\\])\.aws([/\\]|$)/i,
   /(^|[/\\])\.gnupg([/\\]|$)/i,

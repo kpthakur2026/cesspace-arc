@@ -1549,4 +1549,107 @@ describe('CesSpace ARC — RC-03 Safe File Mutation Primitives', () => {
       },
     );
   });
+
+  test('RC03-REM-11: create_file denies .envlocal with ACCESS_DENIED', async () => {
+    await assert.rejects(
+      async () => {
+        await fsSubsystem.createFile(workspaceDir, {
+          path: '.envlocal',
+          content: 'SECRET_LOCAL=1',
+        });
+      },
+      (err) => {
+        assert.ok(err instanceof ArcError);
+        assert.equal(err.code, 'ACCESS_DENIED');
+        return true;
+      },
+    );
+    assert.equal(fs.existsSync(path.join(workspaceDir, '.envlocal')), false);
+  });
+
+  test('RC03-REM-12: write_file denies .envrc with ACCESS_DENIED', async () => {
+    await assert.rejects(
+      async () => {
+        await fsSubsystem.writeFile(workspaceDir, {
+          path: '.envrc',
+          content: 'export FOO=bar',
+          expectedHash: 'a'.repeat(64),
+          overwrite: true,
+        });
+      },
+      (err) => {
+        assert.ok(err instanceof ArcError);
+        assert.equal(err.code, 'ACCESS_DENIED');
+        return true;
+      },
+    );
+  });
+
+  test('RC03-REM-13: delete_file denies .env.production with ACCESS_DENIED', async () => {
+    await assert.rejects(
+      async () => {
+        await fsSubsystem.deleteFile(workspaceDir, {
+          path: '.env.production',
+          expectedHash: 'a'.repeat(64),
+        });
+      },
+      (err) => {
+        assert.ok(err instanceof ArcError);
+        assert.equal(err.code, 'ACCESS_DENIED');
+        return true;
+      },
+    );
+  });
+
+  test('RC03-REM-14: move_file denies nested config/.envstaging as source with ACCESS_DENIED', async () => {
+    await assert.rejects(
+      async () => {
+        await fsSubsystem.moveFile(workspaceDir, {
+          sourcePath: 'config/.envstaging',
+          destinationPath: 'safe-dest.txt',
+          expectedSourceHash: 'a'.repeat(64),
+        });
+      },
+      (err) => {
+        assert.ok(err instanceof ArcError);
+        assert.equal(err.code, 'ACCESS_DENIED');
+        return true;
+      },
+    );
+  });
+
+  test('RC03-REM-15: move_file denies nested config/.envstaging as destination with ACCESS_DENIED', async () => {
+    const srcPath = path.join(workspaceDir, 'move-to-env-src.txt');
+    fs.writeFileSync(srcPath, 'some data');
+    const hash = crypto.createHash('sha256').update('some data').digest('hex');
+
+    await assert.rejects(
+      async () => {
+        await fsSubsystem.moveFile(workspaceDir, {
+          sourcePath: 'move-to-env-src.txt',
+          destinationPath: 'config/.envstaging',
+          expectedSourceHash: hash,
+        });
+      },
+      (err) => {
+        assert.ok(err instanceof ArcError);
+        assert.equal(err.code, 'ACCESS_DENIED');
+        return true;
+      },
+    );
+  });
+
+  test('RC03-REM-16: non-prefix occurrences of env (e.g. safe.environment.txt, safe-file.env.txt) are allowed by mutation blacklist', async () => {
+    const res1 = await fsSubsystem.createFile(workspaceDir, {
+      path: 'safe.environment.txt',
+      content: 'environment content',
+    });
+    assert.equal(res1.created, true);
+
+    const res2 = await fsSubsystem.createFile(workspaceDir, {
+      path: 'safe-file.env.txt',
+      content: 'file env content',
+    });
+    assert.equal(res2.created, true);
+  });
 });
