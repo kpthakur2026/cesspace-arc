@@ -7,8 +7,10 @@ import crypto from 'node:crypto';
 
 import {
   ADMIN_MAX_REASON_BYTES,
+  decodeBase64Strict,
   exportPrivateKeyB64,
   exportPublicKeyB64,
+  importOperatorPrivateKey,
 } from '../packages/protocol/dist/index.js';
 import { WorkspaceRegistry } from '../packages/policy/dist/index.js';
 import { EXIT_FAILURE, EXIT_OK, EXIT_USAGE, runCli } from '../apps/cli/dist/index.js';
@@ -421,6 +423,55 @@ describe('CesSpace ARC — RC-04 Task 3: Operator CLI', () => {
         (err) => err instanceof AdminClientError && err.reason === 'KEY_TOO_LARGE',
       );
       assert.equal(fdIsClosed(overLimit), true);
+    });
+
+    test('RC04-C-38: non-canonical base64 is rejected by decode and by key import', () => {
+      // Unused padding-bit variation, not invalid characters: `AB==` decodes to
+      // the same byte as canonical `AA==` while failing a canonical round-trip.
+      const canonicalByte = 'AA==';
+      const nonCanonicalByte = 'AB==';
+
+      // Verify Node's actual behaviour rather than assuming it.
+      const decodedCanonicalByte = Buffer.from(canonicalByte, 'base64');
+      const decodedNonCanonicalByte = Buffer.from(nonCanonicalByte, 'base64');
+      assert.equal(decodedNonCanonicalByte.toString('hex'), decodedCanonicalByte.toString('hex'));
+      assert.notEqual(decodedNonCanonicalByte.toString('base64'), nonCanonicalByte);
+
+      assert.equal(decodeBase64Strict(nonCanonicalByte), null);
+      assert.equal(decodeBase64Strict(canonicalByte).toString('hex'), '00');
+
+      // Same construction driven from real private-key DER. An Ed25519 PKCS#8
+      // key is 48 bytes, a multiple of 3, so its own base64 has no unused
+      // padding bits; appending one byte creates them without altering the key
+      // prefix, giving a non-canonical encoding of the same secret bytes.
+      const operator = operatorKey();
+      const realDer = Buffer.from(operator.privateKeyB64, 'base64');
+      const paddedDer = Buffer.concat([realDer, Buffer.from([0])]);
+
+      const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+      const paddedB64 = paddedDer.toString('base64');
+      assert.ok(paddedB64.endsWith('=='), 'expected single-byte padding');
+      const lastDataChar = paddedB64[paddedB64.length - 3];
+      const perturbedChar = alphabet[alphabet.indexOf(lastDataChar) | 0b0001];
+      assert.notEqual(perturbedChar, lastDataChar);
+      const nonCanonicalKey = `${paddedB64.slice(0, -3)}${perturbedChar}==`;
+
+      // Non-canonical form decodes to identical bytes but is rejected.
+      const decodedPadded = Buffer.from(paddedB64, 'base64');
+      const decodedNonCanonical = Buffer.from(nonCanonicalKey, 'base64');
+      assert.equal(decodedNonCanonical.toString('hex'), decodedPadded.toString('hex'));
+      assert.notEqual(decodedNonCanonical.toString('base64'), nonCanonicalKey);
+
+      assert.equal(decodeBase64Strict(nonCanonicalKey), null);
+      assert.equal(importOperatorPrivateKey(nonCanonicalKey), null);
+
+      // The canonical encoding of the real key still imports normally.
+      const imported = importOperatorPrivateKey(operator.privateKeyB64);
+      assert.equal(imported.asymmetricKeyType, 'ed25519');
+
+      // Canonical encoding of the padded payload is still decodable: the strict
+      // check rejects non-canonical form, not the payload.
+      assert.deepEqual(decodeBase64Strict(paddedB64), decodedPadded);
     });
   });
 

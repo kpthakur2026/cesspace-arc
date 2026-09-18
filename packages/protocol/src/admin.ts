@@ -286,8 +286,15 @@ export function verifyAdminPayload(
  *
  * Buffer.from(value, 'base64') silently ignores invalid characters, so the
  * input is validated against the base64 alphabet and canonical form first.
+ *
+ * Every rejection that occurs AFTER the decoded Buffer is allocated overwrites
+ * that buffer before returning. This matters for private-key input: a
+ * non-canonical encoding with unused padding bits (for example `AB==` instead
+ * of `AA==`) decodes to the same secret bytes while failing the canonical
+ * round-trip, so the caller never receives the buffer and cannot wipe it.
  */
 export function decodeBase64Strict(value: unknown): Buffer | null {
+  // Rejections below occur before allocation, so there is nothing to wipe.
   if (typeof value !== 'string' || value.length === 0) {
     return null;
   }
@@ -297,9 +304,11 @@ export function decodeBase64Strict(value: unknown): Buffer | null {
   if (!/^[A-Za-z0-9+/]*={0,2}$/.test(value)) {
     return null;
   }
+
   const decoded = Buffer.from(value, 'base64');
   // Re-encoding must round-trip exactly: rejects non-canonical padding.
   if (decoded.toString('base64') !== value) {
+    decoded.fill(0);
     return null;
   }
   return decoded;
