@@ -18,6 +18,7 @@ export type ArcErrorCode =
   | 'INVALID_REQUEST_SCHEMA'
   | 'UNSUPPORTED_METHOD'
   | 'PARSE_ERROR'
+  | 'PATCH_PARSE_ERROR'
 
   // Authentication Errors
   | 'UNAUTHENTICATED'
@@ -36,10 +37,19 @@ export type ArcErrorCode =
   | 'PATH_ESCAPES_ROOT'
   | 'ACCESS_DENIED'
   | 'FILE_NOT_FOUND'
+  | 'PARENT_NOT_FOUND'
+  | 'ALREADY_EXISTS'
+  | 'CONFLICT_PRECONDITION_FAILED'
   | 'NOT_A_DIRECTORY'
   | 'IS_A_DIRECTORY'
+  | 'NOT_A_FILE'
+  | 'HARDLINK_DETECTED'
+  | 'UNSAFE_SYMLINK'
+  | 'CROSS_DEVICE_MOVE_UNSUPPORTED'
   | 'INVALID_PATH_CHARS'
   | 'NO_WORKSPACE_CONFIGURED'
+  | 'PATCH_PREFLIGHT_FAILED'
+  | 'PATCH_UNSUPPORTED_OPERATION'
 
   // Execution & Resource Errors
   | 'EXECUTION_TIMEOUT'
@@ -50,7 +60,8 @@ export type ArcErrorCode =
   | 'RESOURCE_EXHAUSTED'
 
   // Internal Errors
-  | 'INTERNAL_ERROR';
+  | 'INTERNAL_ERROR'
+  | 'ROLLBACK_FAILED';
 
 /**
  * Canonical structured error payload emitted across the control plane.
@@ -205,6 +216,21 @@ export class ArcError extends Error implements ArcErrorPayload {
     });
   }
 
+  public static approvalRequired(
+    message = 'Operation requires explicit human approval.',
+    details?: Record<string, string | number | boolean>,
+  ): ArcError {
+    return new ArcError({
+      code: 'APPROVAL_REQUIRED',
+      category: 'AUTHORIZATION',
+      message,
+      details,
+      retryable: false,
+      remediationHint:
+        'This operation requires explicit human approval. Approval execution is not available until the approval workflow is implemented.',
+    });
+  }
+
   public static internalError(message = 'Internal error occurred.'): ArcError {
     return new ArcError({
       code: 'INTERNAL_ERROR',
@@ -255,6 +281,162 @@ export class ArcError extends Error implements ArcErrorPayload {
       message,
       retryable: false,
       remediationHint: 'Ensure the executable is in the approved development tool allowlist.',
+    });
+  }
+
+  public static conflictPreconditionFailed(
+    message = 'Precondition failed: file content or attributes do not match expected precondition.',
+    details?: Record<string, string | number | boolean>,
+  ): ArcError {
+    return new ArcError({
+      code: 'CONFLICT_PRECONDITION_FAILED',
+      category: 'FILESYSTEM',
+      message,
+      details,
+      retryable: false,
+      remediationHint: 'Verify the expected hash matches the current file contents.',
+    });
+  }
+
+  public static alreadyExists(
+    message = 'Destination or target file already exists.',
+    details?: Record<string, string | number | boolean>,
+  ): ArcError {
+    return new ArcError({
+      code: 'ALREADY_EXISTS',
+      category: 'FILESYSTEM',
+      message,
+      details,
+      retryable: false,
+      remediationHint: 'Ensure destination does not exist prior to creation or move.',
+    });
+  }
+
+  public static parentNotFound(
+    message = 'Immediate parent directory does not exist.',
+    details?: Record<string, string | number | boolean>,
+  ): ArcError {
+    return new ArcError({
+      code: 'PARENT_NOT_FOUND',
+      category: 'FILESYSTEM',
+      message,
+      details,
+      retryable: false,
+      remediationHint: 'Create the parent directory before creating files within it.',
+    });
+  }
+
+  public static notAFile(
+    message = 'Target path is not a regular file.',
+    details?: Record<string, string | number | boolean>,
+  ): ArcError {
+    return new ArcError({
+      code: 'NOT_A_FILE',
+      category: 'FILESYSTEM',
+      message,
+      details,
+      retryable: false,
+    });
+  }
+
+  public static hardlinkDetected(
+    message = 'Security violation: Target file has hardlink count greater than 1.',
+    details?: Record<string, string | number | boolean>,
+  ): ArcError {
+    return new ArcError({
+      code: 'HARDLINK_DETECTED',
+      category: 'FILESYSTEM',
+      message,
+      details,
+      retryable: false,
+      remediationHint: 'Files with multiple hardlinks cannot be mutated safely.',
+    });
+  }
+
+  public static unsafeSymlink(
+    message = 'Security violation: Target or intermediate component is a symbolic link.',
+    details?: Record<string, string | number | boolean>,
+  ): ArcError {
+    return new ArcError({
+      code: 'UNSAFE_SYMLINK',
+      category: 'FILESYSTEM',
+      message,
+      details,
+      retryable: false,
+      remediationHint: 'Symbolic links cannot be created, modified, or traversed for mutation.',
+    });
+  }
+
+  public static crossDeviceMoveUnsupported(
+    message = 'Cross-device file move is not supported.',
+    details?: Record<string, string | number | boolean>,
+  ): ArcError {
+    return new ArcError({
+      code: 'CROSS_DEVICE_MOVE_UNSUPPORTED',
+      category: 'FILESYSTEM',
+      message,
+      details,
+      retryable: false,
+      remediationHint: 'Move operations must be contained within the same filesystem.',
+    });
+  }
+
+  public static rollbackFailed(
+    message = 'Operation rollback failed.',
+    details?: Record<string, string | number | boolean>,
+  ): ArcError {
+    return new ArcError({
+      code: 'ROLLBACK_FAILED',
+      category: 'INTERNAL',
+      message,
+      details,
+      retryable: false,
+      remediationHint: 'Administrative recovery may be required for indicated paths.',
+    });
+  }
+
+  public static patchParseError(
+    message = 'Patch could not be parsed: invalid unified diff structure.',
+    details?: Record<string, string | number | boolean>,
+  ): ArcError {
+    return new ArcError({
+      code: 'PATCH_PARSE_ERROR',
+      category: 'PROTOCOL',
+      message,
+      details,
+      retryable: false,
+      remediationHint:
+        'Ensure the patch is a valid, well-formed unified diff conforming to the RC-03 contract.',
+    });
+  }
+
+  public static patchPreflightFailed(
+    message = 'Patch preflight validation failed.',
+    details?: Record<string, string | number | boolean>,
+  ): ArcError {
+    return new ArcError({
+      code: 'PATCH_PREFLIGHT_FAILED',
+      category: 'FILESYSTEM',
+      message,
+      details,
+      retryable: false,
+      remediationHint:
+        'Ensure the target file exists, is regular UTF-8 text, and exact hunk context lines match.',
+    });
+  }
+
+  public static patchUnsupportedOperation(
+    message = 'Unsupported patch operation.',
+    details?: Record<string, string | number | boolean>,
+  ): ArcError {
+    return new ArcError({
+      code: 'PATCH_UNSUPPORTED_OPERATION',
+      category: 'FILESYSTEM',
+      message,
+      details,
+      retryable: false,
+      remediationHint:
+        'apply_patch only supports modifying existing regular text files. File creation, deletion, renaming, binary patches, and mode changes are forbidden.',
     });
   }
 }

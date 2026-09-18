@@ -1,6 +1,6 @@
 {
   "name": "cesspace-arc",
-  "version": "0.2.0-rc02",
+  "version": "0.3.0-rc03",
   "description": "Secure, vendor-neutral agent-to-machine control plane for AI agents, development environments, and remote systems using MCP",
   "license": "Apache-2.0",
   "author": "P Thakur",
@@ -18,7 +18,7 @@
     "format": "prettier --write .",
     "lint": "eslint .",
     "typecheck": "tsc --build",
-    "test": "node --test tests/protocol-contracts.test.js tests/rc01-negative-controls.test.js tests/rc02-negative-controls.test.js",
+    "test": "node --test tests/protocol-contracts.test.js tests/rc01-negative-controls.test.js tests/rc02-negative-controls.test.js tests/rc03-filesystem-mutations.test.js tests/rc03-patch.test.js tests/rc03-mcp-policy-audit.test.js",
     "bench:rc01": "node benchmarks/rc01-benchmark.js",
     "bench:rc02": "node benchmarks/rc02-benchmark.js",
     "check:docs": "bash scripts/check-docs.sh",
@@ -27,7 +27,8 @@
     "audit": "pnpm audit",
     "verify:rc00": "bash scripts/verify-rc00.sh",
     "verify:rc01": "bash scripts/verify-rc01.sh",
-    "verify:rc02": "bash scripts/verify-rc02.sh"
+    "verify:rc02": "bash scripts/verify-rc02.sh",
+    "verify:rc03": "bash scripts/verify-rc03.sh"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
