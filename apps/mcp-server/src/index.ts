@@ -12,12 +12,18 @@ import {
 
 import {
   ArcError,
+  PolicyOutcome,
   type HealthResponse,
   type SystemStatusResponse,
   type PolicyEvaluationContext,
   type RunCommandRequest,
 } from '@cesspace-arc/protocol';
-import { SecurityKernel, WorkspaceRegistry, type WorkspaceRecord } from '@cesspace-arc/policy';
+import {
+  SecurityKernel,
+  WorkspaceRegistry,
+  type WorkspaceRecord,
+  RC03_MUTATION_TOOLS,
+} from '@cesspace-arc/policy';
 import { AuditLogger, computeSha256, canonicalJson } from '@cesspace-arc/audit';
 import { FilesystemSubsystem } from '@cesspace-arc/filesystem';
 import { GitSubsystem } from '@cesspace-arc/git';
@@ -116,8 +122,27 @@ const EnvValueSchema = z
   .string()
   .max(512, 'env value exceeds maximum allowed length of 512 characters');
 
+const FileContentSchema = z
+  .string()
+  .refine(
+    (val) => Buffer.byteLength(val, 'utf8') <= 1024 * 1024,
+    'content exceeds maximum allowed size of 1 MiB (1,048,576 bytes)',
+  );
+
+const PatchContentSchema = z
+  .string()
+  .min(1, 'patch must not be empty or whitespace-only')
+  .refine(
+    (val) => Buffer.byteLength(val, 'utf8') <= 512 * 1024,
+    'patch exceeds maximum allowed size of 512 KiB (524,288 bytes)',
+  );
+
+const Sha256HashSchema = z
+  .string()
+  .regex(/^[0-9a-fA-F]{64}$/, 'expectedHash must be a 64-character hexadecimal SHA-256 hash');
+
 /**
- * Strict Zod validation schemas for all permitted tools (RC-01 read-only + RC-02 controlled execution).
+ * Strict Zod validation schemas for all permitted tools (RC-01 read-only + RC-02 controlled execution + RC-03 mutation).
  * Enforces runtime schema pre-admission rejection and audit logging.
  */
 export const TOOL_SCHEMAS = {
@@ -210,6 +235,45 @@ export const TOOL_SCHEMAS = {
     .object({
       processId: ProcessIdSchema,
       signal: z.enum(['SIGTERM', 'SIGKILL']).optional(),
+      workspaceId: WorkspaceIdSchema.optional(),
+    })
+    .strict(),
+  create_file: z
+    .object({
+      path: RelativePathSchema,
+      content: FileContentSchema,
+      workspaceId: WorkspaceIdSchema.optional(),
+    })
+    .strict(),
+  write_file: z
+    .object({
+      path: RelativePathSchema,
+      content: FileContentSchema,
+      expectedHash: Sha256HashSchema,
+      overwrite: z.literal(true),
+      workspaceId: WorkspaceIdSchema.optional(),
+    })
+    .strict(),
+  delete_file: z
+    .object({
+      path: RelativePathSchema,
+      expectedHash: Sha256HashSchema,
+      workspaceId: WorkspaceIdSchema.optional(),
+    })
+    .strict(),
+  move_file: z
+    .object({
+      sourcePath: RelativePathSchema,
+      destinationPath: RelativePathSchema,
+      expectedSourceHash: Sha256HashSchema,
+      workspaceId: WorkspaceIdSchema.optional(),
+    })
+    .strict(),
+  apply_patch: z
+    .object({
+      patch: PatchContentSchema,
+      dryRun: z.boolean().optional(),
+      fuzz: z.literal(0).optional(),
       workspaceId: WorkspaceIdSchema.optional(),
     })
     .strict(),
@@ -347,6 +411,155 @@ export const RC02_TOOL_DEFINITIONS: Tool[] = [
         },
       },
       required: ['processId'],
+      additionalProperties: false,
+    },
+  },
+];
+
+/**
+ * Definition of the 5 RC-03 MCP Tools (file mutation primitives).
+ * All invocations require explicit human approval and remain non-executable in RC-03.
+ */
+export const RC03_TOOL_DEFINITIONS: Tool[] = [
+  {
+    name: 'create_file',
+    description:
+      'Registered RC-03 file mutation capability to create a new regular file. Invocation requires explicit human approval and remains fail-closed until the approval execution workflow is available.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Workspace-relative path of the new file (max 1024 characters).',
+        },
+        content: {
+          type: 'string',
+          description: 'UTF-8 content of the file (max 1 MiB / 1,048,576 bytes).',
+        },
+        workspaceId: {
+          type: 'string',
+          description: 'Optional registered workspace ID.',
+        },
+      },
+      required: ['path', 'content'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'write_file',
+    description:
+      'Registered RC-03 file mutation capability to update an existing regular file with hash-guarded overwrite. Invocation requires explicit human approval and remains fail-closed until the approval execution workflow is available.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Workspace-relative path of the file to overwrite (max 1024 characters).',
+        },
+        content: {
+          type: 'string',
+          description: 'New UTF-8 content for the file (max 1 MiB / 1,048,576 bytes).',
+        },
+        expectedHash: {
+          type: 'string',
+          description:
+            'Required 64-character hexadecimal SHA-256 pre-modification hash of the file.',
+        },
+        overwrite: {
+          type: 'boolean',
+          description: 'Explicit overwrite acknowledgment (must be true).',
+          enum: [true],
+        },
+        workspaceId: {
+          type: 'string',
+          description: 'Optional registered workspace ID.',
+        },
+      },
+      required: ['path', 'content', 'expectedHash', 'overwrite'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'apply_patch',
+    description:
+      'Registered RC-03 file mutation capability to apply a bounded unified diff patch across existing workspace files. Invocation requires explicit human approval and remains fail-closed until the approval execution workflow is available.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        patch: {
+          type: 'string',
+          description:
+            'Unified diff patch content in standard format (max 512 KiB / 524,288 bytes).',
+        },
+        dryRun: {
+          type: 'boolean',
+          description:
+            'If true, simulates the patch in memory without modifying any files on disk.',
+        },
+        fuzz: {
+          type: 'integer',
+          description: 'Fuzz tolerance factor (must be exactly 0; fuzz matching is not supported).',
+          enum: [0],
+        },
+        workspaceId: {
+          type: 'string',
+          description: 'Optional registered workspace ID.',
+        },
+      },
+      required: ['patch'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'delete_file',
+    description:
+      'Registered RC-03 file mutation capability to remove an existing regular file with pre-deletion hash verification. Invocation requires explicit human approval and remains fail-closed until the approval execution workflow is available.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        path: {
+          type: 'string',
+          description: 'Workspace-relative path of the file to delete (max 1024 characters).',
+        },
+        expectedHash: {
+          type: 'string',
+          description: 'Required 64-character hexadecimal SHA-256 pre-deletion hash of the file.',
+        },
+        workspaceId: {
+          type: 'string',
+          description: 'Optional registered workspace ID.',
+        },
+      },
+      required: ['path', 'expectedHash'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'move_file',
+    description:
+      'Registered RC-03 file mutation capability to perform a no-replace move/rename with source hash verification. Invocation requires explicit human approval and remains fail-closed until the approval execution workflow is available.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sourcePath: {
+          type: 'string',
+          description:
+            'Workspace-relative path of the existing file to move (max 1024 characters).',
+        },
+        destinationPath: {
+          type: 'string',
+          description: 'Workspace-relative destination path (must not exist; max 1024 characters).',
+        },
+        expectedSourceHash: {
+          type: 'string',
+          description: 'Required 64-character hexadecimal SHA-256 hash of the source file.',
+        },
+        workspaceId: {
+          type: 'string',
+          description: 'Optional registered workspace ID.',
+        },
+      },
+      required: ['sourcePath', 'destinationPath', 'expectedSourceHash'],
       additionalProperties: false,
     },
   },
@@ -644,6 +857,138 @@ export class ProcessAuditSink implements IProcessLifecycleSink {
 }
 
 /**
+ * Safely sanitizes path parameters for audit logging.
+ * Rejects hostile paths (absolute paths, traversals, null bytes) and records only safe metadata.
+ */
+export function sanitizePathForAudit(candidate: unknown): unknown {
+  if (typeof candidate !== 'string') {
+    return { pathType: typeof candidate, pathOmitted: true };
+  }
+  const trimmed = candidate.trim();
+  if (
+    trimmed.includes('\0') ||
+    trimmed.startsWith('/') ||
+    trimmed.startsWith('\\') ||
+    /^[a-zA-Z]:[/\\]/.test(trimmed) ||
+    trimmed.split(/[/\\]/).includes('..') ||
+    trimmed.length > 1024
+  ) {
+    return {
+      pathLength: candidate.length,
+      pathOmitted: true,
+    };
+  }
+  return trimmed;
+}
+
+/**
+ * Authoritative mutation audit sanitizer implementing strict data minimization.
+ * Ensures raw content, raw patches, patch context, and hostile paths NEVER enter audit records.
+ */
+export function sanitizeMutationAuditParameters(
+  toolName: string,
+  parameters: Record<string, unknown>,
+): Record<string, unknown> {
+  const sanitized: Record<string, unknown> = {};
+
+  if (toolName === 'create_file') {
+    sanitized.path = sanitizePathForAudit(parameters.path);
+    sanitized.contentBytes =
+      typeof parameters.content === 'string'
+        ? Buffer.byteLength(parameters.content, 'utf8')
+        : parameters.content !== undefined
+          ? { contentType: typeof parameters.content }
+          : undefined;
+    if (typeof parameters.workspaceId === 'string') {
+      sanitized.workspaceId = parameters.workspaceId;
+    }
+  } else if (toolName === 'write_file') {
+    sanitized.path = sanitizePathForAudit(parameters.path);
+    sanitized.contentBytes =
+      typeof parameters.content === 'string'
+        ? Buffer.byteLength(parameters.content, 'utf8')
+        : parameters.content !== undefined
+          ? { contentType: typeof parameters.content }
+          : undefined;
+    if (
+      typeof parameters.expectedHash === 'string' &&
+      /^[0-9a-fA-F]{64}$/.test(parameters.expectedHash)
+    ) {
+      sanitized.expectedHash = parameters.expectedHash;
+    } else if (parameters.expectedHash !== undefined) {
+      sanitized.expectedHashProvided = true;
+    }
+    if (parameters.overwrite !== undefined) {
+      sanitized.overwrite = parameters.overwrite;
+    }
+    if (typeof parameters.workspaceId === 'string') {
+      sanitized.workspaceId = parameters.workspaceId;
+    }
+  } else if (toolName === 'delete_file') {
+    sanitized.path = sanitizePathForAudit(parameters.path);
+    if (
+      typeof parameters.expectedHash === 'string' &&
+      /^[0-9a-fA-F]{64}$/.test(parameters.expectedHash)
+    ) {
+      sanitized.expectedHash = parameters.expectedHash;
+    } else if (parameters.expectedHash !== undefined) {
+      sanitized.expectedHashProvided = true;
+    }
+    if (typeof parameters.workspaceId === 'string') {
+      sanitized.workspaceId = parameters.workspaceId;
+    }
+  } else if (toolName === 'move_file') {
+    sanitized.sourcePath = sanitizePathForAudit(parameters.sourcePath);
+    sanitized.destinationPath = sanitizePathForAudit(parameters.destinationPath);
+    if (
+      typeof parameters.expectedSourceHash === 'string' &&
+      /^[0-9a-fA-F]{64}$/.test(parameters.expectedSourceHash)
+    ) {
+      sanitized.expectedSourceHash = parameters.expectedSourceHash;
+    } else if (parameters.expectedSourceHash !== undefined) {
+      sanitized.expectedSourceHashProvided = true;
+    }
+    if (typeof parameters.workspaceId === 'string') {
+      sanitized.workspaceId = parameters.workspaceId;
+    }
+  } else if (toolName === 'apply_patch') {
+    sanitized.patchBytes =
+      typeof parameters.patch === 'string'
+        ? Buffer.byteLength(parameters.patch, 'utf8')
+        : parameters.patch !== undefined
+          ? { patchType: typeof parameters.patch }
+          : undefined;
+    if (typeof parameters.dryRun === 'boolean') {
+      sanitized.dryRun = parameters.dryRun;
+    }
+    if (typeof parameters.fuzz === 'number') {
+      sanitized.fuzz = parameters.fuzz;
+    }
+    if (typeof parameters.workspaceId === 'string') {
+      sanitized.workspaceId = parameters.workspaceId;
+    }
+  }
+
+  // Record extra property keys if any were supplied
+  const knownPropertyMap: Record<string, Set<string>> = {
+    create_file: new Set(['path', 'content', 'workspaceId']),
+    write_file: new Set(['path', 'content', 'expectedHash', 'overwrite', 'workspaceId']),
+    delete_file: new Set(['path', 'expectedHash', 'workspaceId']),
+    move_file: new Set(['sourcePath', 'destinationPath', 'expectedSourceHash', 'workspaceId']),
+    apply_patch: new Set(['patch', 'dryRun', 'fuzz', 'workspaceId']),
+  };
+  const knownKeys = knownPropertyMap[toolName];
+  if (knownKeys) {
+    const extraKeys = Object.keys(parameters).filter((k) => !knownKeys.has(k));
+    if (extraKeys.length > 0) {
+      sanitized.extraPropertyKeys = extraKeys;
+    }
+  }
+
+  return sanitized;
+}
+
+/**
  * Sanitizes parameters prior to schema validation for audit logging.
  * Ensures raw arguments, environment values, and secrets are never stored in audit logs.
  */
@@ -718,6 +1063,11 @@ export function sanitizePreValidationParameters(
     return sanitized;
   }
 
+  // Mutation tools: authoritative data minimization
+  if ((RC03_MUTATION_TOOLS as readonly string[]).includes(toolName)) {
+    return sanitizeMutationAuditParameters(toolName, parameters);
+  }
+
   // Generic sanitizer for other tools: scrub raw args/env objects
   const sanitized: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(parameters)) {
@@ -774,7 +1124,7 @@ export class ArcMcpServer implements IArcMcpServer {
     this.server = new Server(
       {
         name: 'cesspace-arc',
-        version: '0.2.0-rc02',
+        version: '0.3.0-rc03',
       },
       {
         capabilities: {
@@ -789,7 +1139,7 @@ export class ArcMcpServer implements IArcMcpServer {
   private setupHandlers(): void {
     this.server.setRequestHandler(ListToolsRequestSchema, async () => {
       return {
-        tools: [...RC01_TOOL_DEFINITIONS, ...RC02_TOOL_DEFINITIONS],
+        tools: [...RC01_TOOL_DEFINITIONS, ...RC02_TOOL_DEFINITIONS, ...RC03_TOOL_DEFINITIONS],
       };
     });
 
@@ -1223,7 +1573,9 @@ export class ArcMcpServer implements IArcMcpServer {
     };
 
     // Safe audit parameters for data minimization (P1-01):
-    // For run_command, replace raw arguments with safe metadata (argCount, safeFlags)
+    // For run_command, replace raw arguments with safe metadata (argCount, safeFlags).
+    // For RC-03 mutation tools, use the authoritative mutation audit sanitizer so that
+    // raw content, patches, and hostile paths NEVER enter audit records.
     let auditParams: Record<string, unknown> = validatedParams;
     if (toolName === 'run_command') {
       const rawArgs = Array.isArray(validatedParams.args) ? (validatedParams.args as string[]) : [];
@@ -1239,14 +1591,23 @@ export class ArcMcpServer implements IArcMcpServer {
           safeFlags,
         },
       };
+    } else if ((RC03_MUTATION_TOOLS as readonly string[]).includes(toolName)) {
+      // Mutation tools: authoritative data minimization — raw content/patch NEVER in audit
+      auditParams = sanitizeMutationAuditParameters(toolName, validatedParams);
     }
+
+    // Authoritative payload hash uses sanitized params for mutation tools (not raw params)
+    const auditPayloadHash = computeSha256(canonicalJson(auditParams));
 
     // 3. Minimal Security Kernel Policy Admission (Default-Deny)
     const evalStart = Date.now();
     const decision = await this.securityKernel.evaluate(context);
     const evalDuration = Date.now() - evalStart;
 
-    if (decision.outcome !== 2 /* PolicyOutcome.ALLOW */) {
+    if (decision.outcome === PolicyOutcome.REQUIRE_APPROVAL) {
+      // RC-03 gate: mutation tools require human approval — not available until RC-04.
+      // Emit structured APPROVAL_REQUIRED audit record and return isError response.
+      // Filesystem mutation methods MUST NOT be called.
       const endMs = Date.now();
       const endTime = new Date().toISOString();
 
@@ -1260,7 +1621,53 @@ export class ArcMcpServer implements IArcMcpServer {
         invocation: {
           toolName,
           parametersRedacted: auditParams,
-          payloadHash: computeSha256(canonicalJson(validatedParams)),
+          payloadHash: auditPayloadHash,
+        },
+        policy: {
+          decision: 'REQUIRE_APPROVAL',
+          ruleId: decision.matchingRuleId,
+          evaluationDurationMs: evalDuration,
+        },
+        execution: {
+          status: 'DENIED',
+          startTime,
+          endTime,
+          durationMs: endMs - startMs,
+        },
+        error: {
+          code: 'APPROVAL_REQUIRED',
+          message: decision.reason,
+        },
+      });
+
+      const arcError = ArcError.approvalRequired(decision.reason);
+      return {
+        isError: true,
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(arcError.toJSON(), null, 2),
+          },
+        ],
+      };
+    }
+
+    if (decision.outcome !== PolicyOutcome.ALLOW) {
+      // DENY or any other non-ALLOW, non-REQUIRE_APPROVAL outcome
+      const endMs = Date.now();
+      const endTime = new Date().toISOString();
+
+      await this.auditLogger.log({
+        timestamp: startTime,
+        actor: auditActor,
+        target: {
+          workspaceId: targetWorkspace.workspaceId,
+          workspacePath: targetWorkspace.rootPath,
+        },
+        invocation: {
+          toolName,
+          parametersRedacted: auditParams,
+          payloadHash: auditPayloadHash,
         },
         policy: {
           decision: decision.effect,
@@ -1292,6 +1699,7 @@ export class ArcMcpServer implements IArcMcpServer {
     }
 
     // 4. Tool Execution within Authorized Boundaries
+
     let result: unknown;
     let executionStatus: 'SUCCESS' | 'ERROR' = 'SUCCESS';
     let arcError: ArcError | undefined;
@@ -1302,8 +1710,8 @@ export class ArcMcpServer implements IArcMcpServer {
         case 'health': {
           const health: HealthResponse = {
             status: 'HEALTHY',
-            version: '0.2.0-rc02',
-            stage: 'RC-02',
+            version: '0.3.0-rc03',
+            stage: 'RC-03',
             policyEngineActive: true,
             auditActive: true,
             authorizedWorkspacesCount: this.workspaceRegistry.getWorkspaces().length,
@@ -1484,6 +1892,16 @@ export class ArcMcpServer implements IArcMcpServer {
         }
 
         default:
+          // Defense-in-depth: RC-03 mutation tools MUST NEVER reach this execution path.
+          // Even if policy evaluation unexpectedly returns ALLOW for a mutation tool
+          // (e.g. via a future refactor or configuration error), this backstop ensures
+          // that filesystem mutation methods are never called in RC-03.
+          if ((RC03_MUTATION_TOOLS as readonly string[]).includes(toolName)) {
+            throw ArcError.policyDenied(
+              `RC-03 backstop: tool '${toolName}' requires human approval and cannot be executed. ` +
+                `Approval workflow is not available until RC-04.`,
+            );
+          }
           throw ArcError.policyDenied(`Tool '${toolName}' execution route not configured.`);
       }
     } catch (err: unknown) {
@@ -1509,7 +1927,7 @@ export class ArcMcpServer implements IArcMcpServer {
       invocation: {
         toolName,
         parametersRedacted: auditParams,
-        payloadHash: computeSha256(canonicalJson(validatedParams)),
+        payloadHash: auditPayloadHash,
       },
       policy: {
         decision: 'ALLOW',

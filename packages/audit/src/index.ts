@@ -54,8 +54,14 @@ export function redactValue(value: unknown): unknown {
 export function redactRecord(payload: Record<string, unknown>): Record<string, unknown> {
   const result: Record<string, unknown> = {};
   for (const [key, val] of Object.entries(payload)) {
-    if (key.toLowerCase() === 'content' && typeof val === 'string') {
-      result[key] = `[FILE_CONTENT_OMITTED: ${val.length} bytes]`;
+    if (key.toLowerCase() === 'content') {
+      const byteLen = typeof val === 'string' ? Buffer.byteLength(val, 'utf8') : 0;
+      result[key] = `[FILE_CONTENT_OMITTED: ${byteLen} bytes]`;
+      continue;
+    }
+    if (key.toLowerCase() === 'patch') {
+      const byteLen = typeof val === 'string' ? Buffer.byteLength(val, 'utf8') : 0;
+      result[key] = `[PATCH_CONTENT_OMITTED: ${byteLen} bytes]`;
       continue;
     }
     if (

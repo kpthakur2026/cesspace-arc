@@ -216,6 +216,21 @@ export class ArcError extends Error implements ArcErrorPayload {
     });
   }
 
+  public static approvalRequired(
+    message = 'Operation requires explicit human approval.',
+    details?: Record<string, string | number | boolean>,
+  ): ArcError {
+    return new ArcError({
+      code: 'APPROVAL_REQUIRED',
+      category: 'AUTHORIZATION',
+      message,
+      details,
+      retryable: false,
+      remediationHint:
+        'This operation requires explicit human approval. Approval execution is not available until the approval workflow is implemented.',
+    });
+  }
+
   public static internalError(message = 'Internal error occurred.'): ArcError {
     return new ArcError({
       code: 'INTERNAL_ERROR',

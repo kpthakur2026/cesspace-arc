@@ -1,8 +1,8 @@
 # RC-03 Scope & Acceptance Criteria — CesSpace ARC
 
-> **Document:** Stage Specification & Quality Gates  
-> **Status:** RC-03 Scope Frozen — Implementation Not Started  
-> **Target Stage:** `RC-03` — Safe File Modification  
+> **Document:** Stage Specification & Quality Gates
+> **Status:** RC-03 Implementation Complete — MCP / Policy / Audit Integration Done (Task 3)
+> **Target Stage:** `RC-03` — Safe File Modification
 > **Base:** `main` (Verified RC-02 Main Merge at `f9560abdca5b122cf29388561a8c6b240cdc871a`)
 
 ---
@@ -78,8 +78,8 @@ Every file mutation operation in RC-03 must pass through the **Minimal Security 
 
 ### 1.2. Scope Freeze Declaration
 
-> **RC-03 STATUS: SCOPE FROZEN / IMPLEMENTATION NOT STARTED**  
-> Task 0 / Task 0.1 / Task 0.2 freezes the architecture, API contracts, security invariants, error taxonomy, serialization model, and acceptance criteria. Zero runtime mutation code in `apps/` or `packages/` is introduced. Implementation begins only after this specification commit is pushed and independently reviewed.
+> **RC-03 STATUS: IMPLEMENTATION COMPLETE**
+> Tasks 0–0.2 froze the architecture, API contracts, security invariants, error taxonomy, serialization model, and acceptance criteria. Tasks 1–1.2 implemented the core filesystem mutation engine. Task 2–2.2 implemented the bounded apply_patch engine. Task 3 completed MCP discovery, Zod schema admission, policy/approval integration, audit data minimization, and all quality gates. RC-03 is fully integrated. The human approval execution workflow is deferred to RC-04.
 
 ---
 

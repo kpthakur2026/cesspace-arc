@@ -49,6 +49,29 @@ export const RC02_ALLOWED_TOOLS = [
 
 export type Rc02AllowedTool = (typeof RC02_ALLOWED_TOOLS)[number];
 
+/**
+ * The 5 file mutation tools introduced in RC-03.
+ * These tools require explicit human approval and remain non-executable in RC-03.
+ */
+export const RC03_MUTATION_TOOLS = [
+  'create_file',
+  'write_file',
+  'apply_patch',
+  'delete_file',
+  'move_file',
+] as const;
+
+export type Rc03MutationTool = (typeof RC03_MUTATION_TOOLS)[number];
+
+/**
+ * The 18 tools recognized in the RC-03 control plane.
+ * (9 RC-01 read-only inspection + 4 RC-02 process supervision + 5 RC-03 file mutation).
+ */
+export const RC03_REGISTERED_TOOLS = [...RC02_ALLOWED_TOOLS, ...RC03_MUTATION_TOOLS] as const;
+
+export const RC03_POLICY_TOOLS = RC03_REGISTERED_TOOLS;
+export type Rc03RegisteredTool = (typeof RC03_REGISTERED_TOOLS)[number];
+
 export const ALLOWED_COMMANDS = RC02_PERMITTED_EXECUTABLES;
 
 export const DENIED_COMMANDS = RC02_FORBIDDEN_EXECUTABLES;
@@ -182,13 +205,13 @@ export class SecurityKernel implements IPolicyEngine {
     const toolName = request.toolName;
 
     // 1. Mandatory Tool Allowlist Gate (Default-Deny)
-    const isAllowedTool = (RC02_ALLOWED_TOOLS as readonly string[]).includes(toolName);
-    if (!isAllowedTool) {
+    const isRegisteredTool = (RC03_REGISTERED_TOOLS as readonly string[]).includes(toolName);
+    if (!isRegisteredTool) {
       return {
         outcome: PolicyOutcome.DENY,
         effect: 'DENY',
         matchingRuleId: 'default-deny-unregistered-tool',
-        reason: `Tool '${toolName}' is not permitted in RC-02 stage (read-only inspection and controlled execution only).`,
+        reason: `Tool '${toolName}' is not permitted in RC-03 stage.`,
       };
     }
 
@@ -341,34 +364,76 @@ export class SecurityKernel implements IPolicyEngine {
       }
     }
 
-    // 5. Sensitive Path Pre-Check
-    const rawPath =
-      (request.parameters.path as string | undefined) ||
-      (request.parameters.subPath as string | undefined) ||
-      (request.parameters.target as string | undefined);
+    const isMutationTool = (RC03_MUTATION_TOOLS as readonly string[]).includes(toolName);
 
-    if (rawPath) {
-      const sensitivePatterns = [
-        /(^|[/\\])\.env($|\..*)/i,
+    // 5. Sensitive Path Pre-Check
+    if (isMutationTool) {
+      const mutationCandidatePaths: string[] = [];
+      if (typeof request.parameters.path === 'string') {
+        mutationCandidatePaths.push(request.parameters.path);
+      }
+      if (typeof request.parameters.sourcePath === 'string') {
+        mutationCandidatePaths.push(request.parameters.sourcePath);
+      }
+      if (typeof request.parameters.destinationPath === 'string') {
+        mutationCandidatePaths.push(request.parameters.destinationPath);
+      }
+
+      const mutationSensitivePatterns = [
+        /(^|[/\\])\.git([/\\]|$)/i,
+        /(^|[/\\])\.env[^/\\]*([/\\]|$)/i,
         /(^|[/\\])\.ssh([/\\]|$)/i,
         /(^|[/\\])\.aws([/\\]|$)/i,
         /(^|[/\\])\.gnupg([/\\]|$)/i,
         /(^|[/\\])\.kube([/\\]|$)/i,
-        /(^|[/\\])\.git[/\\]config$/i,
-        /(^|[/\\])\.git[/\\]hooks([/\\]|$)/i,
         /(^|[/\\])id_rsa/i,
         /(^|[/\\])id_ed25519/i,
         /\.(pem|key|p12|pfx)$/i,
+        /^[/\\]?(etc|proc|sys|root|dev)([/\\]|$)/i,
       ];
 
-      for (const pattern of sensitivePatterns) {
-        if (pattern.test(rawPath)) {
-          return {
-            outcome: PolicyOutcome.DENY,
-            effect: 'DENY',
-            matchingRuleId: 'deny-sensitive-path-pattern',
-            reason: `Target path matches sensitive credential pattern.`,
-          };
+      for (const p of mutationCandidatePaths) {
+        for (const pattern of mutationSensitivePatterns) {
+          if (pattern.test(p)) {
+            return {
+              outcome: PolicyOutcome.DENY,
+              effect: 'DENY',
+              matchingRuleId: 'deny-mutation-sensitive-path',
+              reason:
+                'Target mutation path touches forbidden sensitive credential or Git internal path.',
+            };
+          }
+        }
+      }
+    } else {
+      const rawPath =
+        (request.parameters.path as string | undefined) ||
+        (request.parameters.subPath as string | undefined) ||
+        (request.parameters.target as string | undefined);
+
+      if (rawPath) {
+        const sensitivePatterns = [
+          /(^|[/\\])\.env($|\..*)/i,
+          /(^|[/\\])\.ssh([/\\]|$)/i,
+          /(^|[/\\])\.aws([/\\]|$)/i,
+          /(^|[/\\])\.gnupg([/\\]|$)/i,
+          /(^|[/\\])\.kube([/\\]|$)/i,
+          /(^|[/\\])\.git[/\\]config$/i,
+          /(^|[/\\])\.git[/\\]hooks([/\\]|$)/i,
+          /(^|[/\\])id_rsa/i,
+          /(^|[/\\])id_ed25519/i,
+          /\.(pem|key|p12|pfx)$/i,
+        ];
+
+        for (const pattern of sensitivePatterns) {
+          if (pattern.test(rawPath)) {
+            return {
+              outcome: PolicyOutcome.DENY,
+              effect: 'DENY',
+              matchingRuleId: 'deny-sensitive-path-pattern',
+              reason: `Target path matches sensitive credential pattern.`,
+            };
+          }
         }
       }
     }
@@ -427,7 +492,18 @@ export class SecurityKernel implements IPolicyEngine {
       };
     }
 
-    // 8. Admitted by Default Allow for Read-Only Inspection
+    // 8. RC-03 Mutation Policy Gate: Register but Require Explicit Human Approval
+    if (isMutationTool) {
+      return {
+        outcome: PolicyOutcome.REQUIRE_APPROVAL,
+        effect: 'REQUIRE_APPROVAL',
+        matchingRuleId: 'require-approval-file-mutation',
+        reason:
+          'File mutation requires explicit human approval. Approval redemption is not available in RC-03.',
+      };
+    }
+
+    // 9. Admitted by Default Allow for Read-Only Inspection
     return {
       outcome: PolicyOutcome.ALLOW,
       effect: 'ALLOW',
