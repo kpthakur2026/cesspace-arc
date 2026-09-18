@@ -1,7 +1,7 @@
 # RC-04 Scope & Acceptance Criteria — CesSpace ARC
 
 > **Document:** Stage Specification & Quality Gates
-> **Status:** SCOPE FREEZE — FINAL SECURITY CONTRACT
+> **Status:** SCOPE FREEZE — FINAL SECURITY CONTRACT (AMENDMENT 0.2)
 > **Target Stage:** `RC-04` — Declarative Policy Engine & Human Approval State Machine
 > **Base:** `main` (Verified RC-03 Main Merge at `cff5ce6ac88380341fd69781ab30057b2d165aa3`)
 
@@ -13,9 +13,9 @@ The objective of **RC-04** is to establish the declarative policy evaluation eng
 
 Building upon the verified read-only inspection baseline (RC-01), bounded terminal execution (RC-02), and the verified core filesystem mutation primitives (RC-03), RC-04 provides:
 
-1. **Declarative Policy Specification:** Strict YAML and JSON declarative policy document parsing, schema validation, canonical normalization, and deterministic multi-criteria AST matching.
+1. **Declarative Policy Specification:** Strict YAML and JSON declarative policy document parsing, schema validation, canonical semantic normalization, and deterministic multi-criteria AST matching.
 2. **Permanent Hierarchical Evaluation:** Enforced two-layer authorization architecture with absolute, immutable precedence: `DENY > REQUIRE_APPROVAL > ALLOW`.
-3. **Human Approval State Machine:** Complete race-safe lifecycle management (`PENDING`, `APPROVED`, `REJECTED`, `EXPIRED`, `CONSUMED`) for privileged operations requiring human elevation.
+3. **Human Approval State Machine:** Complete race-safe lifecycle management (`PENDING`, `APPROVED`, `REJECTED`, `EXPIRED`, `CONSUMED`, `INVALIDATED`) for privileged operations requiring human elevation.
 4. **Exact Cryptographic Bindings:** High-entropy one-time approval tokens bound immutably to exact execution payload hashes (`executionPayloadHash`), actor session context, workspace root identity, and normalized policy configuration digests (`policyHash`).
 5. **Local Administrative Channel:** Dedicated out-of-band administrative interface (`arc approve`, `arc reject`, `arc approvals list`, `arc policy test`) accessible exclusively to trusted local operators over authenticated local IPC.
 6. **Controlled Execution of Gated Mutations:** Authorized, atomic execution of previously gated RC-03 mutation tools strictly upon successful redemption and consumption of a valid human approval token.
@@ -24,16 +24,17 @@ Building upon the verified read-only inspection baseline (RC-01), bounded termin
 
 Every policy evaluation and approval redemption in RC-04 must satisfy the following inviolable security invariants:
 
-1. **Absolute Precedence of Permanent Denials:** A human approval token **MUST NEVER** override a `DENY`. If an operation evaluates to `DENY` under the permanent security kernel or operator policy, it is rejected immediately, regardless of any past or present approval token.
+1. **Absolute Precedence of Permanent Denials:** A human approval token **MUST NEVER** override a `DENY`. If an operation evaluates to `DENY` under the permanent security kernel (Layer 1) or operator policy (Layer 2), it is rejected immediately with `POLICY_DENIED`, regardless of any past, present, or presented approval token. Current policy evaluation strictly precedes approval token verification.
 2. **Two-Layer Authorization Separation:**
    - **Layer 1 (Permanent Security Kernel):** Hard-coded, non-overridable security invariants (authenticated caller, registered workspace containment, path jailing, sensitive file deny patterns, Git metadata protection, prohibited commands, default-deny).
    - **Layer 2 (Operator Declarative Policy):** Operator-defined rules that may classify otherwise-admissible actions as `DENY`, `REQUIRE_APPROVAL`, or `ALLOW`. Declarative policy may make execution more restrictive, but can **never** weaken, override, or bypass Layer 1 controls.
 3. **Mandatory Mutation Approval Floor:** All five RC-03 filesystem mutation tools (`create_file`, `write_file`, `apply_patch`, `delete_file`, `move_file`) have a mandatory minimum policy classification of `REQUIRE_APPROVAL` (or `DENY`). An otherwise-valid declarative rule may contain effect `ALLOW`, but candidate `ALLOW` evaluated against any mutation tool is unconditionally clamped at code level to `REQUIRE_APPROVAL`. Automatic execution of file mutations without human approval is strictly impossible in RC-04.
 4. **Out-of-Band Administrative Trust Boundary:** AI agents communicating via MCP have **zero administrative authority**. An agent cannot approve requests, reject requests, list approvals, mint tokens, inspect approval state, or bypass verification. Approval administration is NOT an MCP tool, has no HTTP/SSE remote endpoint, and has no non-loopback TCP listener. Administrative operations are strictly reserved for local human operators through `apps/cli` using an authenticated local IPC channel. If the implementation cannot distinguish the trusted operator from an untrusted local client, it must fail closed rather than assuming "same UID means human".
 5. **Atomic One-Time Token Consumption:** Approval tokens are single-use cryptographic capabilities. Transition from `APPROVED` to `CONSUMED` is atomic and occurs **before** subsystem invocation. If execution fails downstream, the token remains consumed and cannot be replayed.
-6. **Cryptographic Payload & Context Binding:** Approvals are cryptographically bound to the canonical execution payload hash (`executionPayloadHash`), actor identity (`clientId`, `clientType`, `sessionId`, `deviceId`), target workspace (`workspaceId` and SHA-256 `workspaceRootHash`), and the normalized `policyHash`. Tampering with any parameter, path, or payload invalidates the approval immediately.
-7. **Strict 300-Second Absolute TTL:** Approvals are subject to an immutable, server-enforced Time-To-Live (TTL) of 300 seconds from initial creation (`expiresAt = createdAt + 300s`). TTL does not restart on operator approval. Expired approvals fail closed with `APPROVAL_EXPIRED`.
-8. **Audit Data Minimization & Bounded Token Storage:** Raw approval tokens necessarily exist transiently during generation and delivery to the operator CLI. ARC itself does not persist or intentionally log the raw token. Raw tokens MUST NOT be retained in `ApprovalStateManager` and MUST NOT be placed in audit logs or error state; only the fixed 32-byte `tokenDigest` (SHA-256 of raw token bytes) is retained. Audit and internal diagnostics use bounded enumerated reason codes only.
+6. **Cryptographic Payload & Context Binding:** Approvals are cryptographically bound to the canonical execution payload hash (`executionPayloadHash`), actor identity (`clientId`, `clientType`, `sessionId`, `deviceId`), target workspace (`workspaceId` and SHA-256 `workspaceRootHash`), and the normalized semantic `policyHash`. Tampering with any parameter, path, actor context, or payload invalidates the approval immediately.
+7. **Monotonic 300-Second Absolute TTL:** Approvals are subject to an immutable, server-enforced Time-To-Live (TTL) of 300 seconds from initial creation (`createdAt + 300s`). TTL enforcement uses a server-monotonic elapsed-time clock (`process.hrtime.bigint()` or `performance.now()`) to prevent wall-clock rollback from extending approvals. TTL does not restart on operator approval. Expired approvals fail closed with `APPROVAL_EXPIRED`.
+8. **Audit Data Minimization & Bounded Token Storage:** Raw approval tokens necessarily exist transiently during generation and delivery to the operator CLI. ARC itself does not persist or intentionally log the raw token. Raw tokens MUST NOT be retained in `ApprovalStateManager` and MUST NOT be placed in audit logs or error state; only the fixed 32-byte binary `tokenDigest` (`SHA-256(UTF-8 bytes of tokenText)`) is retained. Audit and internal diagnostics use bounded enumerated reason codes only.
+9. **Permanent Invalidation on Policy Mismatch:** An approval generated under one policy configuration cannot be redeemed under another. A policy mismatch permanently transitions the approval to the terminal `INVALIDATED` state. Stale approvals can never be revived even if the policy is subsequently reverted to its original state.
 
 ---
 
@@ -49,7 +50,7 @@ RC-04 does not introduce a secondary authorization system or standalone server. 
                                    ▼
 ┌────────────────────────────────────────────────────────────────────────┐
 │            apps/mcp-server (ArcMcpServer / Tool Handlers)              │
-│  - Schema Admission & Input Length Validation                          │
+│  - Schema Admission & Byte Length Validation (token <= 128 bytes)      │
 │  - _arcApproval Parameter Extraction & Pre-policy Stripping           │
 └──────────────────────────────────┬─────────────────────────────────────┘
                                    │
@@ -58,21 +59,26 @@ RC-04 does not introduce a secondary authorization system or standalone server. 
 │            packages/policy (SecurityKernel & Policy Engine)             │
 │  ┌──────────────────────────────────────────────────────────────────┐  │
 │  │ Layer 1: Permanent Security Kernel (Hard Invariants)             │  │
+│  │ Outcome == DENY ────────► Immediately Reject: POLICY_DENIED      │  │
 │  └───────────────────────────────┬──────────────────────────────────┘  │
 │                                  │ Passes Layer 1                      │
 │                                  ▼                                     │
 │  ┌──────────────────────────────────────────────────────────────────┐  │
 │  │ Layer 2: Declarative Policy Evaluator (Deterministic AST Matcher)│  │
-│  │ Outcome: DENY | REQUIRE_APPROVAL | ALLOW                         │  │
+│  │ Outcome == DENY ────────► Immediately Reject: POLICY_DENIED      │  │
+│  │ Outcome: REQUIRE_APPROVAL | ALLOW                                │  │
 │  │ Mutation Tool Floor Enforcement: ALLOW -> REQUIRE_APPROVAL       │  │
 │  └───────────────────────────────┬──────────────────────────────────┘  │
 │                                  │ Outcome == REQUIRE_APPROVAL         │
 │                                  ▼                                     │
 │  ┌──────────────────────────────────────────────────────────────────┐  │
 │  │ Approval State Machine & Token Verifier                          │  │
+│  │ - Effective policyHash Match Check (Mismatch -> INVALIDATED)     │  │
 │  │ - Exact Payload Hash Revalidation (executionPayloadHash)         │  │
 │  │ - Actor, Workspace & Normalized Policy Binding Checks            │  │
-│  │ - Record Lock: Expiry Check & Atomic State Transitions           │  │
+│  │ - Monotonic Clock Expiry Check                                   │  │
+│  │ - Timing-Safe 32-Byte Buffer Digest Verification                 │  │
+│  │ - Atomic State Transition: APPROVED -> CONSUMED                  │  │
 │  └──────────────────────────────────────────────────────────────────┘  │
 └──────────────────┬─────────────────────────────────┬───────────────────┘
                    │                                 │
@@ -96,18 +102,18 @@ RC-04 does not introduce a secondary authorization system or standalone server. 
 
 - **`packages/protocol`:**
   - Definitive TypeScript interfaces for declarative policy schemas (`PolicyDocument`, `PolicyRule`, `PolicyMatcher`, `NormalizedPolicy`).
-  - Approval state machine types (`ApprovalState`, `ApprovalRequest`, `ApprovalBinding`, `ApprovalTokenDigest`).
+  - Approval state machine types (`ApprovalState`: `'PENDING' | 'APPROVED' | 'REJECTED' | 'EXPIRED' | 'CONSUMED' | 'INVALIDATED'`).
   - Formal client control structures (`ArcApprovalControlObject`: `{ requestId: string; token: string }`).
   - Canonical error codes: `APPROVAL_REQUIRED`, `APPROVAL_EXPIRED`, `APPROVAL_REJECTED`, `POLICY_PARSE_ERROR`, `POLICY_LOAD_ERROR`, `RESOURCE_EXHAUSTED`.
-  - Structured audit event types: `APPROVAL_REQUESTED`, `APPROVAL_GRANTED`, `APPROVAL_REJECTED`, `APPROVAL_EXPIRED`, `APPROVAL_CONSUMED`, `APPROVED_EXECUTION_SUCCEEDED`, `APPROVED_EXECUTION_FAILED`.
+  - Structured audit event types: `APPROVAL_REQUESTED`, `APPROVAL_GRANTED`, `APPROVAL_REJECTED`, `APPROVAL_EXPIRED`, `APPROVAL_CONSUMED`, `APPROVAL_INVALIDATED`, `APPROVED_EXECUTION_SUCCEEDED`, `APPROVED_EXECUTION_FAILED`.
   - Enumerated internal diagnostic reason codes: `TOKEN_MISMATCH`, `PAYLOAD_BINDING_MISMATCH`, `ACTOR_BINDING_MISMATCH`, `WORKSPACE_BINDING_MISMATCH`, `POLICY_BINDING_MISMATCH`, `ALREADY_CONSUMED`.
 - **`packages/policy`:**
-  - `DeclarativePolicyEngine`: Strict YAML/JSON parser, schema validator, AST matchers, rule precedence resolver, and canonical `policyHash` compiler.
-  - `ApprovalStateManager`: In-memory volatile approval store, record-level concurrency locks, high-entropy ID and token generator, SHA-256 digest verifier, state machine transitions, byte quota accountant, and atomic consumption logic.
-  - Integrated `SecurityKernel.evaluate()` workflow enforcing Layer 1 before Layer 2, followed by mutation approval floor enforcement.
+  - `DeclarativePolicyEngine`: Strict YAML/JSON parser (hardened against anchors, aliases, merge keys, tags), schema validator, AST matchers, rule precedence resolver, and canonical `policyHash` compiler.
+  - `ApprovalStateManager`: In-memory volatile approval store, record-level concurrency locks, high-entropy ID and token generator, 32-byte Buffer digest verifier, state machine transitions, byte quota accountant, monotonic deadline tracker, and atomic consumption logic.
+  - Integrated `SecurityKernel.evaluate()` workflow enforcing Layer 1 before Layer 2, followed by mutation approval floor enforcement, and finally approval token redemption.
 - **`apps/mcp-server`:**
   - MCP tool dispatch pipeline integration:
-    - Pre-admission extraction of `_arcApproval` parameter.
+    - Pre-admission extraction and byte-length validation of `_arcApproval` parameter.
     - Three-way scenario routing (absent -> PENDING / `APPROVAL_REQUIRED`; malformed -> `INVALID_REQUEST_SCHEMA`; invalid -> `APPROVAL_REJECTED`).
     - Token redemption handling: validates `_arcApproval`, passes token digest to `ApprovalStateManager`, and dispatches execution upon verified consumption.
 - **`apps/cli`:**
@@ -115,7 +121,7 @@ RC-04 does not introduce a secondary authorization system or standalone server. 
   - Authenticated local IPC channel to the running server.
 - **`packages/audit`:**
   - Automated redaction of `_arcApproval.token` and raw execution payloads from audit logs.
-  - Cryptographic hash-chain continuity for all approval lifecycle events.
+  - Cryptographic hash-chain continuity for all approval lifecycle events, including `APPROVAL_INVALIDATED`.
 
 ---
 
@@ -134,7 +140,7 @@ Layer 1 contains non-overridable, compile-time security controls implemented dir
 5. **Filesystem Structural Invariants:** Path traversal (`..`), symbolic link following on mutation, and multi-hardlink mutation are permanently denied (`UNSAFE_SYMLINK`, `HARDLINK_DETECTED`).
 6. **Command Blacklist:** Prohibited administrative and dangerous commands (e.g. `rm -rf /`, `sudo`, `mkfs`, raw shell wrappers) are permanently denied (`FORBIDDEN_COMMAND`).
 
-**Invariant:** Layer 1 is evaluated **first**. If Layer 1 produces `DENY`, evaluation terminates immediately. Declarative policies and human approvals have **zero power** to bypass Layer 1.
+**Invariant:** Layer 1 is evaluated **first**. If Layer 1 produces `DENY`, evaluation terminates immediately with `POLICY_DENIED`. Declarative policies and human approvals have **zero power** to bypass Layer 1.
 
 ### 3.2. Layer 2: Operator Declarative Policy
 
@@ -145,7 +151,7 @@ If an operation passes Layer 1 without a denial, it enters Layer 2. Layer 2 eval
 
 ---
 
-## 4. Absolute Policy Precedence
+## 4. Absolute Policy Precedence & Redemption Evaluation Order
 
 RC-04 freezes the immutable precedence hierarchy:
 
@@ -158,20 +164,55 @@ $$\mathbf{DENY} > \mathbf{REQUIRE\_APPROVAL} > \mathbf{ALLOW}$$
    - It is not subject to the mutation approval floor.
    - It matches an explicit `ALLOW` rule (or the default baseline policy).
 
-### 4.1. Policy-Change Redemption Semantics (Stale Approvals Voided)
+### 4.1. Frozen Redemption Precedence Order
+
+When a client submits a tool call containing `_arcApproval`, the server evaluates the request in strict sequential order:
+
+1. **Schema Admission:** Validate tool parameters and `_arcApproval` object (canonical request ID format `^[0-9a-f]{32}$`, token byte length $\le 128$ UTF-8 bytes). If malformed, reject immediately with `INVALID_REQUEST_SCHEMA`.
+2. **Permanent Layer-1 Checks:** Evaluate the Permanent Security Kernel. If Layer 1 denies, reject immediately with `POLICY_DENIED`.
+3. **Current Declarative Policy Evaluation:** Evaluate the currently effective Layer-2 policy against the submitted action. If Layer 2 evaluates to `DENY`, reject immediately with `POLICY_DENIED`. **DENY always wins over approval validation.**
+4. **Mutation Approval Floor Enforcement:** If candidate outcome is `ALLOW` but `toolName` is in `RC03_MUTATION_TOOLS`, clamp outcome to `REQUIRE_APPROVAL`.
+5. **Approval Validation:** Only if the current evaluation outcome remains `REQUIRE_APPROVAL` does the server inspect and validate the approval record and token.
+
+```
+Incoming Tool Request with _arcApproval
+               │
+               ▼
+   [1. Schema Admission] ───────► Invalid? ───► Reject: INVALID_REQUEST_SCHEMA
+               │ Valid
+               ▼
+   [2. Layer-1 Kernel] ─────────► DENY? ──────► Reject: POLICY_DENIED
+               │ Pass
+               ▼
+   [3. Current Policy] ─────────► DENY? ──────► Reject: POLICY_DENIED
+               │ Pass (REQUIRE_APPROVAL or ALLOW)
+               ▼
+   [4. Mutation Floor] ─────────► Clamps ALLOW to REQUIRE_APPROVAL for mutations
+               │
+               ▼
+   [5. Approval Validation] ───► Policy mismatch? ──► State -> INVALIDATED, Reject: APPROVAL_REJECTED
+               │ Bindings match
+               ▼
+   [6. Token & Consumed Check] ─► Mismatch/Replay? ──► Reject: APPROVAL_REJECTED
+               │ Valid
+               ▼
+   [7. Atomic Execution] ──────► Transition to CONSUMED -> Execute in Subsystem
+```
+
+### 4.2. Policy-Change Invalidation Semantics (`INVALIDATED` State)
 
 Human approval does **not** grant permanent or immutable authority across policy changes:
 
-- At the moment of token redemption, the approval record's stored `policyHash` is compared against the server's currently effective `policyHash`.
-- **Policy Mismatch Behavior:** If `_arcApproval` is presented and the effective policy identity/hash differs from the approval record:
-  1. Approval redemption **FAILS**.
-  2. The token is **NOT consumed** as a successful authorization.
-  3. The operation does **NOT execute** through that stale approval.
-  4. The request returns `APPROVAL_REJECTED` (with safe internal diagnostic reason code `POLICY_BINDING_MISMATCH`).
-  5. A stale approval **never** becomes authority under a changed policy.
-- Following a policy change, the caller may submit a **NEW** ordinary request without the stale approval. That new request is evaluated entirely fresh under the currently active policy:
-  - For file mutations, the mandatory approval floor still guarantees `REQUIRE_APPROVAL` (or `DENY`).
-  - If the new request evaluates to `REQUIRE_APPROVAL`, a fresh approval request is created with the new `policyHash`.
+1. At the moment of token redemption, the approval record's stored `policyHash` is compared against the server's currently effective `policyHash`.
+2. **Policy Mismatch Behavior:** If `_arcApproval` is presented and the effective policy identity/hash differs from the approval record:
+   - Approval redemption **FAILS**.
+   - The token is **NOT consumed** as a successful authorization.
+   - The operation does **NOT execute** through that stale approval.
+   - The approval record transitions atomically to the terminal state **`INVALIDATED`**.
+   - Client response is `APPROVAL_REJECTED`.
+   - Structured audit log emits `APPROVAL_INVALIDATED` with `reasonCode: 'POLICY_BINDING_MISMATCH'`.
+3. **No Stale-Approval Revival:** Once a record enters `INVALIDATED`, it is permanently non-executable. If the operator later reverts the policy configuration back to the original `policyHash`, the invalidated approval record **CANNOT regain authority**.
+4. **Fresh Submission:** The caller must submit a **NEW** ordinary request without `_arcApproval`. That new request is evaluated fresh under the current policy, generating a brand-new approval request if required.
 
 ---
 
@@ -213,15 +254,18 @@ Declarative policies are authored in **YAML** (preferred) or **JSON**.
 
 ### 7.1. Workspaces in Declarative Policy Are NOT Authorization
 
-**Critical Security Requirement:**
+**Critical Security Invariant:**
 
 - The `workspaces` section of an operator policy **MUST NEVER** register or authorize a new filesystem root.
 - Authorization of workspace directories is established exclusively by `WorkspaceRegistry` through trusted server configuration and startup arguments.
 - Entries in the policy `workspaces` block may only:
   1. Reference already-authorized workspace IDs.
-  2. Optionally assert an expected canonical workspace root identity.
-- If a policy names an unknown workspace ID or its asserted root does not match the server's registered canonical workspace:
-  - Policy loading **fails closed** (`health.status = 'UNHEALTHY'`).
+  2. Optionally assert an expected canonical workspace root SHA-256 digest (`rootHash`).
+- **Forbidden Properties:** The properties `path`, `rootPath`, `directory`, and any filesystem path strings are **strictly forbidden** inside policy workspace objects and cause immediate schema validation failure.
+- **Validation Behavior:**
+  - Unknown workspace `id` $\implies$ Policy load failure (`health.status = 'UNHEALTHY'`).
+  - `rootHash` supplied but does not match canonical `WorkspaceRegistry` root hash $\implies$ Policy load failure.
+  - `rootHash` omitted $\implies$ Workspace `id` must still already exist in `WorkspaceRegistry`.
 - Declarative policy can restrict operations within an authorized workspace; it **cannot** enlarge the set of authorized workspace roots.
 
 ### 7.2. Normative Structure (Version 1.0)
@@ -235,8 +279,9 @@ metadata:
 
 workspaces:
   - id: 'primary-workspace'
-    # References an existing workspace registered in WorkspaceRegistry.
+    # Optional assertion verifying expected canonical root identity.
     # Policy CANNOT authorize new filesystem paths.
+    rootHash: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
 
 rules:
   - id: 'deny-critical-config-write'
@@ -287,7 +332,7 @@ rules:
 
 - **`id`** _(string, required)_: Unique identifier `^[a-zA-Z0-9_-]{1,64}$`.
 - **`effect`** _(enum, required)_: `'DENY' | 'REQUIRE_APPROVAL' | 'ALLOW'`.
-- **`description`** _(string, optional)_: Human-readable rationale (max 256 chars).
+- **`description`** _(string, optional)_: Human-readable rationale (max 256 chars). Excluded from `policyHash`.
 - **`tools`** _(string[], optional)_: Exact tool names to match. Max 128 items.
 - **`paths.patterns`** _(string[], optional)_: Workspace-relative glob patterns. Max 128 items.
 - **`commands.allowedBinaries`** _(string[], optional)_: Positive executable basenames (valid ONLY on `ALLOW` or `REQUIRE_APPROVAL` rules). Max 128 items.
@@ -301,7 +346,14 @@ rules:
 
 To prevent Denial of Service, ReDoS, and parser confusion attacks, the declarative policy parser must satisfy strict constraints:
 
-1. **Safe Parser Implementation:** Uses a safe, standards-compliant YAML/JSON parser without execution capabilities. Custom YAML tags (e.g. `!run`, `!include`), JavaScript expressions, code evaluation, and environment-variable expansion are strictly forbidden.
+1. **Parser Hardening Rules:**
+   - **YAML Anchors Forbidden:** Any document containing YAML anchor declarations (`&anchor`) is rejected immediately.
+   - **YAML Aliases Forbidden:** Any document containing YAML alias references (`*alias`) is rejected immediately.
+   - **YAML Merge Keys Forbidden:** Merge keys (`<<`) are rejected immediately.
+   - **Custom Tags Forbidden:** Custom YAML tags (e.g. `!run`, `!include`, `!env`) are rejected immediately.
+   - **No Self-Referential / Recursive Structures:** Circular references cause immediate parser rejection.
+   - **Bounded Nesting Depth:** Maximum parsed object/array nesting depth is strictly **32** for both YAML and JSON.
+   - **Bounded Alias Expansion:** Even if a parser attempts alias resolution before schema validation, expansion limits are strictly bounded to prevent billion-laughs memory exhaustion.
 2. **Deterministic File Constraints:**
    - **Document Size Limit:** Maximum **256 KiB** UTF-8 (`262,144 bytes`).
    - **Maximum Rules:** Maximum **256** rules per document.
@@ -334,19 +386,24 @@ To prevent path confusion and ReDoS, RC-04 establishes an exact, restricted path
 1. **Normalization:** Path separators are always normalized `/`.
 2. **Case Sensitivity:** Path matching is strictly case-sensitive.
 3. **Workspace Relative:** Patterns and target paths must be workspace-relative.
-   - Patterns containing leading `/` are **rejected by the schema**.
-   - Patterns containing traversal segments (`..`) are **rejected by the schema**.
-4. **Pattern Syntax:**
+   - Patterns containing leading `/` are **rejected by schema validation**.
+   - Patterns containing traversal segments (`..`) are **rejected by schema validation**.
+4. **Supported Wildcard Operators:**
    - `*`: Matches zero or more characters within a single path segment (never crosses `/`).
    - `?`: Matches exactly one character other than `/`.
-   - `**`: Matches zero or more complete path segments (e.g. `src/**` matches `src/a.ts`, `src/nested/b.ts`, and `src/`).
-5. **Forbidden Features:**
-   - No brace expansion (e.g. `{ts,js}` is forbidden and rejected).
-   - No extended glob syntax (`+(...)`, `@(...)` are forbidden and rejected).
-   - No regular expressions.
-   - No backslash escape sequences.
-6. **Pure In-Memory Evaluation:** Matching is performed solely on normalized string representations without filesystem traversal or stat syscalls.
-7. **Syntax Enforcement:** The parser/compiler must reject unsupported pattern syntax rather than silently misinterpreting it.
+   - `**`: Matches zero or more complete path segments. **`**` is valid ONLY when it occupies an entire path segment.**
+     - `src/**/test.ts` $\implies$ Valid.
+     - `src/a**b.ts` $\implies$ **Invalid / schema rejected** (embedded `**` inside a segment is forbidden).
+5. **Forbidden Pattern Syntax:**
+   - Character sets/ranges (`[...]`) are rejected.
+   - Brace expansion (`{...}`) is rejected.
+   - Extglob operators (`+(...)`, `@(...)`, `!(...)`) are rejected.
+   - Regular expressions are rejected.
+   - Backslash escape sequences are rejected.
+6. **Literal Character Semantics:**
+   - The exclamation character `!` has **no glob-negation semantics** and is treated purely as an ordinary literal character. Negation patterns are not supported.
+7. **Pure In-Memory Evaluation:** Matching is performed solely on normalized string representations without filesystem traversal or stat syscalls.
+8. **Syntax Enforcement:** The parser/compiler must reject unsupported pattern syntax rather than silently misinterpreting it.
 
 ### 9.2. Command Matcher Semantics
 
@@ -397,7 +454,7 @@ Policy evaluation is completely order-independent: the physical order of rules i
 
 When an external policy file is explicitly configured by the operator:
 
-1. **Unhealthy State on Load Failure:** If the policy file is corrupted, malformed, unreadable, schema-invalid, references unknown workspaces, or violates parser constraints:
+1. **Unhealthy State on Load Failure:** If the policy file is corrupted, malformed, unreadable, schema-invalid, references unknown workspaces, has mismatched root hashes, or violates parser constraints:
    - `health.status = 'UNHEALTHY'`
    - `policyEngineActive = false`
 2. **Callable Diagnostic Health Probe:** The `health` and `system_status` diagnostic endpoints remain callable to allow operator diagnosis.
@@ -412,57 +469,61 @@ When an external policy file is explicitly configured by the operator:
 The approval state machine governs the lifecycle of requests that evaluate to `REQUIRE_APPROVAL`:
 
 ```
-               ┌──────────────┐
-               │   PENDING    │
-               └──────┬───────┘
-         ┌────────────┼────────────┐
-         │ (Approve)  │ (Reject)   │ (TTL Expiry)
-         ▼            ▼            ▼
-   ┌──────────┐ ┌──────────┐ ┌──────────┐
-   │ APPROVED │ │ REJECTED │ │ EXPIRED  │
-   └────┬─────┘ └──────────┘ └──────────┘
+                    ┌──────────────┐
+                    │   PENDING    │
+                    └──────┬───────┘
+         ┌─────────────────┼─────────────────┬──────────────────┐
+         │ (Approve)       │ (Reject)        │ (TTL Expiry)     │ (Policy Mismatch)
+         ▼                 ▼                 ▼                  ▼
+   ┌──────────┐      ┌──────────┐      ┌──────────┐       ┌─────────────┐
+   │ APPROVED │      │ REJECTED │      │ EXPIRED  │       │ INVALIDATED │
+   └────┬─────┘      └──────────┘      └──────────┘       └─────────────┘
         │
-   ┌────┴─────┐
-   │          │ (TTL Expiry)
-   ▼          ▼
-┌──────────┐ ┌──────────┐
-│ CONSUMED │ │ EXPIRED  │
-└──────────┘ └──────────┘
+   ┌────┴──────────────────────────┬──────────────────┐
+   │ (Redeem & Consume)            │ (TTL Expiry)     │ (Policy Mismatch)
+   ▼                               ▼                  ▼
+┌──────────┐                 ┌──────────┐       ┌─────────────┐
+│ CONSUMED │                 │ EXPIRED  │       │ INVALIDATED │
+└──────────┘                 └──────────┘       └─────────────┘
 ```
 
 ### 13.1. States & Transitions
 
+The state machine consists of 6 canonical states:
+
 - **`PENDING`**: Request created; awaiting human operator review.
-  - Allowed transitions: `-> APPROVED`, `-> REJECTED`, `-> EXPIRED`.
+  - Allowed transitions: `-> APPROVED`, `-> REJECTED`, `-> EXPIRED`, `-> INVALIDATED`.
 - **`APPROVED`**: Trusted human operator granted permission; one-time token generated; awaiting agent redemption.
-  - Allowed transitions: `-> CONSUMED`, `-> EXPIRED`.
+  - Allowed transitions: `-> CONSUMED`, `-> EXPIRED`, `-> INVALIDATED`.
 - **`REJECTED`**: Trusted human operator explicitly denied the request.
   - **Terminal state**. Zero transitions out.
-- **`EXPIRED`**: TTL elapsed (300 seconds from initial creation) without successful consumption.
+- **`EXPIRED`**: Monotonic 300-second TTL elapsed without successful consumption.
   - **Terminal state**. Zero transitions out.
 - **`CONSUMED`**: Token redeemed and verified; operation dispatched to execution subsystem.
   - **Terminal state**. Zero transitions out. Replay is strictly impossible.
+- **`INVALIDATED`**: Effective policy configuration changed between request creation and redemption.
+  - **Terminal state**. Zero transitions out. Cannot be reactivated even if policy reverts.
 
-**Invariant:** Transition into any terminal state (`REJECTED`, `EXPIRED`, `CONSUMED`) is final. State can never return to `PENDING`, and expired or consumed requests can never be reactivated.
+**Terminal Invariant:** Transition into any terminal state (`REJECTED`, `EXPIRED`, `CONSUMED`, `INVALIDATED`) is final and irreversible. State can never return to `PENDING` or `APPROVED`.
 
 ### 13.2. State-Race Winner Rules & Concurrency Serialization
 
 All transitions for an approval request occur under a strict, record-level atomic serialization boundary (in-process mutex or atomic conditional update):
 
-1. **Pre-Transition Expiry Check:** Before executing any non-terminal state transition, server clock is checked (`Date.now() >= expiresAt`). If expired, the record transitions to `EXPIRED`, and the attempted transition fails.
+1. **Pre-Transition Expiry Check:** Before executing any non-terminal state transition, monotonic server clock is checked. If expired, the record transitions to `EXPIRED`, and the attempted transition fails.
 2. **`PENDING` Approve vs Reject Race:**
    - The first valid transition acquired under lock wins (`APPROVED` or `REJECTED`).
    - The competing operation observes a terminal or non-eligible state and fails. No second transition occurs.
 3. **`PENDING` Approve vs Expiry Race:**
-   - If `Date.now() >= expiresAt` when lock is acquired, `EXPIRED` wins. No approval occurs and no token is generated.
-   - If `Date.now() < expiresAt`, the approval transition succeeds and the token is minted.
+   - If monotonic deadline has expired when lock is acquired, `EXPIRED` wins. No approval occurs and no token is generated.
+   - If unexpired, the approval transition succeeds and the token is minted.
 4. **`APPROVED` Consume vs Expiry Race:**
-   - If `Date.now() >= expiresAt` before atomic consumption lock is acquired, `EXPIRED` wins. Consumption fails with `APPROVAL_EXPIRED`.
-   - If `Date.now() < expiresAt`, atomic consumption succeeds, status transitions to `CONSUMED`, and tool execution proceeds.
+   - If monotonic deadline has expired before atomic consumption lock is acquired, `EXPIRED` wins. Consumption fails with `APPROVAL_EXPIRED`.
+   - If unexpired, atomic consumption succeeds, status transitions to `CONSUMED`, and tool execution proceeds.
 5. **`APPROVED` Reject Attempt:**
-   - Forbidden. `REJECTED` is reachable only from `PENDING`. Once approved, an operator cannot reject; the request can only be consumed or expire.
-6. **Approval After Expiry:**
-   - Strictly impossible. If status is `EXPIRED`, `arc approve` fails with an expiry error and no token is minted.
+   - Forbidden. `REJECTED` is reachable only from `PENDING`. Once approved, an operator cannot reject; the request can only be consumed, expire, or be invalidated.
+6. **Approval After Expiry or Invalidation:**
+   - Strictly impossible. If status is `EXPIRED` or `INVALIDATED`, `arc approve` fails with an error and no token is minted.
 7. **Creation Race Safety:** Duplicate `PENDING` creation is atomic: concurrent identical requests resolve to the same active record without creating multiple pending entries.
 
 ---
@@ -471,23 +532,40 @@ All transitions for an approval request occur under a strict, record-level atomi
 
 ### 14.1. Approval Request ID (`approvalRequestId`)
 
-- Generated using `crypto.randomBytes(16).toString('hex')` (128 bits of cryptographic entropy, 32 lowercase hex characters).
-- Opaque identifier returned to the MCP client in the initial `APPROVAL_REQUIRED` error details.
-- Grants **zero authority**. It serves purely as a lookup key for the pending approval record.
+- Generated using:
+  ```typescript
+  const approvalRequestId = crypto.randomBytes(16).toString('hex');
+  ```
+- Exactly **32 lowercase hexadecimal characters** (128 bits of cryptographic entropy).
+- Request IDs are lookup identifiers, not authorization secrets.
+- Admission schema accepts **only** lowercase hexadecimal: `^[0-9a-f]{32}$`. Uppercase aliases are rejected.
 
-### 14.2. One-Time Approval Token & Frozen Token-Digest Construction
+### 14.2. Exact Token Digest Construction
 
-- **Raw Token:** 32 cryptographically random bytes encoded as 64 lowercase hexadecimal characters (256 bits of cryptographic entropy).
-- **Stored Verifier:**
-  $$\text{tokenDigest} = \text{SHA-256}(\text{rawTokenBytes})$$
-  Stored as a fixed 32-byte binary buffer (or 64 hex characters).
-- **No HMAC Secret Required:** Because the underlying raw token already provides 256 bits of cryptographic entropy, an unkeyed SHA-256 digest is cryptographically irreversible and eliminates the complexity of secondary secret-key management.
-- **Timing-Safe Verification:**
-  1. The client supplies a bounded UTF-8 token string (max 128 bytes).
-  2. The server decodes or hashes the supplied token bytes into a 32-byte candidate digest.
-  3. Verification performs a constant-time comparison:
-     $$\text{crypto.timingSafeEqual}(\text{storedDigest}, \text{candidateDigest})$$
-  4. Raw token strings are **never** compared directly with `===` or `==`.
+To completely eliminate token-format ambiguities and second secret-management systems:
+
+1. **Token Generation:**
+   ```typescript
+   const tokenText = crypto.randomBytes(32).toString('hex');
+   ```
+   Generated `tokenText` is exactly **64 lowercase hexadecimal characters** (256 bits of cryptographic entropy).
+2. **Stored Verifier (`tokenDigest`):**
+   ```typescript
+   const tokenDigest = crypto.createHash('sha256').update(tokenText, 'utf8').digest();
+   ```
+   Stored internally strictly as a **32-byte binary Buffer**. ARC does NOT store an alternate hex-string representation internally.
+3. **No HMAC Secret Required:** Because the raw token already possesses 256 bits of cryptographic entropy, an unkeyed SHA-256 digest is cryptographically irreversible and prevents token recovery even from memory dumps.
+4. **Timing-Safe Verification Algorithm:**
+   During redemption:
+   ```typescript
+   // suppliedTokenString is validated to be <= 128 UTF-8 bytes
+   const candidateDigest = crypto.createHash('sha256').update(suppliedTokenString, 'utf8').digest();
+   const isValid = crypto.timingSafeEqual(storedDigest, candidateDigest);
+   ```
+   - Both digests are always fixed 32-byte buffers.
+   - Raw token strings are **never** compared with `===` or `==`.
+   - Hexadecimal strings are **never decoded** before hashing; hashing is performed directly over the UTF-8 bytes of the string.
+   - Case differences fail validation (e.g. uppercase characters yield a completely different SHA-256 digest).
 
 ### 14.3. Raw Token Memory Lifetime & Bounded Claims
 
@@ -517,22 +595,32 @@ Agents supply approval credentials via a reserved top-level parameter object:
 
 ### 15.1. Control Object Handling Rules & Anti-Oracle Bounding
 
-1. **Input Length Bounding:** The `token` string is strictly bounded to a maximum of **128 UTF-8 bytes**. Oversized inputs are rejected immediately with `INVALID_REQUEST_SCHEMA`.
+1. **Exact Token Byte Limit:** The `token` string is strictly bounded to a maximum of **128 UTF-8 bytes**. Verification must check byte length, not merely UTF-16 character count.
 2. **Schema Admission:**
    ```typescript
    export const ArcApprovalSchema = z
      .object({
-       requestId: z.string().regex(/^[0-9a-fA-F]{32}$/, 'Invalid approval request ID format'),
-       token: z.string().min(32).max(128),
+       requestId: z.string().regex(/^[0-9a-f]{32}$/, 'Invalid approval request ID format'),
+       token: z
+         .string()
+         .min(1, 'Approval token cannot be empty')
+         .superRefine((val, ctx) => {
+           if (Buffer.byteLength(val, 'utf8') > 128) {
+             ctx.addIssue({
+               code: z.ZodIssueCode.custom,
+               message: 'Approval token exceeds maximum length of 128 UTF-8 bytes',
+             });
+           }
+         }),
      })
      .strict();
    ```
 3. **Three Distinct Request Scenarios:**
    - **Scenario A: `_arcApproval` Absent & Policy Evaluates to `REQUIRE_APPROVAL`:**
-     - Creates or reuses a `PENDING` request.
+     - Creates or reuses an active request (returns existing request ID if `PENDING` or `APPROVED`).
      - Returns `isError: true` with error code `APPROVAL_REQUIRED` and opaque `approvalRequestId`.
    - **Scenario B: `_arcApproval` Structurally Malformed:**
-     - Missing `requestId` or `token`, invalid types, oversized token string, or unexpected properties.
+     - Missing `requestId` or `token`, uppercase request ID, invalid types, oversized token ($>128$ bytes), or unexpected properties.
      - Returns `INVALID_REQUEST_SCHEMA`.
      - **DOES NOT** create or reuse an approval request.
    - **Scenario C: `_arcApproval` Structurally Admitted But Redemption Invalid:**
@@ -547,9 +635,9 @@ Agents supply approval credentials via a reserved top-level parameter object:
 
 ## 16. Initial `REQUIRE_APPROVAL` Flow & Error Semantics
 
-When a tool request evaluates to `REQUIRE_APPROVAL` and does not provide valid `_arcApproval`:
+When policy evaluates `REQUIRE_APPROVAL` and `_arcApproval` is **ABSENT**:
 
-1. **Pending Record Creation / Deduplication:** The server checks if an active `PENDING` request already exists with identical `executionPayloadHash`. If found, it returns the existing `approvalRequestId` and the **remaining TTL** in seconds (does not reset to 300 seconds). If not, it creates a new record in `ApprovalStateManager`.
+1. **Pending Record Creation / Deduplication:** The server checks if an active request already exists with identical `executionPayloadHash` (see Section 21). If found, it returns the existing `approvalRequestId` and the **remaining TTL** in seconds (does not reset to 300 seconds). If not, it creates a new record in `ApprovalStateManager`.
 2. **Structured Audit Log:** Emits an `APPROVAL_REQUESTED` audit record.
 3. **Safe Error Response:** Returns MCP tool failure (`isError: true`) with structured JSON:
    ```json
@@ -567,13 +655,18 @@ When a tool request evaluates to `REQUIRE_APPROVAL` and does not provide valid `
 
 ---
 
-## 17. Approval Time-To-Live (300-Second Absolute TTL)
+## 17. Approval Time-To-Live (Monotonic 300-Second Absolute TTL)
 
-1. Every approval record stores an immutable expiration timestamp:
-   $$\text{expiresAt} = \text{createdAt} + 300\,000\text{ ms}$$
-2. **No TTL Reset on Approval:** Operator approval does **not** grant a fresh 300 seconds. The expiration timestamp remains strictly bound to initial creation.
-3. **Server Clock Authority:** The server clock (`Date.now()`) is the sole authoritative time source. Client timestamps are ignored.
-4. **Expiry Enforcement:** Any transition attempted at timestamp $T \ge \text{expiresAt}$ transitions the record to `EXPIRED` and returns `APPROVAL_EXPIRED`.
+1. **Monotonic Enforcement Clock:**
+   - `createdAt` and `expiresAt` ISO 8601 timestamps are recorded purely for operator display and audit logging.
+   - Actual 300-second lifetime enforcement is strictly governed by a server-monotonic elapsed-time deadline:
+     ```typescript
+     const deadline = process.hrtime.bigint() + 300_000_000_000n; // 300 seconds in nanoseconds
+     ```
+   - Wall-clock adjustments or rollback (e.g. NTP shifts, manual time tampering) **cannot** extend the lifetime of an approval.
+2. **No TTL Reset on Approval:** Operator approval does **not** grant a fresh 300 seconds. Expiration remains bound to the monotonic deadline established at request creation.
+3. **Server Clock Authority:** Client timestamps are completely ignored.
+4. **Expiry Enforcement:** If `process.hrtime.bigint() >= deadline`, the record transitions to `EXPIRED` and returns `APPROVAL_EXPIRED`.
 
 ---
 
@@ -594,24 +687,55 @@ Where `payloadToSign` consists of:
 7. **`actor.deviceId`**: Caller device identifier (when present).
 8. **`workspaceId`**: Target authorized workspace identifier.
 9. **`workspaceRootHash`**: SHA-256 digest of the server-resolved canonical registered workspace-root path. (The raw host path is never exposed in the binding).
-10. **`policyHash`**: Canonical SHA-256 digest of the validated, normalized effective policy.
+10. **`policyHash`**: Canonical SHA-256 digest of the normalized effective policy.
 
 **Tampering Invariant:** If an attacker modifies even a single character in the file content, patch body, path, actor context, workspace, or flags between approval and redemption, the recomputed `executionPayloadHash` will mismatch, causing immediate rejection with `APPROVAL_REJECTED` (`PAYLOAD_BINDING_MISMATCH`).
 
-### 18.1. Exact Definition of `policyHash`
+### 18.1. Exact Definition of Normalized Policy & `policyHash`
 
-`policyHash` is defined as the SHA-256 digest over the canonical JSON string of the validated, normalized effective policy representation:
+`policyHash` is defined as the SHA-256 digest over the canonical JSON string of the validated, normalized semantic policy representation:
 
 $$\text{policyHash} = \text{SHA-256}(\text{canonicalJson}(\text{normalizedPolicy}))$$
 
-Normalization is deterministic and order-independent:
+The `normalizedPolicy` object includes **only security-relevant semantics**:
 
-1. **Rule Sorting:** Rules are sorted lexicographically by rule `id`.
-2. **Key Canonicalization:** All JSON object keys are canonicalized in lexicographical order.
-3. **Array Normalization:** Order-insensitive matcher arrays (`tools`, `paths.patterns`, `allowedBinaries`, `blockedBinaries`) are deterministically sorted and deduplicated.
-4. **Explicit Defaults:** Default values are represented consistently.
-5. **Format Independence:** Comments, whitespace, indentation, and YAML-vs-JSON syntax differences produce identical `policyHash` values if the effective normalized rules are identical.
-6. **Built-in Policy:** The built-in compatibility policy has a canonical normalized model from which its fixed `policyHash` is derived.
+```typescript
+interface NormalizedPolicy {
+  schemaVersion: '1.0';
+  workspaces: Array<{
+    id: string;
+    rootHash?: string;
+  }>;
+  rules: Array<{
+    id: string;
+    effect: 'DENY' | 'REQUIRE_APPROVAL' | 'ALLOW';
+    tools?: string[];
+    paths?: {
+      patterns?: string[];
+    };
+    commands?: {
+      allowedBinaries?: string[];
+      blockedBinaries?: string[];
+    };
+    git?: {
+      protectedBranches?: string[];
+      actions?: string[];
+    };
+  }>;
+}
+```
+
+**Normalization Rules:**
+
+1. **Exclusion of Non-Semantic Metadata:** Fields such as `metadata.name`, `metadata.description`, `metadata.lastModified`, and rule `description` are **completely excluded** from `normalizedPolicy` and have zero effect on `policyHash`.
+2. **Deterministic Ordering:**
+   - `workspaces`: Sorted lexicographically by `id`.
+   - `rules`: Sorted lexicographically by rule `id`.
+   - All order-independent matcher arrays (`tools`, `paths.patterns`, `commands.allowedBinaries`, `commands.blockedBinaries`, `git.protectedBranches`, `git.actions`) are sorted lexicographically and deduplicated.
+3. **Key Canonicalization:** Object keys are serialized in deterministic lexicographical order.
+4. **Representation of Absent Matchers:** Optional matchers that are omitted or empty are normalized consistently (omitted from rule object).
+5. **Formatting Invariance:** Comments, indentation, whitespace, and YAML-vs-JSON syntax produce identical `policyHash` values if the semantic rules are identical.
+6. **Built-in Policy:** The built-in compatibility policy has a canonical normalized structure from which its fixed `policyHash` is derived.
 
 ---
 
@@ -621,7 +745,7 @@ Approval validation enforces four mandatory context checks:
 
 1. **Actor Binding:** The actor redeeming the token must match the actor who requested it (`clientId`, `clientType`, `sessionId`, `deviceId`). An approval requested by Session A cannot be redeemed by Session B.
 2. **Workspace Binding:** The target workspace of the redemption request must match the approved `workspaceId` and canonical `workspaceRootHash`.
-3. **Policy Binding:** The effective `policyHash` at redemption time must match the approved `policyHash`. If policy changed, redemption fails with `APPROVAL_REJECTED` (`POLICY_BINDING_MISMATCH`).
+3. **Policy Binding:** The effective `policyHash` at redemption time must match the approved `policyHash`. If policy changed, the record transitions to `INVALIDATED` and redemption fails with `APPROVAL_REJECTED` (`POLICY_BINDING_MISMATCH`).
 4. **Payload Binding:** The computed `executionPayloadHash` of the redemption request must match the approved record's hash.
 
 ---
@@ -634,7 +758,7 @@ During token redemption:
 [Agent submits tool call with _arcApproval]
                      │
                      ▼
-  1. Validate MCP schema & extract _arcApproval
+  1. Validate MCP schema & byte length of _arcApproval
      (Malformed -> INVALID_REQUEST_SCHEMA; Absent -> PENDING flow)
                      │
                      ▼
@@ -643,27 +767,35 @@ During token redemption:
      └── PASS
           │
           ▼
-  3. Re-evaluate Layer 2 (Declarative Policy)
+  3. Re-evaluate Layer 2 (Current Declarative Policy)
      ├── DENY ──────────────────────────────────────► Reject with POLICY_DENIED
-     └── REQUIRE_APPROVAL
+     └── REQUIRE_APPROVAL or ALLOW
           │
           ▼
-  4. Lookup approval record by requestId
+  4. Enforce Mutation Floor (Clamps ALLOW -> REQUIRE_APPROVAL for mutations)
+          │
+          ▼
+  5. Lookup approval record by requestId
      ├── Not found / Expired / Rejected ───────────► Reject with APPROVAL_REJECTED / EXPIRED
      └── Found (State == APPROVED)
           │
           ▼
-  5. Validate Cryptographic Digest, Payload Hash, Actor, Workspace & Policy Bindings
+  6. Verify Effective Policy Hash Binding
+     ├── policyHash Mismatch ──────────────────────► State -> INVALIDATED, Reject: APPROVAL_REJECTED
+     └── policyHash Match
+          │
+          ▼
+  7. Validate Token Digest (32-byte timingSafeEqual), Payload Hash, Actor & Workspace Bindings
      ├── Any mismatch ─────────────────────────────► Reject with APPROVAL_REJECTED
      └── Valid
           │
           ▼
-  6. Atomic State Transition: APPROVED -> CONSUMED
+  8. Atomic State Transition: APPROVED -> CONSUMED
      ├── Already consumed (race condition) ────────► Reject with APPROVAL_REJECTED
      └── Transition successful
           │
           ▼
-  7. Strip _arcApproval and execute in Subsystem
+  9. Strip _arcApproval and execute in Subsystem
      ├── Subsystem execution succeeds ─────────────► Emit APPROVED_EXECUTION_SUCCEEDED
      └── Subsystem execution fails ────────────────► Emit APPROVED_EXECUTION_FAILED
 ```
@@ -674,13 +806,14 @@ During token redemption:
 
 ## 21. Request Deduplication Semantics
 
-To prevent flooding the approval store with identical requests, repeated invocations of the same pending action are deduplicated:
+To prevent flooding the approval store with identical requests, repeated invocations of the same action are deduplicated:
 
 $$\text{dedupKey} = \text{executionPayloadHash}$$
 
-- Because `executionPayloadHash` already binds `toolName`, `parameters`, `workspaceId`, `workspaceRootHash`, `actor.clientId`, `actor.clientType`, `actor.sessionId`, `actor.deviceId`, and `policyHash`, two different sessions or actors will **never** share a pending approval record.
-- If an active record with status `PENDING` matches the `dedupKey`, ARC returns the existing `approvalRequestId` and remaining TTL without creating a duplicate record.
-- Once a request reaches a terminal state (`REJECTED`, `EXPIRED`, `CONSUMED`), the deduplication slot is freed, allowing a fresh request to be created.
+1. **Active Record Deduplication:**
+   - If an active record with status `PENDING` matches the `dedupKey`, ARC returns the existing `approvalRequestId` and remaining TTL without creating a new record.
+   - If an active record with status `APPROVED` matches the `dedupKey` (and is unexpired), ARC returns `APPROVAL_REQUIRED` referencing the **existing request ID** and remaining TTL. It does **NOT** allocate duplicate review buffers or spawn a second approval record.
+2. **Terminal Slot Release:** Once a request reaches a terminal state (`REJECTED`, `EXPIRED`, `CONSUMED`, `INVALIDATED`), the deduplication slot is freed, allowing a fresh request to be admitted.
 
 ---
 
@@ -710,7 +843,7 @@ To allow local operators to inspect privileged actions without unbounded memory 
 1. **Volatile Review Retention:** Full review content (e.g. patch diffs, file bodies, executable arguments) is stored only in volatile memory during the `PENDING` state.
 2. **Early Reference Dropping:**
    - Once `PENDING` transitions to `APPROVED`, references to raw review buffers are **dropped immediately** after token generation and recording of the approval decision.
-   - Raw review references are likewise dropped immediately upon transition to `REJECTED`, `EXPIRED`, or `CONSUMED`.
+   - Raw review references are likewise dropped immediately upon transition to `REJECTED`, `EXPIRED`, `CONSUMED`, or `INVALIDATED`.
    - Rationale: During redemption, the agent resubmits the business parameters, which are verified via `executionPayloadHash`. Retaining raw file contents during the `APPROVED` waiting period wastes memory without security benefit.
 3. **Total Audit Redaction:** Audit records store only metadata (`path`, `contentBytes`, `patchBytes`, hashes). Raw content is never written to disk or audit logs.
 
@@ -805,8 +938,9 @@ The audit subsystem (`packages/audit`) captures every stage of the approval life
 3. **`APPROVAL_REJECTED`**: Logged when operator executes `arc reject`.
 4. **`APPROVAL_EXPIRED`**: Logged when a request expires.
 5. **`APPROVAL_CONSUMED`**: Logged when token verification succeeds immediately before subsystem execution.
-6. **`APPROVED_EXECUTION_SUCCEEDED`**: Logged upon successful tool execution.
-7. **`APPROVED_EXECUTION_FAILED`**: Logged if the tool execution fails downstream.
+6. **`APPROVAL_INVALIDATED`**: Logged when an approval record is invalidated due to a policy change (`reasonCode: 'POLICY_BINDING_MISMATCH'`).
+7. **`APPROVED_EXECUTION_SUCCEEDED`**: Logged upon successful tool execution.
+8. **`APPROVED_EXECUTION_FAILED`**: Logged if the tool execution fails downstream.
 
 All events are linked into the append-only SHA-256 hash chain with strict data minimization (zero raw tokens, zero raw content).
 
@@ -848,7 +982,19 @@ RC-04 does **not** implement or expose Git write tools (`git_commit`, `git_push`
 
 ---
 
-## 31. Out of Scope Catalog
+## 31. Policy Loading & Scope Boundaries
+
+### 31.1. Policy Loading vs Hot Reload Scope
+
+1. **Initial External Policy Loading:** Mandatory for RC-04. The server loads and normalizes the configured policy document at startup.
+2. **Hot Reload Scope:** Live hot reloading of policy documents is **NOT required** in RC-04 baseline and is deferred to subsequent independently reviewed stages.
+3. **Replacement Guarantees (If Reload Implemented):** If an operator initiates a policy replacement:
+   - The replacement policy must fully parse, validate, and normalize before taking effect.
+   - An invalid replacement policy **never** becomes active (`health.status = 'UNHEALTHY'`).
+   - Active approvals bound to the previous policy immediately transition to `INVALIDATED`.
+   - Zero partially loaded policy state is permitted.
+
+### 31.2. Out of Scope Catalog
 
 The following capabilities are explicitly deferred beyond RC-04:
 
@@ -864,22 +1010,25 @@ The following capabilities are explicitly deferred beyond RC-04:
 
 ## 32. Exhaustive Threat & Race Condition Matrix
 
-| Threat / Race Scenario                                                                  | Mitigating Security Control                                                                        | Outcome                                                                  |
-| :-------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------- | :----------------------------------------------------------------------- |
-| **Replay Attack:** Agent attempts to use the same token twice.                          | Atomic state transition to `CONSUMED` before execution; subsequent attempts find state `CONSUMED`. | Rejection (`APPROVAL_REJECTED`). Subsystem called once only.             |
-| **Concurrent Redemption Race:** Two concurrent calls submit identical valid token.      | Record lock / atomic CAS on approval record state.                                                 | Exactly one call transitions to `CONSUMED`; second call fails.           |
-| **Parameter Tampering:** Agent alters file path or content after approval.              | `executionPayloadHash` computed over exact parameters mismatches approved hash.                    | Rejection (`APPROVAL_REJECTED`). Zero filesystem modification.           |
-| **Confused Deputy / Cross-Session Hijack:** Agent B intercepts Token A and submits.     | Actor binding check (`clientId`, `sessionId`, `deviceId`) detects caller mismatch.                 | Rejection (`APPROVAL_REJECTED`). Zero execution.                         |
-| **Workspace Redirection:** Agent attempts to redeem approval in another workspace.      | Workspace binding check detects `workspaceId` or `workspaceRootHash` mismatch.                     | Rejection (`APPROVAL_REJECTED`).                                         |
-| **Stale Approval under Policy Update:** Operator updates policy after approval granted. | Policy hash binding check detects `policyHash` mismatch; approval fails redemption.                | Rejection (`APPROVAL_REJECTED`). Token NOT consumed. Operation blocked.  |
-| **Expiry Race before Approval:** Operator approves request after 300s TTL.              | Record lock checks `Date.now() >= expiresAt`; transitions to `EXPIRED`.                            | Expiry failure. Zero token generated.                                    |
-| **Expiry Race before Consumption:** Approval expires while redemption is in flight.     | Pre-consumption expiry check under record lock detects expiration; transitions to `EXPIRED`.       | Rejection (`APPROVAL_EXPIRED`). Zero tool execution.                     |
-| **Malformed Control Object Spam:** Malicious agent floods bad `_arcApproval` objects.   | Schema validation fails with `INVALID_REQUEST_SCHEMA`; does not create or lookup pending records.  | Rejection (`INVALID_REQUEST_SCHEMA`). Zero state pollution.              |
-| **Server Crash & Restart:** Server restarts while approval is `APPROVED`.               | Authoritative store is volatile in-memory; state is purged on restart.                             | Rejection (`APPROVAL_REJECTED`). Client must re-request.                 |
-| **Denial of Service via Pending Flooding:** Malicious agent floods approval requests.   | Record quotas (1024 global, 64 per actor) and deduplication via `executionPayloadHash`.            | `RESOURCE_EXHAUSTED` returned once quota hit; active requests preserved. |
-| **Raw Review Material Memory Exhaustion:** Large payload spam consumes server heap.     | Multi-tier byte quotas (8 MiB actor, 64 MiB global) and immediate drop on approval/terminal.       | `RESOURCE_EXHAUSTED` returned; memory footprint strictly bounded.        |
-| **Token Oracle Attack:** Attacker attempts to brute-force 256-bit token string.         | 256 bits of cryptographic entropy ($2^{256}$ search space) + bounded 128-byte token input limit.   | Computationally infeasible. Generic rejection on mismatch.               |
-| **Local Admin Channel Hijack:** Untrusted local process connects to admin socket.       | Authenticated operator identity in local IPC; fails closed if operator identity unverified.        | Administrative access denied. Zero elevation.                            |
+| Threat / Race Scenario                                                                     | Mitigating Security Control                                                                        | Outcome                                                                  |
+| :----------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------- | :----------------------------------------------------------------------- |
+| **Replay Attack:** Agent attempts to use the same token twice.                             | Atomic state transition to `CONSUMED` before execution; subsequent attempts find state `CONSUMED`. | Rejection (`APPROVAL_REJECTED`). Subsystem called once only.             |
+| **Concurrent Redemption Race:** Two concurrent calls submit identical valid token.         | Record lock / atomic CAS on approval record state.                                                 | Exactly one call transitions to `CONSUMED`; second call fails.           |
+| **Parameter Tampering:** Agent alters file path or content after approval.                 | `executionPayloadHash` computed over exact parameters mismatches approved hash.                    | Rejection (`APPROVAL_REJECTED`). Zero filesystem modification.           |
+| **Confused Deputy / Cross-Session Hijack:** Agent B intercepts Token A and submits.        | Actor binding check (`clientId`, `sessionId`, `deviceId`) detects caller mismatch.                 | Rejection (`APPROVAL_REJECTED`). Zero execution.                         |
+| **Workspace Redirection:** Agent attempts to redeem approval in another workspace.         | Workspace binding check detects `workspaceId` or `workspaceRootHash` mismatch.                     | Rejection (`APPROVAL_REJECTED`).                                         |
+| **Stale Approval under Policy Update:** Operator updates policy after approval granted.    | Policy hash check detects mismatch; record transitions to `INVALIDATED`.                           | Rejection (`APPROVAL_REJECTED`). Stale approval permanently void.        |
+| **Policy Reversion Revival Attack:** Operator changes policy and then changes it back.     | Transition to `INVALIDATED` is terminal; revoked records never regain authority.                   | Rejection (`APPROVAL_REJECTED`). Replay / revival impossible.            |
+| **Declarative DENY Precedence Bypass:** Agent presents token for action denied in Layer 2. | Current policy evaluated first; Layer-2 `DENY` rejects before token verification.                  | Rejection (`POLICY_DENIED`). Zero token consumption or tool execution.   |
+| **Expiry Race before Approval:** Operator approves request after 300s TTL.                 | Record lock checks monotonic deadline; transitions to `EXPIRED`.                                   | Expiry failure. Zero token generated.                                    |
+| **Expiry Race before Consumption:** Approval expires while redemption is in flight.        | Pre-consumption monotonic expiry check detects expiration; transitions to `EXPIRED`.               | Rejection (`APPROVAL_EXPIRED`). Zero tool execution.                     |
+| **Wall-Clock Rollback Attack:** Attacker rolls back system time to extend approval TTL.    | Monotonic timer (`process.hrtime.bigint()`) tracks elapsed time independent of system clock.       | Monotonic deadline expires at 300s; record transitions to `EXPIRED`.     |
+| **Malformed Control Object Spam:** Malicious agent floods bad `_arcApproval` objects.      | Schema validation fails with `INVALID_REQUEST_SCHEMA`; does not create or lookup pending records.  | Rejection (`INVALID_REQUEST_SCHEMA`). Zero state pollution.              |
+| **Server Crash & Restart:** Server restarts while approval is `APPROVED`.                  | Authoritative store is volatile in-memory; state is purged on restart.                             | Rejection (`APPROVAL_REJECTED`). Client must re-request.                 |
+| **Denial of Service via Pending Flooding:** Malicious agent floods approval requests.      | Record quotas (1024 global, 64 per actor) and deduplication via `executionPayloadHash`.            | `RESOURCE_EXHAUSTED` returned once quota hit; active requests preserved. |
+| **Raw Review Material Memory Exhaustion:** Large payload spam consumes server heap.        | Multi-tier byte quotas (8 MiB actor, 64 MiB global) and immediate drop on approval/terminal.       | `RESOURCE_EXHAUSTED` returned; memory footprint strictly bounded.        |
+| **Token Oracle Attack:** Attacker attempts to brute-force 256-bit token string.            | 256 bits of cryptographic entropy ($2^{256}$ search space) + bounded 128-byte token input limit.   | Computationally infeasible. Generic rejection on mismatch.               |
+| **Local Admin Channel Hijack:** Untrusted local process connects to admin socket.          | Authenticated operator identity in local IPC; fails closed if operator identity unverified.        | Administrative access denied. Zero elevation.                            |
 
 ---
 
@@ -887,7 +1036,7 @@ The following capabilities are explicitly deferred beyond RC-04:
 
 1. All approval records and tokens reside exclusively in volatile server memory.
 2. In the event of an unhandled exception, process termination, or system restart:
-   - All pending and approved requests are immediately extinguished.
+   - All pending, approved, and invalidated requests are immediately extinguished.
    - Any token previously issued is rendered permanently invalid.
 3. If a crash occurs during tool execution after token consumption, the token is not recovered. Re-execution requires a brand-new request, review, and approval.
 
@@ -898,23 +1047,23 @@ The following capabilities are explicitly deferred beyond RC-04:
 RC-04 implementation will proceed across six discrete, independently reviewable tasks:
 
 - **Task 1: Protocol Contracts & Approval State Machine Core**
-  - Define all protocol types in `packages/protocol`.
-  - Implement `ApprovalStateManager` with high-entropy token generation and atomic state transitions in `packages/policy`.
-  - Comprehensive unit test suite covering state transitions and concurrency.
+  - Define all protocol types in `packages/protocol` (including 6 states with `INVALIDATED`).
+  - Implement `ApprovalStateManager` with high-entropy token generation, 32-byte Buffer digest verification, monotonic clock deadline, and atomic state transitions in `packages/policy`.
+  - Comprehensive unit test suite covering state transitions, invalidations, and concurrency.
 - **Task 2: Strict Declarative Policy Parser & Matchers**
-  - Implement schema validation, YAML/JSON parser, AST matchers, and canonical `policyHash` normalization in `packages/policy`.
+  - Implement schema validation, YAML/JSON parser hardened against parser attacks (anchors, aliases, merge keys, tags, nesting depth 32), AST matchers, and canonical `policyHash` normalization in `packages/policy`.
   - Order-independent rule evaluation and tie-breaking algorithms.
   - Policy parsing security benchmarks and edge-case unit tests.
 - **Task 3: Local Operator Administrative Channel**
   - Implement authenticated local IPC communication between `apps/cli` and `apps/mcp-server`.
   - Implement `arc approve`, `arc reject`, `arc approvals list`, and `arc policy test` commands.
 - **Task 4: MCP Approval Request & Token Redemption Integration**
-  - Wire `_arcApproval` parameter extraction, validation, and scenario routing into `ArcMcpServer`.
-  - Implement initial `APPROVAL_REQUIRED` flow and verified token redemption path.
+  - Wire `_arcApproval` parameter extraction, validation (byte length $\le 128$), and scenario routing into `ArcMcpServer`.
+  - Implement initial `APPROVAL_REQUIRED` flow and verified token redemption path with correct evaluation order.
   - Enable execution of RC-03 mutation tools strictly upon valid approval consumption.
 - **Task 5: Security Hardening, Race Condition Verification & Audit Integration**
-  - Full audit logging integration for all approval lifecycle events.
-  - Extensive concurrency and race-condition test suite (replays, tampering, expiry races).
+  - Full audit logging integration for all approval lifecycle events, including `APPROVAL_INVALIDATED`.
+  - Extensive concurrency and race-condition test suite (replays, tampering, expiry races, wall-clock rollback resistance).
   - Memory isolation and byte quota verification.
 - **Task 6: Verification Gates, Acceptance Documentation & PR**
   - End-to-end negative control test suite.
@@ -929,12 +1078,12 @@ Subsequent implementation tasks must implement and pass direct test controls for
 
 1. `RC04-NEG-01`: Agent attempt to invoke internal approval/rejection API via MCP is rejected with `POLICY_DENIED`.
 2. `RC04-NEG-02`: Valid approval token cannot override a Layer 1 permanent `DENY`.
-3. `RC04-NEG-03`: Valid approval token cannot override a Layer 2 declarative `DENY`.
+3. `RC04-NEG-03`: Valid approval token cannot override a Layer 2 declarative `DENY`. Current declarative policy `DENY` returns `POLICY_DENIED` before approval token validation.
 4. `RC04-NEG-04`: Declarative policy rule attempting `effect: ALLOW` on file mutation is clamped to `REQUIRE_APPROVAL`.
 5. `RC04-NEG-05`: Mutation tool invocation without `_arcApproval` returns `APPROVAL_REQUIRED`.
 6. `RC04-NEG-06`: Missing token in `_arcApproval` fails schema admission with `INVALID_REQUEST_SCHEMA`.
 7. `RC04-NEG-07`: Nonexistent `requestId` is rejected with `APPROVAL_REJECTED`.
-8. `RC04-NEG-08`: Invalid token string is rejected with `APPROVAL_REJECTED` via timing-safe comparison.
+8. `RC04-NEG-08`: Invalid token string is rejected with `APPROVAL_REJECTED` via 32-byte timing-safe buffer comparison.
 9. `RC04-NEG-09`: Expired approval token ($T > 300\text{s}$) is rejected with `APPROVAL_EXPIRED`.
 10. `RC04-NEG-10`: Explicitly rejected approval request cannot be redeemed and returns `APPROVAL_REJECTED`.
 11. `RC04-NEG-11`: Replay of already `CONSUMED` approval token is rejected with `APPROVAL_REJECTED`.
@@ -943,20 +1092,28 @@ Subsequent implementation tasks must implement and pass direct test controls for
 14. `RC04-NEG-14`: Modifying file path between approval and redemption causes payload hash mismatch and rejection.
 15. `RC04-NEG-15`: Actor mismatch (different `clientId`, `sessionId`, or `deviceId`) causes rejection with `APPROVAL_REJECTED`.
 16. `RC04-NEG-16`: Target workspace mismatch causes rejection with `APPROVAL_REJECTED`.
-17. `RC04-NEG-17`: Policy change between request and redemption invalidates pending approval with `POLICY_BINDING_MISMATCH`; token is not consumed.
-18. `RC04-NEG-18`: Server restart completely purges active approvals; previously issued tokens are unusable.
-19. `RC04-NEG-19`: Malformed YAML policy (syntax error, duplicate mapping keys, custom tags) fails closed with `POLICY_PARSE_ERROR` and sets `health.status = 'UNHEALTHY'`.
-20. `RC04-NEG-20`: Duplicate rule IDs in policy document cause immediate rejection.
-21. `RC04-NEG-21`: Unmatched action under explicit operator policy fails closed with default `DENY`.
-22. `RC04-NEG-22`: Raw approval token never appears in any serialized AuditRecord across all lifecycle states.
-23. `RC04-NEG-23`: Raw file content and patch lines never appear in audit records for approved mutations.
-24. `RC04-NEG-24`: Bypass fields (`approvalToken`, `bypassApproval`, `sudo`, `force`) remain rejected by schema.
-25. `RC04-NEG-25`: Exhaustion of approval quotas (record count or byte limits) safely rejects new requests with `RESOURCE_EXHAUSTED`.
-26. `RC04-NEG-26`: Unsupported glob syntax (brace expansion, extglob, regex, leading slash, traversal) is rejected at policy parse time.
-27. `RC04-NEG-27`: Rule specifying both `allowedBinaries` and `blockedBinaries` is rejected at policy parse time.
-28. `RC04-NEG-28`: Policy attempting to register or authorize a new filesystem root fails closed.
-29. `RC04-NEG-29`: Reused pending request returns remaining TTL, not a reset 300s.
-30. `RC04-NEG-30`: Expiry race before approval transitions to `EXPIRED` without token minting.
+17. `RC04-NEG-17`: Policy change between request and redemption permanently transitions approval record to `INVALIDATED` and returns `APPROVAL_REJECTED`; token is not consumed.
+18. `RC04-NEG-18`: Reverting policy configuration back to previous hash does NOT revive an `INVALIDATED` approval record.
+19. `RC04-NEG-19`: Uppercase or case-modified token string fails timing-safe digest comparison and returns `APPROVAL_REJECTED`.
+20. `RC04-NEG-20`: Multibyte token string exceeding 128 UTF-8 bytes fails schema validation with `INVALID_REQUEST_SCHEMA` even if character count $\le 128$.
+21. `RC04-NEG-21`: Uppercase approval request ID (`^[0-9A-F]{32}$`) is rejected by schema admission with `INVALID_REQUEST_SCHEMA`.
+22. `RC04-NEG-22`: Policy metadata-only changes (`name`, `description`, `lastModified`) do not change `policyHash`.
+23. `RC04-NEG-23`: Semantic policy changes (rules, matchers, workspace assertions) alter `policyHash`.
+24. `RC04-NEG-24`: Policy containing unknown workspace ID or mismatched `rootHash` fails policy loading with `health.status = 'UNHEALTHY'`.
+25. `RC04-NEG-25`: Policy attempting to declare `path`, `rootPath`, or `directory` in workspace assertions is rejected.
+26. `RC04-NEG-26`: YAML policy containing anchors (`&`), aliases (`*`), or merge keys (`<<`) is rejected with `POLICY_PARSE_ERROR`.
+27. `RC04-NEG-27`: YAML or JSON policy exceeding maximum nesting depth of 32 is rejected with `POLICY_PARSE_ERROR`.
+28. `RC04-NEG-28`: Embedded `**` wildcard within a path segment (e.g. `src/a**b.ts`) is rejected at policy parse time.
+29. `RC04-NEG-29`: Unsupported glob syntax (brace expansion, extglob, regex, leading slash, traversal) is rejected at policy parse time.
+30. `RC04-NEG-30`: Rule specifying both `allowedBinaries` and `blockedBinaries` is rejected at policy parse time.
+31. `RC04-NEG-31`: Concurrent identical pending creation requests produce exactly one active approval record.
+32. `RC04-NEG-32`: Identical tool invocation while existing record is `APPROVED` returns existing `requestId` without allocating duplicate approval records or review buffers.
+33. `RC04-NEG-33`: Monotonic TTL deadline cannot be extended by simulated wall-clock rollback.
+34. `RC04-NEG-34`: Exhaustion of approval quotas (record count or byte limits) safely rejects new requests with `RESOURCE_EXHAUSTED`.
+35. `RC04-NEG-35`: Raw approval token never appears in any serialized AuditRecord across all lifecycle states.
+36. `RC04-NEG-36`: Raw file content and patch lines never appear in audit records for approved mutations.
+37. `RC04-NEG-37`: Bypass fields (`approvalToken`, `bypassApproval`, `sudo`, `force`) remain rejected by schema.
+38. `RC04-NEG-38`: Server restart completely purges active approvals; previously issued tokens are unusable.
 
 ---
 
@@ -964,9 +1121,9 @@ Subsequent implementation tasks must implement and pass direct test controls for
 
 This section normatively clarifies and supersedes earlier ambiguities in RC-00 architecture documents:
 
-1. **Approval Token Nature & Verifier:** Early documentation referenced both "cryptographic capabilities" and "HMAC tokens". RC-04 clarifies: tokens are 256-bit cryptographically random strings (64 hex characters) generated out-of-band; the server stores only the SHA-256 digest (`tokenDigest`), eliminating secondary secret management and server-side token leakage risks.
-2. **TTL Start Boundary & Display:** TTL measurement begins strictly at the moment the `PENDING` request record is created on the server (`createdAt + 300s`). It does not restart on operator approval. Reused pending requests return remaining TTL.
-3. **Audit Payload Hash vs Execution Payload Hash:** RC-03 introduced `payloadHash` in `AuditRecord` which hashes sanitized parameters for audit privacy. RC-04 introduces `executionPayloadHash`, a distinct internal cryptographic hash binding the complete, unredacted business parameters, actor context, workspace root hash, and policy hash to guarantee absolute payload immutability.
+1. **Approval Token Nature & Verifier:** Early documentation referenced both "cryptographic capabilities" and "HMAC tokens". RC-04 clarifies: tokens are 256-bit cryptographically random strings (64 lowercase hex characters) generated out-of-band; the server stores only the 32-byte binary SHA-256 digest (`tokenDigest`), eliminating secondary secret management and server-side token leakage risks.
+2. **Monotonic TTL Enforcement:** TTL measurement is strictly bounded by a 300-second monotonic timer from initial creation (`createdAt + 300s`). It does not restart on operator approval and cannot be extended by wall-clock manipulation. Reused pending requests return remaining monotonic TTL.
+3. **Audit Payload Hash vs Execution Payload Hash:** RC-03 introduced `payloadHash` in `AuditRecord` which hashes sanitized parameters for audit privacy. RC-04 introduces `executionPayloadHash`, a distinct internal cryptographic hash binding the complete, unredacted business parameters, actor context, workspace root hash, and semantic policy hash to guarantee absolute payload immutability.
 4. **Local Administrative Trust Boundary:** Clarifies that administrative approval operations belong exclusively to local operator CLI execution over authenticated local IPC. MCP clients have zero administrative surface.
 5. **Mutation Policy Floor:** Clarifies that declarative policies cannot authorize automatic file mutation in RC-04; candidate `ALLOW` for any of the five mutation tools is clamped to `REQUIRE_APPROVAL`.
-6. **Policy Change Redemption:** Clarifies that an approval token bound to an earlier `policyHash` is voided upon policy change, fails redemption with `APPROVAL_REJECTED`, and is not consumed.
+6. **Policy Change Redemption & Invalidation:** Clarifies that policy evaluation strictly precedes approval token verification. An approval token bound to an earlier `policyHash` is permanently `INVALIDATED` upon policy change, fails redemption with `APPROVAL_REJECTED`, and cannot be revived.
