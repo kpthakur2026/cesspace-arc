@@ -1423,13 +1423,42 @@ zc$}q-U|?o-
     fs.writeFileSync(fileA, 'targetA-orig\n', 'utf8');
     fs.writeFileSync(fileB, 'targetB-orig\n', 'utf8');
 
+    // Deterministic external-replacement fixture.
+    //
+    // The replacement is allocated as a live SIBLING TEMP while File A is still
+    // linked, so both inodes are simultaneously live and the allocator cannot
+    // hand back File A's inode. It is then installed with an atomic rename.
+    //
+    // This is deliberately NOT `unlink(fileA); write(fileA)`: that shape yields a
+    // new inode only when the allocator declines to reuse the just-freed one,
+    // which depends on filesystem and allocation state rather than being
+    // guaranteed. The inode-identity guard under test would then not trip, and
+    // rollback would overwrite the external replacement.
+    const replacementTmp = path.join(workspaceDir, `.rc03-replacement-${crypto.randomUUID()}`);
+    let committedStat; // File A identity as committed by ARC, before replacement
+    let committedBytes; // File A bytes as committed by ARC, before replacement
+    let replacementStat; // replacement identity while it is still a temp
+    let replacementBytes; // replacement bytes, captured before installation
+    let installedStat; // File A identity after the atomic rename
+    let replacementInstalled = false;
+
     class SameContentReplaceMockOps extends NodeFilesystemOps {
       rename(src, dst) {
         if (dst === fileB) {
-          // File A was committed with patched-a content.
-          // External actor replaces File A with a brand new file (new inode) having the SAME patched bytes!
-          fs.unlinkSync(fileA);
-          fs.writeFileSync(fileA, 'targetA-patched\n', 'utf8');
+          // File A is already committed by ARC and holds the patched bytes.
+          committedStat = fs.lstatSync(fileA);
+          committedBytes = fs.readFileSync(fileA);
+
+          // Allocate the replacement while File A's inode is still live.
+          fs.writeFileSync(replacementTmp, 'targetA-patched\n', 'utf8');
+          replacementStat = fs.lstatSync(replacementTmp);
+          replacementBytes = fs.readFileSync(replacementTmp);
+
+          // Install it atomically: identical bytes, provably different inode.
+          fs.renameSync(replacementTmp, fileA);
+          replacementInstalled = true;
+          installedStat = fs.lstatSync(fileA);
+
           // Now fail File B commit
           throw new Error('EIO: Target B rename failure');
         }
@@ -1451,19 +1480,51 @@ zc$}q-U|?o-
 +targetB-patched
 `;
 
-    await assert.rejects(
-      async () => applyPatch(workspaceDir, { patch }, mockOps, lockManager),
-      (err) => {
-        assert.ok(err instanceof ArcError);
-        assert.equal(err.code, 'ROLLBACK_FAILED');
-        assert.equal(err.details.recoveryRequired, true);
-        assert.equal(err.details.recoveryFileCount, 1);
-        return true;
-      },
-    );
+    try {
+      await assert.rejects(
+        async () => applyPatch(workspaceDir, { patch }, mockOps, lockManager),
+        (err) => {
+          assert.ok(err instanceof ArcError);
+          assert.equal(err.code, 'ROLLBACK_FAILED');
+          assert.equal(err.details.recoveryRequired, true);
+          assert.equal(err.details.recoveryFileCount, 1);
+          return true;
+        },
+      );
+    } finally {
+      // The rename consumes the temp; this only removes it if the fixture never
+      // reached that point. A test-only file must never leak.
+      fs.rmSync(replacementTmp, { force: true });
+    }
 
-    // External replacement file was NOT overwritten by rollback
-    assert.equal(fs.readFileSync(fileA, 'utf8'), 'targetA-patched\n');
+    // A throw inside the mocked rename is indistinguishable from the injected
+    // EIO, so prove the fixture actually ran to completion out here.
+    assert.ok(replacementInstalled, 'replacement was never installed over File A');
+
+    // (1) Replacement held byte-identical content to ARC's committed bytes.
+    assert.ok(
+      replacementBytes.equals(committedBytes),
+      'replacement bytes differ from ARC committed bytes',
+    );
+    assert.equal(committedBytes.toString('utf8'), 'targetA-patched\n');
+
+    // (2) Replacement had a different inode identity before installation.
+    assert.equal(replacementStat.dev, committedStat.dev, 'replacement on another device');
+    assert.notEqual(replacementStat.ino, committedStat.ino, 'replacement reused File A inode');
+
+    // (3) Replacement became File A.
+    assert.equal(installedStat.dev, replacementStat.dev);
+    assert.equal(installedStat.ino, replacementStat.ino);
+
+    // (4)/(8) ARC rollback refused to overwrite it: the replacement bytes are
+    // intact and it still carries the replacement inode (it was not unlinked and
+    // recreated, and was not restored to the pre-patch bytes).
+    const finalBytes = fs.readFileSync(fileA);
+    assert.ok(finalBytes.equals(replacementBytes), 'external replacement was modified');
+    assert.equal(finalBytes.toString('utf8'), 'targetA-patched\n');
+    const finalStat = fs.lstatSync(fileA);
+    assert.equal(finalStat.dev, replacementStat.dev);
+    assert.equal(finalStat.ino, replacementStat.ino);
   });
 
   test('RC03-PATCH-A-11: Rollback restoration failure raises ROLLBACK_FAILED with truthful recovery metadata', async () => {
