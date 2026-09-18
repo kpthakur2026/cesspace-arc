@@ -94,13 +94,20 @@ describe('CesSpace ARC — RC-01 Mandatory Security Negative & Positive Controls
   // MANDATORY SECURITY NEGATIVE CONTROLS (16 scenarios)
   // ==========================================================================
 
-  test('Negative 1: ../../../../etc/passwd -> PATH_ESCAPES_ROOT', async () => {
+  test('Negative 1: ../../../../etc/passwd is denied (RC-04 Layer 2 fail-closed target admission)', async () => {
     const res = await server.dispatchToolCall('read_file', {
       path: '../../../../etc/passwd',
     });
     assert.equal(res.isError, true);
     const parsed = JSON.parse(res.content[0].text);
-    assert.equal(parsed.code, 'PATH_ESCAPES_ROOT');
+    // RC-04 adds Layer-2 policy evaluation ahead of the subsystem. A path that
+    // is not already a safe normalized workspace-relative target fails closed in
+    // the policy matcher, so the traversal is denied earlier than the
+    // filesystem layer would have denied it. The filesystem-level
+    // PATH_ESCAPES_ROOT control remains directly covered in the RC-03
+    // filesystem suites.
+    assert.equal(parsed.code, 'POLICY_DENIED');
+    assert.ok(!JSON.stringify(parsed).includes('etc/passwd'), 'target path must not be echoed');
   });
 
   test('Negative 2: workspace symlink to external target -> PATH_ESCAPES_ROOT', async () => {
@@ -306,33 +313,38 @@ describe('CesSpace ARC — RC-01 Mandatory Security Negative & Positive Controls
     const parsedNoPath = JSON.parse(resNoPath.content[0].text);
     assert.equal(parsedNoPath.code, 'INVALID_REQUEST_SCHEMA');
 
-    // Null byte in path
+    // Null byte in path. Denied fail-closed by RC-04 Layer-2 target admission
+    // before the subsystem is reached; the filesystem INVALID_PATH_CHARS control
+    // remains directly covered in the RC-03 filesystem suites.
     const resNullByte = await server.dispatchToolCall('read_file', {
       path: 'README.md\0.secret',
     });
     assert.equal(resNullByte.isError, true);
     const parsedNullByte = JSON.parse(resNullByte.content[0].text);
-    assert.equal(parsedNullByte.code, 'INVALID_PATH_CHARS');
+    assert.equal(parsedNullByte.code, 'POLICY_DENIED');
   });
 
   // ==========================================================================
   // POSITIVE CONTROLS (All 9 Tools)
   // ==========================================================================
 
-  test('Positive 1: health returns HEALTHY and RC-03 stage metadata', async () => {
+  test('Positive 1: health returns HEALTHY and RC-04 stage metadata', async () => {
     const res = await server.dispatchToolCall('health', {});
     assert.equal(res.isError, undefined);
     const parsed = JSON.parse(res.content[0].text);
     assert.equal(parsed.status, 'HEALTHY');
-    assert.equal(parsed.stage, 'RC-03');
+    assert.equal(parsed.stage, 'RC-04');
     assert.equal(parsed.policyEngineActive, true);
     assert.equal(parsed.auditActive, true);
     assert.ok(parsed.authorizedWorkspacesCount >= 1);
   });
 
   test('Positive 2: list_directory returns entries in authorized workspace', async () => {
+    // Omitting `path` addresses the workspace root by default. An explicit
+    // `path: '.'` is deliberately NOT used: the frozen RC-04 policy grammar has
+    // no representation for the root itself, and RC-04 fails such a target
+    // closed rather than letting a `paths` rule silently miss.
     const res = await server.dispatchToolCall('list_directory', {
-      path: '.',
       recursive: true,
       maxDepth: 2,
     });

@@ -825,18 +825,18 @@ describe('CesSpace ARC — RC-03 MCP Policy & Audit Integration', () => {
   // ==========================================================================
 
   describe('Section 8: Health Response', () => {
-    test('RC03-HEALTH-01: health response reports version 0.3.0-rc03', async () => {
+    test('RC03-HEALTH-01: health response reports the current RC-04 version', async () => {
       const res = await server.dispatchToolCall('health', {});
       assert.ok(!res.isError, 'health must succeed');
       const body = JSON.parse(res.content[0].text);
-      assert.equal(body.version, '0.3.0-rc03');
+      assert.equal(body.version, '0.4.0-rc04');
     });
 
     test('RC03-HEALTH-02: health response reports stage RC-03', async () => {
       const res = await server.dispatchToolCall('health', {});
       assert.ok(!res.isError, 'health must succeed');
       const body = JSON.parse(res.content[0].text);
-      assert.equal(body.stage, 'RC-03');
+      assert.equal(body.stage, 'RC-04');
     });
   });
 
@@ -1445,7 +1445,7 @@ describe('CesSpace ARC — RC-03 MCP Policy & Audit Integration', () => {
       }
     }
 
-    test('RC03-BACKSTOP-01: table-test all 5 mutation tools when policy returns ALLOW — fail-closed, zero subsystem calls, audit error', async () => {
+    test('RC03-BACKSTOP-01: all 5 mutation tools remain fail-closed when Layer 1 is forced to ALLOW — zero subsystem calls', async () => {
       const forcedFs = new FilesystemSpyForced();
       const forcedReg = new WorkspaceRegistry();
       forcedReg.registerWorkspace('forced-ws', workspaceDir);
@@ -1503,12 +1503,12 @@ describe('CesSpace ARC — RC-03 MCP Policy & Audit Integration', () => {
         const res = await forcedServer.dispatchToolCall(tool, params);
         assert.ok(res.isError, `Expected isError for forced ${tool}`);
         const body = JSON.parse(res.content[0].text);
-        assert.equal(body.code, 'POLICY_DENIED');
-        assert.ok(
-          body.message.includes('RC-03 backstop') &&
-            body.message.includes('requires human approval'),
-          `Expected backstop message for ${tool}, got: ${body.message}`,
-        );
+        // RC-04 preserves the invariant: a mutation never executes without
+        // verified human approval. The permanent floor clamps the forced ALLOW
+        // to REQUIRE_APPROVAL, and the reserved control object is absent, so an
+        // approval is requested and nothing is executed.
+        assert.equal(body.code, 'APPROVAL_REQUIRED');
+        assert.ok(!body.message.includes('token'), 'no token may be disclosed');
       }
 
       assert.equal(forcedFs.createFileCount, 0, 'createFile must remain 0 under forced ALLOW');
@@ -1522,15 +1522,17 @@ describe('CesSpace ARC — RC-03 MCP Policy & Audit Integration', () => {
       const records = forcedAudit.getRecords();
       assert.equal(records.length, 5);
       for (const record of records) {
-        assert.equal(record.policy.decision, 'ALLOW');
-        assert.equal(record.policy.ruleId, 'test-forced-allow');
+        assert.equal(record.policy.decision, 'REQUIRE_APPROVAL');
+        // The built-in Layer-2 policy already requires approval for all five
+        // mutation tools, so the floor is not even reached here.
+        assert.equal(record.policy.ruleId, 'builtin-require-approval-file-mutation');
         assert.equal(
           record.execution.status,
-          'ERROR',
-          'Execution status must be ERROR, never SUCCESS',
+          'DENIED',
+          'Execution status must be DENIED, never SUCCESS',
         );
         assert.ok(record.error, 'Audit record must have error info');
-        assert.equal(record.error.code, 'POLICY_DENIED');
+        assert.equal(record.error.code, 'APPROVAL_REQUIRED');
       }
     });
   });

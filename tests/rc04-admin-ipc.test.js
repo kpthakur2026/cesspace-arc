@@ -1463,9 +1463,14 @@ describe('CesSpace ARC — RC-04 Task 3: Authenticated Local Admin Channel', () 
         const body = JSON.parse(result.content[0].text);
         assert.equal(body.code, 'APPROVAL_REQUIRED');
 
-        // No approval record was created by MCP, no token exists, no
-        // _arcApproval schema is admitted, and nothing was written.
-        assert.equal(approvals.listActive().length, 0);
+        // RC-04 Task 4: with no reserved control object, MCP now creates a
+        // PENDING approval request (it never creates a token and never
+        // executes). RC-03 behaviour -- APPROVAL_REQUIRED, zero execution --
+        // is unchanged.
+        const pending = approvals.listActive();
+        assert.equal(pending.length, 1);
+        assert.equal(pending[0].state, 'PENDING');
+        assert.equal(typeof pending[0].reviewSummary?.contentHash, 'string');
         assert.ok(!JSON.stringify(result).includes('_arcApproval'));
         assert.equal(fs.existsSync(path.join(workspaceDir, 'nope.txt')), false);
       } finally {

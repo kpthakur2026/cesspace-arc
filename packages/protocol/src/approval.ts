@@ -75,7 +75,40 @@ export interface ApprovalRequestSnapshot {
   expiresAt: string;
   remainingSeconds: number;
   reviewMaterialBytes: number;
+  /** Safe bounded metadata. Never raw material. */
+  reviewSummary?: ApprovalReviewSummary;
 }
+
+/**
+ * Safe structured review metadata for an approval request (RC-04 Task 4).
+ *
+ * This is bounded, non-sensitive metadata derived from already-validated
+ * business parameters. It is NOT raw review material and never contains a raw
+ * token, an absolute host path, raw file content, raw patch lines, or raw
+ * environment values.
+ */
+export interface ApprovalReviewSummary {
+  /** Workspace-relative target paths. Bounded to MAX_REVIEW_SUMMARY_PATHS. */
+  targetPaths?: string[];
+  contentBytes?: number;
+  contentHash?: string;
+  patchBytes?: number;
+  patchHash?: string;
+  expectedHash?: string;
+  expectedSourceHash?: string;
+  overwrite?: boolean;
+  dryRun?: boolean;
+  fuzz?: number;
+  executable?: string;
+  argumentCount?: number;
+  insertions?: number;
+  deletions?: number;
+}
+
+/** Maximum number of target paths retained in a review summary. */
+export const MAX_REVIEW_SUMMARY_PATHS = 10;
+/** Maximum length of any single string retained in a review summary. */
+export const MAX_REVIEW_SUMMARY_STRING_LENGTH = 512;
 
 /**
  * Reserved client control object for token redemption.

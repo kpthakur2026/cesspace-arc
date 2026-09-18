@@ -1,0 +1,1371 @@
+import { test, describe, before, after } from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import crypto from 'node:crypto';
+
+import {
+  ArcMcpServer,
+  ALL_TOOL_DEFINITIONS,
+  createArcMcpServer,
+} from '../apps/mcp-server/dist/index.js';
+import {
+  ApprovalStateManager,
+  SecurityKernel,
+  WorkspaceRegistry,
+  canonicalJson,
+  sha256Hex,
+  DeclarativePolicyEngine,
+} from '../packages/policy/dist/index.js';
+import {
+  computeExecutionPayloadHash,
+  extractArcApproval,
+  extractPolicyTargets,
+  normalizeTargetPathForPolicy,
+} from '../apps/mcp-server/dist/approval-gate.js';
+import { AuditLogger } from '../packages/audit/dist/index.js';
+import { FilesystemSubsystem } from '../packages/filesystem/dist/index.js';
+import { GitSubsystem } from '../packages/git/dist/index.js';
+
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
+
+let tempRoot;
+let workspaceDir;
+
+before(() => {
+  tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-rc04-mcp-'));
+  workspaceDir = path.join(tempRoot, 'workspace');
+  fs.mkdirSync(workspaceDir, { recursive: true });
+  fs.mkdirSync(path.join(workspaceDir, '.git'), { recursive: true });
+  fs.writeFileSync(path.join(workspaceDir, '.git', 'config'), '[core]\n');
+  fs.writeFileSync(path.join(workspaceDir, 'README.md'), 'line1\nline2\nline3\n');
+  fs.writeFileSync(path.join(workspaceDir, '.env'), 'SECRET=1\n');
+});
+
+after(() => {
+  try {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  } catch {
+    // ignore
+  }
+});
+
+/** Records every filesystem mutation invocation for isolation assertions. */
+class FilesystemSpy extends FilesystemSubsystem {
+  constructor() {
+    super();
+    this.calls = [];
+  }
+  async createFile(root, request) {
+    this.calls.push({ method: 'createFile', request });
+    return super.createFile(root, request);
+  }
+  async writeFile(root, request) {
+    this.calls.push({ method: 'writeFile', request });
+    return super.writeFile(root, request);
+  }
+  async deleteFile(root, request) {
+    this.calls.push({ method: 'deleteFile', request });
+    return super.deleteFile(root, request);
+  }
+  async moveFile(root, request) {
+    this.calls.push({ method: 'moveFile', request });
+    return super.moveFile(root, request);
+  }
+  async applyPatch(root, request) {
+    this.calls.push({ method: 'applyPatch', request });
+    return super.applyPatch(root, request);
+  }
+}
+
+/** Builds a server with a real workspace and an optional external policy. */
+function makeServer({ policy, workspaceName = 'ws', manager, fsSpy, kernelOverride } = {}) {
+  const registry = new WorkspaceRegistry();
+  const dir = path.join(tempRoot, workspaceName);
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+    fs.mkdirSync(path.join(dir, '.git'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.git', 'config'), '[core]\n');
+    fs.writeFileSync(path.join(dir, 'README.md'), 'line1\nline2\nline3\n');
+    fs.writeFileSync(path.join(dir, 'keep.txt'), 'keep\n');
+  }
+  registry.registerWorkspace('ws', dir);
+
+  const approvals = manager ?? new ApprovalStateManager();
+  const filesystem = fsSpy ?? new FilesystemSpy();
+  const audit = new AuditLogger();
+  const kernel = kernelOverride ?? new SecurityKernel(registry);
+
+  const config = {
+    transport: 'stdio',
+    authorizedRoots: [],
+    defaultWorkspaceId: 'ws',
+    ...(policy === undefined ? {} : { policy }),
+  };
+
+  const server = new ArcMcpServer(
+    registry,
+    kernel,
+    audit,
+    filesystem,
+    new GitSubsystem(),
+    config,
+    undefined,
+    undefined,
+    approvals,
+  );
+  return { server, registry, approvals, filesystem, audit, dir };
+}
+
+function body(res) {
+  return JSON.parse(res.content[0].text);
+}
+
+/** Runs a request, approves it out of band, and redeems the token in one call. */
+async function requestApproveRedeem(server, approvals, toolName, params, actorOverride) {
+  const first = await server.dispatchToolCall(toolName, { ...params }, actorOverride);
+  const firstBody = body(first);
+  assert.equal(
+    firstBody.code,
+    'APPROVAL_REQUIRED',
+    `expected APPROVAL_REQUIRED, got ${firstBody.code}`,
+  );
+  const requestId = firstBody.details.approvalRequestId;
+  assert.match(requestId, /^[0-9a-f]{32}$/);
+  assert.ok(!JSON.stringify(firstBody).includes('"token"'), 'no token may be disclosed');
+
+  const grant = approvals.approve(requestId);
+  assert.match(grant.token, /^[0-9a-f]{64}$/);
+
+  const second = await server.dispatchToolCall(
+    toolName,
+    { ...params, _arcApproval: { requestId, token: grant.token } },
+    actorOverride,
+  );
+  return { requestId, token: grant.token, first, firstBody, second, secondBody: body(second) };
+}
+
+const READ_APPROVAL_POLICY = `version: '1.0'
+rules:
+  - id: 'require-read'
+    effect: 'REQUIRE_APPROVAL'
+    tools: ['read_file']
+`;
+
+const DENY_READ_POLICY = `version: '1.0'
+rules:
+  - id: 'deny-read'
+    effect: 'DENY'
+    tools: ['read_file']
+`;
+
+describe('CesSpace ARC — RC-04 Task 4: MCP Approval, Redemption & Controlled Mutation', () => {
+  // =========================================================================
+  // 1. Reserved control-object admission
+  // =========================================================================
+
+  describe('Reserved control object', () => {
+    test('RC04-M-01: _arcApproval is advertised on all 18 tool schemas and added nowhere else', () => {
+      assert.equal(ALL_TOOL_DEFINITIONS.length, 18);
+      for (const tool of ALL_TOOL_DEFINITIONS) {
+        assert.ok(
+          tool.inputSchema.properties._arcApproval,
+          `${tool.name} must advertise the reserved control object`,
+        );
+      }
+      // The admin surface is still absent from the MCP tool list.
+      const names = ALL_TOOL_DEFINITIONS.map((t) => t.name);
+      for (const forbidden of ['approve', 'reject', 'approvals', 'admin', 'policy_test']) {
+        assert.ok(!names.includes(forbidden), `${forbidden} must not be an MCP tool`);
+      }
+    });
+
+    test('RC04-M-02: malformed control objects are rejected with INVALID_REQUEST_SCHEMA and create no state', async () => {
+      const { server, approvals, filesystem } = makeServer();
+      const malformed = [
+        { _arcApproval: null },
+        { _arcApproval: [] },
+        { _arcApproval: 'string' },
+        { _arcApproval: {} },
+        { _arcApproval: { requestId: 'a'.repeat(32) } },
+        { _arcApproval: { token: 't'.repeat(16) } },
+        { _arcApproval: { requestId: 'A'.repeat(32), token: 'x' } },
+        { _arcApproval: { requestId: 'a'.repeat(31), token: 'x' } },
+        { _arcApproval: { requestId: 'a'.repeat(33), token: 'x' } },
+        { _arcApproval: { requestId: 5, token: 'x' } },
+        { _arcApproval: { requestId: 'a'.repeat(32), token: '' } },
+        { _arcApproval: { requestId: 'a'.repeat(32), token: 7 } },
+        { _arcApproval: { requestId: 'a'.repeat(32), token: 'x'.repeat(129) } },
+        { _arcApproval: { requestId: 'a'.repeat(32), token: '€'.repeat(50) } },
+        { _arcApproval: { requestId: 'a'.repeat(32), token: 'x', extra: 1 } },
+      ];
+
+      for (const params of malformed) {
+        const res = await server.dispatchToolCall('create_file', {
+          path: 'x.txt',
+          content: 'x',
+          workspaceId: 'ws',
+          ...params,
+        });
+        const parsed = body(res);
+        assert.equal(
+          parsed.code,
+          'INVALID_REQUEST_SCHEMA',
+          `expected schema rejection for ${JSON.stringify(params._arcApproval)}`,
+        );
+        assert.ok(
+          !JSON.stringify(parsed).includes('_arcApproval'),
+          'control object must not be echoed',
+        );
+      }
+
+      assert.equal(approvals.listActive().length, 0, 'no approval state may be created');
+      assert.equal(filesystem.calls.length, 0, 'no subsystem call may occur');
+    });
+
+    test('RC04-M-03: a token of <=128 characters but >128 UTF-8 bytes is rejected', () => {
+      const multibyte = '€'.repeat(50); // 50 characters, 150 UTF-8 bytes
+      assert.ok(multibyte.length <= 128);
+      assert.ok(Buffer.byteLength(multibyte, 'utf8') > 128);
+      const extracted = extractArcApproval({
+        requestId: 'a'.repeat(32),
+        _arcApproval: { requestId: 'a'.repeat(32), token: multibyte },
+      });
+      assert.equal(extracted.malformed, true);
+      assert.equal(extracted.control, null);
+    });
+
+    test('RC04-M-04: the control object is removed before business schema validation', () => {
+      const extracted = extractArcApproval({
+        path: 'a.txt',
+        content: 'x',
+        _arcApproval: { requestId: 'a'.repeat(32), token: 'tok' },
+      });
+      assert.deepEqual(extracted.businessParameters, { path: 'a.txt', content: 'x' });
+      assert.equal(extracted.control.requestId, 'a'.repeat(32));
+      assert.equal(extracted.malformed, false);
+    });
+
+    test('RC04-M-05: unofficial bypass fields remain unknown business parameters', async () => {
+      const { server, approvals, filesystem } = makeServer();
+      for (const field of [
+        'approvalToken',
+        'approved',
+        'bypassApproval',
+        'autoApprove',
+        'force',
+        'admin',
+        'sudo',
+      ]) {
+        const res = await server.dispatchToolCall('create_file', {
+          path: 'x.txt',
+          content: 'x',
+          workspaceId: 'ws',
+          [field]: true,
+        });
+        assert.equal(body(res).code, 'INVALID_REQUEST_SCHEMA', `${field} must be rejected`);
+      }
+      assert.equal(approvals.listActive().length, 0);
+      assert.equal(filesystem.calls.length, 0);
+    });
+  });
+
+  // =========================================================================
+  // 2. Execution payload hash
+  // =========================================================================
+
+  describe('Execution payload hash', () => {
+    const base = {
+      toolName: 'create_file',
+      businessParameters: { path: 'a.txt', content: 'x' },
+      actor: { clientId: 'c1', clientType: 't1', sessionId: 's1', deviceId: 'd1' },
+      workspaceId: 'ws',
+      workspaceRootHash: 'b'.repeat(64),
+      policyHash: 'c'.repeat(64),
+    };
+
+    test('RC04-M-06: the hash is canonical JSON + SHA-256 with the frozen shape', () => {
+      const expected = sha256Hex(
+        canonicalJson({
+          schemaVersion: '1.0',
+          toolName: 'create_file',
+          parameters: { path: 'a.txt', content: 'x' },
+          actor: { clientId: 'c1', clientType: 't1', sessionId: 's1', deviceId: 'd1' },
+          workspaceId: 'ws',
+          workspaceRootHash: 'b'.repeat(64),
+          policyHash: 'c'.repeat(64),
+        }),
+      );
+      assert.equal(computeExecutionPayloadHash(base), expected);
+    });
+
+    test('RC04-M-07: the hash changes for every semantic component', () => {
+      const original = computeExecutionPayloadHash(base);
+      const variants = [
+        { ...base, toolName: 'write_file' },
+        { ...base, businessParameters: { path: 'b.txt', content: 'x' } },
+        { ...base, businessParameters: { path: 'a.txt', content: 'y' } },
+        { ...base, actor: { ...base.actor, clientId: 'c2' } },
+        { ...base, actor: { ...base.actor, clientType: 't2' } },
+        { ...base, actor: { ...base.actor, sessionId: 's2' } },
+        { ...base, actor: { ...base.actor, deviceId: 'd2' } },
+        { ...base, workspaceId: 'other' },
+        { ...base, workspaceRootHash: 'd'.repeat(64) },
+        { ...base, policyHash: 'e'.repeat(64) },
+      ];
+      for (const variant of variants) {
+        assert.notEqual(computeExecutionPayloadHash(variant), original);
+      }
+    });
+
+    test('RC04-M-08: optional identity components are bound by exact presence', () => {
+      const withoutSession = computeExecutionPayloadHash({
+        ...base,
+        actor: { clientId: 'c1', clientType: 't1', deviceId: 'd1' },
+      });
+      const withSession = computeExecutionPayloadHash(base);
+      assert.notEqual(withoutSession, withSession);
+      // `authenticated` is deliberately not part of the binding.
+      const withAuthenticated = computeExecutionPayloadHash({
+        ...base,
+        actor: { ...base.actor, authenticated: true },
+      });
+      assert.equal(withAuthenticated, computeExecutionPayloadHash(base));
+    });
+
+    test('RC04-M-09: the same business request hashes identically at request and redemption', async () => {
+      const { server, approvals, filesystem, dir } = makeServer();
+      const params = { path: 'hash.txt', content: 'content', workspaceId: 'ws' };
+      const { secondBody } = await requestApproveRedeem(server, approvals, 'create_file', params);
+      assert.equal(secondBody.code, undefined, `expected success, got ${secondBody.code}`);
+      assert.equal(fs.readFileSync(path.join(dir, 'hash.txt'), 'utf8'), 'content');
+      assert.equal(filesystem.calls.length, 1);
+    });
+  });
+
+  // =========================================================================
+  // 3. Target extraction and normalization
+  // =========================================================================
+
+  describe('Target extraction', () => {
+    test('RC04-M-10: paths are normalized to canonical workspace-relative form', () => {
+      assert.equal(normalizeTargetPathForPolicy('/ws', 'a/b.txt'), 'a/b.txt');
+      assert.equal(normalizeTargetPathForPolicy('/ws', './a/b.txt'), 'a/b.txt');
+      assert.equal(normalizeTargetPathForPolicy('/ws', 'a/./b.txt'), 'a/b.txt');
+      assert.equal(normalizeTargetPathForPolicy('/ws', 'a/../b.txt'), 'b.txt');
+      assert.equal(normalizeTargetPathForPolicy('/ws', 'a/b.txt/'), 'a/b.txt');
+      assert.equal(normalizeTargetPathForPolicy('/ws', undefined), undefined);
+      for (const bad of ['../x', '../../etc/passwd', '/etc/passwd', 'a\\b', 'a b', '.', './']) {
+        assert.equal(normalizeTargetPathForPolicy('/ws', bad), null, `expected unsafe: ${bad}`);
+      }
+    });
+
+    test('RC04-M-11: move_file and apply_patch produce one target per path', () => {
+      const move = extractPolicyTargets(
+        'move_file',
+        { sourcePath: 'a.txt', destinationPath: 'b.txt' },
+        '/ws',
+      );
+      assert.deepEqual(
+        move.map((t) => t.path),
+        ['a.txt', 'b.txt'],
+      );
+
+      const patch = extractPolicyTargets('apply_patch', {}, '/ws', ['one.txt', 'two.txt']);
+      assert.deepEqual(
+        patch.map((t) => t.path),
+        ['one.txt', 'two.txt'],
+      );
+    });
+
+    test('RC04-M-12: run_command uses the normalized executable basename', () => {
+      const targets = extractPolicyTargets('run_command', { executable: '  NPM  ' }, '/ws');
+      assert.equal(targets[0].executableBasename, 'npm');
+    });
+  });
+
+  // =========================================================================
+  // 4. All five mutation tools: request -> approve -> redeem -> execute -> replay
+  // =========================================================================
+
+  describe('Mutation end-to-end', () => {
+    test('RC04-M-13: create_file full lifecycle', async () => {
+      const { server, approvals, filesystem, dir } = makeServer({ workspaceName: 'e2e-create' });
+      const target = path.join(dir, 'created.txt');
+      const params = { path: 'created.txt', content: 'hello', workspaceId: 'ws' };
+
+      const a = await server.dispatchToolCall('create_file', { ...params });
+      assert.equal(body(a).code, 'APPROVAL_REQUIRED');
+      assert.equal(fs.existsSync(target), false, 'A: nothing may be created before approval');
+
+      const { requestId, token, second, secondBody } = await requestApproveRedeem(
+        server,
+        approvals,
+        'create_file',
+        params,
+      );
+      assert.equal(second.isError, undefined);
+      assert.equal(secondBody.path, 'created.txt');
+      assert.equal(fs.readFileSync(target, 'utf8'), 'hello');
+      assert.equal(approvals.getRequest(requestId).state, 'CONSUMED');
+      assert.equal(filesystem.calls.length, 1);
+
+      // D: replay is rejected and executes nothing further.
+      const replay = await server.dispatchToolCall('create_file', {
+        ...params,
+        _arcApproval: { requestId, token },
+      });
+      assert.equal(body(replay).code, 'APPROVAL_REJECTED');
+      assert.equal(filesystem.calls.length, 1, 'no second subsystem invocation');
+      assert.equal(fs.readFileSync(target, 'utf8'), 'hello');
+    });
+
+    test('RC04-M-14: write_file full lifecycle', async () => {
+      const { server, approvals, filesystem, dir } = makeServer({ workspaceName: 'e2e-write' });
+      const target = path.join(dir, 'README.md');
+      const original = fs.readFileSync(target);
+      const expectedHash = crypto.createHash('sha256').update(original).digest('hex');
+      const params = {
+        path: 'README.md',
+        content: 'replaced\n',
+        expectedHash,
+        overwrite: true,
+        workspaceId: 'ws',
+      };
+
+      const a = await server.dispatchToolCall('write_file', { ...params });
+      assert.equal(body(a).code, 'APPROVAL_REQUIRED');
+      assert.deepEqual(fs.readFileSync(target), original, 'A: unchanged');
+
+      const { requestId, token } = await requestApproveRedeem(
+        server,
+        approvals,
+        'write_file',
+        params,
+      );
+      assert.equal(fs.readFileSync(target, 'utf8'), 'replaced\n');
+      assert.equal(filesystem.calls.length, 1);
+
+      const replay = await server.dispatchToolCall('write_file', {
+        ...params,
+        _arcApproval: { requestId, token },
+      });
+      assert.equal(body(replay).code, 'APPROVAL_REJECTED');
+      assert.equal(filesystem.calls.length, 1);
+    });
+
+    test('RC04-M-15: delete_file full lifecycle', async () => {
+      const { server, approvals, filesystem, dir } = makeServer({ workspaceName: 'e2e-delete' });
+      fs.writeFileSync(path.join(dir, 'doomed.txt'), 'bye\n');
+      const target = path.join(dir, 'doomed.txt');
+      const expectedHash = crypto
+        .createHash('sha256')
+        .update(fs.readFileSync(target))
+        .digest('hex');
+      const params = { path: 'doomed.txt', expectedHash, workspaceId: 'ws' };
+
+      const a = await server.dispatchToolCall('delete_file', { ...params });
+      assert.equal(body(a).code, 'APPROVAL_REQUIRED');
+      assert.equal(fs.existsSync(target), true, 'A: still present');
+
+      const { requestId, token } = await requestApproveRedeem(
+        server,
+        approvals,
+        'delete_file',
+        params,
+      );
+      assert.equal(fs.existsSync(target), false, 'C: deleted');
+      assert.equal(filesystem.calls.length, 1);
+
+      const replay = await server.dispatchToolCall('delete_file', {
+        ...params,
+        _arcApproval: { requestId, token },
+      });
+      assert.equal(body(replay).code, 'APPROVAL_REJECTED');
+      assert.equal(filesystem.calls.length, 1);
+    });
+
+    test('RC04-M-16: move_file full lifecycle', async () => {
+      const { server, approvals, filesystem, dir } = makeServer({ workspaceName: 'e2e-move' });
+      fs.writeFileSync(path.join(dir, 'src.txt'), 'move me\n');
+      const sourceHash = crypto
+        .createHash('sha256')
+        .update(fs.readFileSync(path.join(dir, 'src.txt')))
+        .digest('hex');
+      const params = {
+        sourcePath: 'src.txt',
+        destinationPath: 'dst.txt',
+        expectedSourceHash: sourceHash,
+        workspaceId: 'ws',
+      };
+
+      const a = await server.dispatchToolCall('move_file', { ...params });
+      assert.equal(body(a).code, 'APPROVAL_REQUIRED');
+      assert.equal(fs.existsSync(path.join(dir, 'dst.txt')), false, 'A: no destination');
+
+      const { requestId, token } = await requestApproveRedeem(
+        server,
+        approvals,
+        'move_file',
+        params,
+      );
+      assert.equal(fs.existsSync(path.join(dir, 'src.txt')), false);
+      assert.equal(fs.readFileSync(path.join(dir, 'dst.txt'), 'utf8'), 'move me\n');
+      assert.equal(filesystem.calls.length, 1);
+
+      const replay = await server.dispatchToolCall('move_file', {
+        ...params,
+        _arcApproval: { requestId, token },
+      });
+      assert.equal(body(replay).code, 'APPROVAL_REJECTED');
+      assert.equal(filesystem.calls.length, 1);
+    });
+
+    test('RC04-M-17: apply_patch full lifecycle', async () => {
+      const { server, approvals, filesystem, dir } = makeServer({ workspaceName: 'e2e-patch' });
+      const target = path.join(dir, 'README.md');
+      const patch =
+        '--- a/README.md\n+++ b/README.md\n@@ -1,3 +1,3 @@\n-line1\n+LINE1\n line2\n line3\n';
+      const params = { patch, workspaceId: 'ws' };
+
+      const a = await server.dispatchToolCall('apply_patch', { ...params });
+      assert.equal(body(a).code, 'APPROVAL_REQUIRED');
+      assert.equal(fs.readFileSync(target, 'utf8'), 'line1\nline2\nline3\n', 'A: unchanged');
+
+      const { requestId, token } = await requestApproveRedeem(
+        server,
+        approvals,
+        'apply_patch',
+        params,
+      );
+      assert.equal(fs.readFileSync(target, 'utf8'), 'LINE1\nline2\nline3\n');
+      assert.equal(filesystem.calls.length, 1);
+
+      const replay = await server.dispatchToolCall('apply_patch', {
+        ...params,
+        _arcApproval: { requestId, token },
+      });
+      assert.equal(body(replay).code, 'APPROVAL_REJECTED');
+      assert.equal(filesystem.calls.length, 1);
+    });
+
+    test('RC04-M-18: apply_patch dryRun still requires approval and still consumes', async () => {
+      const { server, approvals } = makeServer({ workspaceName: 'e2e-dryrun' });
+      const patch =
+        '--- a/README.md\n+++ b/README.md\n@@ -1,3 +1,3 @@\n-line1\n+DRY\n line2\n line3\n';
+      const params = { patch, dryRun: true, workspaceId: 'ws' };
+      const a = await server.dispatchToolCall('apply_patch', { ...params });
+      assert.equal(body(a).code, 'APPROVAL_REQUIRED', 'no dry-run approval bypass');
+
+      const { requestId } = await requestApproveRedeem(server, approvals, 'apply_patch', params);
+      assert.equal(approvals.getRequest(requestId).state, 'CONSUMED');
+    });
+  });
+
+  // =========================================================================
+  // 5. Layer 1 / Layer 2 DENY before token validation
+  // =========================================================================
+
+  describe('DENY precedes token validation', () => {
+    test('RC04-M-19: a valid approved token cannot override a current Layer-2 DENY', async () => {
+      // The approval is minted under a permissive policy, then the effective
+      // policy changes to DENY before redemption.
+      const manager = new ApprovalStateManager();
+      // Mint under a policy that requires approval for the read...
+      const permissive = makeServer({
+        workspaceName: 'deny-l2',
+        manager,
+        policy: { sourceText: READ_APPROVAL_POLICY, format: 'yaml' },
+      });
+      const params = { path: 'README.md', workspaceId: 'ws' };
+
+      const a = await permissive.server.dispatchToolCall('read_file', { ...params });
+      assert.equal(body(a).code, 'APPROVAL_REQUIRED');
+      const requestId = body(a).details.approvalRequestId;
+      const grant = manager.approve(requestId);
+      assert.equal(manager.getRequest(requestId).state, 'APPROVED');
+
+      // Swap in a policy that DENYs the tool, sharing the same manager.
+      const denying = makeServer({
+        workspaceName: 'deny-l2',
+        manager,
+        policy: { sourceText: DENY_READ_POLICY, format: 'yaml' },
+      });
+
+      const res = await denying.server.dispatchToolCall('read_file', {
+        ...params,
+        _arcApproval: { requestId, token: grant.token },
+      });
+      assert.equal(body(res).code, 'POLICY_DENIED');
+      assert.equal(manager.getRequest(requestId).state, 'APPROVED', 'token must remain unconsumed');
+      assert.equal(denying.filesystem.calls.length, 0);
+    });
+
+    test('RC04-M-20: a valid approved token cannot override a Layer-1 DENY', async () => {
+      const manager = new ApprovalStateManager();
+      const permissive = makeServer({
+        workspaceName: 'deny-l1',
+        manager,
+        policy: { sourceText: READ_APPROVAL_POLICY, format: 'yaml' },
+      });
+      const params = { path: 'README.md', workspaceId: 'ws' };
+
+      const a = await permissive.server.dispatchToolCall('read_file', { ...params });
+      const requestId = body(a).details.approvalRequestId;
+      const grant = manager.approve(requestId);
+
+      // Layer 1 denies unauthenticated callers regardless of any token.
+      const res = await permissive.server.dispatchToolCall(
+        'read_file',
+        { ...params, _arcApproval: { requestId, token: grant.token } },
+        { authenticated: false },
+      );
+      assert.equal(body(res).code, 'POLICY_DENIED');
+      assert.equal(manager.getRequest(requestId).state, 'APPROVED');
+      assert.equal(permissive.filesystem.calls.length, 0);
+    });
+
+    test('RC04-M-21: an unnecessary but valid token on an ALLOW operation is not consumed', async () => {
+      const manager = new ApprovalStateManager();
+      const { server, approvals, filesystem, dir } = makeServer({
+        workspaceName: 'unnecessary',
+        manager,
+      });
+      const params = { path: 'README.md', workspaceId: 'ws' };
+
+      // Mint an approval under a policy that requires it...
+      const requiring = makeServer({
+        workspaceName: 'unnecessary',
+        manager,
+        policy: { sourceText: READ_APPROVAL_POLICY, format: 'yaml' },
+      });
+      const a = await requiring.server.dispatchToolCall('read_file', { ...params });
+      assert.equal(body(a).code, 'APPROVAL_REQUIRED');
+      const requestId = body(a).details.approvalRequestId;
+      const grant = manager.approve(requestId);
+
+      // ...then invoke under the built-in policy, where the same read is ALLOW.
+      const res = await server.dispatchToolCall('read_file', {
+        ...params,
+        _arcApproval: { requestId, token: grant.token },
+      });
+      assert.equal(res.isError, undefined, 'the read executes normally');
+      assert.equal(
+        manager.getRequest(requestId).state,
+        'APPROVED',
+        'an unnecessary token must not be inspected or consumed',
+      );
+      assert.equal(filesystem.calls.length, 0, 'read_file is not a mutation');
+      void dir;
+      void approvals;
+    });
+  });
+
+  // =========================================================================
+  // 6. Policy mismatch, tampering, replay, concurrency
+  // =========================================================================
+
+  describe('Redemption integrity', () => {
+    test('RC04-M-22: a policy change invalidates an approved record permanently', async () => {
+      const manager = new ApprovalStateManager();
+      const original = makeServer({
+        workspaceName: 'policy-change',
+        manager,
+        policy: { sourceText: READ_APPROVAL_POLICY, format: 'yaml' },
+      });
+      const params = { path: 'README.md', workspaceId: 'ws' };
+
+      const a = await original.server.dispatchToolCall('read_file', { ...params });
+      assert.equal(body(a).code, 'APPROVAL_REQUIRED');
+      const requestId = body(a).details.approvalRequestId;
+      const grant = manager.approve(requestId);
+
+      // Current policy still requires approval, but its hash differs.
+      const changed = makeServer({
+        workspaceName: 'policy-change',
+        manager,
+        policy: {
+          sourceText: `version: '1.0'\nrules:\n  - id: 'require-read-v2'\n    effect: 'REQUIRE_APPROVAL'\n    tools: ['read_file']\n`,
+          format: 'yaml',
+        },
+      });
+
+      const res = await changed.server.dispatchToolCall('read_file', {
+        ...params,
+        _arcApproval: { requestId, token: grant.token },
+      });
+      assert.equal(body(res).code, 'APPROVAL_REJECTED');
+      assert.equal(manager.getRequest(requestId).state, 'INVALIDATED');
+
+      // Reverting to the original policy must not revive it.
+      const reverted = makeServer({
+        workspaceName: 'policy-change',
+        manager,
+        policy: { sourceText: READ_APPROVAL_POLICY, format: 'yaml' },
+      });
+      const again = await reverted.server.dispatchToolCall('read_file', {
+        ...params,
+        _arcApproval: { requestId, token: grant.token },
+      });
+      assert.equal(body(again).code, 'APPROVAL_REJECTED');
+      assert.equal(manager.getRequest(requestId).state, 'INVALIDATED');
+    });
+
+    test('RC04-M-23: parameter tampering is rejected and creates no new request', async () => {
+      const tampered = [{ content: 'different' }, { path: 'other.txt' }];
+      for (const change of tampered) {
+        const { server, approvals, filesystem } = makeServer({
+          workspaceName: 'tamper',
+        });
+        const params = { path: 'tamper.txt', content: 'original', workspaceId: 'ws' };
+        const { requestId, token } = await requestApproveRedeem(
+          server,
+          approvals,
+          'create_file',
+          params,
+        );
+        // The first redemption above already consumed the token; mint a fresh
+        // request so the tamper is the only variable under test.
+        const freshParams = { path: 'tamper2.txt', content: 'original', workspaceId: 'ws' };
+        const a = await server.dispatchToolCall('create_file', { ...freshParams });
+        const freshId = body(a).details.approvalRequestId;
+        const freshToken = approvals.approve(freshId).token;
+        const before = approvals.listActive().length;
+
+        const res = await server.dispatchToolCall('create_file', {
+          ...freshParams,
+          ...change,
+          _arcApproval: { requestId: freshId, token: freshToken },
+        });
+        assert.equal(
+          body(res).code,
+          'APPROVAL_REJECTED',
+          `expected rejection for ${JSON.stringify(change)}`,
+        );
+        assert.equal(
+          approvals.getRequest(freshId).state,
+          'APPROVED',
+          'a binding mismatch must not consume the approval',
+        );
+        assert.equal(approvals.listActive().length, before, 'no new request may be created');
+        assert.equal(filesystem.calls.length, 1, 'only the first redemption executed');
+        void requestId;
+        void token;
+      }
+    });
+
+    test('RC04-M-24: an actor mismatch is rejected for each identity component', async () => {
+      for (const change of [
+        { clientId: 'someone-else' },
+        { sessionId: 'other-session' },
+        { deviceId: 'other-device' },
+        { clientType: 'other-client' },
+      ]) {
+        const { server, approvals, filesystem } = makeServer({ workspaceName: 'actor' });
+        const params = { path: 'actor.txt', content: 'x', workspaceId: 'ws' };
+        const actor = { clientId: 'alice', clientType: 'cli', sessionId: 's1', deviceId: 'd1' };
+
+        const a = await server.dispatchToolCall('create_file', { ...params }, actor);
+        const requestId = body(a).details.approvalRequestId;
+        const token = approvals.approve(requestId).token;
+
+        const res = await server.dispatchToolCall(
+          'create_file',
+          { ...params, _arcApproval: { requestId, token } },
+          { ...actor, ...change },
+        );
+        assert.equal(
+          body(res).code,
+          'APPROVAL_REJECTED',
+          `expected rejection for ${JSON.stringify(change)}`,
+        );
+        assert.equal(filesystem.calls.length, 0);
+      }
+    });
+
+    test('RC04-M-25: a workspace mismatch never executes in the other workspace', async () => {
+      const { server, approvals, filesystem } = makeServer({ workspaceName: 'ws-a' });
+      const secondDir = path.join(tempRoot, 'ws-b');
+      fs.mkdirSync(secondDir, { recursive: true });
+      server.workspaceRegistry.registerWorkspace('ws-b', secondDir);
+
+      // The server's own workspace is registered as 'ws'; 'ws-b' is a second
+      // authorized root that the approval must never be usable against.
+      const params = { path: 'x.txt', content: 'x', workspaceId: 'ws' };
+      const a = await server.dispatchToolCall('create_file', { ...params });
+      assert.equal(body(a).code, 'APPROVAL_REQUIRED');
+      const requestId = body(a).details.approvalRequestId;
+      const token = approvals.approve(requestId).token;
+
+      const res = await server.dispatchToolCall('create_file', {
+        ...params,
+        workspaceId: 'ws-b',
+        _arcApproval: { requestId, token },
+      });
+      const code = body(res).code;
+      assert.ok(
+        code === 'APPROVAL_REJECTED' || code === 'POLICY_DENIED',
+        `expected rejection, got ${code}`,
+      );
+      assert.equal(filesystem.calls.length, 0);
+      assert.equal(fs.existsSync(path.join(tempRoot, 'ws-b', 'x.txt')), false);
+    });
+
+    test('RC04-M-26: a case-modified token is rejected', async () => {
+      const { server, approvals, filesystem } = makeServer({ workspaceName: 'case' });
+      const params = { path: 'case.txt', content: 'x', workspaceId: 'ws' };
+      const a = await server.dispatchToolCall('create_file', { ...params });
+      const requestId = body(a).details.approvalRequestId;
+      const token = approvals.approve(requestId).token;
+      const upper = token.toUpperCase();
+      assert.notEqual(upper, token);
+
+      const res = await server.dispatchToolCall('create_file', {
+        ...params,
+        _arcApproval: { requestId, token: upper },
+      });
+      assert.equal(body(res).code, 'APPROVAL_REJECTED');
+      assert.equal(filesystem.calls.length, 0);
+    });
+
+    test('RC04-M-27: a PENDING request presented as a token neither mints nor executes', async () => {
+      const { server, approvals, filesystem } = makeServer({ workspaceName: 'pending' });
+      const params = { path: 'pending.txt', content: 'x', workspaceId: 'ws' };
+      const a = await server.dispatchToolCall('create_file', { ...params });
+      const requestId = body(a).details.approvalRequestId;
+
+      const res = await server.dispatchToolCall('create_file', {
+        ...params,
+        _arcApproval: { requestId, token: 'f'.repeat(64) },
+      });
+      assert.equal(body(res).code, 'APPROVAL_REJECTED');
+      assert.equal(approvals.getRequest(requestId).state, 'PENDING');
+      assert.equal(filesystem.calls.length, 0);
+    });
+
+    test('RC04-M-28: concurrent redemption of one token consumes exactly once', async () => {
+      const { server, approvals, filesystem, dir } = makeServer({ workspaceName: 'race' });
+      const params = { path: 'race.txt', content: 'x', workspaceId: 'ws' };
+      const a = await server.dispatchToolCall('create_file', { ...params });
+      const requestId = body(a).details.approvalRequestId;
+      const token = approvals.approve(requestId).token;
+
+      const envelope = { ...params, _arcApproval: { requestId, token } };
+      const [first, second] = await Promise.all([
+        server.dispatchToolCall('create_file', { ...envelope }),
+        server.dispatchToolCall('create_file', { ...envelope }),
+      ]);
+
+      const codes = [body(first).code, body(second).code].filter((c) => c !== undefined);
+      assert.equal(codes.length, 1, 'exactly one redemption may succeed');
+      assert.equal(codes[0], 'APPROVAL_REJECTED');
+      assert.equal(filesystem.calls.length, 1, 'the subsystem is invoked at most once');
+      assert.equal(approvals.getRequest(requestId).state, 'CONSUMED');
+      assert.ok(fs.existsSync(path.join(dir, 'race.txt')));
+    });
+
+    test('RC04-M-29: execution failure after consumption leaves the token consumed', async () => {
+      const { server, approvals, filesystem } = makeServer({ workspaceName: 'fail' });
+      const params = {
+        path: 'README.md',
+        content: 'x',
+        expectedHash: '0'.repeat(64), // deliberately wrong -> precondition conflict
+        overwrite: true,
+        workspaceId: 'ws',
+      };
+
+      const { requestId, token } = await requestApproveRedeem(
+        server,
+        approvals,
+        'write_file',
+        params,
+      );
+      assert.equal(approvals.getRequest(requestId).state, 'CONSUMED');
+      assert.equal(filesystem.calls.length, 1, 'the subsystem was invoked once');
+
+      const second = await server.dispatchToolCall('write_file', {
+        ...params,
+        _arcApproval: { requestId, token },
+      });
+      assert.equal(body(second).code, 'APPROVAL_REJECTED');
+      assert.equal(filesystem.calls.length, 1, 'no second invocation');
+      assert.equal(approvals.getRequest(requestId).state, 'CONSUMED');
+    });
+  });
+
+  // =========================================================================
+  // 7. Multi-target and sensitive-path controls
+  // =========================================================================
+
+  describe('Multi-target and sensitive paths', () => {
+    test('RC04-M-30: a two-file patch with one DENYd target is denied regardless of ordering', async () => {
+      const policy = `version: '1.0'
+rules:
+  - id: 'deny-second'
+    effect: 'DENY'
+    tools: ['apply_patch']
+    paths:
+      patterns: ['two.txt']
+`;
+
+      for (const order of [
+        ['one.txt', 'two.txt'],
+        ['two.txt', 'one.txt'],
+      ]) {
+        const { server, approvals, filesystem } = makeServer({
+          workspaceName: 'multi-patch',
+          policy: { sourceText: policy, format: 'yaml' },
+        });
+        const hunks = order
+          .map(
+            (file) =>
+              `--- a/${file}\n+++ b/${file}\n@@ -1,3 +1,3 @@\n-line1\n+CHANGED\n line2\n line3\n`,
+          )
+          .join('');
+        const a = await server.dispatchToolCall('apply_patch', { patch: hunks, workspaceId: 'ws' });
+        assert.equal(body(a).code, 'POLICY_DENIED', `ordering ${order.join(',')} must be denied`);
+        assert.equal(approvals.listActive().length, 0, 'no approval may be created');
+        assert.equal(filesystem.calls.length, 0);
+      }
+    });
+
+    test('RC04-M-31: a move with a DENYd destination is denied as a whole', async () => {
+      const policy = `version: '1.0'
+rules:
+  - id: 'deny-destination'
+    effect: 'DENY'
+    tools: ['move_file']
+    paths:
+      patterns: ['forbidden.txt']
+`;
+      const { server, approvals, filesystem } = makeServer({
+        workspaceName: 'multi-move',
+        policy: { sourceText: policy, format: 'yaml' },
+      });
+      const a = await server.dispatchToolCall('move_file', {
+        sourcePath: 'README.md',
+        destinationPath: 'forbidden.txt',
+        expectedSourceHash: '0'.repeat(64),
+        workspaceId: 'ws',
+      });
+      assert.equal(body(a).code, 'POLICY_DENIED');
+      assert.equal(approvals.listActive().length, 0);
+      assert.equal(filesystem.calls.length, 0);
+    });
+
+    test('RC04-M-32: a patch targeting a permanent sensitive path is denied before token consumption', async () => {
+      const { server, approvals, filesystem } = makeServer({ workspaceName: 'sensitive' });
+      const params = {
+        patch: '--- a/.git/config\n+++ b/.git/config\n@@ -1 +1 @@\n-[core]\n+[evil]\n',
+        workspaceId: 'ws',
+      };
+
+      // Mint an approval for the same patch parameters first via a permissive
+      // path, then prove Layer 1 still denies and the token stays APPROVED.
+      const manager = approvals;
+      const seed = await server.dispatchToolCall('apply_patch', { ...params });
+      const seedCode = body(seed).code;
+      // If Layer 1 already denies the seed request, that is the strongest
+      // outcome: the sensitive target never even reaches approval creation.
+      if (seedCode === 'POLICY_DENIED') {
+        assert.equal(manager.listActive().length, 0);
+        assert.equal(filesystem.calls.length, 0);
+        return;
+      }
+
+      const requestId = body(seed).details.approvalRequestId;
+      const token = manager.approve(requestId).token;
+      const res = await server.dispatchToolCall('apply_patch', {
+        ...params,
+        _arcApproval: { requestId, token },
+      });
+      assert.equal(body(res).code, 'POLICY_DENIED');
+      assert.equal(manager.getRequest(requestId).state, 'APPROVED', 'token must remain unconsumed');
+      assert.equal(filesystem.calls.length, 0);
+      assert.equal(fs.readFileSync(path.join(workspaceDir, '.git', 'config'), 'utf8'), '[core]\n');
+    });
+  });
+
+  // =========================================================================
+  // 8. Deduplication, external policy, invalid policy
+  // =========================================================================
+
+  describe('Deduplication and external policy', () => {
+    test('RC04-M-33: identical requests reuse one record with a stable deadline', async () => {
+      const { server, approvals } = makeServer({ workspaceName: 'dedup' });
+      const params = { path: 'dedup.txt', content: 'x', workspaceId: 'ws' };
+
+      const first = await server.dispatchToolCall('create_file', { ...params });
+      const second = await server.dispatchToolCall('create_file', { ...params });
+      const firstBody = body(first);
+      const secondBody = body(second);
+
+      assert.equal(firstBody.details.approvalRequestId, secondBody.details.approvalRequestId);
+      assert.equal(approvals.listActive().length, 1);
+      const deadline = approvals.getRequest(firstBody.details.approvalRequestId).expiresAt;
+
+      // Approving then repeating the ordinary request still reuses the record.
+      approvals.approve(firstBody.details.approvalRequestId);
+      const third = await server.dispatchToolCall('create_file', { ...params });
+      assert.equal(body(third).details.approvalRequestId, firstBody.details.approvalRequestId);
+      assert.equal(
+        approvals.getRequest(firstBody.details.approvalRequestId).expiresAt,
+        deadline,
+        'the TTL must not be reset',
+      );
+      assert.equal(approvals.getRequest(firstBody.details.approvalRequestId).state, 'APPROVED');
+    });
+
+    test('RC04-M-34: an external ALLOW rule permits a read, DENY blocks it, no-match denies', async () => {
+      const allowPolicy = `version: '1.0'
+rules:
+  - id: 'allow-read'
+    effect: 'ALLOW'
+    tools: ['read_file']
+`;
+      const allowed = makeServer({
+        workspaceName: 'ext-allow',
+        policy: { sourceText: allowPolicy, format: 'yaml' },
+      });
+      const ok = await allowed.server.dispatchToolCall('read_file', {
+        path: 'README.md',
+        workspaceId: 'ws',
+      });
+      assert.equal(ok.isError, undefined, 'external ALLOW read executes');
+
+      const denied = makeServer({
+        workspaceName: 'ext-deny',
+        policy: { sourceText: DENY_READ_POLICY, format: 'yaml' },
+      });
+      const blocked = await denied.server.dispatchToolCall('read_file', {
+        path: 'README.md',
+        workspaceId: 'ws',
+      });
+      assert.equal(body(blocked).code, 'POLICY_DENIED');
+
+      // No matching rule in an external policy is default-deny.
+      const nomatch = makeServer({
+        workspaceName: 'ext-nomatch',
+        policy: {
+          sourceText: `version: '1.0'\nrules:\n  - id: 'other'\n    effect: 'ALLOW'\n    tools: ['git_status']\n`,
+          format: 'yaml',
+        },
+      });
+      const miss = await nomatch.server.dispatchToolCall('read_file', {
+        path: 'README.md',
+        workspaceId: 'ws',
+      });
+      assert.equal(body(miss).code, 'POLICY_DENIED');
+    });
+
+    test('RC04-M-35: an external ALLOW rule still cannot auto-allow a mutation', async () => {
+      const policy = `version: '1.0'
+rules:
+  - id: 'allow-mutations'
+    effect: 'ALLOW'
+    tools: ['create_file']
+`;
+      const { server, approvals } = makeServer({
+        workspaceName: 'ext-floor',
+        policy: { sourceText: policy, format: 'yaml' },
+      });
+      const res = await server.dispatchToolCall('create_file', {
+        path: 'floor.txt',
+        content: 'x',
+        workspaceId: 'ws',
+      });
+      assert.equal(body(res).code, 'APPROVAL_REQUIRED', 'the mutation floor still applies');
+      assert.equal(approvals.listActive().length, 1);
+    });
+
+    test('RC04-M-36: the policyHash bound into the approval equals the engine hash', async () => {
+      const manager = new ApprovalStateManager();
+      const { server, approvals } = makeServer({
+        workspaceName: 'hash-bind',
+        manager,
+        policy: { sourceText: READ_APPROVAL_POLICY, format: 'yaml' },
+      });
+      const engine = DeclarativePolicyEngine.fromExternalText(
+        server.workspaceRegistry,
+        READ_APPROVAL_POLICY,
+        'yaml',
+      );
+      const a = await server.dispatchToolCall('read_file', {
+        path: 'README.md',
+        workspaceId: 'ws',
+      });
+      const requestId = body(a).details.approvalRequestId;
+      assert.equal(approvals.getRequest(requestId).binding.policyHash, engine.getPolicyHash());
+      assert.equal(server.effectivePolicyEngine.getPolicyHash(), engine.getPolicyHash());
+    });
+
+    test('RC04-M-37: an invalid external policy fails closed with no built-in fallback', async () => {
+      const marker = 'RC04_MCP_POLICY_MARKER_6612';
+      const bad = makeServer({
+        workspaceName: 'bad-policy',
+        policy: {
+          sourceText: `version: '1.0'\nrules: [\n# ${marker}\n`,
+          format: 'yaml',
+        },
+      });
+
+      assert.equal(bad.server.effectivePolicyEngine, undefined);
+      assert.ok(bad.server.policyInitializationFailure);
+
+      // health remains callable and truthfully reports UNHEALTHY.
+      const health = await bad.server.dispatchToolCall('health', {});
+      const healthBody = body(health);
+      assert.equal(healthBody.status, 'UNHEALTHY');
+      assert.equal(healthBody.policyEngineActive, false);
+      assert.equal(healthBody.stage, 'RC-04');
+
+      // Every non-diagnostic operation fails closed with no approval creation.
+      for (const [tool, params] of [
+        ['read_file', { path: 'README.md', workspaceId: 'ws' }],
+        ['create_file', { path: 'x.txt', content: 'x', workspaceId: 'ws' }],
+        ['run_command', { executable: 'ls', workspaceId: 'ws' }],
+      ]) {
+        const res = await bad.server.dispatchToolCall(tool, params);
+        const parsed = body(res);
+        assert.equal(parsed.code, 'POLICY_LOAD_ERROR', `${tool} must fail closed`);
+        assert.ok(!JSON.stringify(parsed).includes(marker), 'raw policy text must not leak');
+      }
+      assert.equal(bad.approvals.listActive().length, 0);
+      assert.equal(bad.filesystem.calls.length, 0);
+      assert.ok(
+        !JSON.stringify(bad.audit.getRecords()).includes(marker),
+        'raw policy text must not reach audit',
+      );
+    });
+  });
+
+  // =========================================================================
+  // 9. Leakage and isolation
+  // =========================================================================
+
+  describe('Leakage and subsystem isolation', () => {
+    test('RC04-M-38: tokens, content, and patch bodies never reach audit or responses', async () => {
+      const contentMarker = 'RC04_CONTENT_MARKER_9911';
+      const patchMarker = 'RC04_PATCH_MARKER_2277';
+      const { server, approvals, audit, filesystem } = makeServer({ workspaceName: 'leak' });
+
+      const params = { path: 'leak.txt', content: contentMarker, workspaceId: 'ws' };
+      const { requestId, token } = await requestApproveRedeem(
+        server,
+        approvals,
+        'create_file',
+        params,
+      );
+
+      // A patch approval whose review material carries its own marker.
+      const patch = `--- a/README.md\n+++ b/README.md\n@@ -1,3 +1,3 @@\n-line1\n+${patchMarker}\n line2\n line3\n`;
+      const p = await server.dispatchToolCall('apply_patch', { patch, workspaceId: 'ws' });
+      const patchRequestId = body(p).details.approvalRequestId;
+      const patchToken = approvals.approve(patchRequestId).token;
+
+      const auditText = JSON.stringify(audit.getRecords());
+      assert.ok(!auditText.includes(token), 'token leaked into audit');
+      assert.ok(!auditText.includes(patchToken), 'token leaked into audit');
+      assert.ok(!auditText.includes(contentMarker), 'raw content leaked into audit');
+      assert.ok(!auditText.includes(patchMarker), 'raw patch leaked into audit');
+      assert.ok(!auditText.includes('_arcApproval'), 'control object leaked into audit');
+
+      // Responses after the fact must not carry the token either.
+      const after = await server.dispatchToolCall('create_file', {
+        ...params,
+        _arcApproval: { requestId, token },
+      });
+      assert.ok(!JSON.stringify(body(after)).includes(token), 'token leaked into a rejection');
+
+      // The subsystem received only its own request shape.
+      for (const call of filesystem.calls) {
+        const keys = Object.keys(call.request);
+        assert.ok(!keys.includes('_arcApproval'), '_arcApproval reached the subsystem');
+        assert.ok(!keys.includes('token'), 'token reached the subsystem');
+        assert.ok(!keys.includes('requestId'), 'requestId reached the subsystem');
+        assert.ok(!JSON.stringify(call.request).includes(token));
+      }
+    });
+
+    test('RC04-M-39: review summary is safe metadata and never contains raw material', async () => {
+      const contentMarker = 'RC04_SUMMARY_MARKER_5566';
+      const { server, approvals } = makeServer({ workspaceName: 'summary' });
+      const res = await server.dispatchToolCall('create_file', {
+        path: 'summary.txt',
+        content: contentMarker,
+        workspaceId: 'ws',
+      });
+      const requestId = body(res).details.approvalRequestId;
+      const snapshot = approvals.getRequest(requestId);
+
+      assert.deepEqual(snapshot.reviewSummary.targetPaths, ['summary.txt']);
+      assert.equal(typeof snapshot.reviewSummary.contentBytes, 'number');
+      assert.match(snapshot.reviewSummary.contentHash, /^[0-9a-f]{64}$/);
+      assert.ok(
+        !JSON.stringify(snapshot.reviewSummary).includes(contentMarker),
+        'the summary must never carry raw content',
+      );
+      // Raw material is available only through the operator-only pending view.
+      assert.equal(approvals.inspectPending(requestId), contentMarker);
+    });
+
+    test('RC04-M-40: a 1 MiB mutation body is accepted without review-header overflow', async () => {
+      const { server, approvals } = makeServer({ workspaceName: 'bigbody' });
+      const content = 'A'.repeat(1_048_576);
+      assert.equal(Buffer.byteLength(content, 'utf8'), 1_048_576);
+
+      const res = await server.dispatchToolCall('create_file', {
+        path: 'big.txt',
+        content,
+        workspaceId: 'ws',
+      });
+      const requestBody = body(res);
+      assert.equal(
+        requestBody.code,
+        'APPROVAL_REQUIRED',
+        'a legal 1 MiB body must not fail because ARC added metadata',
+      );
+      assert.equal(approvals.listActive().length, 1);
+    });
+
+    test('RC04-M-41: a fresh server has fresh approval state (restart semantics)', async () => {
+      const first = makeServer({ workspaceName: 'restart' });
+      const params = { path: 'restart.txt', content: 'x', workspaceId: 'ws' };
+      const a = await first.server.dispatchToolCall('create_file', { ...params });
+      const requestId = body(a).details.approvalRequestId;
+      const token = first.approvals.approve(requestId).token;
+
+      const second = makeServer({ workspaceName: 'restart' });
+      const res = await second.server.dispatchToolCall('create_file', {
+        ...params,
+        _arcApproval: { requestId, token },
+      });
+      assert.equal(body(res).code, 'APPROVAL_REJECTED');
+      assert.equal(second.filesystem.calls.length, 0);
+    });
+
+    test('RC04-M-42: createArcMcpServer exposes no admin MCP tool and no admin listener', () => {
+      const server = createArcMcpServer({ transport: 'stdio', authorizedRoots: [] });
+      const names = server.getRegisteredTools().map((t) => t.name);
+      for (const forbidden of ['approve', 'reject', 'approvals', 'admin', 'policy_test']) {
+        assert.ok(!names.includes(forbidden));
+      }
+      assert.equal(server.adminIpcServer, undefined);
+      assert.ok(server.approvalStateManager instanceof ApprovalStateManager);
+      assert.equal(server.effectivePolicyEngine.getSourceMode(), 'BUILTIN');
+    });
+
+    test('RC04-M-43: no mutation executes without an invocation-local consumption flag', async () => {
+      // Directly exercise the defense-in-depth backstop: a forced ALLOW kernel
+      // plus a Layer-1-only path still cannot reach a mutation execution case.
+      const registry = new WorkspaceRegistry();
+      registry.registerWorkspace('ws', workspaceDir);
+      const spy = new FilesystemSpy();
+      const forcedAllowKernel = {
+        evaluate: async () => ({
+          outcome: 2,
+          effect: 'ALLOW',
+          matchingRuleId: 'forced-allow',
+          reason: 'forced',
+        }),
+      };
+      const server = new ArcMcpServer(
+        registry,
+        forcedAllowKernel,
+        new AuditLogger(),
+        spy,
+        new GitSubsystem(),
+        { transport: 'stdio', authorizedRoots: [], defaultWorkspaceId: 'ws' },
+        undefined,
+        undefined,
+        new ApprovalStateManager(),
+      );
+
+      for (const [tool, params] of [
+        ['create_file', { path: 'backstop.txt', content: 'x', workspaceId: 'ws' }],
+        [
+          'write_file',
+          {
+            path: 'README.md',
+            content: 'x',
+            expectedHash: '0'.repeat(64),
+            overwrite: true,
+            workspaceId: 'ws',
+          },
+        ],
+        ['delete_file', { path: 'README.md', expectedHash: '0'.repeat(64), workspaceId: 'ws' }],
+        [
+          'move_file',
+          {
+            sourcePath: 'README.md',
+            destinationPath: 'z.txt',
+            expectedSourceHash: '0'.repeat(64),
+            workspaceId: 'ws',
+          },
+        ],
+        [
+          'apply_patch',
+          { patch: '--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-a\n+b\n', workspaceId: 'ws' },
+        ],
+      ]) {
+        const res = await server.dispatchToolCall(tool, params);
+        assert.ok(res.isError, `${tool} must not execute`);
+        assert.equal(body(res).code, 'APPROVAL_REQUIRED');
+      }
+      assert.equal(spy.calls.length, 0, 'no mutation may reach the subsystem');
+    });
+  });
+
+  // =========================================================================
+  // 10. Non-mutation REQUIRE_APPROVAL
+  // =========================================================================
+
+  describe('Non-mutation approval', () => {
+    test('RC04-M-44: an external policy can require approval for a read and redemption executes it', async () => {
+      const { server, approvals, filesystem } = makeServer({
+        workspaceName: 'read-approval',
+        policy: { sourceText: READ_APPROVAL_POLICY, format: 'yaml' },
+      });
+      const params = { path: 'README.md', workspaceId: 'ws' };
+
+      const first = await server.dispatchToolCall('read_file', { ...params });
+      assert.equal(body(first).code, 'APPROVAL_REQUIRED');
+      const requestId = body(first).details.approvalRequestId;
+      assert.match(String(body(first).details.expiresInSeconds), /^[0-9]+$/);
+
+      const token = approvals.approve(requestId).token;
+      const second = await server.dispatchToolCall('read_file', {
+        ...params,
+        _arcApproval: { requestId, token },
+      });
+      assert.equal(second.isError, undefined, 'the approved read executes');
+      assert.equal(body(second).content, 'line1\nline2\nline3\n');
+      assert.equal(approvals.getRequest(requestId).state, 'CONSUMED');
+      assert.equal(filesystem.calls.length, 0, 'a read is not a mutation');
+    });
+
+    test('RC04-M-45: an invalid redemption never fabricates a new pending request', async () => {
+      const { server, approvals } = makeServer({
+        workspaceName: 'no-fabricate',
+        policy: { sourceText: READ_APPROVAL_POLICY, format: 'yaml' },
+      });
+      const params = { path: 'README.md', workspaceId: 'ws' };
+
+      const before = approvals.listActive().length;
+      for (const control of [
+        { requestId: 'f'.repeat(32), token: 'f'.repeat(64) },
+        { requestId: '0'.repeat(32), token: '0'.repeat(64) },
+      ]) {
+        const res = await server.dispatchToolCall('read_file', {
+          ...params,
+          _arcApproval: control,
+        });
+        assert.equal(body(res).code, 'APPROVAL_REJECTED');
+      }
+      assert.equal(approvals.listActive().length, before, 'no request may be created');
+    });
+  });
+});

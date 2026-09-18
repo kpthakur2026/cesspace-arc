@@ -8,12 +8,15 @@ import {
   type ApprovalGrant,
   type ApprovalRedemptionInput,
   type ApprovalConsumptionResult,
+  type ApprovalReviewSummary,
   APPROVAL_TTL_SECONDS,
   MAX_ACTIVE_APPROVALS_GLOBAL,
   MAX_ACTIVE_APPROVALS_PER_ACTOR,
   MAX_REVIEW_BYTES_PER_RECORD,
   MAX_REVIEW_BYTES_PER_ACTOR,
   MAX_REVIEW_BYTES_GLOBAL,
+  MAX_REVIEW_SUMMARY_PATHS,
+  MAX_REVIEW_SUMMARY_STRING_LENGTH,
   MAX_TOKEN_BYTES,
   TERMINAL_APPROVAL_STATES,
 } from '@cesspace-arc/protocol';
@@ -37,6 +40,96 @@ export interface CreatePendingApprovalInput {
   executionPayloadHash: string;
   binding: ApprovalBinding;
   reviewMaterial?: string;
+  /**
+   * Safe bounded metadata describing the request. This is NOT raw review
+   * material and does not count against review byte quotas.
+   */
+  reviewSummary?: ApprovalReviewSummary;
+}
+
+/**
+ * Copies and bounds a caller-supplied review summary.
+ *
+ * Only known fields with the expected primitive types survive; targetPaths is
+ * capped and every string is length-bounded. Unknown properties are dropped, so
+ * no arbitrary object can be stored.
+ */
+function sanitizeReviewSummary(input: unknown): ApprovalReviewSummary | undefined {
+  if (input === null || typeof input !== 'object' || Array.isArray(input)) {
+    return undefined;
+  }
+  const source = input as Record<string, unknown>;
+  const out: ApprovalReviewSummary = {};
+
+  if (Array.isArray(source.targetPaths)) {
+    const paths: string[] = [];
+    for (const entry of source.targetPaths) {
+      if (paths.length >= MAX_REVIEW_SUMMARY_PATHS) break;
+      if (typeof entry !== 'string' || entry.length === 0) continue;
+      if (entry.length > MAX_REVIEW_SUMMARY_STRING_LENGTH) continue;
+      paths.push(entry);
+    }
+    if (paths.length > 0) out.targetPaths = paths;
+  }
+
+  const numberFields: ReadonlyArray<keyof ApprovalReviewSummary> = [
+    'contentBytes',
+    'patchBytes',
+    'fuzz',
+    'argumentCount',
+    'insertions',
+    'deletions',
+  ];
+  for (const field of numberFields) {
+    const value = source[field];
+    if (typeof value === 'number' && Number.isInteger(value) && value >= 0) {
+      (out as Record<string, unknown>)[field] = value;
+    }
+  }
+
+  const hashFields: ReadonlyArray<keyof ApprovalReviewSummary> = [
+    'contentHash',
+    'patchHash',
+    'expectedHash',
+    'expectedSourceHash',
+  ];
+  for (const field of hashFields) {
+    const value = source[field];
+    if (typeof value === 'string' && HEX_64_REGEX.test(value)) {
+      (out as Record<string, unknown>)[field] = value;
+    }
+  }
+
+  const booleanFields: ReadonlyArray<keyof ApprovalReviewSummary> = ['overwrite', 'dryRun'];
+  for (const field of booleanFields) {
+    const value = source[field];
+    if (typeof value === 'boolean') {
+      (out as Record<string, unknown>)[field] = value;
+    }
+  }
+
+  const executable = source.executable;
+  if (
+    typeof executable === 'string' &&
+    executable.length > 0 &&
+    executable.length <= MAX_REVIEW_SUMMARY_STRING_LENGTH
+  ) {
+    out.executable = executable;
+  }
+
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** Deep-copies a stored review summary so callers cannot mutate stored state. */
+function cloneReviewSummary(
+  summary: ApprovalReviewSummary | undefined,
+): ApprovalReviewSummary | undefined {
+  if (summary === undefined) return undefined;
+  const clone: ApprovalReviewSummary = { ...summary };
+  if (summary.targetPaths !== undefined) {
+    clone.targetPaths = [...summary.targetPaths];
+  }
+  return clone;
 }
 
 /**
@@ -81,6 +174,7 @@ interface InternalApprovalRecord {
   tokenDigest?: Buffer; // strictly 32-byte Buffer
   reviewMaterial?: string;
   reviewBytes: number;
+  reviewSummary?: ApprovalReviewSummary;
   actorQuotaKey: string;
 }
 
@@ -227,6 +321,7 @@ export class ApprovalStateManager {
       expiresAt: record.expiresAtIso,
       remainingSeconds,
       reviewMaterialBytes: record.reviewBytes,
+      reviewSummary: cloneReviewSummary(record.reviewSummary),
     };
   }
 
@@ -475,6 +570,7 @@ export class ApprovalStateManager {
       monotonicDeadline,
       reviewMaterial: reviewMaterial ? String(reviewMaterial) : undefined,
       reviewBytes,
+      reviewSummary: sanitizeReviewSummary(input.reviewSummary),
       actorQuotaKey,
     };
 
