@@ -11,11 +11,11 @@
 
 The objective of **RC-03** is to introduce safe, policy-governed file modification capabilities into CesSpace ARC. Building upon the verified read-only inspection baseline (RC-01) and controlled terminal execution (RC-02), RC-03 introduces five discrete mutation tools:
 
-1. `create_file`: Create a new file within an authorized workspace root (target must not exist).
+1. `create_file`: Create a new file within an authorized workspace root (target must not exist; parent directory must already exist).
 2. `write_file`: Overwrite an existing file with complete content (requires exact `expectedHash` precondition).
-3. `apply_patch`: Apply a bounded unified diff patch to existing files using a preflight-all, commit-with-rollback model.
+3. `apply_patch`: Apply a bounded unified diff patch to existing files using a preflight-all, commit-with-rollback model with safe rollback revalidation.
 4. `delete_file`: Delete a single authorized regular file (target must exist and match `expectedHash`; no directory deletion).
-5. `move_file`: Move or rename a file within authorized workspace roots (destination must not exist; requires `expectedSourceHash`).
+5. `move_file`: Execute a no-replace move with rollback within authorized workspace roots (destination must not exist; requires `expectedSourceHash`).
 
 ### 1.1. Core Invariants Maintained
 
@@ -35,40 +35,51 @@ Every file mutation operation in RC-03 must pass through the **Minimal Security 
    - `.git/modules/**`
      File mutation must never serve as a filesystem-level bypass around Git repository governance or object integrity.
 4. **No Shell Execution or External Binary Delegation:** File mutations and patch applications are implemented strictly in native Node.js / POSIX filesystem calls. Invoking host binaries (such as `patch`, `git apply`, `rm`, `mv`, `cp`, `touch`, `sed`, `awk`, or shell subshells) is strictly forbidden.
-5. **Jailed Canonical Path Resolution & Length Constraints:** Every target path (source, destination, and patch targets) must undergo canonical normalization, symlink resolution, and prefix-enclosure verification against the authorized workspace root before any file descriptor is opened. Maximum input path length is strictly **1024 characters** (matching the ARC protocol schema). Operating system limits (255 bytes per segment, 4096 bytes host path) act as additional constraints. Any attempt to traverse (`../`), escape via symlink, or access outside the workspace fails closed immediately with `PATH_ESCAPES_ROOT`.
+5. **Jailed Canonical Path Resolution & Parent Semantics:** Every target path (source, destination, and patch targets) must undergo canonical normalization, symlink resolution, and prefix-enclosure verification against the authorized workspace root before any file descriptor is opened. Maximum input path length is strictly **1024 characters** (matching the ARC protocol schema). Operating system limits (255 bytes per segment, 4096 bytes host path) act as additional constraints. Any attempt to traverse (`../`), escape via symlink, or access outside the workspace fails closed immediately with `PATH_ESCAPES_ROOT`. For `create_file`, the immediate parent directory must already exist within the workspace root; ARC does **not** automatically create intermediate directories, avoiding unmanaged side-effects and hidden directory creation capabilities. If the parent directory is missing, the operation fails with `PARENT_NOT_FOUND`.
 6. **Hardlink Aliasing Defense:** Filesystem operations must verify inode link counts (`stat.nlink > 1`). Mutating a file with multiple hardlinks is rejected immediately with `HARDLINK_DETECTED` to prevent modifying external files aliased into the workspace via hardlinks.
 7. **Strict Symlink Immutability:** To prevent symlink confusion, TOCTOU redirection, and arbitrary target overwrites:
    - `create_file`, `write_file`, and `apply_patch` never follow or replace symbolic links. If target or any intermediate path is a symlink, the operation fails with `UNSAFE_SYMLINK` or `PATH_ESCAPES_ROOT`.
    - `move_file` requires the source to be a regular file; symbolic-link sources are denied with `UNSAFE_SYMLINK`.
    - `delete_file` in RC-03 rejects symbolic link targets with `UNSAFE_SYMLINK` (only regular files may be deleted).
-8. **Deterministic Mandatory Preconditions (Lost-Update Defense):** Preconditions are mandatory across all mutation operations to prevent silent lost updates:
+8. **Deterministic Mandatory Preconditions & TOCTOU Residual Risk:** Preconditions are mandatory across all mutation operations to prevent silent lost updates under cooperating/normal execution:
    - `write_file`: Caller must provide `expectedHash` (64-character SHA-256 hex string). Current on-disk content SHA-256 must match exactly; otherwise fails with `CONFLICT_PRECONDITION_FAILED`.
    - `delete_file`: Caller must provide `expectedHash`. Current on-disk content SHA-256 must match; otherwise fails with `CONFLICT_PRECONDITION_FAILED`.
    - `move_file`: Caller must provide `expectedSourceHash`. Current on-disk source file SHA-256 must match; otherwise fails with `CONFLICT_PRECONDITION_FAILED`.
    - `create_file`: Precondition is target **MUST NOT EXIST**. If target exists, fails with `ALREADY_EXISTS`.
    - `apply_patch`: Preflight captures content hashes of all targets. Immediately prior to each file commit, the implementation verifies the target has not changed since preflight; if changed, commits halt and rollback is invoked.
-   - _TOCTOU Acknowledgment:_ Userspace check-then-act sequences have inherent race windows unless commit-time filesystem semantics enforce preconditions. The implementation must use commit-time no-replace and exclusive primitives to minimize race exposure.
-9. **No-Replace Primitives for Creation and Movement:**
-   - `create_file` must never replace an existing file. It uses an exclusive commit primitive (e.g. `O_CREAT | O_EXCL` via `wx` flag or native link-based commit) so the final commit fails at the kernel level if the destination exists.
-   - `move_file` destination must not exist. Ordinary `rename()` replaces existing destinations in POSIX; therefore, `move_file` must employ a commit-time verification or exclusive atomic primitive (such as `fs.link` which fails with `EEXIST` if destination exists, followed by `fs.unlink` of source) ensuring that a destination appearing after an initial check is never overwritten.
-   - Cross-filesystem moves (`EXDEV`) are strictly rejected with `CROSS_DEVICE_MOVE_UNSUPPORTED`; silent copy-and-delete fallback is forbidden.
-10. **File Permission Preservation & Safe Creation Mode:**
+   - _Pre-Commit Revalidation:_ Immediately before destructive commit, the implementation revalidates content hash, file type, dev/inode identity (where applicable), and symlink/hardlink conditions. If any value changed, fails with `CONFLICT_PRECONDITION_FAILED`.
+   - _Truthful TOCTOU Acknowledgment:_ Standard userspace Node.js path APIs cannot completely eliminate a malicious same-user filesystem race between the final revalidation and the kernel mutation operation. Absolute TOCTOU elimination is not claimed. This residual risk remains explicitly documented until a descriptor-relative / kernel-enforced mutation primitive (`openat2` / `RESOLVE_BENEATH`) is implemented in a later hardening stage.
+9. **In-Process Mutation Serialization:** To prevent concurrent ARC callers or concurrent requests within the same process from racing each other:
+   - ARC enforces strict in-process serialization for conflicting mutations per workspace and per canonical target path.
+   - Multi-file `apply_patch` acquires exclusive in-process locks for all candidate target paths before preflight and retains them through commit or rollback.
+   - Lock acquisition order is strictly deterministic (lexicographical sorting by canonical path) to guarantee deadlock freedom.
+   - Locks are guaranteed released via `finally` blocks on success or error.
+   - _Boundary Note:_ Serialization guarantees coordination between ARC invocations; it does not protect against uncoordinated concurrent processes running outside ARC on the host.
+10. **Safe Move Contract (No-Replace Move with Rollback):**
+    - `move_file` is specified as a **no-replace move with rollback**, not an atomic operation.
+    - Destination must not exist. The implementation creates the destination entry using an exclusive linking operation (`fs.link`), verifies that destination refers to the intended source identity/content, and only then unlinks the source.
+    - If unlinking the source fails, the implementation attempts rollback by unlinking the newly-created destination. If rollback fails, `ROLLBACK_FAILED` is reported with recovery metadata.
+    - If an OS crash or power loss occurs between link and unlink, both filenames may temporarily point to the same inode. Crash-transactional atomicity is not claimed.
+    - Cross-filesystem movement (`EXDEV`) fails deterministically with `CROSS_DEVICE_MOVE_UNSUPPORTED`; silent copy+delete fallback is strictly forbidden.
+11. **File Permission Preservation & Safe Creation Mode:**
     - `write_file` atomic replacement must preserve the original regular file's mode bits (`stat.mode & 0o777`). The replacement file must have its permissions set to match the original file prior to atomic commit.
-    - `create_file` must create new files with conservative default permissions (`0o644` masked by process umask) and directories with `0o755` masked by umask. Source files must never be rendered executable or world-writable inadvertently.
-11. **Truthful Multi-File Patch Contract:** Multi-file patch application is **not** a single transactional filesystem commit. It is specified truthfully as **preflight-all, commit-with-rollback**. If a failure occurs during commit and deterministic rollback cannot restore previous state, a distinct severe error (`ROLLBACK_FAILED`) is raised and audited.
-12. **Permanent Sensitive Path Blacklist:** The immutable blacklist (`.git/**`, `.env*`, `.ssh/`, `.aws/`, `.gnupg/`, `.kube/`, `id_rsa*`, `id_ed25519*`, `/etc/`, `/proc/`, `/sys/`, `/dev/`, `/root/`) applies unconditionally to all mutation targets.
-13. **Resource Bounds & Payload Limits:**
+    - `create_file` must create new files with conservative default permissions (`0o644` masked by process umask). Source files must never be rendered executable or world-writable inadvertently.
+12. **Truthful Multi-File Patch Contract & Rollback Safety:**
+    - Multi-file patch application is specified truthfully as **preflight-all, commit-with-rollback**.
+    - When rolling back an already-committed patch target, the engine **does not blindly overwrite** the file. It verifies that the file's current content hash matches what ARC committed. If another actor modified the file in the interim, rollback halts for that file, and `ROLLBACK_FAILED` is raised with audit metadata indicating which files require administrative recovery.
+13. **Permanent Sensitive Path Blacklist:** The immutable blacklist (`.git/**`, `.env*`, `.ssh/`, `.aws/`, `.gnupg/`, `.kube/`, `id_rsa*`, `id_ed25519*`, `/etc/`, `/proc/`, `/sys/`, `/dev/`, `/root/`) applies unconditionally to all mutation targets.
+14. **Resource Bounds & Payload Limits:**
     - Maximum input path length: 1024 characters.
     - Maximum write content payload: 1 MiB (1,048,576 bytes).
     - Maximum patch size: 512 KiB (524,288 bytes).
     - Maximum changed files per patch: 10 files.
     - Requests exceeding limits fail closed immediately with `PAYLOAD_TOO_LARGE` or `INVALID_REQUEST_SCHEMA`.
-14. **Audit Evidence & Data Minimization:** Every file mutation emits a structured audit record (`FILE_CREATED`, `FILE_WRITTEN`, `PATCH_APPLIED`, `FILE_DELETED`, `FILE_MOVED`) with cryptographic SHA-256 hash chaining. Raw file content and patch text are **strictly omitted** from audit log events and error messages. Only metadata is recorded: canonical relative paths, byte counts, pre-operation SHA-256 hashes, post-operation SHA-256 hashes, and operation status.
+15. **Audit Evidence & Data Minimization:** Every file mutation emits a structured audit record (`FILE_CREATED`, `FILE_WRITTEN`, `PATCH_APPLIED`, `FILE_DELETED`, `FILE_MOVED`) with cryptographic SHA-256 hash chaining. Raw file content and patch text are **strictly omitted** from audit log events and error messages. Only metadata is recorded: canonical relative paths, byte counts, pre-operation SHA-256 hashes, post-operation SHA-256 hashes, and operation status.
 
 ### 1.2. Scope Freeze Declaration
 
 > **RC-03 STATUS: SCOPE FROZEN / IMPLEMENTATION NOT STARTED**  
-> Task 0 / Task 0.1 freezes the architecture, API contracts, security invariants, error taxonomy, and acceptance criteria. Zero runtime mutation code in `apps/` or `packages/` is introduced. Implementation begins only after this specification commit is pushed and independently reviewed.
+> Task 0 / Task 0.1 / Task 0.2 freezes the architecture, API contracts, security invariants, error taxonomy, serialization model, and acceptance criteria. Zero runtime mutation code in `apps/` or `packages/` is introduced. Implementation begins only after this specification commit is pushed and independently reviewed.
 
 ---
 
@@ -76,7 +87,7 @@ Every file mutation operation in RC-03 must pass through the **Minimal Security 
 
 ### 2.1. `create_file`
 
-Creates a new file at the specified workspace-relative path. Target **MUST NOT** exist.
+Creates a new file at the specified workspace-relative path. Target **MUST NOT** exist, and parent directory **MUST** already exist.
 
 - **Input Schema:**
   ```json
@@ -98,11 +109,13 @@ Creates a new file at the specified workspace-relative path. Target **MUST NOT**
   1. Validates path length <= 1024 characters; checks for null bytes and URL encoding.
   2. Verifies path does not target `.git/**` or any blacklisted pattern (`ACCESS_DENIED`).
   3. Resolves canonical parent directory; verifies parent is enclosed within workspace root (`PATH_ESCAPES_ROOT`).
-  4. If parent directory does not exist, creates missing directories within workspace with `0o755` mode.
-  5. Target must not exist. If target exists, fails immediately with `ALREADY_EXISTS`. `create_file` has **no** overwrite parameter.
-  6. Writes file content to a sibling temporary file in the same directory (`.arc-tmp-{uuid}`) with `0o644` mode (masked by umask) and calls `fsync`.
-  7. Commits via a kernel-level no-replace primitive (e.g. `fs.link(tmp, target)` which fails with `EEXIST` if target exists, followed by unlinking the temporary sibling file). If target appears concurrently, commit fails with `ALREADY_EXISTS`.
-  8. Emits `FILE_CREATED` audit event (metadata only, raw content omitted).
+  4. Verifies parent directory exists and is a directory. If parent directory does not exist, fails closed with `PARENT_NOT_FOUND`. Intermediate directories are **never** automatically created in RC-03.
+  5. Verifies parent directory is not a symbolic link.
+  6. Acquires in-process lock for canonical target path.
+  7. Target must not exist. If target exists, fails with `ALREADY_EXISTS`. `create_file` has **no** overwrite parameter.
+  8. Writes file content to a sibling temporary file in the same directory (`.arc-tmp-{uuid}`) with `0o644` mode (masked by umask) and calls `fsync`.
+  9. Commits via a kernel-level no-replace primitive (e.g. `fs.link(tmp, target)` which fails with `EEXIST` if target exists, followed by unlinking the temporary sibling file). If target appears concurrently, commit fails with `ALREADY_EXISTS`.
+  10. Emits `FILE_CREATED` audit event (metadata only, raw content omitted).
 
 ### 2.2. `write_file`
 
@@ -130,14 +143,16 @@ Overwrites an existing file with complete content. Target **MUST** already exist
   1. Validates path length <= 1024 characters; verifies path does not target `.git/**` or blacklist (`ACCESS_DENIED`).
   2. If `overwrite !== true`, rejects with `INVALID_REQUEST_SCHEMA`.
   3. Validates `expectedHash` format (64-character hex string); if missing or invalid, rejects with `INVALID_REQUEST_SCHEMA`.
-  4. Resolves canonical path within workspace root. Target must exist; if missing, rejects with `FILE_NOT_FOUND` (`write_file` never creates new files).
-  5. Inspects file type using `lstat`. If target is a directory (`IS_A_DIRECTORY`), symlink (`UNSAFE_SYMLINK`), or special file (`NOT_A_FILE`), rejects immediately.
-  6. Inspects hardlink count (`stat.nlink > 1`); fails with `HARDLINK_DETECTED` if aliased.
-  7. Reads current file content and computes SHA-256. If hash !== `expectedHash`, rejects with `CONFLICT_PRECONDITION_FAILED`.
-  8. Captures existing file mode bits (`stat.mode & 0o777`).
-  9. Writes new content to sibling temporary file (`.arc-tmp-{uuid}`), applies original file permissions (`fchmod`), and calls `fsync`.
-  10. Atomically replaces target via `fs.rename`.
-  11. Emits `FILE_WRITTEN` audit event with old and new hashes; raw content is redacted.
+  4. Acquires in-process lock for canonical target path.
+  5. Resolves canonical path within workspace root. Target must exist; if missing, rejects with `FILE_NOT_FOUND` (`write_file` never creates new files).
+  6. Inspects file type using `lstat`. If target is a directory (`IS_A_DIRECTORY`), symlink (`UNSAFE_SYMLINK`), or special file (`NOT_A_FILE`), rejects immediately.
+  7. Inspects hardlink count (`stat.nlink > 1`); fails with `HARDLINK_DETECTED` if aliased.
+  8. Reads current file content and computes SHA-256. If hash !== `expectedHash`, rejects with `CONFLICT_PRECONDITION_FAILED`.
+  9. Captures existing file mode bits (`stat.mode & 0o777`).
+  10. Writes new content to sibling temporary file (`.arc-tmp-{uuid}`), applies original file permissions (`fchmod`), and calls `fsync`.
+  11. Revalidates target preconditions immediately prior to commit (content hash, type, inode identity). If changed, aborts with `CONFLICT_PRECONDITION_FAILED`.
+  12. Atomically replaces target via `fs.rename`.
+  13. Emits `FILE_WRITTEN` audit event with old and new hashes; raw content is redacted.
 
 ### 2.3. `apply_patch`
 
@@ -174,22 +189,24 @@ Applies a bounded unified diff patch to existing workspace files using a **prefl
      - Target or traverse symbolic links (`UNSAFE_SYMLINK` / `PATCH_UNSUPPORTED_OPERATION`).
      - Target `.git/**` or blacklisted paths (`ACCESS_DENIED`).
   3. **Input Bounds:** Rejects patch if length > 512 KiB, if targets > 10 files (`PAYLOAD_TOO_LARGE`), or if `fuzz > 0` (`INVALID_REQUEST_SCHEMA`).
-  4. **Phase 1: Parse & Preflight (Zero Disk Mutation):**
+  4. **Lock Acquisition:** Sorts canonical target paths lexicographically and acquires all in-process locks before preflight.
+  5. **Phase 1: Parse & Preflight (Zero Disk Mutation):**
      - Parses unified diff into structured file hunks in-memory.
      - Resolves canonical path for each target file; verifies each resides in workspace root, is not blacklisted, is a regular file (`stat.isFile()`), not a symlink, and has `stat.nlink === 1`.
      - Reads existing content and records `preflightHash` (SHA-256) and original permissions for every target file.
      - Simulates applying hunks in-memory with zero fuzz.
      - If any hunk fails to match context lines exactly, or if any target is missing, the entire operation fails with `PATCH_PREFLIGHT_FAILED`. Zero disk changes occur.
-  5. If `dryRun === true`, returns preflight success and stats without writing to disk.
-  6. **Phase 2: Staging Sibling Replacement Files:**
+  6. If `dryRun === true`, returns preflight success and stats without writing to disk.
+  7. **Phase 2: Staging Sibling Replacement Files:**
      - For each target file, writes modified buffer to sibling temp file (`.arc-tmp-{uuid}`) in the same directory, applies original permissions (`fchmod`), and `fsync`s.
-  7. **Phase 3: Pre-Commit Revalidation & Individual Commit:**
+  8. **Phase 3: Pre-Commit Revalidation & Individual Commit:**
      - Immediately before committing each file, verifies current on-disk SHA-256 still matches `preflightHash`. If any file changed concurrently, halts commit immediately and initiates rollback.
-     - Atomically commits files one by one via `fs.rename`.
-  8. **Phase 4: Deterministic Rollback on Failure:**
+     - Commits files one by one via `fs.rename`.
+  9. **Phase 4: Safe Rollback on Failure:**
      - If an error occurs during commit of file `N`, the engine attempts to restore files `1` through `N-1` to their preflight content.
-     - If rollback fails for any reason, raises `ROLLBACK_FAILED` with detailed metadata indicating which files require administrative recovery.
-  9. Emits `PATCH_APPLIED` audit event (metadata only; patch text and file contents omitted).
+     - _Rollback Verification:_ Before restoring file `i`, the engine verifies that the current file content hash matches the committed content hash (ensuring no intermediate changes occurred). If a file was modified after ARC's commit, the engine does **not** overwrite it, logs recovery-required audit metadata, and raises `ROLLBACK_FAILED`.
+     - If rollback fails or encounters an unresolvable conflict, raises `ROLLBACK_FAILED` with detailed metadata.
+  10. Emits `PATCH_APPLIED` audit event (metadata only; patch text and file contents omitted).
 
 ### 2.4. `delete_file`
 
@@ -213,17 +230,19 @@ Deletes a single authorized regular file within the workspace root. Target **MUS
 - **Operational Semantics:**
   1. Validates path length <= 1024 characters; verifies path does not target `.git/**` or blacklist (`ACCESS_DENIED`).
   2. Validates `expectedHash` format (64-character hex string); if missing or invalid, rejects with `INVALID_REQUEST_SCHEMA`.
-  3. Resolves canonical path within workspace root. Target must exist; if missing, rejects with `FILE_NOT_FOUND`.
-  4. Inspects target using `lstat`. If target is a directory, rejects with `IS_A_DIRECTORY`. **Recursive directory deletion is strictly forbidden.**
-  5. If target is a symbolic link, rejects with `UNSAFE_SYMLINK`.
-  6. Inspects hardlink count (`stat.nlink > 1`); fails with `HARDLINK_DETECTED` if aliased.
-  7. Reads file content and computes SHA-256. If hash !== `expectedHash`, rejects with `CONFLICT_PRECONDITION_FAILED`.
-  8. Unlinks file via `fs.unlinkSync` / `fs.promises.unlink`.
-  9. Emits `FILE_DELETED` audit event with `contentHash`.
+  3. Acquires in-process lock for canonical target path.
+  4. Resolves canonical path within workspace root. Target must exist; if missing, rejects with `FILE_NOT_FOUND`.
+  5. Inspects target using `lstat`. If target is a directory, rejects with `IS_A_DIRECTORY`. **Recursive directory deletion is strictly forbidden.**
+  6. If target is a symbolic link, rejects with `UNSAFE_SYMLINK`.
+  7. Inspects hardlink count (`stat.nlink > 1`); fails with `HARDLINK_DETECTED` if aliased.
+  8. Reads file content and computes SHA-256. If hash !== `expectedHash`, rejects with `CONFLICT_PRECONDITION_FAILED`.
+  9. Revalidates preconditions immediately before `fs.unlink`.
+  10. Unlinks file via `fs.unlinkSync` / `fs.promises.unlink`.
+  11. Emits `FILE_DELETED` audit event with `contentHash`.
 
 ### 2.5. `move_file`
 
-Moves or renames a file within authorized workspace roots. Destination **MUST NOT** exist; source **MUST** match `expectedSourceHash`.
+Executes a **no-replace move with rollback** within authorized workspace roots. Destination **MUST NOT** exist; source **MUST** match `expectedSourceHash`.
 
 - **Input Schema:**
   ```json
@@ -241,40 +260,50 @@ Moves or renames a file within authorized workspace roots. Destination **MUST NO
     "moved": true
   }
   ```
-- **Operational Semantics:**
+- **Operational Semantics (No-Replace Move with Rollback):**
   1. Validates path lengths <= 1024 characters; checks for null bytes and URL encoding.
   2. Verifies neither `sourcePath` nor `destinationPath` targets `.git/**` or blacklist (`ACCESS_DENIED`).
   3. Resolves canonical path for `sourcePath` (must exist; otherwise `FILE_NOT_FOUND`).
   4. Inspects source using `lstat`. Source must be a regular file; if directory (`IS_A_DIRECTORY`) or symlink (`UNSAFE_SYMLINK`), rejects immediately.
   5. Inspects source hardlink count (`stat.nlink > 1`); fails with `HARDLINK_DETECTED`.
   6. Validates `expectedSourceHash` format. Computes current source SHA-256; if mismatched, rejects with `CONFLICT_PRECONDITION_FAILED`.
-  7. Resolves destination canonical parent directory; verifies parent is inside workspace root (`PATH_ESCAPES_ROOT`).
+  7. Resolves destination canonical parent directory; verifies parent exists and is inside workspace root (`PATH_ESCAPES_ROOT`).
   8. If destination already exists, rejects with `ALREADY_EXISTS`. `move_file` has **no** overwrite parameter in RC-03.
-  9. **No-Replace & Cross-Device Commit:**
-     - Cross-device movement is rejected with `CROSS_DEVICE_MOVE_UNSUPPORTED` (no silent copy-delete fallback).
-     - To guarantee no replacement at commit time, uses an exclusive linking primitive (e.g. `fs.link(source, dest)` which fails if destination exists, followed by `fs.unlink(source)`).
-  10. Emits `FILE_MOVED` audit event (metadata only).
+  9. **Lock Acquisition:** Acquires in-process locks for `sourcePath` and `destinationPath` in deterministic lexicographical order.
+  10. **Pre-Commit Revalidation & Link Creation:**
+      - Revalidates source content hash and preconditions immediately before link creation.
+      - Cross-device movement is rejected with `CROSS_DEVICE_MOVE_UNSUPPORTED` (no silent copy-delete fallback).
+      - Creates destination hardlink using exclusive linking (`fs.link`). If destination appears concurrently, `fs.link` fails with `EEXIST` -> `ALREADY_EXISTS`.
+      - Verifies destination refers to intended source identity (`stat` dev and inode match source).
+  11. **Source Unlink & Rollback:**
+      - Removes source name via `fs.unlink(source)`.
+      - If removing source fails, attempts rollback by unlinking the newly-created destination (`fs.unlink(destination)`).
+      - If rollback fails, raises `ROLLBACK_FAILED` with recovery metadata.
+      - _Crash Note:_ An unexpected system crash between link and unlink may leave both paths referencing the same inode; full multi-step crash atomicity is not claimed.
+  12. Emits `FILE_MOVED` audit event (metadata only).
 
 ---
 
 ## 3. Security Boundary & Threat Mitigations
 
-| Threat Vector                        | Mitigation Strategy in RC-03                                                                        | Fail-Closed Mechanism                        |
-| :----------------------------------- | :-------------------------------------------------------------------------------------------------- | :------------------------------------------- |
-| **Git Metadata Tampering**           | Permanent denial of `.git/**` for all mutation operations (`HEAD`, `refs`, `index`, `hooks`, etc.). | `ACCESS_DENIED`                              |
-| **Silent Lost Updates**              | Mandatory `expectedHash` on `write_file`/`delete_file` and `expectedSourceHash` on `move_file`.     | `CONFLICT_PRECONDITION_FAILED`               |
-| **Accidental Overwrites**            | `create_file` and `move_file` strictly require destination to not exist; no `overwrite` flag.       | `ALREADY_EXISTS`                             |
-| **Create/Move Replace Races**        | Commit-time exclusive/no-replace primitives (e.g. `O_EXCL` / `fs.link` semantics).                  | `ALREADY_EXISTS`                             |
-| **Cross-Device Move Corruption**     | Cross-filesystem `move_file` fails closed deterministically; no copy+delete fallback.               | `CROSS_DEVICE_MOVE_UNSUPPORTED`              |
-| **Multi-File Patch Partial State**   | Preflight-all, commit-with-rollback model; rollback failure explicitly surfaced and audited.        | `PATCH_PREFLIGHT_FAILED` / `ROLLBACK_FAILED` |
-| **Patch Scope Smuggling**            | Directives creating, deleting, renaming files, changing modes, or targeting symlinks are denied.    | `PATCH_UNSUPPORTED_OPERATION`                |
-| **File Permission Drift**            | `write_file` preserves original regular file mode (`0o777`); `create_file` uses `0o644` with umask. | Explicit mode propagation                    |
-| **Symlink Redirection / Traversal**  | Symlink targets permanently denied for create/write/patch/move/delete.                              | `UNSAFE_SYMLINK` / `PATH_ESCAPES_ROOT`       |
-| **Hardlink Inode Aliasing**          | `stat.nlink > 1` checked on all candidate targets; rejected before mutation.                        | `HARDLINK_DETECTED`                          |
-| **Path Traversal (`../`, `%2e%2e`)** | Canonical realpath resolution, normalization, 1024-char limit, prefix enclosure.                    | `PATH_ESCAPES_ROOT` / `INVALID_PATH_CHARS`   |
-| **Directory Destruction**            | `delete_file` restricted strictly to regular files; directory deletion permanently blocked.         | `IS_A_DIRECTORY`                             |
-| **Secret Leakage in Audit Trail**    | Raw file contents and diff text strictly omitted from audit logs and errors; only hashes logged.    | Data minimization by design                  |
-| **Unauthorized Execution**           | All mutation tools classified `REQUIRE APPROVAL`; direct MCP invocation fails closed.               | `REQUIRE_APPROVAL`                           |
+| Threat Vector                        | Mitigation Strategy in RC-03                                                                         | Fail-Closed Mechanism                        |
+| :----------------------------------- | :--------------------------------------------------------------------------------------------------- | :------------------------------------------- |
+| **Git Metadata Tampering**           | Permanent denial of `.git/**` for all mutation operations (`HEAD`, `refs`, `index`, `hooks`, etc.).  | `ACCESS_DENIED`                              |
+| **Silent Lost Updates**              | Mandatory `expectedHash` on `write_file`/`delete_file` and `expectedSourceHash` on `move_file`.      | `CONFLICT_PRECONDITION_FAILED`               |
+| **Accidental Overwrites**            | `create_file` and `move_file` strictly require destination to not exist; no `overwrite` flag.        | `ALREADY_EXISTS`                             |
+| **Create/Move Replace Races**        | Commit-time exclusive/no-replace primitives (e.g. `O_EXCL` / `fs.link` semantics).                   | `ALREADY_EXISTS`                             |
+| **Unintended Directory Creation**    | `create_file` requires immediate parent directory to already exist; no recursive directory creation. | `PARENT_NOT_FOUND`                           |
+| **Internal Mutation Races**          | In-process lexicographical path locking serializes conflicting ARC mutations.                        | Deadlock-free serialization                  |
+| **Cross-Device Move Corruption**     | Cross-filesystem `move_file` fails closed deterministically; no copy+delete fallback.                | `CROSS_DEVICE_MOVE_UNSUPPORTED`              |
+| **Multi-File Patch Partial State**   | Preflight-all, commit-with-rollback model; safe rollback revalidation; failure audited.              | `PATCH_PREFLIGHT_FAILED` / `ROLLBACK_FAILED` |
+| **Patch Scope Smuggling**            | Directives creating, deleting, renaming files, changing modes, or targeting symlinks are denied.     | `PATCH_UNSUPPORTED_OPERATION`                |
+| **File Permission Drift**            | `write_file` preserves original regular file mode (`0o777`); `create_file` uses `0o644` with umask.  | Explicit mode propagation                    |
+| **Symlink Redirection / Traversal**  | Symlink targets permanently denied for create/write/patch/move/delete.                               | `UNSAFE_SYMLINK` / `PATH_ESCAPES_ROOT`       |
+| **Hardlink Inode Aliasing**          | `stat.nlink > 1` checked on all candidate targets; rejected before mutation.                         | `HARDLINK_DETECTED`                          |
+| **Path Traversal (`../`, `%2e%2e`)** | Canonical realpath resolution, normalization, 1024-char limit, prefix enclosure.                     | `PATH_ESCAPES_ROOT` / `INVALID_PATH_CHARS`   |
+| **Directory Destruction**            | `delete_file` restricted strictly to regular files; directory deletion permanently blocked.          | `IS_A_DIRECTORY`                             |
+| **Secret Leakage in Audit Trail**    | Raw file contents and diff text strictly omitted from audit logs and errors; only hashes logged.     | Data minimization by design                  |
+| **Unauthorized Execution**           | All mutation tools classified `REQUIRE APPROVAL`; direct MCP invocation fails closed.                | `REQUIRE_APPROVAL`                           |
 
 ---
 
@@ -287,6 +316,7 @@ The following structured error codes extend `@cesspace-arc/protocol` for RC-03:
 | `CONFLICT_PRECONDITION_FAILED`  | 412 Precondition Failed  | Current file SHA-256 does not match caller's `expectedHash` or `expectedSourceHash`.             |
 | `ALREADY_EXISTS`                | 409 Conflict             | Target destination file already exists (for `create_file` or `move_file`).                       |
 | `FILE_NOT_FOUND`                | 404 Not Found            | Target file to write, delete, or move does not exist.                                            |
+| `PARENT_NOT_FOUND`              | 404 Not Found            | Immediate parent directory for file creation does not exist.                                     |
 | `IS_A_DIRECTORY`                | 400 Bad Request          | Target path is a directory where a regular file was required.                                    |
 | `NOT_A_FILE`                    | 400 Bad Request          | Target is a special filesystem node (socket, FIFO, device) rather than a regular file.           |
 | `HARDLINK_DETECTED`             | 403 Forbidden            | Target file has link count > 1, preventing external hardlink aliasing mutation.                  |
@@ -295,7 +325,7 @@ The following structured error codes extend `@cesspace-arc/protocol` for RC-03:
 | `PATCH_PREFLIGHT_FAILED`        | 422 Unprocessable Entity | Patch cannot apply cleanly (hunk context mismatch, missing file, or out-of-bounds path).         |
 | `PATCH_UNSUPPORTED_OPERATION`   | 400 Bad Request          | Patch contains forbidden directives (file creation, deletion, rename, mode change, symlink).     |
 | `CROSS_DEVICE_MOVE_UNSUPPORTED` | 400 Bad Request          | `move_file` spans distinct filesystems/mountpoints; copy+delete fallback is disallowed.          |
-| `ROLLBACK_FAILED`               | 500 Internal Error       | Multi-file patch commit failed and rollback could not restore prior file state.                  |
+| `ROLLBACK_FAILED`               | 500 Internal Error       | Multi-file patch commit or move failed and rollback could not restore prior file state.          |
 | `PATH_ESCAPES_ROOT`             | 403 Forbidden            | Target path attempts to escape the authorized workspace root boundary.                           |
 | `ACCESS_DENIED`                 | 403 Forbidden            | Target path targets `.git/**` or matches sensitive blacklist patterns.                           |
 | `PAYLOAD_TOO_LARGE`             | 413 Payload Too Large    | Content exceeds 1 MiB or patch exceeds 512 KiB / 10 files.                                       |
@@ -322,6 +352,7 @@ When RC-03 implementation begins, acceptance verification must prove both negati
 - [ ] Attempting `write_file` with `overwrite: false` or omitted fails with `INVALID_REQUEST_SCHEMA`.
 - [ ] Attempting `write_file` on non-existent file fails with `FILE_NOT_FOUND`.
 - [ ] Attempting `create_file` on existing path fails with `ALREADY_EXISTS` (never overwrites).
+- [ ] Attempting `create_file` when immediate parent directory does not exist fails with `PARENT_NOT_FOUND`.
 - [ ] Concurrent creation race fails safely with `ALREADY_EXISTS` at commit time.
 - [ ] Attempting `delete_file` without `expectedHash` fails with `INVALID_REQUEST_SCHEMA`.
 - [ ] Attempting `delete_file` with mismatched `expectedHash` fails with `CONFLICT_PRECONDITION_FAILED`.
@@ -347,14 +378,13 @@ When RC-03 implementation begins, acceptance verification must prove both negati
 - [ ] Attempting `apply_patch` where target file changes between preflight and commit halts and triggers rollback.
 - [ ] Attempting `apply_patch` exceeding 512 KiB or 10 files fails with `PAYLOAD_TOO_LARGE`.
 - [ ] Attempting `apply_patch` with `fuzz > 0` fails with `INVALID_REQUEST_SCHEMA`.
-- [ ] Simulated rollback failure reports `ROLLBACK_FAILED` with damaged file metadata.
+- [ ] Simulated rollback failure (or unresolvable rollback conflict) reports `ROLLBACK_FAILED` with damaged file metadata.
 - [ ] Direct invocation of any of the 5 tools through policy engine fails with `REQUIRE_APPROVAL` (default-deny).
 - [ ] Audit logs confirm raw file and patch contents are completely redacted.
 
 ### 5.2. Mandatory Positive Controls
 
-- [ ] `create_file` creates a new file and returns correct canonical relative path, byte count, and SHA-256 hash.
-- [ ] `create_file` creates required intermediate parent directories within the workspace root with `0o755` mode.
+- [ ] `create_file` creates a new file and returns correct canonical relative path, byte count, and SHA-256 hash when parent directory exists.
 - [ ] `create_file` creates file with conservative mode (`0o644` modified by umask).
 - [ ] `write_file` replaces existing file atomically and preserves original regular file mode bits (`stat.mode`).
 - [ ] `write_file` with matching `expectedHash` succeeds cleanly and returns previous and new SHA-256 hashes.
@@ -363,7 +393,7 @@ When RC-03 implementation begins, acceptance verification must prove both negati
 - [ ] `apply_patch` with `dryRun: true` returns success and stats without writing to disk.
 - [ ] `delete_file` unlinks target file and returns deleted file SHA-256 hash.
 - [ ] `delete_file` with matching `expectedHash` deletes successfully.
-- [ ] `move_file` with matching `expectedSourceHash` atomically moves file to new path and verifies old path no longer exists.
+- [ ] `move_file` with matching `expectedSourceHash` executes no-replace move with rollback to new path and verifies old path is removed.
 - [ ] All mutations emit valid structured audit log events with SHA-256 chaining and zero payload leakage.
 
 ---
