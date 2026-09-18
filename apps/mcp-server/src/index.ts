@@ -19,11 +19,13 @@ import {
   type RunCommandRequest,
 } from '@cesspace-arc/protocol';
 import {
+  ApprovalStateManager,
   SecurityKernel,
   WorkspaceRegistry,
   type WorkspaceRecord,
   RC03_MUTATION_TOOLS,
 } from '@cesspace-arc/policy';
+import { AdminIpcError, AdminIpcServer } from './admin-ipc.js';
 import { AuditLogger, computeSha256, canonicalJson } from '@cesspace-arc/audit';
 import { FilesystemSubsystem } from '@cesspace-arc/filesystem';
 import { GitSubsystem } from '@cesspace-arc/git';
@@ -40,6 +42,20 @@ export interface ArcServerConfig {
   authorizedRoots: Array<{ id: string; path: string }>;
   defaultWorkspaceId?: string;
   stage?: string;
+  /**
+   * Trusted operator admin channel configuration.
+   *
+   * Both fields must be supplied together. Supplying exactly one fails server
+   * startup rather than silently starting a partially configured admin access
+   * path. When absent entirely, no admin listener is created.
+   *
+   * The endpoint is a local IPC path only; the operator public key is not a
+   * secret and grants no authority without the corresponding private key.
+   */
+  admin?: {
+    endpoint?: string;
+    operatorPublicKeyB64?: string;
+  };
 }
 
 const WorkspaceIdSchema = z
@@ -1209,6 +1225,16 @@ export class ArcMcpServer implements IArcMcpServer {
     config?: Partial<ArcServerConfig>,
     public readonly terminalSubsystem?: ITerminalSubsystem,
     processRegistry?: ProcessRegistry,
+    /**
+     * Optional approval state manager. Composition only: Task 3 does not route
+     * MCP requests through it, and MCP mutations still execute nothing.
+     */
+    public readonly approvalStateManager?: ApprovalStateManager,
+    /**
+     * Optional authenticated local admin channel. Started only when trusted
+     * launch configuration supplies both an endpoint and an operator key.
+     */
+    public readonly adminIpcServer?: AdminIpcServer,
   ) {
     this.defaultWorkspaceId = config?.defaultWorkspaceId;
     this.processRegistry =
@@ -2116,6 +2142,22 @@ export class ArcMcpServer implements IArcMcpServer {
   public async start(): Promise<void> {
     this.transport = new StdioServerTransport();
     await this.server.connect(this.transport);
+
+    // The admin channel exists only when explicitly composed in. There is no
+    // implicit endpoint and no default socket path.
+    if (this.adminIpcServer) {
+      try {
+        await this.adminIpcServer.start();
+      } catch (err: unknown) {
+        // Fail closed and tear down stdio rather than running without the
+        // admin channel the operator configured.
+        await this.stop();
+        if (err instanceof AdminIpcError) {
+          throw new Error(`Admin IPC channel failed to start: ${err.reason}`, { cause: err });
+        }
+        throw new Error('Admin IPC channel failed to start.', { cause: err });
+      }
+    }
   }
 
   public async flushAudit(): Promise<void> {
@@ -2125,6 +2167,9 @@ export class ArcMcpServer implements IArcMcpServer {
   }
 
   public async stop(): Promise<void> {
+    if (this.adminIpcServer) {
+      await this.adminIpcServer.stop();
+    }
     await this.flushAudit();
     if (this.transport) {
       await this.transport.close();
@@ -2166,6 +2211,32 @@ export function createArcMcpServer(config?: Partial<ArcServerConfig>): ArcMcpSer
   const gitSubsystem = new GitSubsystem();
   const terminalSubsystem = new ControlledProcessRunner(processRegistry);
 
+  const approvalStateManager = new ApprovalStateManager();
+
+  // The admin channel is opt-in through trusted launch configuration only.
+  // Supplying exactly one half of the pair fails closed rather than starting
+  // partially configured admin access.
+  let adminIpcServer: AdminIpcServer | undefined;
+  const admin = config?.admin;
+  if (admin !== undefined && admin !== null) {
+    const endpoint = admin.endpoint;
+    const operatorPublicKeyB64 = admin.operatorPublicKeyB64;
+    const hasEndpoint = typeof endpoint === 'string' && endpoint.length > 0;
+    const hasKey = typeof operatorPublicKeyB64 === 'string' && operatorPublicKeyB64.length > 0;
+    if (hasEndpoint !== hasKey) {
+      throw new Error(
+        'Admin channel requires both a local IPC endpoint and an operator public key; exactly one was supplied.',
+      );
+    }
+    if (hasEndpoint && hasKey) {
+      adminIpcServer = new AdminIpcServer({
+        endpoint: endpoint as string,
+        operatorPublicKeyB64: operatorPublicKeyB64 as string,
+        approvalStateManager,
+      });
+    }
+  }
+
   return new ArcMcpServer(
     workspaceRegistry,
     securityKernel,
@@ -2175,6 +2246,8 @@ export function createArcMcpServer(config?: Partial<ArcServerConfig>): ArcMcpSer
     config,
     terminalSubsystem,
     processRegistry,
+    approvalStateManager,
+    adminIpcServer,
   );
 }
 
@@ -2191,10 +2264,29 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       ]
     : [];
 
+  // Admin channel configuration is PUBLIC-ONLY on the server side.
+  // CESSPACE_ARC_ADMIN_SOCKET is the local IPC endpoint and
+  // CESSPACE_ARC_ADMIN_PUBLIC_KEY_B64 is the operator public key (not a secret).
+  // No private key, secret, or bearer token is accepted in server environment.
+  const adminSocket = process.env.CESSPACE_ARC_ADMIN_SOCKET;
+  const adminPublicKey = process.env.CESSPACE_ARC_ADMIN_PUBLIC_KEY_B64;
+  const hasAdminSocket = typeof adminSocket === 'string' && adminSocket.length > 0;
+  const hasAdminKey = typeof adminPublicKey === 'string' && adminPublicKey.length > 0;
+
+  if (hasAdminSocket !== hasAdminKey) {
+    process.stderr.write(
+      'Admin channel requires both CESSPACE_ARC_ADMIN_SOCKET and CESSPACE_ARC_ADMIN_PUBLIC_KEY_B64; exactly one was supplied.\n',
+    );
+    process.exit(1);
+  }
+
   const server = createArcMcpServer({
     transport: 'stdio',
     authorizedRoots,
     defaultWorkspaceId: configuredWorkspace ? 'workspace' : undefined,
+    admin: hasAdminSocket
+      ? { endpoint: adminSocket, operatorPublicKeyB64: adminPublicKey }
+      : undefined,
   });
 
   server.start().catch((err) => {
