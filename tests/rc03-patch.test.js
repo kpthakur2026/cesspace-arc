@@ -10,6 +10,7 @@ import {
   NodeFilesystemOps,
   ProcessWideLockManager,
   applyPatch,
+  safeUnlinkTemp,
   MAX_PATCH_BYTES,
 } from '../packages/filesystem/dist/index.js';
 import { ArcError } from '../packages/protocol/dist/index.js';
@@ -1597,112 +1598,378 @@ zc$}q-U|?o-
   });
 
   test('RC03-PATCH-A-13: Serialized ArcError never leaks injected paths, temp names, tokens, or content', async () => {
-    const fileA = path.join(workspaceDir, 'leak-test.txt');
-    fs.writeFileSync(fileA, 'initial\n', 'utf8');
-
     const secretToken = 'SECRET_TOKEN_123_SUPER_CLASSIFIED';
     const secretPath = '/home/secretuser/workspace/file.ts';
     const secretTemp = '/home/secretuser/workspace/.arc-tmp-secret';
     const secretContext = 'sensitive hunk context string';
 
-    const patch = `--- a/leak-test.txt
-+++ b/leak-test.txt
+    // 1. Staging failure with raw injected error
+    {
+      const fileStaging = path.join(workspaceDir, 'leak-staging.txt');
+      fs.writeFileSync(fileStaging, 'initial staging\n', 'utf8');
+
+      const patchStaging = `--- a/leak-staging.txt
++++ b/leak-staging.txt
 @@ -1,1 +1,1 @@
--initial
-+modified
+-initial staging
++modified staging
 `;
 
-    // 1. Staging failure with raw injected error
-    class LeakStagingMockOps extends NodeFilesystemOps {
+      class LeakStagingMockOps extends NodeFilesystemOps {
+        open(p, flags, mode) {
+          if (p.includes('.arc-tmp-')) {
+            const err = new Error(
+              `EACCES: permission denied, open '${secretTemp}' with token ${secretToken}`,
+            );
+            err.code = 'EACCES';
+            throw err;
+          }
+          return super.open(p, flags, mode);
+        }
+      }
+      const stagingOps = new LeakStagingMockOps();
+      const lockManager = new ProcessWideLockManager();
+
+      try {
+        await applyPatch(workspaceDir, { patch: patchStaging }, stagingOps, lockManager);
+        assert.fail('Should have failed');
+      } catch (err) {
+        assert.ok(err instanceof ArcError);
+        const json = JSON.stringify(err);
+        assert.ok(!json.includes(secretToken));
+        assert.ok(!json.includes(secretPath));
+        assert.ok(!json.includes(secretTemp));
+        assert.ok(!json.includes(secretContext));
+      }
+    }
+
+    // 2. Post-rename verify failure with raw injected error
+    {
+      const fileVerify = path.join(workspaceDir, 'leak-verify.txt');
+      fs.writeFileSync(fileVerify, 'initial verify\n', 'utf8');
+
+      const patchVerify = `--- a/leak-verify.txt
++++ b/leak-verify.txt
+@@ -1,1 +1,1 @@
+-initial verify
++modified verify
+`;
+
+      let renamed = false;
+      class LeakVerifyMockOps extends NodeFilesystemOps {
+        rename(src, dst) {
+          super.rename(src, dst);
+          renamed = true;
+        }
+        readFile(p) {
+          if (renamed && p === fileVerify) {
+            const err = new Error(`EIO: I/O error reading '${secretPath}' token ${secretToken}`);
+            err.code = 'EIO';
+            throw err;
+          }
+          return super.readFile(p);
+        }
+      }
+      const verifyOps = new LeakVerifyMockOps();
+      const lockManager = new ProcessWideLockManager();
+
+      try {
+        await applyPatch(workspaceDir, { patch: patchVerify }, verifyOps, lockManager);
+        assert.fail('Should have failed');
+      } catch (err) {
+        assert.ok(err instanceof ArcError);
+        const json = JSON.stringify(err);
+        assert.ok(!json.includes(secretToken));
+        assert.ok(!json.includes(secretPath));
+        assert.ok(!json.includes(secretTemp));
+        assert.ok(!json.includes(secretContext));
+      }
+    }
+
+    // 3. Rollback failure with raw injected error (exercises actual rollback restoration failure)
+    {
+      const fileRollA = path.join(workspaceDir, 'leak-roll-a.txt');
+      const fileRollB = path.join(workspaceDir, 'leak-roll-b.txt');
+      fs.writeFileSync(fileRollA, 'initial roll a\n', 'utf8');
+      fs.writeFileSync(fileRollB, 'initial roll b\n', 'utf8');
+
+      const patchRollback = `--- a/leak-roll-a.txt
++++ b/leak-roll-a.txt
+@@ -1,1 +1,1 @@
+-initial roll a
++modified roll a
+--- a/leak-roll-b.txt
++++ b/leak-roll-b.txt
+@@ -1,1 +1,1 @@
+-initial roll b
++modified roll b
+`;
+
+      let targetACommitted = false;
+      let rollbackStarted = false;
+
+      class LeakRollbackMockOps extends NodeFilesystemOps {
+        rename(src, dst) {
+          if (dst === fileRollA && !rollbackStarted) {
+            targetACommitted = true;
+            return super.rename(src, dst);
+          }
+          if (dst === fileRollB && !rollbackStarted) {
+            const err = new Error('EIO: second target commit rename failure');
+            err.code = 'EIO';
+            throw err;
+          }
+          if (rollbackStarted && dst === fileRollA) {
+            const err = new Error(
+              `EIO: rollback rename failed for '${secretPath}' temp '${secretTemp}' token ${secretToken}`,
+            );
+            err.code = 'EIO';
+            throw err;
+          }
+          return super.rename(src, dst);
+        }
+
+        open(p, flags, mode) {
+          if (targetACommitted && p.includes('.arc-tmp-')) {
+            rollbackStarted = true;
+          }
+          return super.open(p, flags, mode);
+        }
+      }
+
+      const rollbackOps = new LeakRollbackMockOps();
+      const lockManager = new ProcessWideLockManager();
+
+      try {
+        await applyPatch(workspaceDir, { patch: patchRollback }, rollbackOps, lockManager);
+        assert.fail('Should have failed');
+      } catch (err) {
+        assert.ok(err instanceof ArcError);
+        assert.equal(err.code, 'ROLLBACK_FAILED');
+        assert.equal(err.details?.recoveryRequired, true);
+        const json = JSON.stringify(err);
+        assert.ok(!json.includes(secretToken), 'Must not leak secret token');
+        assert.ok(!json.includes(secretPath), 'Must not leak secret path');
+        assert.ok(!json.includes(secretTemp), 'Must not leak secret temp');
+        assert.ok(!json.includes(secretContext), 'Must not leak secret context');
+      }
+    }
+  });
+
+  test('5.A: Temp open fails before temp creation -> cleanup gets ENOENT -> treated clean -> original sanitized error returned', async () => {
+    const file5a = path.join(workspaceDir, 'test-5a.txt');
+    fs.writeFileSync(file5a, 'original 5a\n', 'utf8');
+
+    const patch5a = `--- a/test-5a.txt
++++ b/test-5a.txt
+@@ -1,1 +1,1 @@
+-original 5a
++modified 5a
+`;
+
+    class OpenFailOps extends NodeFilesystemOps {
       open(p, flags, mode) {
         if (p.includes('.arc-tmp-')) {
-          const err = new Error(
-            `EACCES: permission denied, open '${secretTemp}' with token ${secretToken}`,
-          );
+          const err = new Error('EACCES: permission denied');
           err.code = 'EACCES';
           throw err;
         }
         return super.open(p, flags, mode);
       }
     }
-    const stagingOps = new LeakStagingMockOps();
+
+    const ops = new OpenFailOps();
     const lockManager = new ProcessWideLockManager();
 
     try {
-      await applyPatch(workspaceDir, { patch }, stagingOps, lockManager);
+      await applyPatch(workspaceDir, { patch: patch5a }, ops, lockManager);
       assert.fail('Should have failed');
     } catch (err) {
       assert.ok(err instanceof ArcError);
-      const json = JSON.stringify(err);
-      assert.ok(!json.includes(secretToken));
-      assert.ok(!json.includes(secretPath));
-      assert.ok(!json.includes(secretTemp));
-      assert.ok(!json.includes(secretContext));
+      assert.notEqual(
+        err.code,
+        'ROLLBACK_FAILED',
+        'Must not return ROLLBACK_FAILED when temp was never created',
+      );
+      assert.equal(err.code, 'ACCESS_DENIED');
+      assert.equal(fs.readFileSync(file5a, 'utf8'), 'original 5a\n');
     }
+  });
 
-    // 2. Post-rename verify failure with raw injected error
-    let renamed = false;
-    class LeakVerifyMockOps extends NodeFilesystemOps {
-      rename(src, dst) {
-        super.rename(src, dst);
-        renamed = true;
+  test('5.B: Precommit conflict before first commit + injected staged temp unlink failure -> ROLLBACK_FAILED with recoveryRequired true', async () => {
+    const file5b = path.join(workspaceDir, 'test-5b.txt');
+    fs.writeFileSync(file5b, 'original 5b\n', 'utf8');
+
+    const patch5b = `--- a/test-5b.txt
++++ b/test-5b.txt
+@@ -1,1 +1,1 @@
+-original 5b
++modified 5b
+`;
+
+    let stagingComplete = false;
+
+    class PrecommitConflictUnlinkFailOps extends NodeFilesystemOps {
+      open(p, flags, mode) {
+        const fd = super.open(p, flags, mode);
+        if (p.includes('.arc-tmp-')) {
+          stagingComplete = true;
+        }
+        return fd;
       }
       readFile(p) {
-        if (renamed && p === fileA) {
-          const err = new Error(`EIO: I/O error reading '${secretPath}' token ${secretToken}`);
-          err.code = 'EIO';
-          throw err;
+        if (stagingComplete && p === file5b) {
+          return Buffer.from('external modification\n', 'utf8');
         }
         return super.readFile(p);
       }
+      unlink(p) {
+        if (p.includes('.arc-tmp-')) {
+          const err = new Error('EPERM: operation not permitted');
+          err.code = 'EPERM';
+          throw err;
+        }
+        return super.unlink(p);
+      }
     }
-    const verifyOps = new LeakVerifyMockOps();
+
+    const ops = new PrecommitConflictUnlinkFailOps();
+    const lockManager = new ProcessWideLockManager();
+
     try {
-      await applyPatch(workspaceDir, { patch }, verifyOps, lockManager);
+      await applyPatch(workspaceDir, { patch: patch5b }, ops, lockManager);
       assert.fail('Should have failed');
     } catch (err) {
       assert.ok(err instanceof ArcError);
-      const json = JSON.stringify(err);
-      assert.ok(!json.includes(secretToken));
-      assert.ok(!json.includes(secretPath));
-      assert.ok(!json.includes(secretTemp));
-      assert.ok(!json.includes(secretContext));
+      assert.equal(err.code, 'ROLLBACK_FAILED');
+      assert.equal(err.details?.recoveryRequired, true);
+      assert.equal(fs.readFileSync(file5b, 'utf8'), 'original 5b\n');
     }
+  });
 
-    // 3. Rollback failure with raw injected error
-    let fileCommitted = false;
-    class LeakRollbackMockOps extends NodeFilesystemOps {
+  test('5.C: First target rename failure + staged temp unlink failure -> ROLLBACK_FAILED with 0 target contents committed', async () => {
+    const file5c = path.join(workspaceDir, 'test-5c.txt');
+    fs.writeFileSync(file5c, 'original 5c\n', 'utf8');
+
+    const patch5c = `--- a/test-5c.txt
++++ b/test-5c.txt
+@@ -1,1 +1,1 @@
+-original 5c
++modified 5c
+`;
+
+    class RenameFailUnlinkFailOps extends NodeFilesystemOps {
       rename(src, dst) {
-        if (dst === fileA && !fileCommitted) {
-          fileCommitted = true;
-          return super.rename(src, dst);
-        }
-        if (fileCommitted) {
-          const err = new Error(`EIO: rollback failed for '${secretPath}' token ${secretToken}`);
+        if (dst === file5c) {
+          const err = new Error('EIO: rename failed');
           err.code = 'EIO';
           throw err;
         }
         return super.rename(src, dst);
       }
-      lstat(p) {
-        if (fileCommitted && p === fileA) {
-          const st = super.lstat(p);
-          return { ...st, dev: st.dev + 999 };
+      unlink(p) {
+        if (p.includes('.arc-tmp-')) {
+          const err = new Error('EPERM: staged cleanup failed');
+          err.code = 'EPERM';
+          throw err;
         }
-        return super.lstat(p);
+        return super.unlink(p);
       }
     }
-    const rollbackOps = new LeakRollbackMockOps();
+
+    const ops = new RenameFailUnlinkFailOps();
+    const lockManager = new ProcessWideLockManager();
+
     try {
-      await applyPatch(workspaceDir, { patch }, rollbackOps, lockManager);
+      await applyPatch(workspaceDir, { patch: patch5c }, ops, lockManager);
       assert.fail('Should have failed');
     } catch (err) {
       assert.ok(err instanceof ArcError);
-      const json = JSON.stringify(err);
-      assert.ok(!json.includes(secretToken));
-      assert.ok(!json.includes(secretPath));
-      assert.ok(!json.includes(secretTemp));
-      assert.ok(!json.includes(secretContext));
+      assert.equal(err.code, 'ROLLBACK_FAILED');
+      assert.equal(err.details?.recoveryRequired, true);
+      assert.equal(fs.readFileSync(file5c, 'utf8'), 'original 5c\n');
     }
+  });
+
+  test('5.D: Cleanup ENOENT caused by temp already absent -> not considered recovery failure', async () => {
+    const file5d = path.join(workspaceDir, 'test-5d.txt');
+    fs.writeFileSync(file5d, 'original 5d\n', 'utf8');
+
+    const patch5d = `--- a/test-5d.txt
++++ b/test-5d.txt
+@@ -1,1 +1,1 @@
+-original 5d
++modified 5d
+`;
+
+    class StagedEnoentOps extends NodeFilesystemOps {
+      rename(src, dst) {
+        if (dst === file5d) {
+          const err = new Error('EACCES: rename permission denied');
+          err.code = 'EACCES';
+          throw err;
+        }
+        return super.rename(src, dst);
+      }
+      unlink(p) {
+        if (p.includes('.arc-tmp-')) {
+          const err = new Error('ENOENT: no such file or directory');
+          err.code = 'ENOENT';
+          throw err;
+        }
+        return super.unlink(p);
+      }
+    }
+
+    const ops = new StagedEnoentOps();
+    const lockManager = new ProcessWideLockManager();
+
+    try {
+      await applyPatch(workspaceDir, { patch: patch5d }, ops, lockManager);
+      assert.fail('Should have failed');
+    } catch (err) {
+      assert.ok(err instanceof ArcError);
+      assert.notEqual(
+        err.code,
+        'ROLLBACK_FAILED',
+        'ENOENT on temp cleanup must not trigger ROLLBACK_FAILED',
+      );
+      assert.equal(err.code, 'ACCESS_DENIED');
+      assert.equal(fs.readFileSync(file5d, 'utf8'), 'original 5d\n');
+    }
+  });
+
+  test('safeUnlinkTemp helper unit behavior', () => {
+    const successOps = {
+      unlink(_p) {
+        return;
+      },
+    };
+    assert.equal(safeUnlinkTemp(successOps, '/some/tmp'), true);
+
+    const enoentOps = {
+      unlink(_p) {
+        const err = new Error('ENOENT: file not found');
+        err.code = 'ENOENT';
+        throw err;
+      },
+    };
+    assert.equal(safeUnlinkTemp(enoentOps, '/some/tmp'), true);
+
+    const epermOps = {
+      unlink(_p) {
+        const err = new Error('EPERM: permission denied');
+        err.code = 'EPERM';
+        throw err;
+      },
+    };
+    assert.equal(safeUnlinkTemp(epermOps, '/some/tmp'), false);
+
+    const otherOps = {
+      unlink(_p) {
+        throw new Error('disk failure');
+      },
+    };
+    assert.equal(safeUnlinkTemp(otherOps, '/some/tmp'), false);
   });
 });

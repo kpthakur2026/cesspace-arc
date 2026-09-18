@@ -516,6 +516,28 @@ export function applyHunksExact(
 }
 
 /**
+ * Authoritative safe temp-cleanup helper for patch-engine.
+ *
+ * - Unlink success -> CLEAN (true)
+ * - Unlink ENOENT -> CLEAN (true, file is already absent; this is not recovery failure)
+ * - Any other unlink failure -> CLEANUP FAILED (false)
+ *
+ * Never exposes raw error, path, or temp filename.
+ */
+export function safeUnlinkTemp(fsOps: IFilesystemOps, tmpPath: string): boolean {
+  try {
+    fsOps.unlink(tmpPath);
+    return true;
+  } catch (err: unknown) {
+    const code = (err as { code?: string })?.code;
+    if (code === 'ENOENT') {
+      return true;
+    }
+    return false;
+  }
+}
+
+/**
  * Authoritative apply_patch engine implementing:
  * PARSE -> RESOLVE TARGETS -> ACQUIRE LOCKS -> PREFLIGHT ALL -> DRY-RUN OR STAGE ALL -> REVALIDATE -> COMMIT -> ROLLBACK
  */
@@ -683,15 +705,11 @@ export async function applyPatch(
             // ignore
           }
         }
-        try {
-          fsOps.unlink(tmpPath);
-        } catch {
+        if (!safeUnlinkTemp(fsOps, tmpPath)) {
           stagingCleanupFailed = true;
         }
         for (const s of stagedItems) {
-          try {
-            fsOps.unlink(s.tmpPath);
-          } catch {
+          if (!safeUnlinkTemp(fsOps, s.tmpPath)) {
             stagingCleanupFailed = true;
           }
         }
@@ -795,9 +813,7 @@ export async function applyPatch(
       // Clean up any unconsumed staged files
       for (const s of stagedItems) {
         if (!committedFiles.some((c) => c.preflight === s.preflight)) {
-          try {
-            fsOps.unlink(s.tmpPath);
-          } catch {
+          if (!safeUnlinkTemp(fsOps, s.tmpPath)) {
             stagedCleanupFailed = true;
           }
         }
@@ -883,10 +899,8 @@ export async function applyPatch(
               unrestoredFiles.push(p.relativePath);
               rollbackErrorOccurred = true;
             } finally {
-              try {
-                fsOps.unlink(rollTmp);
-              } catch {
-                // ignore
+              if (!safeUnlinkTemp(fsOps, rollTmp)) {
+                rollbackErrorOccurred = true;
               }
             }
           } else {
@@ -903,6 +917,13 @@ export async function applyPatch(
               recoveryRequired: true,
               recoveryFileCount: unrestoredFiles.length,
             },
+          );
+        }
+      } else {
+        if (stagedCleanupFailed) {
+          throw ArcError.rollbackFailed(
+            'Patch application failed and staged temporary files could not be safely removed.',
+            { recoveryRequired: true },
           );
         }
       }
