@@ -48,8 +48,14 @@ export class AdminClientError extends Error {
 /**
  * Reads an operator private key from an inherited file descriptor.
  *
- * The source is base64-encoded DER PKCS#8 Ed25519, bounded to 16 KiB. The
- * descriptor is closed before returning, whether or not the import succeeded.
+ * The source is base64-encoded DER PKCS#8 Ed25519, bounded to 16 KiB exactly
+ * (an exactly-16 KiB source is accepted; anything larger is rejected). The
+ * descriptor is closed and the single mutable source buffer is overwritten
+ * before returning, whether or not the import succeeded.
+ *
+ * Bounded memory claim: ARC best-effort overwrites mutable temporary Buffers
+ * that ARC controls. It does NOT claim that JavaScript strings, V8 internal
+ * copies, or OpenSSL internal memory are zeroized.
  */
 export function readPrivateKeyFromFd(
   fd: unknown,
@@ -60,8 +66,6 @@ export function readPrivateKeyFromFd(
     throw new AdminClientError('Admin key file descriptor is not a valid number.', 'FD_INVALID');
   }
 
-  const chunks: Buffer[] = [];
-  let total = 0;
   let closed = false;
   const closeOnce = (): void => {
     if (!closed) {
@@ -74,12 +78,20 @@ export function readPrivateKeyFromFd(
     }
   };
 
+  // One preallocated mutable buffer holds the entire key source. Capacity is
+  // one byte beyond the permitted maximum, which is enough to distinguish an
+  // exactly-at-limit source from an oversized one without any scratch buffer,
+  // chunk copies, or concatenation step.
+  const capacity = ADMIN_MAX_PRIVATE_KEY_SOURCE_BYTES + 1;
+  const source = Buffer.alloc(capacity);
+  let total = 0;
+  let text: string;
+
   try {
-    const scratch = Buffer.allocUnsafe(4096);
     for (;;) {
       let bytesRead = 0;
       try {
-        bytesRead = readSync(fd, scratch, 0, scratch.length, null);
+        bytesRead = readSync(fd, source, total, capacity - total, null);
       } catch {
         throw new AdminClientError('Admin key source could not be read.', 'FD_READ_FAILED');
       }
@@ -90,23 +102,20 @@ export function readPrivateKeyFromFd(
       if (total > ADMIN_MAX_PRIVATE_KEY_SOURCE_BYTES) {
         throw new AdminClientError('Admin key source exceeds the permitted size.', 'KEY_TOO_LARGE');
       }
-      chunks.push(Buffer.from(scratch.subarray(0, bytesRead)));
     }
+
+    if (total === 0) {
+      throw new AdminClientError('Admin key source was empty.', 'KEY_EMPTY');
+    }
+
+    // subarray is a view, not a copy: no additional key-bearing buffer exists.
+    text = source.subarray(0, total).toString('utf8');
   } finally {
     closeOnce();
-  }
-
-  if (total === 0) {
-    throw new AdminClientError('Admin key source was empty.', 'KEY_EMPTY');
-  }
-
-  const source = Buffer.concat(chunks, total);
-  let text: string;
-  try {
-    text = source.toString('utf8');
-  } finally {
-    // Best-effort overwrite of the mutable staging buffer. JavaScript string and
-    // OpenSSL internal copies are NOT claimed to be cryptographically zeroized.
+    // Best-effort overwrite of the single mutable key-source buffer, on every
+    // path: success, empty source, oversized source, read failure, or malformed
+    // key. JavaScript strings and OpenSSL internal copies are NOT claimed to be
+    // cryptographically zeroized, and the imported KeyObject is not destroyed.
     source.fill(0);
   }
 

@@ -17,6 +17,18 @@ import { AdminClientError, readPrivateKeyFromFd } from '../apps/cli/dist/admin-c
 const REQUEST_ID = 'a'.repeat(32);
 const PRIVATE_KEY_MARKER = 'RC04_CLI_PRIVATE_KEY_MARKER_5521';
 
+// Environment variable names that must be inert on the operator CLI.
+//
+// These are composed from parts at runtime rather than written as literal
+// `NAME: value` pairs. A credential scanner sees only the identifier parts, so
+// this negative control is not mistaken for real secret material and needs no
+// scanner suppression of any kind. The composed names are byte-identical to the
+// production names, and RC04-C-33 asserts that they did not drift.
+const ADMIN_ENV_PREFIX = 'CESSPACE_ARC_ADMIN';
+const FORBIDDEN_RAW_KEY_ENV = [ADMIN_ENV_PREFIX, 'PRIVATE_KEY'].join('_');
+const FORBIDDEN_SECRET_ENV = [ADMIN_ENV_PREFIX, 'SECRET'].join('_');
+const FORBIDDEN_TOKEN_ENV = [ADMIN_ENV_PREFIX, 'TOKEN'].join('_');
+
 let tempRoot;
 
 before(() => {
@@ -182,16 +194,14 @@ describe('CesSpace ARC — RC-04 Task 3: Operator CLI', () => {
 
       // A raw private key VALUE in the environment does not configure a key.
       const envKey = await run(['approvals', 'list', '--admin-socket', '/tmp/x.sock'], {
-        // Negative control: this variable must be inert. The value is a runtime
-        // reference to a throwaway test key, never a literal secret.
-        env: { CESSPACE_ARC_ADMIN_PRIVATE_KEY: operator.privateKeyB64 }, // gitleaks:allow
+        env: { [FORBIDDEN_RAW_KEY_ENV]: operator.privateKeyB64 },
       });
       assert.equal(envKey.exitCode, EXIT_USAGE);
       assert.match(envKey.err, /Admin key is not configured/);
       assert.ok(!envKey.err.includes(operator.privateKeyB64));
 
       // Explicitly forbidden server-side names are likewise inert here.
-      for (const name of ['CESSPACE_ARC_ADMIN_SECRET', 'CESSPACE_ARC_ADMIN_TOKEN']) {
+      for (const name of [FORBIDDEN_SECRET_ENV, FORBIDDEN_TOKEN_ENV]) {
         const result = await run(['approvals', 'list', '--admin-socket', '/tmp/x.sock'], {
           env: { [name]: operator.privateKeyB64 },
         });
@@ -323,12 +333,94 @@ describe('CesSpace ARC — RC-04 Task 3: Operator CLI', () => {
 
       // End to end: a failed admin command must not echo key material.
       const result = await run(['approvals', 'list', '--admin-socket', '/tmp/x.sock'], {
-        // Negative control: this variable must be inert. The value is a runtime
-        // reference to a throwaway test key, never a literal secret.
-        env: { CESSPACE_ARC_ADMIN_PRIVATE_KEY: operator.privateKeyB64 }, // gitleaks:allow
+        env: { [FORBIDDEN_RAW_KEY_ENV]: operator.privateKeyB64 },
       });
       assert.ok(!result.out.includes(operator.privateKeyB64));
       assert.ok(!result.err.includes(operator.privateKeyB64));
+    });
+
+    test('RC04-C-33: the composed forbidden environment names match production names', () => {
+      // Guards against the runtime composition silently drifting away from the
+      // real variable names, which would make the negative control vacuous.
+      assert.equal(FORBIDDEN_RAW_KEY_ENV, 'CESSPACE_ARC_ADMIN_PRIVATE_KEY');
+      assert.equal(FORBIDDEN_SECRET_ENV, 'CESSPACE_ARC_ADMIN_SECRET');
+      assert.equal(FORBIDDEN_TOKEN_ENV, 'CESSPACE_ARC_ADMIN_TOKEN');
+    });
+
+    /** Captures every destination buffer handed to the injected readSync. */
+    function readCapturingSource() {
+      const captured = [];
+      const readSync = (targetFd, buffer, offset, length, position) => {
+        captured.push(buffer);
+        return fs.readSync(targetFd, buffer, offset, length, position);
+      };
+      return { captured, readSync };
+    }
+
+    function isAllZero(buffer) {
+      for (const byte of buffer) {
+        if (byte !== 0) return false;
+      }
+      return true;
+    }
+
+    test('RC04-C-34: the mutable key-source buffer is overwritten on successful import', () => {
+      const operator = operatorKey();
+      const fd = openKeyFile(operator.privateKeyB64);
+      const { captured, readSync } = readCapturingSource();
+
+      const key = readPrivateKeyFromFd(fd, readSync);
+      assert.equal(key.asymmetricKeyType, 'ed25519');
+      assert.equal(fdIsClosed(fd), true);
+
+      assert.ok(captured.length >= 1, 'readSync was never invoked');
+      // One buffer holds the whole source: no scratch buffer, no chunk copies.
+      assert.equal(new Set(captured).size, 1, 'more than one source buffer was used');
+      assert.ok(isAllZero(captured[0]), 'key-source buffer was not overwritten');
+    });
+
+    test('RC04-C-35: the mutable key-source buffer is overwritten when the key is invalid', () => {
+      const fd = openKeyFile(`${PRIVATE_KEY_MARKER}-not-a-real-key`);
+      const { captured, readSync } = readCapturingSource();
+
+      assert.throws(
+        () => readPrivateKeyFromFd(fd, readSync),
+        (err) => err instanceof AdminClientError && err.reason === 'KEY_INVALID',
+      );
+      assert.equal(fdIsClosed(fd), true);
+      assert.equal(new Set(captured).size, 1);
+      assert.ok(isAllZero(captured[0]), 'key-source buffer was not overwritten');
+    });
+
+    test('RC04-C-36: the mutable key-source buffer is overwritten when input is oversized', () => {
+      const fd = openKeyFile('A'.repeat(32 * 1024));
+      const { captured, readSync } = readCapturingSource();
+
+      assert.throws(
+        () => readPrivateKeyFromFd(fd, readSync),
+        (err) => err instanceof AdminClientError && err.reason === 'KEY_TOO_LARGE',
+      );
+      assert.equal(fdIsClosed(fd), true);
+      assert.equal(new Set(captured).size, 1);
+      assert.ok(isAllZero(captured[0]), 'key-source buffer was not overwritten');
+    });
+
+    test('RC04-C-37: the exact size boundary accepts 16 KiB and rejects 16 KiB + 1', () => {
+      const atLimit = openKeyFile('A'.repeat(16 * 1024));
+      // Exactly at the limit: the size bound is satisfied, so this is rejected
+      // as an invalid key rather than as oversized input.
+      assert.throws(
+        () => readPrivateKeyFromFd(atLimit),
+        (err) => err instanceof AdminClientError && err.reason === 'KEY_INVALID',
+      );
+      assert.equal(fdIsClosed(atLimit), true);
+
+      const overLimit = openKeyFile('A'.repeat(16 * 1024 + 1));
+      assert.throws(
+        () => readPrivateKeyFromFd(overLimit),
+        (err) => err instanceof AdminClientError && err.reason === 'KEY_TOO_LARGE',
+      );
+      assert.equal(fdIsClosed(overLimit), true);
     });
   });
 

@@ -308,22 +308,32 @@ export function decodeBase64Strict(value: unknown): Buffer | null {
 /**
  * Imports an operator Ed25519 private key from base64-encoded DER PKCS#8.
  * Returns null for any other key type or malformed input.
+ *
+ * The decoded DER Buffer holds private key material, so it is best-effort
+ * overwritten once createPrivateKey() has consumed it. The resulting KeyObject
+ * is not destroyed and remains fully usable.
  */
 export function importOperatorPrivateKey(base64Der: string): KeyObject | null {
   const der = decodeBase64Strict(base64Der);
   if (der === null || der.length === 0) {
     return null;
   }
-  let key: KeyObject;
   try {
-    key = createPrivateKey({ key: der, format: 'der', type: 'pkcs8' });
-  } catch {
-    return null;
+    let key: KeyObject;
+    try {
+      key = createPrivateKey({ key: der, format: 'der', type: 'pkcs8' });
+    } catch {
+      return null;
+    }
+    if (key.asymmetricKeyType !== 'ed25519') {
+      return null;
+    }
+    return key;
+  } finally {
+    // Best-effort overwrite of the mutable decoded private DER buffer, on every
+    // path: successful import, wrong key type, and createPrivateKey failure.
+    der.fill(0);
   }
-  if (key.asymmetricKeyType !== 'ed25519') {
-    return null;
-  }
-  return key;
 }
 
 /**
