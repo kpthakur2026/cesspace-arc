@@ -15,7 +15,8 @@ CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
 echo "--> Gate 1: Git Branch Check"
 echo "    Current branch: $CURRENT_BRANCH"
 if [[ "$CURRENT_BRANCH" != "feat/rc-03-safe-file-modification" ]]; then
-  echo "    [WARN] Not on recommended feature branch 'feat/rc-03-safe-file-modification'!"
+  echo "    [FAIL] Not on required feature branch 'feat/rc-03-safe-file-modification'!"
+  exit 1
 else
   echo "    [PASS] Correct feature branch: feat/rc-03-safe-file-modification"
 fi
@@ -73,6 +74,14 @@ echo ""
 # 10. RC-03 Mutation Security Invariant Assertions
 echo "--> Gate 10: RC-03 Mutation Security Invariant Assertions"
 
+# Confirm required RC-03 test file exists
+TEST_FILE="tests/rc03-mcp-policy-audit.test.js"
+if [[ ! -f "$TEST_FILE" ]]; then
+  echo "    [FAIL] Required test file '$TEST_FILE' does not exist"
+  exit 1
+fi
+echo "    [PASS] $TEST_FILE exists"
+
 # Confirm all 5 mutation tools are present in RC03_MUTATION_TOOLS export
 POLICY_SRC="packages/policy/src/index.ts"
 for TOOL in create_file write_file apply_patch delete_file move_file; do
@@ -112,6 +121,13 @@ if ! grep -q "RC03_TOOL_DEFINITIONS" "$MCP_SRC"; then
   exit 1
 fi
 echo "    [PASS] RC03_TOOL_DEFINITIONS included in ListTools response"
+
+# Confirm ALL_TOOL_DEFINITIONS authoritative tool list is present
+if ! grep -q "ALL_TOOL_DEFINITIONS" "$MCP_SRC"; then
+  echo "    [FAIL] ALL_TOOL_DEFINITIONS not found in $MCP_SRC"
+  exit 1
+fi
+echo "    [PASS] ALL_TOOL_DEFINITIONS authoritative tool list present"
 
 # Confirm defense-in-depth backstop present
 if ! grep -q "RC-03 backstop" "$MCP_SRC"; then

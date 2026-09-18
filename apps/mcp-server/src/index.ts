@@ -131,7 +131,7 @@ const FileContentSchema = z
 
 const PatchContentSchema = z
   .string()
-  .min(1, 'patch must not be empty or whitespace-only')
+  .refine((val) => val.trim().length > 0, 'patch must not be empty or whitespace-only')
   .refine(
     (val) => Buffer.byteLength(val, 'utf8') <= 512 * 1024,
     'patch exceeds maximum allowed size of 512 KiB (524,288 bytes)',
@@ -788,6 +788,16 @@ export const RC01_TOOL_DEFINITIONS: Tool[] = [
   },
 ];
 
+/**
+ * Authoritative complete list of all 18 registered tools (RC-01 + RC-02 + RC-03).
+ * Used directly by the ListTools handler.
+ */
+export const ALL_TOOL_DEFINITIONS: Tool[] = [
+  ...RC01_TOOL_DEFINITIONS,
+  ...RC02_TOOL_DEFINITIONS,
+  ...RC03_TOOL_DEFINITIONS,
+];
+
 export interface IArcMcpServer {
   start(): Promise<void>;
   stop(): Promise<void>;
@@ -969,7 +979,7 @@ export function sanitizeMutationAuditParameters(
     }
   }
 
-  // Record extra property keys if any were supplied
+  // Record extra property count if any were supplied (no attacker keys stored)
   const knownPropertyMap: Record<string, Set<string>> = {
     create_file: new Set(['path', 'content', 'workspaceId']),
     write_file: new Set(['path', 'content', 'expectedHash', 'overwrite', 'workspaceId']),
@@ -981,7 +991,107 @@ export function sanitizeMutationAuditParameters(
   if (knownKeys) {
     const extraKeys = Object.keys(parameters).filter((k) => !knownKeys.has(k));
     if (extraKeys.length > 0) {
-      sanitized.extraPropertyKeys = extraKeys;
+      sanitized.extraPropertyCount = extraKeys.length;
+    }
+  }
+
+  return sanitized;
+}
+
+/**
+ * Dedicated pre-validation mutation sanitizer for audit logging.
+ * When a mutation request fails schema admission, this ensures arbitrary raw user strings
+ * (malformed paths, unknown property names, content, patches, workspace IDs, hash strings)
+ * are NEVER stored in audit logs.
+ * Records ONLY safe facts: property counts and metadata types/lengths.
+ */
+export function sanitizePreValidationMutationParameters(
+  toolName: string,
+  parameters: Record<string, unknown>,
+): Record<string, unknown> {
+  const sanitized: Record<string, unknown> = {
+    propertyCount: Object.keys(parameters).length,
+  };
+
+  const knownPropertyMap: Record<string, Set<string>> = {
+    create_file: new Set(['path', 'content', 'workspaceId']),
+    write_file: new Set(['path', 'content', 'expectedHash', 'overwrite', 'workspaceId']),
+    delete_file: new Set(['path', 'expectedHash', 'workspaceId']),
+    move_file: new Set(['sourcePath', 'destinationPath', 'expectedSourceHash', 'workspaceId']),
+    apply_patch: new Set(['patch', 'dryRun', 'fuzz', 'workspaceId']),
+  };
+
+  const knownKeys = knownPropertyMap[toolName] || new Set();
+  const extraPropertyCount = Object.keys(parameters).filter((k) => !knownKeys.has(k)).length;
+  if (extraPropertyCount > 0) {
+    sanitized.extraPropertyCount = extraPropertyCount;
+  }
+
+  if (parameters.path !== undefined) {
+    sanitized.pathType = typeof parameters.path;
+    if (typeof parameters.path === 'string') {
+      sanitized.pathLength = parameters.path.length;
+    }
+  }
+
+  if (parameters.sourcePath !== undefined) {
+    sanitized.sourcePathType = typeof parameters.sourcePath;
+    if (typeof parameters.sourcePath === 'string') {
+      sanitized.sourcePathLength = parameters.sourcePath.length;
+    }
+  }
+
+  if (parameters.destinationPath !== undefined) {
+    sanitized.destinationPathType = typeof parameters.destinationPath;
+    if (typeof parameters.destinationPath === 'string') {
+      sanitized.destinationPathLength = parameters.destinationPath.length;
+    }
+  }
+
+  if (parameters.content !== undefined) {
+    sanitized.contentType = typeof parameters.content;
+    if (typeof parameters.content === 'string') {
+      sanitized.contentBytes = Buffer.byteLength(parameters.content, 'utf8');
+    }
+  }
+
+  if (parameters.patch !== undefined) {
+    sanitized.patchType = typeof parameters.patch;
+    if (typeof parameters.patch === 'string') {
+      sanitized.patchBytes = Buffer.byteLength(parameters.patch, 'utf8');
+    }
+  }
+
+  if (parameters.expectedHash !== undefined) {
+    sanitized.expectedHashType = typeof parameters.expectedHash;
+    if (typeof parameters.expectedHash === 'string') {
+      sanitized.expectedHashLength = parameters.expectedHash.length;
+    }
+  }
+
+  if (parameters.expectedSourceHash !== undefined) {
+    sanitized.expectedSourceHashType = typeof parameters.expectedSourceHash;
+    if (typeof parameters.expectedSourceHash === 'string') {
+      sanitized.expectedSourceHashLength = parameters.expectedSourceHash.length;
+    }
+  }
+
+  if (parameters.overwrite !== undefined) {
+    sanitized.overwriteType = typeof parameters.overwrite;
+  }
+
+  if (parameters.dryRun !== undefined) {
+    sanitized.dryRunType = typeof parameters.dryRun;
+  }
+
+  if (parameters.fuzz !== undefined) {
+    sanitized.fuzzType = typeof parameters.fuzz;
+  }
+
+  if (parameters.workspaceId !== undefined) {
+    sanitized.workspaceIdType = typeof parameters.workspaceId;
+    if (typeof parameters.workspaceId === 'string') {
+      sanitized.workspaceIdLength = parameters.workspaceId.length;
     }
   }
 
@@ -1063,9 +1173,9 @@ export function sanitizePreValidationParameters(
     return sanitized;
   }
 
-  // Mutation tools: authoritative data minimization
+  // Mutation tools: authoritative pre-validation data minimization
   if ((RC03_MUTATION_TOOLS as readonly string[]).includes(toolName)) {
-    return sanitizeMutationAuditParameters(toolName, parameters);
+    return sanitizePreValidationMutationParameters(toolName, parameters);
   }
 
   // Generic sanitizer for other tools: scrub raw args/env objects
@@ -1136,10 +1246,14 @@ export class ArcMcpServer implements IArcMcpServer {
     this.setupHandlers();
   }
 
+  public getRegisteredTools(): Tool[] {
+    return ALL_TOOL_DEFINITIONS;
+  }
+
   private setupHandlers(): void {
     this.server.setRequestHandler(ListToolsRequestSchema, async () => {
       return {
-        tools: [...RC01_TOOL_DEFINITIONS, ...RC02_TOOL_DEFINITIONS, ...RC03_TOOL_DEFINITIONS],
+        tools: ALL_TOOL_DEFINITIONS,
       };
     });
 
@@ -1223,9 +1337,24 @@ export class ArcMcpServer implements IArcMcpServer {
           (iss) => iss.path.includes('length') && iss.code === 'too_big',
         );
 
-      const issueMessages = parseResult.error.issues
-        .map((iss) => `${iss.path.join('.') || 'root'}: ${iss.message}`)
-        .join('; ');
+      const isMutation = (RC03_MUTATION_TOOLS as readonly string[]).includes(toolName);
+      let issueMessages: string;
+      if (isMutation) {
+        issueMessages = parseResult.error.issues
+          .map((iss) => {
+            if (iss.code === 'unrecognized_keys') {
+              return `unrecognized parameter(s) provided (count: ${iss.keys.length})`;
+            }
+            const pathKey = iss.path.length > 0 ? iss.path.join('.') : 'root';
+            return `${pathKey}: ${iss.message}`;
+          })
+          .join('; ');
+      } else {
+        issueMessages = parseResult.error.issues
+          .map((iss) => `${iss.path.join('.') || 'root'}: ${iss.message}`)
+          .join('; ');
+      }
+
       const arcErr = isReadLengthTooLarge
         ? ArcError.payloadTooLarge('Requested read length exceeds maximum allowed limit of 1 MiB.')
         : ArcError.invalidRequestSchema(
@@ -1254,7 +1383,9 @@ export class ArcMcpServer implements IArcMcpServer {
         },
         error: {
           code: arcErr.code,
-          message: arcErr.message,
+          message: isMutation
+            ? `Invalid parameters for tool '${toolName}': request failed schema validation.`
+            : arcErr.message,
         },
       });
       return {
