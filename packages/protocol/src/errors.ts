@@ -19,6 +19,7 @@ export type ArcErrorCode =
   | 'UNSUPPORTED_METHOD'
   | 'PARSE_ERROR'
   | 'PATCH_PARSE_ERROR'
+  | 'POLICY_PARSE_ERROR'
 
   // Authentication Errors
   | 'UNAUTHENTICATED'
@@ -30,6 +31,7 @@ export type ArcErrorCode =
   | 'APPROVAL_REQUIRED'
   | 'APPROVAL_EXPIRED'
   | 'APPROVAL_REJECTED'
+  | 'POLICY_LOAD_ERROR'
   | 'PROTECTED_BRANCH_DENIED'
   | 'FORBIDDEN_COMMAND'
 
@@ -227,7 +229,64 @@ export class ArcError extends Error implements ArcErrorPayload {
       details,
       retryable: false,
       remediationHint:
-        'This operation requires explicit human approval. Approval execution is not available until the approval workflow is implemented.',
+        'Obtain explicit approval through the trusted operator workflow before retrying this protected operation.',
+    });
+  }
+
+  public static approvalExpired(
+    message = 'Approval request has expired.',
+    details?: Record<string, string | number | boolean>,
+  ): ArcError {
+    return new ArcError({
+      code: 'APPROVAL_EXPIRED',
+      category: 'AUTHORIZATION',
+      message,
+      details,
+      retryable: false,
+      remediationHint: 'Request a new human approval for this operation.',
+    });
+  }
+
+  public static approvalRejected(
+    message = 'Approval validation failed.',
+    details?: Record<string, string | number | boolean>,
+  ): ArcError {
+    return new ArcError({
+      code: 'APPROVAL_REJECTED',
+      category: 'AUTHORIZATION',
+      message,
+      details,
+      retryable: false,
+      remediationHint: 'Ensure approval token and request bindings match exactly.',
+    });
+  }
+
+  public static policyParseError(
+    message = 'Declarative policy document could not be parsed: invalid structure.',
+    details?: Record<string, string | number | boolean>,
+  ): ArcError {
+    return new ArcError({
+      code: 'POLICY_PARSE_ERROR',
+      category: 'PROTOCOL',
+      message,
+      details,
+      retryable: false,
+      remediationHint:
+        'Ensure policy adheres to the RC-04 declarative schema and resource constraints.',
+    });
+  }
+
+  public static policyLoadError(
+    message = 'Declarative policy could not be loaded into the policy engine.',
+    details?: Record<string, string | number | boolean>,
+  ): ArcError {
+    return new ArcError({
+      code: 'POLICY_LOAD_ERROR',
+      category: 'AUTHORIZATION',
+      message,
+      details,
+      retryable: false,
+      remediationHint: 'Check that all referenced workspaces exist and policy syntax is valid.',
     });
   }
 

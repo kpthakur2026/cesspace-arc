@@ -12,18 +12,38 @@ import {
 
 import {
   ArcError,
-  PolicyOutcome,
   type HealthResponse,
   type SystemStatusResponse,
   type PolicyEvaluationContext,
   type RunCommandRequest,
 } from '@cesspace-arc/protocol';
 import {
+  ApprovalStateManager,
+  DeclarativePolicyEngine,
   SecurityKernel,
   WorkspaceRegistry,
+  getApprovalFailureReason,
+  sha256Hex,
+  type PolicyEffect,
+  type PolicyMatchTarget,
   type WorkspaceRecord,
   RC03_MUTATION_TOOLS,
 } from '@cesspace-arc/policy';
+import { AdminIpcError, AdminIpcServer } from './admin-ipc.js';
+import { ApprovalAuditSink, getApprovalAuditSink } from './approval-audit.js';
+import {
+  ARC_APPROVAL_KEY,
+  computeExecutionPayloadHash,
+  deriveCanonicalPathTargets,
+  extractArcApproval,
+  extractPolicyTargets,
+  buildReviewPayload,
+  mostRestrictive,
+  parsePatchTargetPaths,
+  reduceDecisions,
+  safeApprovalAuditMetadata,
+  withArcApprovalSchema,
+} from './approval-gate.js';
 import { AuditLogger, computeSha256, canonicalJson } from '@cesspace-arc/audit';
 import { FilesystemSubsystem } from '@cesspace-arc/filesystem';
 import { GitSubsystem } from '@cesspace-arc/git';
@@ -40,6 +60,37 @@ export interface ArcServerConfig {
   authorizedRoots: Array<{ id: string; path: string }>;
   defaultWorkspaceId?: string;
   stage?: string;
+  /**
+   * Trusted operator admin channel configuration.
+   *
+   * Both fields must be supplied together. Supplying exactly one fails server
+   * startup rather than silently starting a partially configured admin access
+   * path. When absent entirely, no admin listener is created.
+   *
+   * The endpoint is a local IPC path only; the operator public key is not a
+   * secret and grants no authority without the corresponding private key.
+   */
+  admin?: {
+    endpoint?: string;
+    operatorPublicKeyB64?: string;
+  };
+  /**
+   * Trusted external declarative policy configuration (RC-04 Task 4).
+   *
+   * The format is explicit and never sniffed from content. When supplied and
+   * INVALID, the server fails closed: there is no fallback to the built-in
+   * compatibility policy, and every non-health operation is refused.
+   */
+  policy?: {
+    sourceText: string;
+    format: 'json' | 'yaml';
+  };
+}
+
+/** Safe, non-sensitive reason the Layer-2 engine is unavailable. */
+export interface PolicyInitializationFailure {
+  /** Coarse category only. Never raw policy text, paths, or parser detail. */
+  reason: 'POLICY_PARSE_ERROR' | 'POLICY_LOAD_ERROR';
 }
 
 const WorkspaceIdSchema = z
@@ -140,6 +191,22 @@ const PatchContentSchema = z
 const Sha256HashSchema = z
   .string()
   .regex(/^[0-9a-fA-F]{64}$/, 'expectedHash must be a 64-character hexadecimal SHA-256 hash');
+
+/**
+ * Advertises the reserved `_arcApproval` control object on every registered MCP
+ * tool, because Layer 2 may elevate ANY tool to REQUIRE_APPROVAL.
+ *
+ * The JSON schema is advisory to the client; the runtime Zod control schema in
+ * approval-gate.ts remains authoritative, including the UTF-8 byte bound.
+ */
+function withArcApprovalSchemaOnTools(tools: Tool[]): Tool[] {
+  return tools.map((tool) => ({
+    ...tool,
+    inputSchema: withArcApprovalSchema(
+      tool.inputSchema as Record<string, unknown>,
+    ) as Tool['inputSchema'],
+  }));
+}
 
 /**
  * Strict Zod validation schemas for all permitted tools (RC-01 read-only + RC-02 controlled execution + RC-03 mutation).
@@ -282,7 +349,7 @@ export const TOOL_SCHEMAS = {
 /**
  * Definition of the 4 RC-02 MCP Tools (controlled terminal & process execution).
  */
-export const RC02_TOOL_DEFINITIONS: Tool[] = [
+export const RC02_TOOL_DEFINITIONS: Tool[] = withArcApprovalSchemaOnTools([
   {
     name: 'run_command',
     description:
@@ -414,13 +481,13 @@ export const RC02_TOOL_DEFINITIONS: Tool[] = [
       additionalProperties: false,
     },
   },
-];
+]);
 
 /**
  * Definition of the 5 RC-03 MCP Tools (file mutation primitives).
  * All invocations require explicit human approval and remain non-executable in RC-03.
  */
-export const RC03_TOOL_DEFINITIONS: Tool[] = [
+export const RC03_TOOL_DEFINITIONS: Tool[] = withArcApprovalSchemaOnTools([
   {
     name: 'create_file',
     description:
@@ -563,12 +630,12 @@ export const RC03_TOOL_DEFINITIONS: Tool[] = [
       additionalProperties: false,
     },
   },
-];
+]);
 
 /**
  * Definition of the 9 RC-01 MCP Tools.
  */
-export const RC01_TOOL_DEFINITIONS: Tool[] = [
+export const RC01_TOOL_DEFINITIONS: Tool[] = withArcApprovalSchemaOnTools([
   {
     name: 'health',
     description: 'Check control plane readiness, active stage, and subsystem health.',
@@ -786,17 +853,17 @@ export const RC01_TOOL_DEFINITIONS: Tool[] = [
       additionalProperties: false,
     },
   },
-];
+]);
 
 /**
  * Authoritative complete list of all 18 registered tools (RC-01 + RC-02 + RC-03).
  * Used directly by the ListTools handler.
  */
-export const ALL_TOOL_DEFINITIONS: Tool[] = [
+export const ALL_TOOL_DEFINITIONS: Tool[] = withArcApprovalSchemaOnTools([
   ...RC01_TOOL_DEFINITIONS,
   ...RC02_TOOL_DEFINITIONS,
   ...RC03_TOOL_DEFINITIONS,
-];
+]);
 
 export interface IArcMcpServer {
   start(): Promise<void>;
@@ -1199,6 +1266,17 @@ export class ArcMcpServer implements IArcMcpServer {
   private transport?: StdioServerTransport;
   private defaultWorkspaceId?: string;
   public processRegistry?: ProcessRegistry;
+  /** Approval state manager. Always present; a fresh one is created if not injected. */
+  public readonly approvalStateManager: ApprovalStateManager;
+  /**
+   * Bounded lifecycle audit sink. Buffers safe lifecycle events emitted by the
+   * state machine and flushes them into the one existing audit hash chain.
+   */
+  public readonly approvalAuditSink: ApprovalAuditSink;
+  /** Immutable effective Layer-2 policy engine. Undefined only on fail-closed init. */
+  public readonly effectivePolicyEngine?: DeclarativePolicyEngine;
+  /** Safe failure category when an explicitly configured policy was invalid. */
+  public readonly policyInitializationFailure?: PolicyInitializationFailure;
 
   constructor(
     public readonly workspaceRegistry: WorkspaceRegistry,
@@ -1209,7 +1287,28 @@ export class ArcMcpServer implements IArcMcpServer {
     config?: Partial<ArcServerConfig>,
     public readonly terminalSubsystem?: ITerminalSubsystem,
     processRegistry?: ProcessRegistry,
+    /**
+     * Optional approval state manager. Composition only: Task 3 does not route
+     * MCP requests through it, and MCP mutations still execute nothing.
+     */
+    approvalStateManager?: ApprovalStateManager,
+    /**
+     * Optional authenticated local admin channel. Started only when trusted
+     * launch configuration supplies both an endpoint and an operator key.
+     */
+    public readonly adminIpcServer?: AdminIpcServer,
   ) {
+    // The approval state manager is mandatory for Task 4 authorization.
+    this.approvalStateManager = approvalStateManager ?? new ApprovalStateManager();
+
+    // Lifecycle audit evidence: the manager emits synchronously, the sink
+    // buffers, and the control plane flushes into the existing audit chain.
+    // The sink is memoized per chain so a separately composed admin channel
+    // over the same logger cannot register a second observer (which would
+    // double-write every transition).
+    this.approvalAuditSink = getApprovalAuditSink(this.auditLogger);
+    this.approvalStateManager.registerLifecycleSink(this.approvalAuditSink);
+
     this.defaultWorkspaceId = config?.defaultWorkspaceId;
     this.processRegistry =
       processRegistry ||
@@ -1231,6 +1330,36 @@ export class ArcMcpServer implements IArcMcpServer {
       }
     }
 
+    // Layer 2: one immutable effective policy engine, built once at startup.
+    //
+    // Startup order matters: the trusted configured roots MUST already be
+    // registered before workspace assertions are verified, otherwise a valid
+    // external policy naming a configured workspace would fail
+    // UNKNOWN_WORKSPACE_ID. Policy workspaces still only ASSERT expected
+    // registry identity; they never authorize or register a root.
+    //
+    // An explicitly configured but INVALID external policy fails closed with no
+    // fallback to the built-in compatibility policy (rc04 §12, §44).
+    const policyConfig = config?.policy;
+    if (policyConfig !== undefined && policyConfig !== null) {
+      try {
+        this.effectivePolicyEngine = DeclarativePolicyEngine.fromExternalText(
+          this.workspaceRegistry,
+          policyConfig.sourceText,
+          policyConfig.format,
+        );
+      } catch (err: unknown) {
+        this.effectivePolicyEngine = undefined;
+        const code = (err as { code?: string })?.code;
+        this.policyInitializationFailure = {
+          reason: code === 'POLICY_LOAD_ERROR' ? 'POLICY_LOAD_ERROR' : 'POLICY_PARSE_ERROR',
+        };
+      }
+    } else {
+      this.effectivePolicyEngine = DeclarativePolicyEngine.builtIn(this.workspaceRegistry);
+      this.policyInitializationFailure = undefined;
+    }
+
     this.server = new Server(
       {
         name: 'cesspace-arc',
@@ -1248,6 +1377,21 @@ export class ArcMcpServer implements IArcMcpServer {
 
   public getRegisteredTools(): Tool[] {
     return ALL_TOOL_DEFINITIONS;
+  }
+
+  /**
+   * Defense-in-depth gate for mutation execution.
+   *
+   * Throws unless the current invocation recorded a successful approval
+   * consumption. This is deliberately a method rather than an inline check so
+   * the invariant is stated in exactly one place.
+   */
+  private assertApprovalConsumed(consumed: boolean, toolName: string): void {
+    if (!consumed) {
+      throw ArcError.policyDenied(
+        `Internal authorization failure: tool '${toolName}' reached execution without verified approval consumption.`,
+      );
+    }
   }
 
   private setupHandlers(): void {
@@ -1291,13 +1435,67 @@ export class ArcMcpServer implements IArcMcpServer {
       authenticated: actorOverride?.authenticated ?? true,
     };
 
+    /** Audits a denial and returns the sanitized MCP error response. */
+    const denyWith = async (
+      arcErr: ArcError,
+      ruleId: string,
+      decision: 'DENY' | 'REQUIRE_APPROVAL' | 'ALLOW',
+      denialAuditParams: Record<string, unknown>,
+      workspaceInfo?: { workspaceId: string; workspacePath: string },
+      evalMs = 0,
+    ): Promise<{ isError?: boolean; content: Array<{ type: 'text'; text: string }> }> => {
+      await this.auditLogger.log({
+        timestamp: startTime,
+        actor: auditActor,
+        target: workspaceInfo ?? { workspaceId: 'unbound', workspacePath: '' },
+        invocation: {
+          toolName,
+          parametersRedacted: denialAuditParams,
+          payloadHash: computeSha256(canonicalJson(denialAuditParams)),
+        },
+        policy: { decision, ruleId, evaluationDurationMs: evalMs },
+        execution: {
+          status: 'DENIED',
+          startTime,
+          endTime: new Date().toISOString(),
+          durationMs: Date.now() - startMs,
+        },
+        error: { code: arcErr.code, message: arcErr.message },
+      });
+      return {
+        isError: true,
+        content: [{ type: 'text', text: JSON.stringify(arcErr.toJSON(), null, 2) }],
+      };
+    };
+
+    // 1b. Reserved control-object admission (rc04 §4.1 step 1, §5, §6).
+    // The control object is extracted and validated SEPARATELY, then removed, so
+    // the business schemas below see exact business parameters and the subsystem
+    // never receives it. A malformed control object creates no approval state and
+    // performs no approval lookup.
+    const rawControl = (parameters ?? {})[ARC_APPROVAL_KEY];
+    const extracted = extractArcApproval(parameters);
+    const businessParameters = extracted.businessParameters;
+
+    // Bounded, non-sensitive audit facts about any supplied control object. A
+    // malformed control object is untrusted input and is never serialized
+    // wholesale, and the raw token never reaches an audit record.
+    const approvalAuditMetadata = safeApprovalAuditMetadata(rawControl, extracted.control);
+
+    if (extracted.malformed) {
+      const arcErr = ArcError.invalidRequestSchema(
+        `Invalid parameters for tool '${toolName}': reserved control object failed schema validation.`,
+      );
+      return denyWith(arcErr, 'schema-arc-approval-control', 'DENY', approvalAuditMetadata);
+    }
+
     // 2. Pre-Admission Tool Name & Runtime Schema Validation Gate (P1-02)
     const schema = (TOOL_SCHEMAS as Record<string, z.ZodTypeAny | undefined>)[toolName];
     if (!schema) {
       const arcErr = ArcError.policyDenied(
         `Tool '${toolName}' is not permitted in RC-01 stage (read-only inspection core only).`,
       );
-      const preAuditParams = sanitizePreValidationParameters(toolName, parameters);
+      const preAuditParams = sanitizePreValidationParameters(toolName, businessParameters);
       await this.auditLogger.log({
         timestamp: startTime,
         actor: auditActor,
@@ -1329,7 +1527,7 @@ export class ArcMcpServer implements IArcMcpServer {
       };
     }
 
-    const parseResult = schema.safeParse(parameters);
+    const parseResult = schema.safeParse(businessParameters);
     if (!parseResult.success) {
       const isReadLengthTooLarge =
         toolName === 'read_file' &&
@@ -1360,7 +1558,7 @@ export class ArcMcpServer implements IArcMcpServer {
         : ArcError.invalidRequestSchema(
             `Invalid parameters for tool '${toolName}': ${issueMessages}`,
           );
-      const preAuditParams = sanitizePreValidationParameters(toolName, parameters);
+      const preAuditParams = sanitizePreValidationParameters(toolName, businessParameters);
       await this.auditLogger.log({
         timestamp: startTime,
         actor: auditActor,
@@ -1449,7 +1647,7 @@ export class ArcMcpServer implements IArcMcpServer {
         const arcErr = ArcError.policyDenied(
           'Access denied: run_command requires verified caller identity (clientId and sessionId).',
         );
-        const preAuditParams = sanitizePreValidationParameters(toolName, parameters);
+        const preAuditParams = sanitizePreValidationParameters(toolName, businessParameters);
         await this.auditLogger.log({
           timestamp: startTime,
           actor: auditActor,
@@ -1490,7 +1688,7 @@ export class ArcMcpServer implements IArcMcpServer {
     if (isProcessLifecycleTool) {
       if (!this.processRegistry) {
         const arcErr = ArcError.policyDenied('Process ownership verifier is unavailable.');
-        const preAuditParams = sanitizePreValidationParameters(toolName, parameters);
+        const preAuditParams = sanitizePreValidationParameters(toolName, businessParameters);
         await this.auditLogger.log({
           timestamp: startTime,
           actor: auditActor,
@@ -1526,7 +1724,7 @@ export class ArcMcpServer implements IArcMcpServer {
       const procRecord = this.processRegistry.getProcess(processId);
       if (!procRecord) {
         const arcErr = ArcError.processNotFound(`Process not found: '${processId}'.`);
-        const preAuditParams = sanitizePreValidationParameters(toolName, parameters);
+        const preAuditParams = sanitizePreValidationParameters(toolName, businessParameters);
         await this.auditLogger.log({
           timestamp: startTime,
           actor: auditActor,
@@ -1563,7 +1761,7 @@ export class ArcMcpServer implements IArcMcpServer {
         const arcErr = ArcError.policyDenied(
           `Target workspace '${procRecord.workspaceId}' for process is not registered.`,
         );
-        const preAuditParams = sanitizePreValidationParameters(toolName, parameters);
+        const preAuditParams = sanitizePreValidationParameters(toolName, businessParameters);
         await this.auditLogger.log({
           timestamp: startTime,
           actor: auditActor,
@@ -1599,7 +1797,7 @@ export class ArcMcpServer implements IArcMcpServer {
         const arcErr = ArcError.policyDenied(
           'Access denied: Caller workspace does not match process workspace.',
         );
-        const preAuditParams = sanitizePreValidationParameters(toolName, parameters);
+        const preAuditParams = sanitizePreValidationParameters(toolName, businessParameters);
         await this.auditLogger.log({
           timestamp: startTime,
           actor: auditActor,
@@ -1727,107 +1925,439 @@ export class ArcMcpServer implements IArcMcpServer {
       auditParams = sanitizeMutationAuditParameters(toolName, validatedParams);
     }
 
+    if (Object.keys(approvalAuditMetadata).length > 0) {
+      auditParams = { ...auditParams, ...approvalAuditMetadata };
+    }
+
     // Authoritative payload hash uses sanitized params for mutation tools (not raw params)
     const auditPayloadHash = computeSha256(canonicalJson(auditParams));
 
-    // 3. Minimal Security Kernel Policy Admission (Default-Deny)
+    // 3. Authorization: Layer 1 (permanent kernel), then Layer 2 (declarative
+    //    policy), then the mutation floor, and only then approval validation.
+    //
+    // Frozen redemption order (rc04 §4.1). Both DENY decisions are determined
+    // BEFORE any approval record is inspected or any token is validated, so a
+    // token can never override a current DENY.
+
+    // An explicitly configured but invalid external policy fails closed: there
+    // is no fallback to the built-in compatibility policy (rc04 §13, §44).
+    //
+    // The minimal diagnostic tools remain callable so an operator can diagnose
+    // the failure (rc04 §12.2 / §12.3); every other operation is refused.
+    const policyEngine = this.effectivePolicyEngine;
+    const isDiagnosticTool = toolName === 'health' || toolName === 'system_status';
+    if (policyEngine === undefined && !isDiagnosticTool) {
+      const arcErr = ArcError.policyLoadError(
+        'Policy engine is not active: the configured declarative policy could not be loaded.',
+        { policyEngineActive: false },
+      );
+      return denyWith(arcErr, 'deny-policy-engine-unavailable', 'DENY', auditParams, {
+        workspaceId: targetWorkspace.workspaceId,
+        workspacePath: targetWorkspace.rootPath,
+      });
+    }
+
     const evalStart = Date.now();
-    const decision = await this.securityKernel.evaluate(context);
+
+    // apply_patch embeds its target paths inside the patch body. Parse with the
+    // authoritative RC-03 parser BEFORE any approval creation or consumption, so
+    // Layer 1 and Layer 2 can see every real target and a malformed patch can
+    // never create or consume an approval.
+    let patchTargetPaths: string[] | undefined;
+    if (toolName === 'apply_patch') {
+      try {
+        patchTargetPaths = parsePatchTargetPaths(validatedParams.patch);
+      } catch (parseErr: unknown) {
+        const arcErr =
+          parseErr instanceof ArcError
+            ? parseErr
+            : ArcError.patchParseError('Patch payload could not be parsed.');
+        return denyWith(arcErr, 'patch-parse-failure', 'DENY', auditParams, {
+          workspaceId: targetWorkspace.workspaceId,
+          workspacePath: targetWorkspace.rootPath,
+        });
+      }
+    }
+
+    // --- Layer 1: permanent SecurityKernel --------------------------------
+    // Evaluated for the business target and, for apply_patch, once per parsed
+    // target through an INTERNAL derived context. That derived context is not
+    // the business parameter object, is never hashed, and is never passed to any
+    // subsystem; it exists only so the kernel can see patch-embedded paths.
+    const layer1Decisions: Array<{
+      effect: PolicyEffect;
+      matchingRuleId: string;
+      reason: string;
+    }> = [];
+    layer1Decisions.push(await this.securityKernel.evaluate(context));
+    if (toolName === 'apply_patch' && patchTargetPaths !== undefined) {
+      for (const targetPath of patchTargetPaths) {
+        const derivedContext: PolicyEvaluationContext = {
+          ...context,
+          request: { toolName, parameters: { ...validatedParams, path: targetPath } },
+        };
+        layer1Decisions.push(await this.securityKernel.evaluate(derivedContext));
+      }
+    }
+    // Multi-target Layer-1 reduction uses the same most-restrictive precedence.
+    const layer1 = reduceDecisions(layer1Decisions) as {
+      effect: PolicyEffect;
+      matchingRuleId: string;
+      reason: string;
+    };
     const evalDuration = Date.now() - evalStart;
 
-    if (decision.outcome === PolicyOutcome.REQUIRE_APPROVAL) {
-      // RC-03 gate: mutation tools require human approval — not available until RC-04.
-      // Emit structured APPROVAL_REQUIRED audit record and return isError response.
-      // Filesystem mutation methods MUST NOT be called.
-      const endMs = Date.now();
-      const endTime = new Date().toISOString();
-
-      await this.auditLogger.log({
-        timestamp: startTime,
-        actor: auditActor,
-        target: {
-          workspaceId: targetWorkspace.workspaceId,
-          workspacePath: targetWorkspace.rootPath,
-        },
-        invocation: {
-          toolName,
-          parametersRedacted: auditParams,
-          payloadHash: auditPayloadHash,
-        },
-        policy: {
-          decision: 'REQUIRE_APPROVAL',
-          ruleId: decision.matchingRuleId,
-          evaluationDurationMs: evalDuration,
-        },
-        execution: {
-          status: 'DENIED',
-          startTime,
-          endTime,
-          durationMs: endMs - startMs,
-        },
-        error: {
-          code: 'APPROVAL_REQUIRED',
-          message: decision.reason,
-        },
-      });
-
-      const arcError = ArcError.approvalRequired(decision.reason);
-      return {
-        isError: true,
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(arcError.toJSON(), null, 2),
-          },
-        ],
-      };
+    if (layer1.effect === 'DENY') {
+      return denyWith(
+        ArcError.policyDenied(layer1.reason),
+        layer1.matchingRuleId,
+        'DENY',
+        auditParams,
+        { workspaceId: targetWorkspace.workspaceId, workspacePath: targetWorkspace.rootPath },
+        evalDuration,
+      );
     }
 
-    if (decision.outcome !== PolicyOutcome.ALLOW) {
-      // DENY or any other non-ALLOW, non-REQUIRE_APPROVAL outcome
-      const endMs = Date.now();
-      const endTime = new Date().toISOString();
+    // --- Layer 2: current declarative policy ------------------------------
+    // One deterministic target-extraction helper feeds every branch; multi-target
+    // operations are reduced with the same precedence so the result is
+    // independent of target order.
+    // With no engine (fail-closed diagnostic path) the mode is irrelevant;
+    // EXTERNAL keeps the strictest target semantics.
+    const policyMode = policyEngine?.getSourceMode() ?? 'EXTERNAL';
 
-      await this.auditLogger.log({
-        timestamp: startTime,
-        actor: auditActor,
-        target: {
-          workspaceId: targetWorkspace.workspaceId,
-          workspacePath: targetWorkspace.rootPath,
-        },
-        invocation: {
-          toolName,
-          parametersRedacted: auditParams,
-          payloadHash: auditPayloadHash,
-        },
-        policy: {
-          decision: decision.effect,
-          ruleId: decision.matchingRuleId,
-          evaluationDurationMs: evalDuration,
-        },
-        execution: {
-          status: 'DENIED',
-          startTime,
-          endTime,
-          durationMs: endMs - startMs,
-        },
-        error: {
-          code: 'POLICY_DENIED',
-          message: decision.reason,
-        },
+    // ONE authoritative canonical-target derivation, shared by the policy
+    // matcher and the operator review summary, so the human-reviewed target,
+    // the policy target, and the filesystem target can never diverge. It does
+    // not mutate `validatedParams`: the execution payload hash and subsystem
+    // execution remain bound to the exact post-schema validated parameters.
+    const canonicalTargets = deriveCanonicalPathTargets(
+      toolName,
+      validatedParams,
+      targetWorkspace.rootPath,
+      patchTargetPaths,
+      policyMode,
+    );
+
+    const layer2Targets = extractPolicyTargets(
+      toolName,
+      validatedParams,
+      targetWorkspace.rootPath,
+      patchTargetPaths,
+      policyMode,
+    );
+
+    // An empty target list means a supplied path had no safe canonical
+    // workspace-relative form (traversal, NUL, backslash, or the workspace root
+    // itself, which the frozen policy grammar cannot express). Dropping the path
+    // would let a `paths` rule silently miss, so the request fails closed.
+    if (canonicalTargets.blocked || layer2Targets.length === 0) {
+      return denyWith(
+        ArcError.policyDenied('Target path has no safe canonical workspace-relative form.'),
+        'deny-unnormalizable-target-path',
+        'DENY',
+        auditParams,
+        { workspaceId: targetWorkspace.workspaceId, workspacePath: targetWorkspace.rootPath },
+      );
+    }
+    // On the fail-closed diagnostic path there is no Layer-2 engine at all; the
+    // diagnostic tools carry no targets and no side effects, so the absent layer
+    // contributes no restriction. Every other tool was already refused above.
+    const layer2Decisions =
+      policyEngine === undefined
+        ? [{ effect: 'ALLOW' as PolicyEffect, matchingRuleId: 'no-layer2-engine', reason: '' }]
+        : layer2Targets.map((target: PolicyMatchTarget) => policyEngine.evaluate(target as never));
+    const layer2 = reduceDecisions(layer2Decisions) as {
+      effect: PolicyEffect;
+      matchingRuleId: string;
+      reason: string;
+    };
+
+    if (layer2.effect === 'DENY') {
+      return denyWith(
+        ArcError.policyDenied(layer2.reason),
+        layer2.matchingRuleId,
+        'DENY',
+        auditParams,
+        { workspaceId: targetWorkspace.workspaceId, workspacePath: targetWorkspace.rootPath },
+        evalDuration,
+      );
+    }
+
+    // --- Composition and the mandatory mutation approval floor -------------
+    let effectiveEffect: PolicyEffect = mostRestrictive(layer1.effect, layer2.effect);
+    let effectiveRuleId =
+      layer1.effect === effectiveEffect ? layer1.matchingRuleId : layer2.matchingRuleId;
+
+    const isMutationTool = (RC03_MUTATION_TOOLS as readonly string[]).includes(toolName);
+    if (effectiveEffect === 'ALLOW' && isMutationTool) {
+      // Defense in depth: a mutation can never resolve to automatic ALLOW.
+      effectiveEffect = 'REQUIRE_APPROVAL';
+      effectiveRuleId = 'require-approval-file-mutation';
+    }
+
+    // Invocation-local, non-user-controlled authorization state. Mutation
+    // execution requires this to be set true by a SUCCESSFUL consumption during
+    // this invocation. It is never derived from parameters, actor input, a
+    // policy ALLOW, or any request property.
+    let approvalConsumedForExecution = false;
+    let consumedApprovalRequestId: string | undefined;
+    let consumedApprovalContext:
+      | {
+          requestId: string;
+          toolName: string;
+          actor: {
+            clientId: string;
+            clientType: string;
+            sessionId?: string;
+            deviceId?: string;
+          };
+          workspaceId: string;
+          workspaceRootHash: string;
+          policyHash: string;
+        }
+      | undefined;
+
+    if (effectiveEffect === 'REQUIRE_APPROVAL') {
+      const actorBinding = {
+        clientId: actor.clientId,
+        clientType: actor.clientType,
+        sessionId: actor.sessionId,
+        deviceId: actor.deviceId,
+      };
+      // The raw host path never enters the binding; only its digest.
+      const workspaceRootHash = sha256Hex(targetWorkspace.rootPath);
+      const workspaceBinding = {
+        workspaceId: targetWorkspace.workspaceId,
+        workspaceRootHash,
+      };
+      // The approval path is unreachable without a Layer-2 engine: with no
+      // engine, Layer 2 contributes ALLOW and only the two side-effect-free
+      // diagnostic tools are admitted.
+      const currentPolicyHash = (policyEngine as DeclarativePolicyEngine).getPolicyHash();
+      const executionPayloadHash = computeExecutionPayloadHash({
+        toolName,
+        businessParameters: validatedParams,
+        actor: actorBinding,
+        workspaceId: workspaceBinding.workspaceId,
+        workspaceRootHash,
+        policyHash: currentPolicyHash,
       });
 
-      const arcError = ArcError.policyDenied(decision.reason);
-      return {
-        isError: true,
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify(arcError.toJSON(), null, 2),
+      if (extracted.control === null) {
+        // Scenario A: no control object -> create or reuse a pending approval.
+        const { reviewMaterial, reviewSummary } = buildReviewPayload(
+          toolName,
+          validatedParams,
+          canonicalTargets.paths,
+        );
+        const snapshot = this.approvalStateManager.createOrReusePending({
+          toolName,
+          executionPayloadHash,
+          binding: {
+            actor: actorBinding,
+            workspace: workspaceBinding,
+            policyHash: currentPolicyHash,
           },
-        ],
-      };
+          reviewMaterial,
+          reviewSummary,
+        });
+
+        const arcError = ArcError.approvalRequired(
+          `Action requires human approval. Request ID: ${snapshot.requestId}`,
+          {
+            approvalRequestId: snapshot.requestId,
+            toolName,
+            expiresInSeconds: snapshot.remainingSeconds,
+          },
+        );
+
+        // Lifecycle evidence is committed BEFORE the request ID is returned.
+        // A failure here fails the initiating action closed rather than
+        // proceeding without required audit evidence.
+        try {
+          await this.approvalAuditSink.flush();
+        } catch {
+          return denyWith(
+            ArcError.internalError('Required approval audit evidence could not be recorded.'),
+            'approval-audit-failed',
+            'REQUIRE_APPROVAL',
+            auditParams,
+            { workspaceId: targetWorkspace.workspaceId, workspacePath: targetWorkspace.rootPath },
+          );
+        }
+
+        await this.auditLogger.log({
+          timestamp: startTime,
+          actor: auditActor,
+          target: {
+            workspaceId: targetWorkspace.workspaceId,
+            workspacePath: targetWorkspace.rootPath,
+          },
+          invocation: {
+            toolName,
+            parametersRedacted: auditParams,
+            payloadHash: auditPayloadHash,
+          },
+          policy: {
+            decision: 'REQUIRE_APPROVAL',
+            ruleId: effectiveRuleId,
+            evaluationDurationMs: evalDuration,
+            approvalId: snapshot.requestId,
+          },
+          execution: {
+            status: 'DENIED',
+            startTime,
+            endTime: new Date().toISOString(),
+            durationMs: Date.now() - startMs,
+          },
+          approval: {
+            requestId: snapshot.requestId,
+            state: snapshot.state,
+            source: 'MCP',
+          },
+          error: { code: 'APPROVAL_REQUIRED', message: arcError.message },
+        });
+
+        return {
+          isError: true,
+          content: [{ type: 'text', text: JSON.stringify(arcError.toJSON(), null, 2) }],
+        };
+      }
+
+      // Scenario C: a structurally valid control object is present. Only now is
+      // the approval record inspected, validated, and atomically consumed.
+      // The manager remains authoritative for expiry, state, policy, payload,
+      // actor, and workspace binding, and for timing-safe token comparison.
+      try {
+        const consumption = this.approvalStateManager.redeemAndConsume({
+          requestId: extracted.control.requestId,
+          token: extracted.control.token,
+          executionPayloadHash,
+          actor: actorBinding,
+          workspace: workspaceBinding,
+          policyHash: currentPolicyHash,
+        });
+        // Consumption happened BEFORE any subsystem call. The CONSUMED
+        // lifecycle evidence must be committed before execution begins; if it
+        // cannot be recorded the subsystem MUST NOT run, and the approval
+        // remains CONSUMED (never rolled back to APPROVED).
+        try {
+          await this.approvalAuditSink.flush();
+        } catch {
+          return denyWith(
+            ArcError.internalError('Required approval audit evidence could not be recorded.'),
+            'approval-audit-failed',
+            'REQUIRE_APPROVAL',
+            auditParams,
+            {
+              workspaceId: targetWorkspace.workspaceId,
+              workspacePath: targetWorkspace.rootPath,
+            },
+            evalDuration,
+          );
+        }
+        approvalConsumedForExecution = true;
+        consumedApprovalRequestId = consumption.requestId;
+        consumedApprovalContext = {
+          requestId: consumption.requestId,
+          toolName,
+          actor: actorBinding,
+          workspaceId: workspaceBinding.workspaceId,
+          workspaceRootHash: workspaceBinding.workspaceRootHash,
+          policyHash: currentPolicyHash,
+        };
+      } catch (redemptionErr: unknown) {
+        const code = (redemptionErr as { code?: string })?.code;
+        const arcError =
+          code === 'APPROVAL_EXPIRED'
+            ? ArcError.approvalExpired()
+            : ArcError.approvalRejected(
+                'Approval could not be redeemed. The request, token, or bindings are not valid.',
+              );
+        // Internal diagnostic ONLY. It is written to the audit record, never to
+        // the ArcError, its details, toJSON(), or the MCP response (anti-oracle).
+        const internalReason = getApprovalFailureReason(redemptionErr);
+
+        await this.auditLogger.log({
+          timestamp: startTime,
+          actor: auditActor,
+          target: {
+            workspaceId: targetWorkspace.workspaceId,
+            workspacePath: targetWorkspace.rootPath,
+          },
+          invocation: {
+            toolName,
+            parametersRedacted: auditParams,
+            payloadHash: auditPayloadHash,
+          },
+          policy: {
+            decision: 'REQUIRE_APPROVAL',
+            ruleId: effectiveRuleId,
+            evaluationDurationMs: evalDuration,
+            approvalId: extracted.control.requestId,
+          },
+          execution: {
+            status: 'DENIED',
+            startTime,
+            endTime: new Date().toISOString(),
+            durationMs: Date.now() - startMs,
+          },
+          approval: {
+            requestId: extracted.control.requestId,
+            source: 'MCP',
+            ...(internalReason === undefined ? {} : { reasonCode: internalReason }),
+          },
+          error: { code: arcError.code, message: arcError.message },
+        });
+
+        // Expiry/invalidation discovered during redemption is lifecycle
+        // evidence too, and must be committed before the rejection is returned.
+        //
+        // Which failure this was matters: POLICY_BINDING_MISMATCH permanently
+        // INVALIDATES the record, and APPROVAL_EXPIRED is a real EXPIRED
+        // transition. Both were committed to the state machine; only their
+        // evidence is at stake here.
+        let lifecycleEvidenceCommitted = true;
+        try {
+          await this.approvalAuditSink.flush();
+        } catch {
+          lifecycleEvidenceCommitted = false;
+        }
+
+        const causedLifecycleTransition =
+          internalReason === 'POLICY_BINDING_MISMATCH' || code === 'APPROVAL_EXPIRED';
+
+        if (!lifecycleEvidenceCommitted && causedLifecycleTransition) {
+          // The record is permanently EXPIRED/INVALIDATED and is NOT rolled
+          // back, but a semantic outcome (APPROVAL_EXPIRED / APPROVAL_REJECTED)
+          // must not be reported as though its required lifecycle evidence were
+          // durable. The queued evidence is retained for a later retry.
+          const auditError = ArcError.internalError(
+            'Required approval audit evidence could not be recorded.',
+          );
+          return {
+            isError: true,
+            content: [{ type: 'text', text: JSON.stringify(auditError.toJSON(), null, 2) }],
+          };
+        }
+
+        return {
+          isError: true,
+          content: [{ type: 'text', text: JSON.stringify(arcError.toJSON(), null, 2) }],
+        };
+      }
     }
+
+    // Approval classification is recorded truthfully on the ordinary invocation
+    // audit record below: an approved execution is reported as REQUIRE_APPROVAL,
+    // never as an ordinary ALLOW.
+    const effectiveDecisionLabel: 'ALLOW' | 'REQUIRE_APPROVAL' = approvalConsumedForExecution
+      ? 'REQUIRE_APPROVAL'
+      : 'ALLOW';
+    const effectiveRuleIdForAudit = approvalConsumedForExecution
+      ? effectiveRuleId
+      : layer2.matchingRuleId;
 
     // 4. Tool Execution within Authorized Boundaries
 
@@ -1839,11 +2369,15 @@ export class ArcMcpServer implements IArcMcpServer {
     try {
       switch (toolName) {
         case 'health': {
+          // Truthful runtime reporting: the policy engine is active only when a
+          // usable effective Layer-2 engine was initialized. An explicitly
+          // configured but invalid policy reports UNHEALTHY with no fallback.
+          const policyEngineActive = this.effectivePolicyEngine !== undefined;
           const health: HealthResponse = {
-            status: 'HEALTHY',
-            version: '0.3.0-rc03',
-            stage: 'RC-03',
-            policyEngineActive: true,
+            status: policyEngineActive ? 'HEALTHY' : 'UNHEALTHY',
+            version: '0.4.0-rc04',
+            stage: 'RC-04',
+            policyEngineActive,
             auditActive: true,
             authorizedWorkspacesCount: this.workspaceRegistry.getWorkspaces().length,
           };
@@ -2022,15 +2556,70 @@ export class ArcMcpServer implements IArcMcpServer {
           break;
         }
 
+        // RC-03 mutation routes (RC-04 Task 4). Each of these is reachable ONLY
+        // after a successful atomic APPROVED -> CONSUMED transition during THIS
+        // invocation. The guard is invocation-local state, never derived from
+        // parameters, actor input, a policy ALLOW, or any request property.
+        //
+        // Only validated business parameters are forwarded; the reserved control
+        // object was removed before schema validation and is never passed here.
+        case 'create_file': {
+          this.assertApprovalConsumed(approvalConsumedForExecution, toolName);
+          result = await this.filesystemSubsystem.createFile(targetWorkspace.rootPath, {
+            path: validatedParams.path as string,
+            content: validatedParams.content as string,
+          } as never);
+          break;
+        }
+
+        case 'write_file': {
+          this.assertApprovalConsumed(approvalConsumedForExecution, toolName);
+          result = await this.filesystemSubsystem.writeFile(targetWorkspace.rootPath, {
+            path: validatedParams.path as string,
+            content: validatedParams.content as string,
+            expectedHash: validatedParams.expectedHash as string,
+            overwrite: true,
+          } as never);
+          break;
+        }
+
+        case 'delete_file': {
+          this.assertApprovalConsumed(approvalConsumedForExecution, toolName);
+          result = await this.filesystemSubsystem.deleteFile(targetWorkspace.rootPath, {
+            path: validatedParams.path as string,
+            expectedHash: validatedParams.expectedHash as string,
+          } as never);
+          break;
+        }
+
+        case 'move_file': {
+          this.assertApprovalConsumed(approvalConsumedForExecution, toolName);
+          result = await this.filesystemSubsystem.moveFile(targetWorkspace.rootPath, {
+            sourcePath: validatedParams.sourcePath as string,
+            destinationPath: validatedParams.destinationPath as string,
+            expectedSourceHash: validatedParams.expectedSourceHash as string,
+          } as never);
+          break;
+        }
+
+        case 'apply_patch': {
+          this.assertApprovalConsumed(approvalConsumedForExecution, toolName);
+          // dryRun: true still belongs to RC03_MUTATION_TOOLS and still requires
+          // human approval; there is no dry-run bypass.
+          result = await this.filesystemSubsystem.applyPatch(targetWorkspace.rootPath, {
+            patch: validatedParams.patch as string,
+            dryRun: validatedParams.dryRun === true,
+            ...(validatedParams.fuzz !== undefined ? { fuzz: validatedParams.fuzz } : {}),
+          } as never);
+          break;
+        }
+
         default:
-          // Defense-in-depth: RC-03 mutation tools MUST NEVER reach this execution path.
-          // Even if policy evaluation unexpectedly returns ALLOW for a mutation tool
-          // (e.g. via a future refactor or configuration error), this backstop ensures
-          // that filesystem mutation methods are never called in RC-03.
+          // Defense-in-depth backstop. A mutation tool must never reach an
+          // unguarded execution path, whatever the policy outcome was.
           if ((RC03_MUTATION_TOOLS as readonly string[]).includes(toolName)) {
             throw ArcError.policyDenied(
-              `RC-03 backstop: tool '${toolName}' requires human approval and cannot be executed. ` +
-                `Approval workflow is not available until RC-04.`,
+              `Tool '${toolName}' requires verified human approval consumption before execution.`,
             );
           }
           throw ArcError.policyDenied(`Tool '${toolName}' execution route not configured.`);
@@ -2061,10 +2650,24 @@ export class ArcMcpServer implements IArcMcpServer {
         payloadHash: auditPayloadHash,
       },
       policy: {
-        decision: 'ALLOW',
-        ruleId: decision.matchingRuleId,
+        // Truthful classification: an approved execution is recorded as
+        // REQUIRE_APPROVAL, never as an ordinary ALLOW.
+        decision: effectiveDecisionLabel,
+        ruleId: effectiveRuleIdForAudit,
         evaluationDurationMs: evalDuration,
+        ...(consumedApprovalRequestId === undefined
+          ? {}
+          : { approvalId: consumedApprovalRequestId }),
       },
+      ...(consumedApprovalRequestId === undefined
+        ? {}
+        : {
+            approval: {
+              requestId: consumedApprovalRequestId,
+              state: 'CONSUMED' as const,
+              source: 'MCP' as const,
+            },
+          }),
       execution: {
         status: executionStatus,
         startTime,
@@ -2079,6 +2682,37 @@ export class ArcMcpServer implements IArcMcpServer {
           }
         : undefined,
     });
+
+    // Execution lifecycle evidence, emitted ONLY when this invocation actually
+    // consumed an approval. Ordered after the ordinary invocation record, and
+    // committed before the MCP response returns.
+    if (consumedApprovalContext !== undefined) {
+      this.approvalAuditSink.onApprovalLifecycleEvent({
+        eventType: arcError ? 'APPROVED_EXECUTION_FAILED' : 'APPROVED_EXECUTION_SUCCEEDED',
+        requestId: consumedApprovalContext.requestId,
+        state: 'CONSUMED',
+        toolName: consumedApprovalContext.toolName,
+        actor: consumedApprovalContext.actor,
+        workspaceId: consumedApprovalContext.workspaceId,
+        workspaceRootHash: consumedApprovalContext.workspaceRootHash,
+        policyHash: consumedApprovalContext.policyHash,
+        occurredAt: new Date().toISOString(),
+      });
+      try {
+        await this.approvalAuditSink.flush();
+      } catch {
+        // Required lifecycle evidence could not be committed. The subsystem
+        // call already happened, but a client MUST NOT receive a successful
+        // result for an approved execution whose evidence is missing: fail the
+        // invocation closed with a sanitized error instead of returning the
+        // result. An already-failing execution keeps its more specific error;
+        // the chain retains the queued evidence and keeps failing closed on
+        // every later flush. The execution fact stays truthfully recorded above.
+        arcError ??= ArcError.internalError(
+          'Required approval audit evidence could not be recorded.',
+        );
+      }
+    }
 
     // 6. Sanitized Response Formatting
     if (arcError) {
@@ -2116,15 +2750,35 @@ export class ArcMcpServer implements IArcMcpServer {
   public async start(): Promise<void> {
     this.transport = new StdioServerTransport();
     await this.server.connect(this.transport);
+
+    // The admin channel exists only when explicitly composed in. There is no
+    // implicit endpoint and no default socket path.
+    if (this.adminIpcServer) {
+      try {
+        await this.adminIpcServer.start();
+      } catch (err: unknown) {
+        // Fail closed and tear down stdio rather than running without the
+        // admin channel the operator configured.
+        await this.stop();
+        if (err instanceof AdminIpcError) {
+          throw new Error(`Admin IPC channel failed to start: ${err.reason}`, { cause: err });
+        }
+        throw new Error('Admin IPC channel failed to start.', { cause: err });
+      }
+    }
   }
 
   public async flushAudit(): Promise<void> {
+    await this.approvalAuditSink.flush();
     if (this.processRegistry) {
       await this.processRegistry.flushLifecycleEvents();
     }
   }
 
   public async stop(): Promise<void> {
+    if (this.adminIpcServer) {
+      await this.adminIpcServer.stop();
+    }
     await this.flushAudit();
     if (this.transport) {
       await this.transport.close();
@@ -2166,6 +2820,33 @@ export function createArcMcpServer(config?: Partial<ArcServerConfig>): ArcMcpSer
   const gitSubsystem = new GitSubsystem();
   const terminalSubsystem = new ControlledProcessRunner(processRegistry);
 
+  const approvalStateManager = new ApprovalStateManager();
+
+  // The admin channel is opt-in through trusted launch configuration only.
+  // Supplying exactly one half of the pair fails closed rather than starting
+  // partially configured admin access.
+  let adminIpcServer: AdminIpcServer | undefined;
+  const admin = config?.admin;
+  if (admin !== undefined && admin !== null) {
+    const endpoint = admin.endpoint;
+    const operatorPublicKeyB64 = admin.operatorPublicKeyB64;
+    const hasEndpoint = typeof endpoint === 'string' && endpoint.length > 0;
+    const hasKey = typeof operatorPublicKeyB64 === 'string' && operatorPublicKeyB64.length > 0;
+    if (hasEndpoint !== hasKey) {
+      throw new Error(
+        'Admin channel requires both a local IPC endpoint and an operator public key; exactly one was supplied.',
+      );
+    }
+    if (hasEndpoint && hasKey) {
+      adminIpcServer = new AdminIpcServer({
+        endpoint: endpoint as string,
+        operatorPublicKeyB64: operatorPublicKeyB64 as string,
+        approvalStateManager,
+        auditLogger,
+      });
+    }
+  }
+
   return new ArcMcpServer(
     workspaceRegistry,
     securityKernel,
@@ -2175,6 +2856,8 @@ export function createArcMcpServer(config?: Partial<ArcServerConfig>): ArcMcpSer
     config,
     terminalSubsystem,
     processRegistry,
+    approvalStateManager,
+    adminIpcServer,
   );
 }
 
@@ -2191,10 +2874,29 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       ]
     : [];
 
+  // Admin channel configuration is PUBLIC-ONLY on the server side.
+  // CESSPACE_ARC_ADMIN_SOCKET is the local IPC endpoint and
+  // CESSPACE_ARC_ADMIN_PUBLIC_KEY_B64 is the operator public key (not a secret).
+  // No private key, secret, or bearer token is accepted in server environment.
+  const adminSocket = process.env.CESSPACE_ARC_ADMIN_SOCKET;
+  const adminPublicKey = process.env.CESSPACE_ARC_ADMIN_PUBLIC_KEY_B64;
+  const hasAdminSocket = typeof adminSocket === 'string' && adminSocket.length > 0;
+  const hasAdminKey = typeof adminPublicKey === 'string' && adminPublicKey.length > 0;
+
+  if (hasAdminSocket !== hasAdminKey) {
+    process.stderr.write(
+      'Admin channel requires both CESSPACE_ARC_ADMIN_SOCKET and CESSPACE_ARC_ADMIN_PUBLIC_KEY_B64; exactly one was supplied.\n',
+    );
+    process.exit(1);
+  }
+
   const server = createArcMcpServer({
     transport: 'stdio',
     authorizedRoots,
     defaultWorkspaceId: configuredWorkspace ? 'workspace' : undefined,
+    admin: hasAdminSocket
+      ? { endpoint: adminSocket, operatorPublicKeyB64: adminPublicKey }
+      : undefined,
   });
 
   server.start().catch((err) => {

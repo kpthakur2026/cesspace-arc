@@ -58,7 +58,7 @@ export interface PolicyDecisionResult {
 export interface PolicyRule {
   id: string;
   effect: PolicyEffect;
-  description: string;
+  description?: string;
   tools?: string[];
   paths?: {
     patterns: string[];
@@ -71,4 +71,63 @@ export interface PolicyRule {
     protectedBranches?: string[];
     actions?: string[];
   };
+}
+
+/**
+ * Metadata associated with a declarative policy document.
+ * Non-semantic: excluded from canonical policyHash.
+ */
+export interface PolicyMetadata {
+  name?: string;
+  description?: string;
+  lastModified?: string;
+}
+
+/**
+ * Declarative workspace assertion in an operator policy document.
+ * Asserts expected canonical workspace root identity.
+ * Invariant: Policy never authorizes filesystem paths; 'path' and 'rootPath' are forbidden.
+ */
+export interface PolicyWorkspaceAssertion {
+  id: string;
+  rootHash?: string;
+}
+
+/**
+ * Top-level declarative policy document schema (Version 1.0).
+ */
+export interface PolicyDocument {
+  version: '1.0';
+  metadata?: PolicyMetadata;
+  workspaces?: PolicyWorkspaceAssertion[];
+  rules: PolicyRule[];
+}
+
+/**
+ * Canonical normalized policy representation.
+ * Represents strictly security-relevant semantics for policyHash derivation.
+ * Non-semantic metadata and descriptions are excluded.
+ */
+export interface NormalizedPolicy {
+  schemaVersion: '1.0';
+  workspaces: Array<{
+    id: string;
+    rootHash?: string;
+  }>;
+  rules: Array<{
+    id: string;
+    effect: PolicyEffect;
+    tools?: string[];
+    paths?: {
+      patterns?: string[];
+    };
+    commands?: {
+      allowedBinaries?: string[];
+      blockedBinaries?: string[];
+    };
+    git?: {
+      protectedBranches?: string[];
+      actions?: string[];
+    };
+  }>;
 }

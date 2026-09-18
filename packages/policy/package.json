@@ -12,6 +12,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@cesspace-arc/protocol": "workspace:*"
+    "@cesspace-arc/protocol": "workspace:*",
+    "yaml": "2.9.1"
   }
 }

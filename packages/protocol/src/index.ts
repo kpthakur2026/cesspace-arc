@@ -8,3 +8,5 @@ export * from './policy.js';
 export * from './audit.js';
 export * from './tools.js';
 export * from './commands.js';
+export * from './approval.js';
+export * from './admin.js';
