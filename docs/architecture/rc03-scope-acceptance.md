@@ -22,7 +22,7 @@ The objective of **RC-03** is to introduce safe, policy-governed file modificati
 Every file mutation operation in RC-03 must pass through the **Minimal Security Kernel** and satisfy the following non-negotiable security invariants:
 
 1. **Strict Default-Deny & Policy Classification:** All five mutation tools are classified under `REQUIRE APPROVAL` in the policy engine.
-2. **Approval Boundary Architecture & No Bypass:** RC-03 defines the mutation tools and implements the underlying mutation engine, validation pipelines, and subsystem interfaces (`IFilesystemSubsystem`). In RC-03, there is **NO** approval-token redemption path or elevation mechanism; the complete interactive human approval state machine and approval token lifecycle are owned strictly by **RC-04**. Therefore, direct MCP tool invocations for mutation tools remain **permanently fail-closed / non-executable** in RC-03 with `REQUIRE_APPROVAL` or `POLICY_DENIED`. No fake token, temporary bypass, environment flag, test backdoor, or unconditional `ALLOW` may be introduced. Subsystem unit and integration tests exercise bounded mutation primitives directly through the `IFilesystemSubsystem` driver interface.
+2. **Approval Boundary Architecture & No Bypass:** RC-03 defines the mutation tools and implements the underlying mutation engine, validation pipelines, and subsystem interfaces (`IFilesystemSubsystem`). In RC-03, there is **NO** approval-token redemption path or elevation mechanism; the complete interactive human approval state machine and approval token lifecycle are owned strictly by **RC-04**. Therefore, direct MCP tool invocations for mutation tools remain **permanently fail-closed / non-executable** in RC-03 with `APPROVAL_REQUIRED` (policy outcome: `REQUIRE_APPROVAL`) or `POLICY_DENIED`. No fake token, temporary bypass, environment flag, test backdoor, or unconditional `ALLOW` may be introduced. Subsystem unit and integration tests exercise bounded mutation primitives directly through the `IFilesystemSubsystem` driver interface.
 3. **Permanent Denial of All Git Internal Metadata Mutation:** RC-03 mutation APIs may modify working-tree files, but **NEVER** Git metadata. Every RC-03 mutation tool permanently denies any operation targeting `.git/**`. This includes at minimum:
    - `.git/HEAD`
    - `.git/index`
@@ -303,7 +303,7 @@ Executes a **no-replace move with rollback** within authorized workspace roots. 
 | **Path Traversal (`../`, `%2e%2e`)** | Canonical realpath resolution, normalization, 1024-char limit, prefix enclosure.                     | `PATH_ESCAPES_ROOT` / `INVALID_PATH_CHARS`   |
 | **Directory Destruction**            | `delete_file` restricted strictly to regular files; directory deletion permanently blocked.          | `IS_A_DIRECTORY`                             |
 | **Secret Leakage in Audit Trail**    | Raw file contents and diff text strictly omitted from audit logs and errors; only hashes logged.     | Data minimization by design                  |
-| **Unauthorized Execution**           | All mutation tools classified `REQUIRE APPROVAL`; direct MCP invocation fails closed.                | `REQUIRE_APPROVAL`                           |
+| **Unauthorized Execution**           | All mutation tools classified `REQUIRE APPROVAL`; direct MCP invocation fails closed.                | `APPROVAL_REQUIRED`                          |
 
 ---
 
@@ -311,26 +311,26 @@ Executes a **no-replace move with rollback** within authorized workspace roots. 
 
 The following structured error codes extend `@cesspace-arc/protocol` for RC-03:
 
-| Error Code                      | HTTP-Equivalent          | Description                                                                                      |
-| :------------------------------ | :----------------------- | :----------------------------------------------------------------------------------------------- |
-| `CONFLICT_PRECONDITION_FAILED`  | 412 Precondition Failed  | Current file SHA-256 does not match caller's `expectedHash` or `expectedSourceHash`.             |
-| `ALREADY_EXISTS`                | 409 Conflict             | Target destination file already exists (for `create_file` or `move_file`).                       |
-| `FILE_NOT_FOUND`                | 404 Not Found            | Target file to write, delete, or move does not exist.                                            |
-| `PARENT_NOT_FOUND`              | 404 Not Found            | Immediate parent directory for file creation does not exist.                                     |
-| `IS_A_DIRECTORY`                | 400 Bad Request          | Target path is a directory where a regular file was required.                                    |
-| `NOT_A_FILE`                    | 400 Bad Request          | Target is a special filesystem node (socket, FIFO, device) rather than a regular file.           |
-| `HARDLINK_DETECTED`             | 403 Forbidden            | Target file has link count > 1, preventing external hardlink aliasing mutation.                  |
-| `UNSAFE_SYMLINK`                | 403 Forbidden            | Target is or traverses a symbolic link, which is forbidden for mutation in RC-03.                |
-| `PATCH_PARSE_ERROR`             | 400 Bad Request          | Patch syntax is invalid or not recognized as standard unified diff.                              |
-| `PATCH_PREFLIGHT_FAILED`        | 422 Unprocessable Entity | Patch cannot apply cleanly (hunk context mismatch, missing file, or out-of-bounds path).         |
-| `PATCH_UNSUPPORTED_OPERATION`   | 400 Bad Request          | Patch contains forbidden directives (file creation, deletion, rename, mode change, symlink).     |
-| `CROSS_DEVICE_MOVE_UNSUPPORTED` | 400 Bad Request          | `move_file` spans distinct filesystems/mountpoints; copy+delete fallback is disallowed.          |
-| `ROLLBACK_FAILED`               | 500 Internal Error       | Multi-file patch commit or move failed and rollback could not restore prior file state.          |
-| `PATH_ESCAPES_ROOT`             | 403 Forbidden            | Target path attempts to escape the authorized workspace root boundary.                           |
-| `ACCESS_DENIED`                 | 403 Forbidden            | Target path targets `.git/**` or matches sensitive blacklist patterns.                           |
-| `PAYLOAD_TOO_LARGE`             | 413 Payload Too Large    | Content exceeds 1 MiB or patch exceeds 512 KiB / 10 files.                                       |
-| `INVALID_REQUEST_SCHEMA`        | 400 Bad Request          | Request arguments fail schema validation (missing required fields, path > 1024 chars, fuzz > 0). |
-| `REQUIRE_APPROVAL`              | 403 Forbidden            | MCP invocation requires human approval token (RC-04 boundary).                                   |
+| Error Code                      | HTTP-Equivalent          | Description                                                                                        |
+| :------------------------------ | :----------------------- | :------------------------------------------------------------------------------------------------- |
+| `CONFLICT_PRECONDITION_FAILED`  | 412 Precondition Failed  | Current file SHA-256 does not match caller's `expectedHash` or `expectedSourceHash`.               |
+| `ALREADY_EXISTS`                | 409 Conflict             | Target destination file already exists (for `create_file` or `move_file`).                         |
+| `FILE_NOT_FOUND`                | 404 Not Found            | Target file to write, delete, or move does not exist.                                              |
+| `PARENT_NOT_FOUND`              | 404 Not Found            | Immediate parent directory for file creation does not exist.                                       |
+| `IS_A_DIRECTORY`                | 400 Bad Request          | Target path is a directory where a regular file was required.                                      |
+| `NOT_A_FILE`                    | 400 Bad Request          | Target is a special filesystem node (socket, FIFO, device) rather than a regular file.             |
+| `HARDLINK_DETECTED`             | 403 Forbidden            | Target file has link count > 1, preventing external hardlink aliasing mutation.                    |
+| `UNSAFE_SYMLINK`                | 403 Forbidden            | Target is or traverses a symbolic link, which is forbidden for mutation in RC-03.                  |
+| `PATCH_PARSE_ERROR`             | 400 Bad Request          | Patch syntax is invalid or not recognized as standard unified diff.                                |
+| `PATCH_PREFLIGHT_FAILED`        | 422 Unprocessable Entity | Patch cannot apply cleanly (hunk context mismatch, missing file, or out-of-bounds path).           |
+| `PATCH_UNSUPPORTED_OPERATION`   | 400 Bad Request          | Patch contains forbidden directives (file creation, deletion, rename, mode change, symlink).       |
+| `CROSS_DEVICE_MOVE_UNSUPPORTED` | 400 Bad Request          | `move_file` spans distinct filesystems/mountpoints; copy+delete fallback is disallowed.            |
+| `ROLLBACK_FAILED`               | 500 Internal Error       | Multi-file patch commit or move failed and rollback could not restore prior file state.            |
+| `PATH_ESCAPES_ROOT`             | 403 Forbidden            | Target path attempts to escape the authorized workspace root boundary.                             |
+| `ACCESS_DENIED`                 | 403 Forbidden            | Target path targets `.git/**` or matches sensitive blacklist patterns.                             |
+| `PAYLOAD_TOO_LARGE`             | 413 Payload Too Large    | Content exceeds 1 MiB or patch exceeds 512 KiB / 10 files.                                         |
+| `INVALID_REQUEST_SCHEMA`        | 400 Bad Request          | Request arguments fail schema validation (missing required fields, path > 1024 chars, fuzz > 0).   |
+| `APPROVAL_REQUIRED`             | 403 Forbidden            | MCP invocation requires human approval token (policy outcome: `REQUIRE_APPROVAL`, RC-04 boundary). |
 
 ---
 
@@ -379,7 +379,7 @@ When RC-03 implementation begins, acceptance verification must prove both negati
 - [ ] Attempting `apply_patch` exceeding 512 KiB or 10 files fails with `PAYLOAD_TOO_LARGE`.
 - [ ] Attempting `apply_patch` with `fuzz > 0` fails with `INVALID_REQUEST_SCHEMA`.
 - [ ] Simulated rollback failure (or unresolvable rollback conflict) reports `ROLLBACK_FAILED` with damaged file metadata.
-- [ ] Direct invocation of any of the 5 tools through policy engine fails with `REQUIRE_APPROVAL` (default-deny).
+- [ ] Direct invocation of any of the 5 tools through policy engine fails with `APPROVAL_REQUIRED` (policy outcome `REQUIRE_APPROVAL`, default-deny).
 - [ ] Audit logs confirm raw file and patch contents are completely redacted.
 
 ### 5.2. Mandatory Positive Controls

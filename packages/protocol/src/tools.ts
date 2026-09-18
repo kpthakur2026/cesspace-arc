@@ -205,16 +205,53 @@ export interface TerminateProcessResponse {
   signal: string;
 }
 
+export interface CreateFileRequest {
+  path: string;
+  content: string;
+}
+
+export interface CreateFileResponse {
+  path: string;
+  bytesWritten: number;
+  contentHash: string;
+  created: true;
+}
+
 export interface WriteFileRequest {
   path: string;
   content: string;
-  overwrite?: boolean;
+  expectedHash: string;
+  overwrite: true;
 }
 
 export interface WriteFileResponse {
   path: string;
   bytesWritten: number;
-  created: boolean;
+  contentHash: string;
+  previousHash: string;
+}
+
+export interface DeleteFileRequest {
+  path: string;
+  expectedHash: string;
+}
+
+export interface DeleteFileResponse {
+  path: string;
+  deleted: true;
+  contentHash: string;
+}
+
+export interface MoveFileRequest {
+  sourcePath: string;
+  destinationPath: string;
+  expectedSourceHash: string;
+}
+
+export interface MoveFileResponse {
+  sourcePath: string;
+  destinationPath: string;
+  moved: true;
 }
 
 export interface ApplyPatchRequest {

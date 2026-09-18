@@ -1,5 +1,6 @@
 import { realpathSync, statSync, readdirSync, openSync, readSync, closeSync } from 'node:fs';
 import { resolve, normalize, sep, relative, join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import {
   ArcError,
   type ListDirectoryRequest,
@@ -12,7 +13,30 @@ import {
   type SearchTextRequest,
   type SearchTextResponse,
   type TextMatchItem,
+  type CreateFileRequest,
+  type CreateFileResponse,
+  type WriteFileRequest,
+  type WriteFileResponse,
+  type DeleteFileRequest,
+  type DeleteFileResponse,
+  type MoveFileRequest,
+  type MoveFileResponse,
 } from '@cesspace-arc/protocol';
+
+export * from './fs-ops.js';
+export * from './locks.js';
+export * from './mutation-security.js';
+export * from './file-identity.js';
+
+import { type IFilesystemOps, NodeFilesystemOps } from './fs-ops.js';
+import { type ILockManager, defaultLockManager } from './locks.js';
+import { MAX_MUTATION_BYTES, validateMutationPath } from './mutation-security.js';
+import {
+  captureFileIdentity,
+  verifyPrecommitIdentity,
+  computeSha256,
+  validateExpectedHash,
+} from './file-identity.js';
 
 /**
  * Interface definition for Jailed Filesystem Subsystem.
@@ -26,6 +50,10 @@ export interface IFilesystemSubsystem {
   readFile(workspaceRoot: string, request: ReadFileRequest): Promise<ReadFileResponse>;
   searchFiles(workspaceRoot: string, request: SearchFilesRequest): Promise<SearchFilesResponse>;
   searchText(workspaceRoot: string, request: SearchTextRequest): Promise<SearchTextResponse>;
+  createFile(workspaceRoot: string, request: CreateFileRequest): Promise<CreateFileResponse>;
+  writeFile(workspaceRoot: string, request: WriteFileRequest): Promise<WriteFileResponse>;
+  deleteFile(workspaceRoot: string, request: DeleteFileRequest): Promise<DeleteFileResponse>;
+  moveFile(workspaceRoot: string, request: MoveFileRequest): Promise<MoveFileResponse>;
 }
 
 /**
@@ -121,9 +149,13 @@ export function isBinaryFile(filePath: string): boolean {
  */
 export class FilesystemSubsystem implements IFilesystemSubsystem {
   private searchBackend: ISearchBackend;
+  private fsOps: IFilesystemOps;
+  private lockManager: ILockManager;
 
-  constructor(searchBackend?: ISearchBackend) {
+  constructor(searchBackend?: ISearchBackend, fsOps?: IFilesystemOps, lockManager?: ILockManager) {
     this.searchBackend = searchBackend || new NodeSearchBackend();
+    this.fsOps = fsOps || new NodeFilesystemOps();
+    this.lockManager = lockManager || defaultLockManager;
   }
 
   /**
@@ -417,6 +449,345 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
   ): Promise<SearchTextResponse> {
     const canonicalRoot = realpathSync(resolve(workspaceRoot));
     return this.searchBackend.searchText(canonicalRoot, request);
+  }
+
+  public async createFile(
+    workspaceRoot: string,
+    request: CreateFileRequest,
+  ): Promise<CreateFileResponse> {
+    if (!request || typeof request !== 'object') {
+      throw ArcError.invalidRequestSchema('Invalid request payload.');
+    }
+    if (typeof request.content !== 'string') {
+      throw ArcError.invalidRequestSchema('content must be a string.');
+    }
+
+    const contentBuffer = Buffer.from(request.content, 'utf8');
+    if (contentBuffer.length > MAX_MUTATION_BYTES) {
+      throw ArcError.payloadTooLarge('create_file content exceeds maximum allowed limit of 1 MiB.');
+    }
+
+    const { absolutePath, relativePath, parentDir } = validateMutationPath(
+      workspaceRoot,
+      request.path,
+      this.fsOps,
+    );
+
+    // Immediate parent directory must already exist
+    let parentSt;
+    try {
+      parentSt = this.fsOps.lstat(parentDir);
+    } catch (err: unknown) {
+      const code = (err as { code?: string }).code;
+      if (code === 'ENOENT') {
+        throw ArcError.parentNotFound('Immediate parent directory does not exist.');
+      }
+      throw err;
+    }
+
+    if (!parentSt.isDirectory()) {
+      throw ArcError.notADirectory('Immediate parent path is not a directory.');
+    }
+    if (parentSt.isSymbolicLink()) {
+      throw ArcError.unsafeSymlink('Immediate parent path is a symbolic link.');
+    }
+
+    return this.lockManager.withLocks([absolutePath], async () => {
+      try {
+        const existing = this.fsOps.lstat(absolutePath);
+        if (existing) {
+          throw ArcError.alreadyExists('Target file already exists.');
+        }
+      } catch (err: unknown) {
+        if (err instanceof ArcError) {
+          throw err;
+        }
+        const code = (err as { code?: string }).code;
+        if (code !== 'ENOENT') {
+          throw err;
+        }
+      }
+
+      const tmpPath = join(parentDir, `.arc-tmp-${randomUUID()}`);
+      let tmpCreated = false;
+      let fd: number | undefined;
+
+      try {
+        fd = this.fsOps.open(tmpPath, 'wx', 0o644);
+        tmpCreated = true;
+        this.fsOps.write(fd, contentBuffer);
+        this.fsOps.fsync(fd);
+        this.fsOps.close(fd);
+        fd = undefined;
+
+        try {
+          this.fsOps.link(tmpPath, absolutePath);
+        } catch (linkErr: unknown) {
+          const code = (linkErr as { code?: string }).code;
+          if (code === 'EEXIST') {
+            throw ArcError.alreadyExists('Target file already exists.');
+          }
+          throw linkErr;
+        }
+
+        this.fsOps.unlink(tmpPath);
+        tmpCreated = false;
+      } finally {
+        if (fd !== undefined) {
+          try {
+            this.fsOps.close(fd);
+          } catch {
+            // ignore
+          }
+        }
+        if (tmpCreated) {
+          try {
+            this.fsOps.unlink(tmpPath);
+          } catch {
+            // ignore
+          }
+        }
+      }
+
+      return {
+        path: relativePath,
+        bytesWritten: contentBuffer.length,
+        contentHash: computeSha256(contentBuffer),
+        created: true,
+      };
+    });
+  }
+
+  public async writeFile(
+    workspaceRoot: string,
+    request: WriteFileRequest,
+  ): Promise<WriteFileResponse> {
+    if (!request || typeof request !== 'object') {
+      throw ArcError.invalidRequestSchema('Invalid request payload.');
+    }
+    if (typeof request.content !== 'string') {
+      throw ArcError.invalidRequestSchema('content must be a string.');
+    }
+    if (request.overwrite !== true) {
+      throw ArcError.invalidRequestSchema('overwrite must be explicitly true.');
+    }
+
+    const expectedHash = validateExpectedHash(request.expectedHash);
+    const contentBuffer = Buffer.from(request.content, 'utf8');
+    if (contentBuffer.length > MAX_MUTATION_BYTES) {
+      throw ArcError.payloadTooLarge('write_file content exceeds maximum allowed limit of 1 MiB.');
+    }
+
+    const { absolutePath, relativePath, parentDir } = validateMutationPath(
+      workspaceRoot,
+      request.path,
+      this.fsOps,
+    );
+
+    return this.lockManager.withLocks([absolutePath], async () => {
+      const initial = captureFileIdentity(this.fsOps, absolutePath);
+      if (initial.hash !== expectedHash) {
+        throw ArcError.conflictPreconditionFailed('Current file hash does not match expectedHash.');
+      }
+
+      const tmpPath = join(parentDir, `.arc-tmp-${randomUUID()}`);
+      let tmpCreated = false;
+      let fd: number | undefined;
+
+      try {
+        fd = this.fsOps.open(tmpPath, 'wx', initial.mode);
+        tmpCreated = true;
+        this.fsOps.write(fd, contentBuffer);
+        this.fsOps.fsync(fd);
+        this.fsOps.close(fd);
+        fd = undefined;
+
+        verifyPrecommitIdentity(this.fsOps, absolutePath, {
+          dev: initial.dev,
+          ino: initial.ino,
+          hash: expectedHash,
+        });
+
+        this.fsOps.rename(tmpPath, absolutePath);
+        tmpCreated = false;
+      } finally {
+        if (fd !== undefined) {
+          try {
+            this.fsOps.close(fd);
+          } catch {
+            // ignore
+          }
+        }
+        if (tmpCreated) {
+          try {
+            this.fsOps.unlink(tmpPath);
+          } catch {
+            // ignore
+          }
+        }
+      }
+
+      return {
+        path: relativePath,
+        bytesWritten: contentBuffer.length,
+        contentHash: computeSha256(contentBuffer),
+        previousHash: initial.hash,
+      };
+    });
+  }
+
+  public async deleteFile(
+    workspaceRoot: string,
+    request: DeleteFileRequest,
+  ): Promise<DeleteFileResponse> {
+    if (!request || typeof request !== 'object') {
+      throw ArcError.invalidRequestSchema('Invalid request payload.');
+    }
+    const expectedHash = validateExpectedHash(request.expectedHash);
+
+    const { absolutePath, relativePath } = validateMutationPath(
+      workspaceRoot,
+      request.path,
+      this.fsOps,
+    );
+
+    return this.lockManager.withLocks([absolutePath], async () => {
+      const initial = captureFileIdentity(this.fsOps, absolutePath);
+      if (initial.hash !== expectedHash) {
+        throw ArcError.conflictPreconditionFailed('Current file hash does not match expectedHash.');
+      }
+
+      verifyPrecommitIdentity(this.fsOps, absolutePath, {
+        dev: initial.dev,
+        ino: initial.ino,
+        hash: expectedHash,
+      });
+
+      this.fsOps.unlink(absolutePath);
+
+      return {
+        path: relativePath,
+        deleted: true,
+        contentHash: initial.hash,
+      };
+    });
+  }
+
+  public async moveFile(
+    workspaceRoot: string,
+    request: MoveFileRequest,
+  ): Promise<MoveFileResponse> {
+    if (!request || typeof request !== 'object') {
+      throw ArcError.invalidRequestSchema('Invalid request payload.');
+    }
+    const expectedSourceHash = validateExpectedHash(
+      request.expectedSourceHash,
+      'expectedSourceHash',
+    );
+
+    const src = validateMutationPath(workspaceRoot, request.sourcePath, this.fsOps);
+    const dest = validateMutationPath(workspaceRoot, request.destinationPath, this.fsOps);
+
+    if (src.absolutePath === dest.absolutePath) {
+      throw ArcError.alreadyExists('Destination path is identical to source path.');
+    }
+
+    // Destination parent directory must exist
+    let destParentSt;
+    try {
+      destParentSt = this.fsOps.lstat(dest.parentDir);
+    } catch (err: unknown) {
+      const code = (err as { code?: string }).code;
+      if (code === 'ENOENT') {
+        throw ArcError.parentNotFound('Destination parent directory does not exist.');
+      }
+      throw err;
+    }
+
+    if (!destParentSt.isDirectory()) {
+      throw ArcError.notADirectory('Destination parent path is not a directory.');
+    }
+    if (destParentSt.isSymbolicLink()) {
+      throw ArcError.unsafeSymlink('Destination parent path is a symbolic link.');
+    }
+
+    return this.lockManager.withLocks([src.absolutePath, dest.absolutePath], async () => {
+      const srcInitial = captureFileIdentity(this.fsOps, src.absolutePath);
+      if (srcInitial.hash !== expectedSourceHash) {
+        throw ArcError.conflictPreconditionFailed(
+          'Current source file hash does not match expectedSourceHash.',
+        );
+      }
+
+      try {
+        const destSt = this.fsOps.lstat(dest.absolutePath);
+        if (destSt) {
+          throw ArcError.alreadyExists('Destination file already exists.');
+        }
+      } catch (err: unknown) {
+        if (err instanceof ArcError) {
+          throw err;
+        }
+        const code = (err as { code?: string }).code;
+        if (code !== 'ENOENT') {
+          throw err;
+        }
+      }
+
+      verifyPrecommitIdentity(this.fsOps, src.absolutePath, {
+        dev: srcInitial.dev,
+        ino: srcInitial.ino,
+        hash: expectedSourceHash,
+      });
+
+      try {
+        this.fsOps.link(src.absolutePath, dest.absolutePath);
+      } catch (err: unknown) {
+        const code = (err as { code?: string }).code;
+        if (code === 'EEXIST') {
+          throw ArcError.alreadyExists('Destination file already exists.');
+        }
+        if (code === 'EXDEV') {
+          throw ArcError.crossDeviceMoveUnsupported('Cross-device move is not supported.');
+        }
+        throw err;
+      }
+
+      const destSt = this.fsOps.lstat(dest.absolutePath);
+      if (destSt.dev !== srcInitial.dev || destSt.ino !== srcInitial.ino) {
+        try {
+          this.fsOps.unlink(dest.absolutePath);
+        } catch {
+          // ignore
+        }
+        throw ArcError.conflictPreconditionFailed(
+          'Destination link identity does not match source file.',
+        );
+      }
+
+      try {
+        this.fsOps.unlink(src.absolutePath);
+      } catch (unlinkErr: unknown) {
+        try {
+          this.fsOps.unlink(dest.absolutePath);
+        } catch {
+          throw ArcError.rollbackFailed(
+            'Move failed and rollback could not remove linked destination.',
+            {
+              sourcePath: src.relativePath,
+              destinationPath: dest.relativePath,
+            },
+          );
+        }
+        throw unlinkErr;
+      }
+
+      return {
+        sourcePath: src.relativePath,
+        destinationPath: dest.relativePath,
+        moved: true,
+      };
+    });
   }
 }
 
