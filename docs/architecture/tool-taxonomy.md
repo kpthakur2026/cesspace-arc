@@ -190,15 +190,17 @@ Read-only tools provide visibility into development environments without alterin
 
 These tools modify files, run commands, or interact with processes. They are strictly governed by policy and human approval.
 
-| Tool Name             | Stage | Primary Function                                             | Default Policy Outcome                                        |
-| :-------------------- | :---- | :----------------------------------------------------------- | :------------------------------------------------------------ |
-| `run_command`         | RC-02 | Execute whitelisted command with argv array and timeout.     | `REQUIRE APPROVAL` (or `ALLOW` for pre-approved test runners) |
-| `read_command_output` | RC-02 | Read stdout/stderr stream from running or completed command. | `ALLOW` (scoped to caller's task ID)                          |
-| `cancel_command`      | RC-02 | Terminate running command task via SIGTERM/SIGKILL.          | `ALLOW` (scoped to caller's task ID)                          |
-| `process_list`        | RC-02 | List processes spawned by the control plane.                 | `ALLOW`                                                       |
-| `apply_patch`         | RC-03 | Apply unified diff patch to workspace files atomically.      | `REQUIRE APPROVAL`                                            |
-| `write_file`          | RC-03 | Write complete contents to a file inside authorized root.    | `REQUIRE APPROVAL`                                            |
-| `create_file`         | RC-03 | Create a new file within authorized root.                    | `REQUIRE APPROVAL`                                            |
+| Tool Name           | Stage | Primary Function                                                 | Default Policy Outcome                                        |
+| :------------------ | :---- | :--------------------------------------------------------------- | :------------------------------------------------------------ |
+| `run_command`       | RC-02 | Execute whitelisted command with argv array and timeout.         | `REQUIRE APPROVAL` (or `ALLOW` for pre-approved test runners) |
+| `process_status`    | RC-02 | Query process execution state by opaque process ID.              | `ALLOW` (scoped to caller identity and workspace)             |
+| `process_output`    | RC-02 | Read bounded stdout/stderr streams from running or exited child. | `ALLOW` (scoped to caller identity and workspace)             |
+| `terminate_process` | RC-02 | Terminate running command task via SIGTERM/SIGKILL.              | `ALLOW` (scoped to caller identity and workspace)             |
+| `create_file`       | RC-03 | Create a new file within authorized root.                        | `REQUIRE APPROVAL`                                            |
+| `write_file`        | RC-03 | Write complete contents to a file inside authorized root.        | `REQUIRE APPROVAL`                                            |
+| `apply_patch`       | RC-03 | Apply unified diff patch to workspace files atomically.          | `REQUIRE APPROVAL`                                            |
+| `delete_file`       | RC-03 | Delete a single authorized file within workspace root.           | `REQUIRE APPROVAL`                                            |
+| `move_file`         | RC-03 | Move or rename an authorized file within workspace root.         | `REQUIRE APPROVAL`                                            |
 
 ---
 
