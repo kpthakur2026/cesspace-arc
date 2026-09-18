@@ -1684,4 +1684,185 @@ rules: []
       }
     });
   });
+  // =========================================================================
+  // 12. Task 4.2: canonical review targets and move fail-closed completeness
+  // =========================================================================
+
+  describe('Canonical review targets', () => {
+    test('RC04-M-58: move_file fails the WHOLE request closed when either path is unsafe', async () => {
+      const { server, approvals, filesystem, dir } = makeServer({ workspaceName: 'move-block' });
+      fs.writeFileSync(path.join(dir, 'from.txt'), 'move me\n');
+      const absoluteInside = path.join(dir, 'abs.txt');
+      const nulName = `bad${String.fromCharCode(0)}name.txt`;
+
+      const unsafeOperands = [
+        absoluteInside,
+        '/etc/passwd',
+        'C:/ws/x.txt',
+        '../outside.txt',
+        '../../etc/passwd',
+        'bad\\name.txt',
+        nulName,
+      ];
+
+      let index = 0;
+      for (const unsafe of unsafeOperands) {
+        for (const side of ['source', 'destination']) {
+          index++;
+          const safe = `safe-${index}.txt`;
+          const params =
+            side === 'source'
+              ? { sourcePath: unsafe, destinationPath: safe, expectedSourceHash: '0'.repeat(64) }
+              : {
+                  sourcePath: 'from.txt',
+                  destinationPath: unsafe,
+                  expectedSourceHash: '0'.repeat(64),
+                };
+
+          const res = await server.dispatchToolCall('move_file', { ...params, workspaceId: 'ws' });
+          const parsed = body(res);
+          assert.equal(
+            parsed.code,
+            'POLICY_DENIED',
+            `${side}=${JSON.stringify(unsafe)} must deny the whole request`,
+          );
+          assert.ok(!JSON.stringify(parsed).includes(dir), 'host path must not be echoed');
+          assert.ok(parsed.message !== undefined);
+        }
+      }
+
+      // Zero approvals, zero consumption, zero filesystem invocation.
+      assert.equal(approvals.listActive().length, 0, 'no approval may be created');
+      assert.equal(filesystem.calls.length, 0, 'no subsystem invocation');
+      assert.equal(fs.existsSync(path.join(dir, 'from.txt')), true, 'source untouched');
+      assert.equal(filesystem.calls.filter((c) => c.method === 'moveFile').length, 0);
+    });
+
+    test('RC04-M-59: an absolute move source or destination never creates an approval', async () => {
+      const { server, approvals, filesystem, dir } = makeServer({ workspaceName: 'move-abs' });
+      fs.writeFileSync(path.join(dir, 'from.txt'), 'x\n');
+      const absolute = path.join(dir, 'from.txt');
+
+      // Absolute source, safe destination.
+      const forward = await server.dispatchToolCall('move_file', {
+        sourcePath: absolute,
+        destinationPath: 'safe.txt',
+        expectedSourceHash: '0'.repeat(64),
+        workspaceId: 'ws',
+      });
+      assert.equal(body(forward).code, 'POLICY_DENIED');
+
+      // Safe source, absolute destination.
+      const reverse = await server.dispatchToolCall('move_file', {
+        sourcePath: 'from.txt',
+        destinationPath: absolute,
+        expectedSourceHash: '0'.repeat(64),
+        workspaceId: 'ws',
+      });
+      assert.equal(body(reverse).code, 'POLICY_DENIED');
+
+      assert.equal(approvals.listActive().length, 0);
+      assert.equal(filesystem.calls.length, 0);
+    });
+
+    test('RC04-M-60: reviewSummary shows the canonical target, not the raw spelling', async () => {
+      const { server, approvals, dir } = makeServer({ workspaceName: 'canon-create' });
+      const res = await server.dispatchToolCall('create_file', {
+        path: 'dir/../actual.txt',
+        content: 'x',
+        workspaceId: 'ws',
+      });
+      const requestId = body(res).details.approvalRequestId;
+      const summary = approvals.getRequest(requestId).reviewSummary;
+      assert.deepEqual(summary.targetPaths, ['actual.txt'], 'the operator reviews the real target');
+      void dir;
+    });
+
+    test('RC04-M-61: move_file reviewSummary shows both canonical targets', async () => {
+      const { server, approvals, dir } = makeServer({ workspaceName: 'canon-move' });
+      fs.writeFileSync(path.join(dir, 'from.txt'), 'x\n');
+      const res = await server.dispatchToolCall('move_file', {
+        sourcePath: 'src/../from.txt',
+        destinationPath: 'tmp/../to.txt',
+        expectedSourceHash: '0'.repeat(64),
+        workspaceId: 'ws',
+      });
+      const requestId = body(res).details.approvalRequestId;
+      const summary = approvals.getRequest(requestId).reviewSummary;
+      assert.deepEqual(summary.targetPaths, ['from.txt', 'to.txt']);
+    });
+
+    test('RC04-M-62: apply_patch reviewSummary keeps parser-derived canonical targets', async () => {
+      const { server, approvals, dir } = makeServer({ workspaceName: 'canon-patch' });
+      fs.writeFileSync(path.join(dir, 'p.txt'), 'line1\nline2\nline3\n');
+      const patch = '--- a/p.txt\n+++ b/p.txt\n@@ -1,3 +1,3 @@\n-line1\n+P\n line2\n line3\n';
+      const res = await server.dispatchToolCall('apply_patch', { patch, workspaceId: 'ws' });
+      const requestId = body(res).details.approvalRequestId;
+      assert.deepEqual(approvals.getRequest(requestId).reviewSummary.targetPaths, ['p.txt']);
+    });
+
+    test('RC04-M-63: a non-canonical but legal path is reviewed canonically and executes there', async () => {
+      const { server, approvals, filesystem, dir } = makeServer({ workspaceName: 'canon-exec' });
+      fs.mkdirSync(path.join(dir, 'nested'), { recursive: true });
+
+      // The filesystem accepts `nested/../actual.txt`; the operator must be shown
+      // the canonical `actual.txt` BEFORE approving.
+      const params = { path: 'nested/../actual.txt', content: 'landed\n', workspaceId: 'ws' };
+      const first = await server.dispatchToolCall('create_file', { ...params });
+      const firstBody = body(first);
+      assert.equal(firstBody.code, 'APPROVAL_REQUIRED');
+      const requestId = firstBody.details.approvalRequestId;
+
+      const summary = approvals.getRequest(requestId).reviewSummary;
+      assert.deepEqual(
+        summary.targetPaths,
+        ['actual.txt'],
+        'human-reviewed target must be the canonical target',
+      );
+      assert.equal(fs.existsSync(path.join(dir, 'actual.txt')), false, 'nothing yet');
+
+      const token = approvals.approve(requestId).token;
+      const second = await server.dispatchToolCall('create_file', {
+        ...params,
+        _arcApproval: { requestId, token },
+      });
+      assert.equal(second.isError, undefined, JSON.stringify(body(second)));
+      assert.equal(fs.readFileSync(path.join(dir, 'actual.txt'), 'utf8'), 'landed\n');
+      assert.equal(filesystem.calls.length, 1);
+      assert.equal(approvals.getRequest(requestId).state, 'CONSUMED');
+    });
+
+    test('RC04-M-64: executionPayloadHash still binds the exact validated business parameters', async () => {
+      const { server, approvals } = makeServer({ workspaceName: 'canon-hash' });
+
+      // Two spellings that canonicalize to the SAME review target are still two
+      // DIFFERENT business requests, so they must not collide in the approval
+      // binding or dedup.
+      const plain = await server.dispatchToolCall('create_file', {
+        path: 'same.txt',
+        content: 'x',
+        workspaceId: 'ws',
+      });
+      const spelled = await server.dispatchToolCall('create_file', {
+        path: './same.txt',
+        content: 'x',
+        workspaceId: 'ws',
+      });
+
+      const plainId = body(plain).details.approvalRequestId;
+      const spelledId = body(spelled).details.approvalRequestId;
+      assert.notEqual(plainId, spelledId, 'distinct business requests must not dedup');
+
+      // ...while both present the SAME canonical target to the operator.
+      assert.deepEqual(approvals.getRequest(plainId).reviewSummary.targetPaths, ['same.txt']);
+      assert.deepEqual(approvals.getRequest(spelledId).reviewSummary.targetPaths, ['same.txt']);
+      assert.equal(approvals.listActive().length, 2);
+
+      // The stored hashes differ, proving the raw validated params are bound.
+      assert.notEqual(
+        approvals.getRequest(plainId).executionPayloadHash,
+        approvals.getRequest(spelledId).executionPayloadHash,
+      );
+    });
+  });
 });

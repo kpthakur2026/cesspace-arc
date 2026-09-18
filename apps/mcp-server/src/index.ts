@@ -32,6 +32,7 @@ import { AdminIpcError, AdminIpcServer } from './admin-ipc.js';
 import {
   ARC_APPROVAL_KEY,
   computeExecutionPayloadHash,
+  deriveCanonicalPathTargets,
   extractArcApproval,
   extractPolicyTargets,
   buildReviewPayload,
@@ -2006,21 +2007,36 @@ export class ArcMcpServer implements IArcMcpServer {
     // One deterministic target-extraction helper feeds every branch; multi-target
     // operations are reduced with the same precedence so the result is
     // independent of target order.
+    // With no engine (fail-closed diagnostic path) the mode is irrelevant;
+    // EXTERNAL keeps the strictest target semantics.
+    const policyMode = policyEngine?.getSourceMode() ?? 'EXTERNAL';
+
+    // ONE authoritative canonical-target derivation, shared by the policy
+    // matcher and the operator review summary, so the human-reviewed target,
+    // the policy target, and the filesystem target can never diverge. It does
+    // not mutate `validatedParams`: the execution payload hash and subsystem
+    // execution remain bound to the exact post-schema validated parameters.
+    const canonicalTargets = deriveCanonicalPathTargets(
+      toolName,
+      validatedParams,
+      targetWorkspace.rootPath,
+      patchTargetPaths,
+      policyMode,
+    );
+
     const layer2Targets = extractPolicyTargets(
       toolName,
       validatedParams,
       targetWorkspace.rootPath,
       patchTargetPaths,
-      // With no engine (fail-closed diagnostic path) the mode is irrelevant;
-      // EXTERNAL keeps the strictest target semantics.
-      policyEngine?.getSourceMode() ?? 'EXTERNAL',
+      policyMode,
     );
 
     // An empty target list means a supplied path had no safe canonical
     // workspace-relative form (traversal, NUL, backslash, or the workspace root
     // itself, which the frozen policy grammar cannot express). Dropping the path
     // would let a `paths` rule silently miss, so the request fails closed.
-    if (layer2Targets.length === 0) {
+    if (canonicalTargets.blocked || layer2Targets.length === 0) {
       return denyWith(
         ArcError.policyDenied('Target path has no safe canonical workspace-relative form.'),
         'deny-unnormalizable-target-path',
@@ -2102,7 +2118,7 @@ export class ArcMcpServer implements IArcMcpServer {
         const { reviewMaterial, reviewSummary } = buildReviewPayload(
           toolName,
           validatedParams,
-          patchTargetPaths,
+          canonicalTargets.paths,
         );
         const snapshot = this.approvalStateManager.createOrReusePending({
           toolName,

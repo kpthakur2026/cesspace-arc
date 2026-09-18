@@ -304,6 +304,138 @@ export function executableBasename(executable: unknown): string | undefined {
  * Multi-target operations return one target per affected path; the caller
  * reduces them with the same most-restrictive precedence.
  */
+export interface CanonicalPathTargets {
+  /**
+   * Canonical workspace-relative paths, in business order. These are the paths
+   * the policy matcher evaluates AND the paths shown to the human operator, so
+   * human-reviewed target == policy target == filesystem target.
+   */
+  paths: string[];
+  /**
+   * True when a REQUIRED business path is unsafe or unrepresentable. The caller
+   * MUST fail the whole request closed; a required path is never silently
+   * dropped.
+   */
+  blocked: boolean;
+}
+
+/**
+ * The ONE authoritative derivation of canonical path targets from validated
+ * business parameters.
+ *
+ * Shared by Layer-2 policy target extraction and by the operator review
+ * summary, so the two can never diverge. It never mutates `validatedParams`:
+ * the execution payload hash and subsystem execution stay bound to the exact
+ * post-schema validated business parameters, and canonicalization feeds only
+ * policy targeting and safe review metadata.
+ */
+export function deriveCanonicalPathTargets(
+  toolName: string,
+  params: Record<string, unknown>,
+  workspaceRoot: string,
+  patchTargetPaths?: readonly string[],
+  policyMode: 'BUILTIN' | 'EXTERNAL' = 'EXTERNAL',
+): CanonicalPathTargets {
+  /**
+   * Normalizes one candidate.
+   *
+   * - a non-empty string: the canonical relative path
+   * - `''`: a safe workspace-root selector. The frozen v1 external grammar has
+   *   no root representation, so EXTERNAL fails closed; BUILTIN falls back to
+   *   the tool-only target (verified RC-01 compatibility).
+   * - `undefined`: no path supplied
+   * - `null`: unsafe/unrepresentable
+   */
+  const normalize = (candidate: unknown): string | undefined | null => {
+    const normalized = normalizeTargetPathForPolicy(workspaceRoot, candidate);
+    if (normalized === '') {
+      return policyMode === 'BUILTIN' ? undefined : null;
+    }
+    return normalized;
+  };
+
+  const single = (candidate: unknown): CanonicalPathTargets => {
+    const normalized = normalize(candidate);
+    if (normalized === null) return { paths: [], blocked: true };
+    if (normalized === undefined) return { paths: [], blocked: false };
+    return { paths: [normalized], blocked: false };
+  };
+
+  switch (toolName) {
+    case 'create_file':
+    case 'write_file':
+    case 'delete_file':
+    case 'read_file':
+      return single(params.path);
+
+    case 'move_file': {
+      // BOTH paths are mandatory, and a move operand is always a file: a root
+      // selector is not a valid operand. If EITHER side is unsafe, absent, or
+      // the root, the whole request fails closed. Evaluating only the surviving
+      // side would let an unreviewed target be moved.
+      const source = normalizeTargetPathForPolicy(workspaceRoot, params.sourcePath);
+      const destination = normalizeTargetPathForPolicy(workspaceRoot, params.destinationPath);
+      if (
+        source === null ||
+        source === undefined ||
+        source === '' ||
+        destination === null ||
+        destination === undefined ||
+        destination === ''
+      ) {
+        return { paths: [], blocked: true };
+      }
+      return { paths: [source, destination], blocked: false };
+    }
+
+    case 'apply_patch': {
+      const rawPaths = patchTargetPaths ?? [];
+      if (rawPaths.length === 0) return { paths: [], blocked: false };
+      const paths: string[] = [];
+      for (const rawPath of rawPaths) {
+        const normalized = normalize(rawPath);
+        // A patch target is a file path; a root selector is not a valid target.
+        if (normalized === null || normalized === undefined || normalized === '') {
+          return { paths: [], blocked: true };
+        }
+        paths.push(normalized);
+      }
+      return { paths, blocked: false };
+    }
+
+    case 'run_command': {
+      const cwd = normalize(params.cwd);
+      if (cwd === null) return { paths: [], blocked: true };
+      return { paths: cwd === undefined ? [] : [cwd], blocked: false };
+    }
+
+    case 'list_directory':
+      return single(params.path);
+
+    case 'search_files':
+      return single(params.subPath);
+
+    case 'search_text': {
+      const filePattern = asString(params.filePattern);
+      return { paths: filePattern === undefined ? [] : [filePattern], blocked: false };
+    }
+
+    case 'git_diff':
+    case 'git_log':
+      return single(params.path);
+
+    default:
+      return { paths: [], blocked: false };
+  }
+}
+
+/**
+ * Maps canonical paths into deterministic policy match targets.
+ *
+ * Multi-target operations return one target per affected path; the caller
+ * reduces them with the same most-restrictive precedence. An empty array means
+ * the request must fail closed (see {@link deriveCanonicalPathTargets}).
+ */
 export function extractPolicyTargets(
   toolName: string,
   params: Record<string, unknown>,
@@ -312,110 +444,51 @@ export function extractPolicyTargets(
   policyMode: 'BUILTIN' | 'EXTERNAL' = 'EXTERNAL',
 ): PolicyMatchTarget[] {
   const base: PolicyMatchTarget = { toolName };
-
-  /**
-   * Adds a normalized path target.
-   *
-   * `null` means the path has no safe canonical relative form at all; the whole
-   * request fails closed, signalled by returning `null` here.
-   *
-   * `''` means the candidate safely denotes the WORKSPACE ROOT. The frozen v1
-   * external grammar cannot represent the root, so an EXTERNAL policy keeps
-   * failing it closed; the BUILTIN compatibility policy falls back to the
-   * tool-only base target, preserving the verified RC-01 behaviour.
-   */
-  const withPath = (candidate: unknown): PolicyMatchTarget | null | undefined => {
-    const normalized = normalizeTargetPathForPolicy(workspaceRoot, candidate);
-    if (normalized === null) return null;
-    if (normalized === undefined) return undefined;
-    if (normalized === '') {
-      return policyMode === 'BUILTIN' ? base : null;
-    }
-    return { ...base, path: normalized };
-  };
+  const canonical = deriveCanonicalPathTargets(
+    toolName,
+    params,
+    workspaceRoot,
+    patchTargetPaths,
+    policyMode,
+  );
 
   switch (toolName) {
-    case 'create_file':
-    case 'write_file':
-    case 'delete_file':
-    case 'read_file': {
-      const target = withPath(params.path);
-      return target === null || target === undefined ? [] : [target];
-    }
-
-    case 'move_file': {
-      const source = withPath(params.sourcePath);
-      const destination = withPath(params.destinationPath);
-      const targets: PolicyMatchTarget[] = [];
-      if (source !== null && source !== undefined) targets.push(source);
-      if (destination !== null && destination !== undefined) targets.push(destination);
-      return targets;
-    }
-
-    case 'apply_patch': {
-      const paths = patchTargetPaths ?? [];
-      if (paths.length === 0) return [base];
-      const targets: PolicyMatchTarget[] = [];
-      for (const rawPath of paths) {
-        const target = withPath(rawPath);
-        if (target === null || target === undefined) return [];
-        targets.push(target);
-      }
-      return targets;
-    }
-
     case 'run_command': {
-      const executableBasenameValue = executableBasename(params.executable);
       const target: PolicyMatchTarget = { ...base };
-      if (executableBasenameValue !== undefined) {
-        target.executableBasename = executableBasenameValue;
+      const executable = executableBasename(params.executable);
+      if (executable !== undefined) {
+        target.executableBasename = executable;
       }
-      const cwdTarget = withPath(params.cwd);
-      if (cwdTarget === null) return [];
-      if (cwdTarget !== undefined) target.path = cwdTarget.path;
+      if (canonical.paths.length > 0) {
+        target.path = canonical.paths[0];
+      }
       return [target];
-    }
-
-    case 'list_directory': {
-      const target = withPath(params.path);
-      return target === null ? [] : target === undefined ? [base] : [target];
-    }
-
-    case 'search_files': {
-      const target = withPath(params.subPath);
-      return target === null ? [] : target === undefined ? [base] : [target];
-    }
-
-    case 'search_text': {
-      const filePattern = asString(params.filePattern);
-      return filePattern === undefined ? [base] : [{ ...base, path: filePattern }];
     }
 
     case 'git_status':
       return [{ ...base, gitAction: 'status' }];
 
-    case 'git_diff': {
-      const target = withPath(params.path);
-      return target === null
-        ? []
-        : [
-            target === undefined
-              ? { ...base, gitAction: 'diff' }
-              : { ...target, gitAction: 'diff' },
-          ];
-    }
+    case 'git_diff':
+      return canonical.paths.length === 0
+        ? [{ ...base, gitAction: 'diff' }]
+        : [{ ...base, path: canonical.paths[0], gitAction: 'diff' }];
 
-    case 'git_log': {
-      const target = withPath(params.path);
-      return target === null
-        ? []
-        : [target === undefined ? { ...base, gitAction: 'log' } : { ...target, gitAction: 'log' }];
-    }
+    case 'git_log':
+      return canonical.paths.length === 0
+        ? [{ ...base, gitAction: 'log' }]
+        : [{ ...base, path: canonical.paths[0], gitAction: 'log' }];
 
-    default:
-      // Process/system tools have no synthetic policy target: revision strings
-      // are never reinterpreted as branches merely to make a matcher match.
-      return [base];
+    case 'search_text':
+      return canonical.paths.length === 0 ? [base] : [{ ...base, path: canonical.paths[0] }];
+
+    default: {
+      // A single-path tool with no path supplied still evaluates as the
+      // tool-only base target.
+      if (canonical.paths.length === 0) {
+        return [base];
+      }
+      return canonical.paths.map((path) => ({ ...base, path }));
+    }
   }
 }
 
@@ -517,16 +590,23 @@ function boundTargetPaths(paths: readonly string[]): string[] {
 export function buildReviewPayload(
   toolName: string,
   params: Record<string, unknown>,
-  patchTargetPaths?: readonly string[],
+  /**
+   * Canonical workspace-relative targets from the shared derivation
+   * ({@link deriveCanonicalPathTargets}). Raw parameter spellings are never
+   * used here, so the operator reviews the same target the policy matcher and
+   * the filesystem act on.
+   */
+  canonicalTargetPaths: readonly string[] = [],
 ): ReviewMaterialAndSummary {
   switch (toolName) {
     case 'create_file': {
       const content = typeof params.content === 'string' ? params.content : '';
-      const path = asString(params.path);
       return {
         reviewMaterial: content,
         reviewSummary: {
-          ...(path === undefined ? {} : { targetPaths: boundTargetPaths([path]) }),
+          ...(canonicalTargetPaths.length === 0
+            ? {}
+            : { targetPaths: boundTargetPaths(canonicalTargetPaths) }),
           contentBytes: Buffer.byteLength(content, 'utf8'),
           contentHash: sha256OfText(content),
         },
@@ -535,12 +615,13 @@ export function buildReviewPayload(
 
     case 'write_file': {
       const content = typeof params.content === 'string' ? params.content : '';
-      const path = asString(params.path);
       const expectedHash = asString(params.expectedHash);
       return {
         reviewMaterial: content,
         reviewSummary: {
-          ...(path === undefined ? {} : { targetPaths: boundTargetPaths([path]) }),
+          ...(canonicalTargetPaths.length === 0
+            ? {}
+            : { targetPaths: boundTargetPaths(canonicalTargetPaths) }),
           contentBytes: Buffer.byteLength(content, 'utf8'),
           contentHash: sha256OfText(content),
           ...(expectedHash === undefined ? {} : { expectedHash: expectedHash.toLowerCase() }),
@@ -550,27 +631,27 @@ export function buildReviewPayload(
     }
 
     case 'delete_file': {
-      const path = asString(params.path);
       const expectedHash = asString(params.expectedHash);
       // A delete has no body to review; the safe summary is sufficient.
       return {
         reviewMaterial: undefined,
         reviewSummary: {
-          ...(path === undefined ? {} : { targetPaths: boundTargetPaths([path]) }),
+          ...(canonicalTargetPaths.length === 0
+            ? {}
+            : { targetPaths: boundTargetPaths(canonicalTargetPaths) }),
           ...(expectedHash === undefined ? {} : { expectedHash: expectedHash.toLowerCase() }),
         },
       };
     }
 
     case 'move_file': {
-      const sourcePath = asString(params.sourcePath);
-      const destinationPath = asString(params.destinationPath);
       const expectedSourceHash = asString(params.expectedSourceHash);
-      const paths = [sourcePath, destinationPath].filter((p): p is string => p !== undefined);
       return {
         reviewMaterial: undefined,
         reviewSummary: {
-          ...(paths.length === 0 ? {} : { targetPaths: boundTargetPaths(paths) }),
+          ...(canonicalTargetPaths.length === 0
+            ? {}
+            : { targetPaths: boundTargetPaths(canonicalTargetPaths) }),
           ...(expectedSourceHash === undefined
             ? {}
             : { expectedSourceHash: expectedSourceHash.toLowerCase() }),
@@ -580,11 +661,12 @@ export function buildReviewPayload(
 
     case 'apply_patch': {
       const patch = typeof params.patch === 'string' ? params.patch : '';
-      const paths = patchTargetPaths ?? [];
       return {
         reviewMaterial: patch,
         reviewSummary: {
-          ...(paths.length === 0 ? {} : { targetPaths: boundTargetPaths(paths) }),
+          ...(canonicalTargetPaths.length === 0
+            ? {}
+            : { targetPaths: boundTargetPaths(canonicalTargetPaths) }),
           patchBytes: Buffer.byteLength(patch, 'utf8'),
           patchHash: sha256OfText(patch),
           dryRun: params.dryRun === true,
