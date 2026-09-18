@@ -1865,4 +1865,131 @@ rules: []
       );
     });
   });
+  // =========================================================================
+  // 13. Task 4.3: no target-less mutation approval
+  // =========================================================================
+
+  describe('Root mutation targets are blocked', () => {
+    test('RC04-M-65: BUILTIN create/write/delete with a root selector is denied with no approval', async () => {
+      const { server, approvals, filesystem } = makeServer({ workspaceName: 'root-mut-block' });
+
+      const requests = [
+        ['create_file', { path: '.', content: 'x' }],
+        ['create_file', { path: './', content: 'x' }],
+        ['write_file', { path: '.', content: 'x', expectedHash: '0'.repeat(64), overwrite: true }],
+        ['delete_file', { path: '.', expectedHash: '0'.repeat(64) }],
+      ];
+
+      for (const [tool, params] of requests) {
+        const res = await server.dispatchToolCall(tool, { ...params, workspaceId: 'ws' });
+        const parsed = body(res);
+        assert.equal(
+          parsed.code,
+          'POLICY_DENIED',
+          `${tool} ${JSON.stringify(params.path)} must be denied, got ${parsed.code}`,
+        );
+      }
+
+      assert.equal(approvals.listActive().length, 0, 'zero approval records');
+      assert.equal(filesystem.calls.length, 0, 'zero subsystem calls');
+    });
+
+    test('RC04-M-66: BUILTIN list_directory with a root selector still succeeds', async () => {
+      const { server, dir } = makeServer({ workspaceName: 'root-mut-compat' });
+      fs.writeFileSync(path.join(dir, 'visible.txt'), 'x\n');
+
+      const res = await server.dispatchToolCall('list_directory', {
+        path: '.',
+        recursive: true,
+        maxDepth: 2,
+        workspaceId: 'ws',
+      });
+      assert.equal(res.isError, undefined, JSON.stringify(res.content[0].text));
+      const entries = JSON.parse(res.content[0].text).entries;
+      assert.ok(entries.some((e) => e.name === 'visible.txt'));
+    });
+
+    test('RC04-M-67: move_file root operands and unrepresentable patch targets stay denied', async () => {
+      const { server, approvals, filesystem } = makeServer({ workspaceName: 'root-mut-others' });
+
+      for (const params of [
+        { sourcePath: '.', destinationPath: 'x.txt', expectedSourceHash: '0'.repeat(64) },
+        { sourcePath: 'x.txt', destinationPath: '.', expectedSourceHash: '0'.repeat(64) },
+        { sourcePath: '.', destinationPath: '.', expectedSourceHash: '0'.repeat(64) },
+      ]) {
+        const res = await server.dispatchToolCall('move_file', { ...params, workspaceId: 'ws' });
+        assert.equal(body(res).code, 'POLICY_DENIED', JSON.stringify(params));
+      }
+
+      // A patch whose declared target is the root or otherwise unrepresentable.
+      for (const patch of [
+        '--- a/.\n+++ b/.\n@@ -1 +1 @@\n-a\n+b\n',
+        '--- a/../outside.txt\n+++ b/../outside.txt\n@@ -1 +1 @@\n-a\n+b\n',
+      ]) {
+        const res = await server.dispatchToolCall('apply_patch', { patch, workspaceId: 'ws' });
+        // The authoritative parser accepts both spellings; the canonical-target
+        // derivation then blocks them, so the denial is POLICY_DENIED.
+        assert.equal(body(res).code, 'POLICY_DENIED', patch.split('\n')[0]);
+      }
+
+      assert.equal(approvals.listActive().length, 0);
+      assert.equal(filesystem.calls.length, 0);
+    });
+
+    test('RC04-M-68: every mutation approval carries a complete review target list', async () => {
+      const { server, approvals, dir } = makeServer({ workspaceName: 'target-invariant' });
+      fs.writeFileSync(path.join(dir, 'inv.txt'), 'line1\nline2\nline3\n');
+      fs.writeFileSync(path.join(dir, 'inv2.txt'), 'line1\nline2\nline3\n');
+
+      const twoFilePatch =
+        '--- a/inv.txt\n+++ b/inv.txt\n@@ -1,3 +1,3 @@\n-line1\n+A\n line2\n line3\n' +
+        '--- a/inv2.txt\n+++ b/inv2.txt\n@@ -1,3 +1,3 @@\n-line1\n+B\n line2\n line3\n';
+
+      const cases = [
+        ['create_file', { path: 'inv-new.txt', content: 'x' }, 1],
+        [
+          'write_file',
+          { path: 'inv.txt', content: 'y', expectedHash: '0'.repeat(64), overwrite: true },
+          1,
+        ],
+        ['delete_file', { path: 'inv.txt', expectedHash: '0'.repeat(64) }, 1],
+        [
+          'move_file',
+          {
+            sourcePath: 'inv.txt',
+            destinationPath: 'moved.txt',
+            expectedSourceHash: '0'.repeat(64),
+          },
+          2,
+        ],
+        ['apply_patch', { patch: twoFilePatch }, 2],
+      ];
+
+      for (const [tool, params, expectedTargetCount] of cases) {
+        const res = await server.dispatchToolCall(tool, { ...params, workspaceId: 'ws' });
+        const parsed = body(res);
+        assert.equal(parsed.code, 'APPROVAL_REQUIRED', `${tool} must require approval`);
+
+        const snapshot = approvals.getRequest(parsed.details.approvalRequestId);
+        assert.ok(snapshot.reviewSummary, `${tool}: reviewSummary must be present`);
+        assert.ok(
+          Array.isArray(snapshot.reviewSummary.targetPaths),
+          `${tool}: targetPaths must be present`,
+        );
+        assert.ok(
+          snapshot.reviewSummary.targetPaths.length >= 1,
+          `${tool}: a mutation approval must never be target-less`,
+        );
+        assert.equal(
+          snapshot.reviewSummary.targetPaths.length,
+          expectedTargetCount,
+          `${tool}: every required mutation target must be listed`,
+        );
+        for (const path of snapshot.reviewSummary.targetPaths) {
+          assert.ok(path.length > 0, `${tool}: target path must be non-empty`);
+          assert.ok(!path.startsWith('/'), `${tool}: target path must be workspace-relative`);
+        }
+      }
+    });
+  });
 });

@@ -361,10 +361,32 @@ export function deriveCanonicalPathTargets(
     return { paths: [normalized], blocked: false };
   };
 
+  /**
+   * A required FILE-MUTATION target.
+   *
+   * The workspace-root sentinel is BLOCKED here regardless of policy mode. A
+   * file mutation must always have a concrete canonical target, and a human must
+   * never be asked to approve a mutation whose actual target is absent from the
+   * review summary. This is stricter than {@link single}, which keeps the
+   * verified BUILTIN root compatibility for read-only tools where the workspace
+   * root is a legitimate target.
+   */
+  const singleFileTarget = (candidate: unknown): CanonicalPathTargets => {
+    const normalized = normalizeTargetPathForPolicy(workspaceRoot, candidate);
+    if (normalized === null || normalized === undefined || normalized === '') {
+      return { paths: [], blocked: true };
+    }
+    return { paths: [normalized], blocked: false };
+  };
+
   switch (toolName) {
+    // Required file-mutation targets: never target-less.
     case 'create_file':
     case 'write_file':
     case 'delete_file':
+      return singleFileTarget(params.path);
+
+    // Read-only: keeps existing BUILTIN root-selector compatibility.
     case 'read_file':
       return single(params.path);
 
