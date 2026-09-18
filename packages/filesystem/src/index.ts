@@ -29,15 +29,19 @@ import {
   type DeleteFileResponse,
   type MoveFileRequest,
   type MoveFileResponse,
+  type ApplyPatchRequest,
+  type ApplyPatchResponse,
 } from '@cesspace-arc/protocol';
 
 export * from './fs-ops.js';
 export * from './locks.js';
 export * from './mutation-security.js';
 export * from './file-identity.js';
+export * from './patch-engine.js';
 
 import { type IFilesystemOps, NodeFilesystemOps } from './fs-ops.js';
 import { type ILockManager, defaultLockManager } from './locks.js';
+import { applyPatch } from './patch-engine.js';
 import {
   MAX_MUTATION_BYTES,
   validateMutationPath,
@@ -67,6 +71,7 @@ export interface IFilesystemSubsystem {
   writeFile(workspaceRoot: string, request: WriteFileRequest): Promise<WriteFileResponse>;
   deleteFile(workspaceRoot: string, request: DeleteFileRequest): Promise<DeleteFileResponse>;
   moveFile(workspaceRoot: string, request: MoveFileRequest): Promise<MoveFileResponse>;
+  applyPatch(workspaceRoot: string, request: ApplyPatchRequest): Promise<ApplyPatchResponse>;
 }
 
 /**
@@ -940,6 +945,13 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
         moved: true,
       };
     });
+  }
+
+  public async applyPatch(
+    workspaceRoot: string,
+    request: ApplyPatchRequest,
+  ): Promise<ApplyPatchResponse> {
+    return applyPatch(workspaceRoot, request, this.fsOps, this.lockManager);
   }
 }
 

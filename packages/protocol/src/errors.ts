@@ -18,6 +18,7 @@ export type ArcErrorCode =
   | 'INVALID_REQUEST_SCHEMA'
   | 'UNSUPPORTED_METHOD'
   | 'PARSE_ERROR'
+  | 'PATCH_PARSE_ERROR'
 
   // Authentication Errors
   | 'UNAUTHENTICATED'
@@ -47,6 +48,8 @@ export type ArcErrorCode =
   | 'CROSS_DEVICE_MOVE_UNSUPPORTED'
   | 'INVALID_PATH_CHARS'
   | 'NO_WORKSPACE_CONFIGURED'
+  | 'PATCH_PREFLIGHT_FAILED'
+  | 'PATCH_UNSUPPORTED_OPERATION'
 
   // Execution & Resource Errors
   | 'EXECUTION_TIMEOUT'
@@ -374,6 +377,51 @@ export class ArcError extends Error implements ArcErrorPayload {
       details,
       retryable: false,
       remediationHint: 'Administrative recovery may be required for indicated paths.',
+    });
+  }
+
+  public static patchParseError(
+    message = 'Patch could not be parsed: invalid unified diff structure.',
+    details?: Record<string, string | number | boolean>,
+  ): ArcError {
+    return new ArcError({
+      code: 'PATCH_PARSE_ERROR',
+      category: 'PROTOCOL',
+      message,
+      details,
+      retryable: false,
+      remediationHint:
+        'Ensure the patch is a valid, well-formed unified diff conforming to the RC-03 contract.',
+    });
+  }
+
+  public static patchPreflightFailed(
+    message = 'Patch preflight validation failed.',
+    details?: Record<string, string | number | boolean>,
+  ): ArcError {
+    return new ArcError({
+      code: 'PATCH_PREFLIGHT_FAILED',
+      category: 'FILESYSTEM',
+      message,
+      details,
+      retryable: false,
+      remediationHint:
+        'Ensure the target file exists, is regular UTF-8 text, and exact hunk context lines match.',
+    });
+  }
+
+  public static patchUnsupportedOperation(
+    message = 'Unsupported patch operation.',
+    details?: Record<string, string | number | boolean>,
+  ): ArcError {
+    return new ArcError({
+      code: 'PATCH_UNSUPPORTED_OPERATION',
+      category: 'FILESYSTEM',
+      message,
+      details,
+      retryable: false,
+      remediationHint:
+        'apply_patch only supports modifying existing regular text files. File creation, deletion, renaming, binary patches, and mode changes are forbidden.',
     });
   }
 }

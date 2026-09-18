@@ -256,10 +256,17 @@ export interface MoveFileResponse {
 
 export interface ApplyPatchRequest {
   patch: string;
-  targetPath?: string;
+  dryRun?: boolean;
+  fuzz?: number;
 }
 
 export interface ApplyPatchResponse {
-  appliedFiles: string[];
-  success: boolean;
+  success: true;
+  modifiedFiles: string[];
+  stats: {
+    filesChanged: number;
+    insertions: number;
+    deletions: number;
+  };
+  dryRun: boolean;
 }
