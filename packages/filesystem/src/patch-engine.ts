@@ -124,6 +124,7 @@ export function parseUnifiedPatch(patch: string): ParsedPatch {
   let expectedContextAndInsertions = 0;
   let seenContextAndDeletions = 0;
   let seenContextAndInsertions = 0;
+  let cumulativeDelta = 0;
 
   function finalizeCurrentFile(): void {
     const oldTarget = extractLogicalPath(currentOldPath!);
@@ -163,6 +164,7 @@ export function parseUnifiedPatch(patch: string): ParsedPatch {
     currentOldPath = null;
     currentNewPath = null;
     currentFileHunks = [];
+    cumulativeDelta = 0;
   }
 
   for (let i = 0; i < rawLines.length; i++) {
@@ -194,6 +196,7 @@ export function parseUnifiedPatch(patch: string): ParsedPatch {
           seenContextAndDeletions === expectedContextAndDeletions &&
           seenContextAndInsertions === expectedContextAndInsertions
         ) {
+          cumulativeDelta += currentHunk.newCount - currentHunk.oldCount;
           currentFileHunks.push(currentHunk);
           currentHunk = null;
           inHunk = false;
@@ -263,6 +266,38 @@ export function parseUnifiedPatch(patch: string): ParsedPatch {
       const newStart = parseInt(hunkMatch[3], 10);
       const newCount = hunkMatch[4] !== undefined ? parseInt(hunkMatch[4], 10) : 1;
 
+      if (
+        !Number.isSafeInteger(oldStart) ||
+        !Number.isSafeInteger(oldCount) ||
+        !Number.isSafeInteger(newStart) ||
+        !Number.isSafeInteger(newCount) ||
+        oldStart < 0 ||
+        oldCount < 0 ||
+        newStart < 0 ||
+        newCount < 0
+      ) {
+        throw ArcError.patchParseError('Hunk header contains invalid numeric coordinates.');
+      }
+
+      let expectedNewStart: number;
+      if (oldCount > 0 && newCount > 0) {
+        expectedNewStart = oldStart + cumulativeDelta;
+      } else if (oldCount === 0) {
+        if (oldStart === 0) {
+          expectedNewStart = newCount === 0 ? 0 : 1 + cumulativeDelta;
+        } else {
+          expectedNewStart = oldStart + cumulativeDelta + 1;
+        }
+      } else {
+        expectedNewStart = oldStart + cumulativeDelta > 0 ? oldStart + cumulativeDelta - 1 : 0;
+      }
+
+      if (newStart !== expectedNewStart) {
+        throw ArcError.patchParseError(
+          `Hunk new-range coordinates (${newStart}) are inconsistent with old-range coordinates (${oldStart}) and delta (${cumulativeDelta}).`,
+        );
+      }
+
       currentHunk = {
         oldStart,
         oldCount,
@@ -277,6 +312,7 @@ export function parseUnifiedPatch(patch: string): ParsedPatch {
       seenContextAndInsertions = 0;
 
       if (oldCount === 0 && newCount === 0) {
+        cumulativeDelta += newCount - oldCount;
         currentFileHunks.push(currentHunk);
         currentHunk = null;
         inHunk = false;
@@ -452,6 +488,8 @@ export function applyHunksExact(
     cursor = hunkEnd;
   }
 
+  const hadUntouchedTrailingLines = cursor < lines.length;
+
   while (cursor < lines.length) {
     newLines.push(lines[cursor]);
     cursor++;
@@ -461,10 +499,10 @@ export function applyHunksExact(
   let finalNewline: boolean;
   if (newLines.length === 0) {
     finalNewline = false;
-  } else if (lastLineNoNewline) {
-    finalNewline = false;
-  } else {
+  } else if (hadUntouchedTrailingLines) {
     finalNewline = hasFinalNewline;
+  } else {
+    finalNewline = !lastLineNoNewline;
   }
 
   const patchedText = newLines.join(eol) + (finalNewline ? eol : '');
@@ -613,8 +651,11 @@ export async function applyPatch(
     interface StagedItem {
       preflight: PatchPreflightFile;
       tmpPath: string;
+      stagedDev: number;
+      stagedIno: number;
     }
     const stagedItems: StagedItem[] = [];
+    let stagingCleanupFailed = false;
 
     for (const p of preflightFiles) {
       const tmpPath = join(p.parentDir, `.arc-tmp-${randomUUID()}`);
@@ -626,7 +667,14 @@ export async function applyPatch(
         fsOps.fsync(fd);
         fsOps.close(fd);
         fd = undefined;
-        stagedItems.push({ preflight: p, tmpPath });
+
+        const stagedSt = fsOps.lstat(tmpPath);
+        stagedItems.push({
+          preflight: p,
+          tmpPath,
+          stagedDev: stagedSt.dev,
+          stagedIno: stagedSt.ino,
+        });
       } catch (err: unknown) {
         if (fd !== undefined) {
           try {
@@ -638,23 +686,42 @@ export async function applyPatch(
         try {
           fsOps.unlink(tmpPath);
         } catch {
-          // ignore
+          stagingCleanupFailed = true;
         }
         for (const s of stagedItems) {
           try {
             fsOps.unlink(s.tmpPath);
           } catch {
-            // ignore
+            stagingCleanupFailed = true;
           }
+        }
+        if (stagingCleanupFailed) {
+          throw ArcError.rollbackFailed(
+            'Patch staging failed and temporary replacement files could not be safely removed.',
+            { recoveryRequired: true },
+          );
+        }
+        if (err instanceof ArcError) {
+          throw err;
         }
         sanitizeFsError(err);
       }
     }
 
     // 7. Phase 3: Precommit Revalidation & Individual Commit with Rollback
-    const committedFiles: PatchPreflightFile[] = [];
+    interface CommittedPatchFile {
+      preflight: PatchPreflightFile;
+      stagedDev: number;
+      stagedIno: number;
+      committedDev: number;
+      committedIno: number;
+      patchedHash: string;
+      verified: boolean;
+    }
+    const committedFiles: CommittedPatchFile[] = [];
     let commitFailed = false;
     let failureError: unknown = null;
+    let stagedCleanupFailed = false;
 
     try {
       for (const s of stagedItems) {
@@ -676,26 +743,62 @@ export async function applyPatch(
         // Commit via atomic rename
         try {
           fsOps.rename(s.tmpPath, p.canonicalPath);
+        } catch (renameErr: unknown) {
+          commitFailed = true;
+          failureError = renameErr;
+          break;
+        }
+
+        // RENAME OCCURRED: target has changed on disk!
+        // Register immediately into committedFiles so it is never lost or forgotten
+        const committedRecord: CommittedPatchFile = {
+          preflight: p,
+          stagedDev: s.stagedDev,
+          stagedIno: s.stagedIno,
+          committedDev: s.stagedDev,
+          committedIno: s.stagedIno,
+          patchedHash: p.patchedHash,
+          verified: false,
+        };
+        committedFiles.push(committedRecord);
+
+        // Post-commit identity and content verification
+        try {
+          const targetSt = fsOps.lstat(p.canonicalPath);
+          if (
+            !targetSt.isFile() ||
+            targetSt.isSymbolicLink() ||
+            targetSt.nlink !== 1 ||
+            targetSt.dev !== s.stagedDev ||
+            targetSt.ino !== s.stagedIno
+          ) {
+            throw ArcError.conflictPreconditionFailed(
+              'Committed file inode identity did not match staged file identity.',
+            );
+          }
+          committedRecord.committedDev = targetSt.dev;
+          committedRecord.committedIno = targetSt.ino;
+
           const postBytes = fsOps.readFile(p.canonicalPath);
           const postHash = computeSha256(postBytes);
           if (postHash !== p.patchedHash) {
             throw ArcError.conflictPreconditionFailed('Post-commit content hash mismatch.');
           }
-          committedFiles.push(p);
-        } catch (err: unknown) {
+          committedRecord.verified = true;
+        } catch (postVerifyErr: unknown) {
           commitFailed = true;
-          failureError = err;
+          failureError = postVerifyErr;
           break;
         }
       }
     } finally {
       // Clean up any unconsumed staged files
       for (const s of stagedItems) {
-        if (!committedFiles.includes(s.preflight)) {
+        if (!committedFiles.some((c) => c.preflight === s.preflight)) {
           try {
             fsOps.unlink(s.tmpPath);
           } catch {
-            // ignore
+            stagedCleanupFailed = true;
           }
         }
       }
@@ -708,7 +811,8 @@ export async function applyPatch(
         let rollbackErrorOccurred = false;
 
         for (let i = committedFiles.length - 1; i >= 0; i--) {
-          const p = committedFiles[i];
+          const c = committedFiles[i];
+          const p = c.preflight;
           let curSt: Stats | undefined;
           let curHash: string | undefined;
 
@@ -722,8 +826,15 @@ export async function applyPatch(
             curSt = undefined;
           }
 
-          if (curSt && curHash === p.patchedHash) {
-            // File matches ARC committed state: safe to rollback
+          // Inode identity MUST match ARC committed identity!
+          // If inode changed: DO NOT OVERWRITE even if content hash is identical!
+          if (
+            curSt &&
+            curSt.dev === c.committedDev &&
+            curSt.ino === c.committedIno &&
+            curHash === p.patchedHash
+          ) {
+            // File matches ARC committed state and inode: safe to rollback
             const rollTmp = join(p.parentDir, `.arc-tmp-${randomUUID()}`);
             let fd: number | undefined;
             try {
@@ -736,11 +847,27 @@ export async function applyPatch(
 
               const preRollSt = fsOps.lstat(p.canonicalPath);
               if (
-                preRollSt.dev === curSt.dev &&
-                preRollSt.ino === curSt.ino &&
+                preRollSt.dev === c.committedDev &&
+                preRollSt.ino === c.committedIno &&
                 computeSha256(fsOps.readFile(p.canonicalPath)) === p.patchedHash
               ) {
                 fsOps.rename(rollTmp, p.canonicalPath);
+
+                // Immediately verify rollback restoration
+                const restoredSt = fsOps.lstat(p.canonicalPath);
+                const restoredBytes = fsOps.readFile(p.canonicalPath);
+                const restoredHash = computeSha256(restoredBytes);
+
+                if (
+                  !restoredSt.isFile() ||
+                  restoredSt.isSymbolicLink() ||
+                  restoredSt.nlink !== 1 ||
+                  (restoredSt.mode & 0o777) !== p.originalMode ||
+                  restoredHash !== p.preflightHash
+                ) {
+                  unrestoredFiles.push(p.relativePath);
+                  rollbackErrorOccurred = true;
+                }
               } else {
                 unrestoredFiles.push(p.relativePath);
                 rollbackErrorOccurred = true;
@@ -769,7 +896,7 @@ export async function applyPatch(
           }
         }
 
-        if (rollbackErrorOccurred || unrestoredFiles.length > 0) {
+        if (rollbackErrorOccurred || unrestoredFiles.length > 0 || stagedCleanupFailed) {
           throw ArcError.rollbackFailed(
             'Patch application failed and one or more committed files could not be safely rolled back.',
             {

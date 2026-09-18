@@ -325,6 +325,44 @@ describe('CesSpace ARC — RC-03 Bounded apply_patch Engine', () => {
     assert.equal(tmpFiles.length, 0);
   });
 
+  test('RC03-PATCH-P-12: no-final-newline to final-newline transition adds newline', async () => {
+    const fileRel = 'no-to-final.txt';
+    const filePath = path.join(workspaceDir, fileRel);
+    fs.writeFileSync(filePath, 'alpha', 'utf8'); // no newline
+
+    const patch = `--- a/no-to-final.txt
++++ b/no-to-final.txt
+@@ -1 +1 @@
+-alpha
+\\ No newline at end of file
++alpha-mod
+`;
+
+    const res = await fsSubsystem.applyPatch(workspaceDir, { patch });
+    assert.equal(res.success, true);
+    const content = fs.readFileSync(filePath, 'utf8');
+    assert.equal(content, 'alpha-mod\n');
+  });
+
+  test('RC03-PATCH-P-13: final-newline to no-final-newline transition removes newline', async () => {
+    const fileRel = 'final-to-no.txt';
+    const filePath = path.join(workspaceDir, fileRel);
+    fs.writeFileSync(filePath, 'alpha\n', 'utf8'); // has newline
+
+    const patch = `--- a/final-to-no.txt
++++ b/final-to-no.txt
+@@ -1 +1 @@
+-alpha
++alpha-mod
+\\ No newline at end of file
+`;
+
+    const res = await fsSubsystem.applyPatch(workspaceDir, { patch });
+    assert.equal(res.success, true);
+    const content = fs.readFileSync(filePath, 'utf8');
+    assert.equal(content, 'alpha-mod');
+  });
+
   // ==========================================================================
   // 2. Negative Parser & Input Validation Tests
   // ==========================================================================
@@ -662,12 +700,7 @@ describe('CesSpace ARC — RC-03 Bounded apply_patch Engine', () => {
     const realFile = path.join(workspaceDir, 'real.txt');
     const linkFile = path.join(workspaceDir, 'link.txt');
     fs.writeFileSync(realFile, 'real content\n', 'utf8');
-    try {
-      fs.symlinkSync(realFile, linkFile);
-    } catch {
-      // If symlinks not supported, skip
-      return;
-    }
+    fs.symlinkSync(realFile, linkFile);
 
     const patch = `--- a/link.txt
 +++ b/link.txt
@@ -678,9 +711,7 @@ describe('CesSpace ARC — RC-03 Bounded apply_patch Engine', () => {
 
     await assert.rejects(
       async () => fsSubsystem.applyPatch(workspaceDir, { patch }),
-      (err) =>
-        err instanceof ArcError &&
-        (err.code === 'UNSAFE_SYMLINK' || err.code === 'PATCH_UNSUPPORTED_OPERATION'),
+      (err) => err instanceof ArcError && err.code === 'UNSAFE_SYMLINK',
     );
   });
 
@@ -688,11 +719,7 @@ describe('CesSpace ARC — RC-03 Bounded apply_patch Engine', () => {
     const origFile = path.join(workspaceDir, 'orig-hard.txt');
     const hardlinkFile = path.join(workspaceDir, 'link-hard.txt');
     fs.writeFileSync(origFile, 'hard content\n', 'utf8');
-    try {
-      fs.linkSync(origFile, hardlinkFile);
-    } catch {
-      return;
-    }
+    fs.linkSync(origFile, hardlinkFile);
 
     const patch = `--- a/orig-hard.txt
 +++ b/orig-hard.txt
@@ -781,6 +808,117 @@ describe('CesSpace ARC — RC-03 Bounded apply_patch Engine', () => {
     await assert.rejects(
       async () => fsSubsystem.applyPatch(workspaceDir, { patch: patch3 }),
       (err) => err instanceof ArcError && err.code === 'ACCESS_DENIED',
+    );
+  });
+
+  test('RC03-PATCH-N-27: Intermediate symlink directory fails with UNSAFE_SYMLINK and leaves real target untouched', async () => {
+    const realDir = path.join(workspaceDir, 'real-dir');
+    fs.mkdirSync(realDir, { recursive: true });
+    const realTarget = path.join(realDir, 'target.txt');
+    const origContent = 'original-unmodified-content\n';
+    fs.writeFileSync(realTarget, origContent, 'utf8');
+
+    const linkedDir = path.join(workspaceDir, 'linked-dir');
+    fs.symlinkSync(realDir, linkedDir);
+
+    const patch = `--- a/linked-dir/target.txt
++++ b/linked-dir/target.txt
+@@ -1,1 +1,1 @@
+-original-unmodified-content
++tampered-content
+`;
+
+    await assert.rejects(
+      async () => fsSubsystem.applyPatch(workspaceDir, { patch }),
+      (err) => err instanceof ArcError && err.code === 'UNSAFE_SYMLINK',
+    );
+
+    // Real target was NOT modified
+    assert.equal(fs.readFileSync(realTarget, 'utf8'), origContent);
+  });
+
+  test('RC03-PATCH-N-28: Special non-regular node target rejected with NOT_A_FILE', async () => {
+    const fileRel = 'special-fifo.txt';
+    const filePath = path.join(workspaceDir, fileRel);
+    fs.writeFileSync(filePath, 'special content\n', 'utf8');
+
+    class SpecialMockOps extends NodeFilesystemOps {
+      lstat(targetPath) {
+        const st = super.lstat(targetPath);
+        if (targetPath === filePath) {
+          return {
+            ...st,
+            isFile: () => false,
+            isDirectory: () => false,
+            isSymbolicLink: () => false,
+            isFIFO: () => true,
+            nlink: 1,
+          };
+        }
+        return st;
+      }
+    }
+    const mockOps = new SpecialMockOps();
+    const lockManager = new ProcessWideLockManager();
+
+    const patch = `--- a/special-fifo.txt
++++ b/special-fifo.txt
+@@ -1,1 +1,1 @@
+-special content
++modified
+`;
+
+    await assert.rejects(
+      async () => applyPatch(workspaceDir, { patch }, mockOps, lockManager),
+      (err) => err instanceof ArcError && err.code === 'NOT_A_FILE',
+    );
+
+    assert.equal(fs.readFileSync(filePath, 'utf8'), 'special content\n');
+  });
+
+  test('RC03-PATCH-N-29: Negative fuzz (fuzz: -1) rejected with INVALID_REQUEST_SCHEMA', async () => {
+    const patch = `--- a/foo.txt
++++ b/foo.txt
+@@ -1,1 +1,1 @@
+-a
++b
+`;
+    await assert.rejects(
+      async () => fsSubsystem.applyPatch(workspaceDir, { patch, fuzz: -1 }),
+      (err) => err instanceof ArcError && err.code === 'INVALID_REQUEST_SCHEMA',
+    );
+  });
+
+  test('RC03-PATCH-N-30: Fraudulent newStart coordinate rejected with PATCH_PARSE_ERROR', async () => {
+    const fraudulentPatch = `--- a/foo.txt
++++ b/foo.txt
+@@ -1,3 +999,3 @@
+ line1
+ line2
+ line3
+`;
+    await assert.rejects(
+      async () => fsSubsystem.applyPatch(workspaceDir, { patch: fraudulentPatch }),
+      (err) => err instanceof ArcError && err.code === 'PATCH_PARSE_ERROR',
+    );
+  });
+
+  test('RC03-PATCH-N-31: Multi-hunk delta coordinate inconsistency rejected with PATCH_PARSE_ERROR', async () => {
+    const inconsistentMultiHunk = `--- a/foo.txt
++++ b/foo.txt
+@@ -1,2 +1,3 @@
+ line1
+-line2
++line2-a
++line2-b
+@@ -5,2 +5,2 @@
+ line5
+ line6
+`;
+    // Hunk 1 delta was +1, so hunk 2 newStart must be 6, not 5
+    await assert.rejects(
+      async () => fsSubsystem.applyPatch(workspaceDir, { patch: inconsistentMultiHunk }),
+      (err) => err instanceof ArcError && err.code === 'PATCH_PARSE_ERROR',
     );
   });
 
@@ -1183,6 +1321,388 @@ zc$}q-U|?o-
         !jsonStr.includes(superSecret),
         'Secret token must not appear anywhere in ArcError serialized payload',
       );
+    }
+  });
+
+  test('RC03-PATCH-A-08: Rename succeeds then post-commit readFile fails: target is not forgotten and ROLLBACK_FAILED is returned if unrestorable', async () => {
+    const fileA = path.join(workspaceDir, 'post-read-fail-a.txt');
+    fs.writeFileSync(fileA, 'initial-content\n', 'utf8');
+
+    let renameDone = false;
+    class PostReadFailMockOps extends NodeFilesystemOps {
+      rename(src, dst) {
+        super.rename(src, dst);
+        if (dst === fileA) {
+          renameDone = true;
+        }
+      }
+      readFile(targetPath) {
+        if (renameDone && targetPath === fileA) {
+          throw new Error('EIO: Injected disk read error post-commit');
+        }
+        return super.readFile(targetPath);
+      }
+    }
+    const mockOps = new PostReadFailMockOps();
+    const lockManager = new ProcessWideLockManager();
+
+    const patch = `--- a/post-read-fail-a.txt
++++ b/post-read-fail-a.txt
+@@ -1,1 +1,1 @@
+-initial-content
++patched-content
+`;
+
+    await assert.rejects(
+      async () => applyPatch(workspaceDir, { patch }, mockOps, lockManager),
+      (err) => {
+        assert.ok(err instanceof ArcError);
+        assert.equal(err.code, 'ROLLBACK_FAILED');
+        assert.equal(err.details.recoveryRequired, true);
+        assert.equal(err.details.recoveryFileCount, 1);
+        return true;
+      },
+    );
+  });
+
+  test('RC03-PATCH-A-09: Rename succeeds then post-commit inode mismatch halts and triggers safe rollback', async () => {
+    const fileA = path.join(workspaceDir, 'post-lstat-fail-a.txt');
+    fs.writeFileSync(fileA, 'initial-a\n', 'utf8');
+
+    let renameDone = false;
+    let rollbackRenamed = false;
+    class PostLstatFailMockOps extends NodeFilesystemOps {
+      rename(src, dst) {
+        super.rename(src, dst);
+        if (dst === fileA) {
+          if (!renameDone) {
+            renameDone = true;
+          } else {
+            rollbackRenamed = true;
+          }
+        }
+      }
+      lstat(targetPath) {
+        const st = super.lstat(targetPath);
+        if (renameDone && !rollbackRenamed && targetPath === fileA) {
+          // Return simulated mismatched dev/ino
+          return {
+            ...st,
+            dev: st.dev + 1,
+            ino: st.ino + 9999,
+          };
+        }
+        return st;
+      }
+    }
+    const mockOps = new PostLstatFailMockOps();
+    const lockManager = new ProcessWideLockManager();
+
+    const patch = `--- a/post-lstat-fail-a.txt
++++ b/post-lstat-fail-a.txt
+@@ -1,1 +1,1 @@
+-initial-a
++patched-a
+`;
+
+    await assert.rejects(
+      async () => applyPatch(workspaceDir, { patch }, mockOps, lockManager),
+      (err) => {
+        assert.ok(err instanceof ArcError);
+        assert.equal(err.code, 'ROLLBACK_FAILED');
+        assert.equal(err.details.recoveryRequired, true);
+        return true;
+      },
+    );
+  });
+
+  test('RC03-PATCH-A-10: Rollback does not overwrite external replacement with identical content bytes and new inode', async () => {
+    const fileA = path.join(workspaceDir, 'same-content-a.txt');
+    const fileB = path.join(workspaceDir, 'same-content-b.txt');
+    fs.writeFileSync(fileA, 'targetA-orig\n', 'utf8');
+    fs.writeFileSync(fileB, 'targetB-orig\n', 'utf8');
+
+    class SameContentReplaceMockOps extends NodeFilesystemOps {
+      rename(src, dst) {
+        if (dst === fileB) {
+          // File A was committed with patched-a content.
+          // External actor replaces File A with a brand new file (new inode) having the SAME patched bytes!
+          fs.unlinkSync(fileA);
+          fs.writeFileSync(fileA, 'targetA-patched\n', 'utf8');
+          // Now fail File B commit
+          throw new Error('EIO: Target B rename failure');
+        }
+        return super.rename(src, dst);
+      }
+    }
+    const mockOps = new SameContentReplaceMockOps();
+    const lockManager = new ProcessWideLockManager();
+
+    const patch = `--- a/same-content-a.txt
++++ b/same-content-a.txt
+@@ -1,1 +1,1 @@
+-targetA-orig
++targetA-patched
+--- a/same-content-b.txt
++++ b/same-content-b.txt
+@@ -1,1 +1,1 @@
+-targetB-orig
++targetB-patched
+`;
+
+    await assert.rejects(
+      async () => applyPatch(workspaceDir, { patch }, mockOps, lockManager),
+      (err) => {
+        assert.ok(err instanceof ArcError);
+        assert.equal(err.code, 'ROLLBACK_FAILED');
+        assert.equal(err.details.recoveryRequired, true);
+        assert.equal(err.details.recoveryFileCount, 1);
+        return true;
+      },
+    );
+
+    // External replacement file was NOT overwritten by rollback
+    assert.equal(fs.readFileSync(fileA, 'utf8'), 'targetA-patched\n');
+  });
+
+  test('RC03-PATCH-A-11: Rollback restoration failure raises ROLLBACK_FAILED with truthful recovery metadata', async () => {
+    const fileA = path.join(workspaceDir, 'restore-fail-a.txt');
+    const fileB = path.join(workspaceDir, 'restore-fail-b.txt');
+    fs.writeFileSync(fileA, 'fileA-orig\n', 'utf8');
+    fs.writeFileSync(fileB, 'fileB-orig\n', 'utf8');
+
+    let fileACommitted = false;
+    class RestoreFailMockOps extends NodeFilesystemOps {
+      rename(src, dst) {
+        if (dst === fileA && !fileACommitted) {
+          fileACommitted = true;
+          return super.rename(src, dst);
+        }
+        if (dst === fileB) {
+          throw new Error('EIO: Injected Target B commit failure');
+        }
+        if (dst === fileA && fileACommitted) {
+          // Fail the rollback rename of Target A
+          throw new Error('EIO: Injected rollback rename failure on Target A');
+        }
+        return super.rename(src, dst);
+      }
+    }
+    const mockOps = new RestoreFailMockOps();
+    const lockManager = new ProcessWideLockManager();
+
+    const patch = `--- a/restore-fail-a.txt
++++ b/restore-fail-a.txt
+@@ -1,1 +1,1 @@
+-fileA-orig
++fileA-patched
+--- a/restore-fail-b.txt
++++ b/restore-fail-b.txt
+@@ -1,1 +1,1 @@
+-fileB-orig
++fileB-patched
+`;
+
+    await assert.rejects(
+      async () => applyPatch(workspaceDir, { patch }, mockOps, lockManager),
+      (err) => {
+        assert.ok(err instanceof ArcError);
+        assert.equal(err.code, 'ROLLBACK_FAILED');
+        assert.equal(err.details.recoveryRequired, true);
+        assert.equal(err.details.recoveryFileCount, 1);
+        const jsonStr = JSON.stringify(err);
+        assert.ok(!jsonStr.includes(workspaceDir));
+        assert.ok(!jsonStr.includes('.arc-tmp-'));
+        assert.ok(!jsonStr.includes('fileA-orig'));
+        return true;
+      },
+    );
+  });
+
+  test('RC03-PATCH-A-12: Exclusive in-process locks are acquired for ALL targets before preflight begins', async () => {
+    const fileA = path.join(workspaceDir, 'lock-barrier-a.txt');
+    const fileB = path.join(workspaceDir, 'lock-barrier-b.txt');
+    fs.writeFileSync(fileA, 'content-a\n', 'utf8');
+    fs.writeFileSync(fileB, 'content-b\n', 'utf8');
+
+    const canonicalB = fs.realpathSync(fileB);
+    const lockManager = new ProcessWideLockManager();
+
+    let releaseBarrier;
+    const barrier = new Promise((r) => {
+      releaseBarrier = r;
+    });
+    let barrierReached;
+    const reached = new Promise((r) => {
+      barrierReached = r;
+    });
+
+    const origWithLocks = lockManager.withLocks.bind(lockManager);
+    let patchLockCall = true;
+    lockManager.withLocks = async (paths, fn) => {
+      if (patchLockCall) {
+        patchLockCall = false;
+        return origWithLocks(paths, async () => {
+          barrierReached();
+          await barrier;
+          return fn();
+        });
+      }
+      return origWithLocks(paths, fn);
+    };
+
+    const patch = `--- a/lock-barrier-a.txt
++++ b/lock-barrier-a.txt
+@@ -1,1 +1,1 @@
+-content-a
++modified-a
+--- a/lock-barrier-b.txt
++++ b/lock-barrier-b.txt
+@@ -1,1 +1,1 @@
+-content-b
++modified-b
+`;
+
+    const patchPromise = applyPatch(workspaceDir, { patch }, new NodeFilesystemOps(), lockManager);
+
+    // Wait until applyPatch has acquired all locks
+    await reached;
+
+    let concurrentEntered = false;
+    const concurrentLockPromise = lockManager.withLocks([canonicalB], async () => {
+      concurrentEntered = true;
+    });
+
+    // Short yield: concurrentLockPromise should NOT be able to enter because canonicalB is locked
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(
+      concurrentEntered,
+      false,
+      'Concurrent action must not enter while applyPatch holds lock',
+    );
+
+    // Release the barrier so applyPatch can proceed
+    releaseBarrier();
+
+    const patchRes = await patchPromise;
+    assert.equal(patchRes.success, true);
+
+    await concurrentLockPromise;
+    assert.equal(
+      concurrentEntered,
+      true,
+      'Concurrent action must enter once applyPatch releases lock',
+    );
+    assert.equal(lockManager.activeLockCount, 0, 'Active lock count must return to 0');
+  });
+
+  test('RC03-PATCH-A-13: Serialized ArcError never leaks injected paths, temp names, tokens, or content', async () => {
+    const fileA = path.join(workspaceDir, 'leak-test.txt');
+    fs.writeFileSync(fileA, 'initial\n', 'utf8');
+
+    const secretToken = 'SECRET_TOKEN_123_SUPER_CLASSIFIED';
+    const secretPath = '/home/secretuser/workspace/file.ts';
+    const secretTemp = '/home/secretuser/workspace/.arc-tmp-secret';
+    const secretContext = 'sensitive hunk context string';
+
+    const patch = `--- a/leak-test.txt
++++ b/leak-test.txt
+@@ -1,1 +1,1 @@
+-initial
++modified
+`;
+
+    // 1. Staging failure with raw injected error
+    class LeakStagingMockOps extends NodeFilesystemOps {
+      open(p, flags, mode) {
+        if (p.includes('.arc-tmp-')) {
+          const err = new Error(
+            `EACCES: permission denied, open '${secretTemp}' with token ${secretToken}`,
+          );
+          err.code = 'EACCES';
+          throw err;
+        }
+        return super.open(p, flags, mode);
+      }
+    }
+    const stagingOps = new LeakStagingMockOps();
+    const lockManager = new ProcessWideLockManager();
+
+    try {
+      await applyPatch(workspaceDir, { patch }, stagingOps, lockManager);
+      assert.fail('Should have failed');
+    } catch (err) {
+      assert.ok(err instanceof ArcError);
+      const json = JSON.stringify(err);
+      assert.ok(!json.includes(secretToken));
+      assert.ok(!json.includes(secretPath));
+      assert.ok(!json.includes(secretTemp));
+      assert.ok(!json.includes(secretContext));
+    }
+
+    // 2. Post-rename verify failure with raw injected error
+    let renamed = false;
+    class LeakVerifyMockOps extends NodeFilesystemOps {
+      rename(src, dst) {
+        super.rename(src, dst);
+        renamed = true;
+      }
+      readFile(p) {
+        if (renamed && p === fileA) {
+          const err = new Error(`EIO: I/O error reading '${secretPath}' token ${secretToken}`);
+          err.code = 'EIO';
+          throw err;
+        }
+        return super.readFile(p);
+      }
+    }
+    const verifyOps = new LeakVerifyMockOps();
+    try {
+      await applyPatch(workspaceDir, { patch }, verifyOps, lockManager);
+      assert.fail('Should have failed');
+    } catch (err) {
+      assert.ok(err instanceof ArcError);
+      const json = JSON.stringify(err);
+      assert.ok(!json.includes(secretToken));
+      assert.ok(!json.includes(secretPath));
+      assert.ok(!json.includes(secretTemp));
+      assert.ok(!json.includes(secretContext));
+    }
+
+    // 3. Rollback failure with raw injected error
+    let fileCommitted = false;
+    class LeakRollbackMockOps extends NodeFilesystemOps {
+      rename(src, dst) {
+        if (dst === fileA && !fileCommitted) {
+          fileCommitted = true;
+          return super.rename(src, dst);
+        }
+        if (fileCommitted) {
+          const err = new Error(`EIO: rollback failed for '${secretPath}' token ${secretToken}`);
+          err.code = 'EIO';
+          throw err;
+        }
+        return super.rename(src, dst);
+      }
+      lstat(p) {
+        if (fileCommitted && p === fileA) {
+          const st = super.lstat(p);
+          return { ...st, dev: st.dev + 999 };
+        }
+        return super.lstat(p);
+      }
+    }
+    const rollbackOps = new LeakRollbackMockOps();
+    try {
+      await applyPatch(workspaceDir, { patch }, rollbackOps, lockManager);
+      assert.fail('Should have failed');
+    } catch (err) {
+      assert.ok(err instanceof ArcError);
+      const json = JSON.stringify(err);
+      assert.ok(!json.includes(secretToken));
+      assert.ok(!json.includes(secretPath));
+      assert.ok(!json.includes(secretTemp));
+      assert.ok(!json.includes(secretContext));
     }
   });
 });
