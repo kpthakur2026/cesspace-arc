@@ -172,6 +172,35 @@ export type ApprovalAuditEventType =
   | 'APPROVED_EXECUTION_FAILED';
 
 /**
+ * Safe, bounded approval lifecycle event emitted synchronously by
+ * ApprovalStateManager at the moment a state transition is committed.
+ *
+ * This carries ONLY what is needed to write an audit record. It deliberately
+ * excludes the raw token, the token digest, review material, file content,
+ * patch text, the absolute host root path, environment values, private key and
+ * signature material, and the monotonic deadline.
+ *
+ * `executionPayloadHash` is intentionally omitted: audit correlation uses the
+ * approval `requestId` instead.
+ */
+export interface ApprovalLifecycleEvent {
+  eventType: ApprovalAuditEventType;
+  requestId: string;
+  state: ApprovalState;
+  toolName: string;
+  actor: ApprovalActorBinding;
+  workspaceId: string;
+  workspaceRootHash: string;
+  policyHash: string;
+  /** Server wall-clock ISO display time. Never used for TTL decisions. */
+  occurredAt: string;
+  /** Frozen enum only, when applicable. Never attacker-controlled text. */
+  reasonCode?: ApprovalFailureReasonCode;
+  /** Safe boolean: whether an operator supplied a reason. The text is never kept. */
+  operatorReasonProvided?: boolean;
+}
+
+/**
  * Enumerated internal failure reason codes for diagnostic logging.
  * Anti-oracle rule: these are never exposed directly to calling MCP agents.
  */

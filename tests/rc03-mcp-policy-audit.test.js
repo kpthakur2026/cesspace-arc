@@ -1519,7 +1519,12 @@ describe('CesSpace ARC — RC-03 MCP Policy & Audit Integration', () => {
 
       assert.ok(!fs.existsSync(testFile), 'File must NOT have been created on disk');
 
-      const records = forcedAudit.getRecords();
+      // Task 5 adds APPROVAL_REQUESTED lifecycle records alongside the ordinary
+      // invocation records. Select the ordinary invocation records for the
+      // original assertions; strength is unchanged.
+      const records = forcedAudit
+        .getRecords()
+        .filter((record) => record.approval?.eventType === undefined);
       assert.equal(records.length, 5);
       for (const record of records) {
         assert.equal(record.policy.decision, 'REQUIRE_APPROVAL');

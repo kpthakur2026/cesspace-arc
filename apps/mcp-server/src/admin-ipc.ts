@@ -47,6 +47,8 @@ import {
 } from '@cesspace-arc/protocol';
 import type { ApprovalStateManager } from '@cesspace-arc/policy';
 import { toAdminSummary } from './approval-gate.js';
+import { ApprovalAuditSink, getApprovalAuditSink } from './approval-audit.js';
+import type { AuditLogger } from '@cesspace-arc/audit';
 
 /**
  * Conservative bound on a Unix socket path.
@@ -68,6 +70,13 @@ export interface AdminIpcServerOptions {
   approvalStateManager: ApprovalStateManager;
   /** Injectable monotonic clock in milliseconds. Defaults to performance.now(). */
   getMonotonicTimeMs?: () => number;
+  /**
+   * Audit logger used to commit approval lifecycle evidence. When supplied, the
+   * sink is flushed BEFORE an admin response is returned, so
+   * APPROVAL_GRANTED/REJECTED/EXPIRED evidence is durable before the operator
+   * observes the outcome. No raw token ever enters the sink.
+   */
+  auditLogger?: AuditLogger;
 }
 
 /** Machine-readable startup/socket failures. */
@@ -161,6 +170,7 @@ export class AdminIpcServer {
   private readonly approvalStateManager: ApprovalStateManager;
   private readonly getMonotonicTimeMs: () => number;
 
+  private readonly approvalAuditSink?: ApprovalAuditSink;
   private server?: net.Server;
   private socketIdentity?: SocketIdentity;
   private started = false;
@@ -201,6 +211,19 @@ export class AdminIpcServer {
     this.endpoint = assertSafeEndpoint(options.endpoint, currentUid);
 
     this.getMonotonicTimeMs = options.getMonotonicTimeMs ?? (() => performance.now());
+
+    // The admin channel is a local operator channel: every state transition it
+    // causes must be committed to the same audit chain before the operator sees
+    // the result. No raw token ever enters the sink.
+    //
+    // The sink is memoized per audit chain. Constructing a second sink over the
+    // same logger would register a second lifecycle observer on the same
+    // manager, and the manager emits one event per observer, so every
+    // transition would be written to the chain twice.
+    if (options.auditLogger !== undefined) {
+      this.approvalAuditSink = getApprovalAuditSink(options.auditLogger);
+      this.approvalStateManager.registerLifecycleSink(this.approvalAuditSink);
+    }
   }
 
   /** Starts listening. Rejects if the endpoint already exists for any reason. */
@@ -271,6 +294,13 @@ export class AdminIpcServer {
    * before any identity check could run.
    */
   public async stop(): Promise<void> {
+    // Best effort: commit any lifecycle evidence still buffered before the
+    // channel goes away. A standalone admin channel has no later flush point,
+    // and the operator may have already observed outcomes whose transitions
+    // were only queued. Failure here is not fatal to teardown — the queue keeps
+    // the evidence and every later flush still fails closed.
+    await this.flushLifecycleAudit();
+
     const server = this.server;
     this.server = undefined;
     this.started = false;
@@ -375,7 +405,7 @@ export class AdminIpcServer {
         return;
       }
 
-      const response = this.processAuthenticatedFrame(frame, challengeId, nonce, issuedAtMs);
+      const response = await this.processAuthenticatedFrame(frame, challengeId, nonce, issuedAtMs);
       this.writeResponse(socket, response);
     } catch {
       // Any unexpected failure closes without disclosing detail.
@@ -458,12 +488,12 @@ export class AdminIpcServer {
    * Verifies the signature over the raw received payload bytes against THIS
    * connection's challenge, and only then parses and validates the request.
    */
-  private processAuthenticatedFrame(
+  private async processAuthenticatedFrame(
     frame: Buffer,
     challengeId: string,
     nonce: string,
     issuedAtMs: number,
-  ): AdminResponse {
+  ): Promise<AdminResponse> {
     // Enforce the authentication deadline on a monotonic clock.
     if (this.getMonotonicTimeMs() - issuedAtMs >= ADMIN_CHALLENGE_TTL_MS) {
       return errorResponse('AUTHENTICATION_FAILED');
@@ -599,14 +629,14 @@ export class AdminIpcServer {
   // Method dispatch
   // -------------------------------------------------------------------------
 
-  private dispatch(payload: AdminRequestPayload): AdminResponse {
+  private async dispatch(payload: AdminRequestPayload): Promise<AdminResponse> {
     const { method, params } = payload;
 
     if (method === 'approvals.list') {
       if (params.requestId !== undefined || params.reason !== undefined) {
         return errorResponse('INVALID_ADMIN_REQUEST');
       }
-      return this.handleList();
+      return await this.handleList();
     }
 
     if (method === 'approvals.inspect') {
@@ -616,7 +646,7 @@ export class AdminIpcServer {
       if (!ADMIN_REQUEST_ID_REGEX.test(params.requestId)) {
         return errorResponse('INVALID_ADMIN_REQUEST');
       }
-      return this.handleInspect(params.requestId);
+      return await this.handleInspect(params.requestId);
     }
 
     if (method === 'approval.approve') {
@@ -626,7 +656,7 @@ export class AdminIpcServer {
       if (!ADMIN_REQUEST_ID_REGEX.test(params.requestId)) {
         return errorResponse('INVALID_ADMIN_REQUEST');
       }
-      return this.handleApprove(params.requestId);
+      return await this.handleApprove(params.requestId);
     }
 
     if (method === 'approval.reject') {
@@ -644,16 +674,40 @@ export class AdminIpcServer {
           return errorResponse('INVALID_ADMIN_REQUEST');
         }
       }
-      return this.handleReject(params.requestId);
+      return await this.handleReject(params.requestId);
     }
 
     return errorResponse('INVALID_ADMIN_REQUEST');
   }
 
-  private handleList(): AdminResponse {
+  /**
+   * Commits buffered approval lifecycle evidence before the operator observes a
+   * result. Returns false when required evidence could not be written, in which
+   * case the caller fails the admin request closed rather than disclosing a
+   * token or confirming a transition the audit chain does not record.
+   */
+  private async flushLifecycleAudit(): Promise<boolean> {
+    if (this.approvalAuditSink === undefined) {
+      return true;
+    }
+    try {
+      await this.approvalAuditSink.flush();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async handleList(): Promise<AdminResponse> {
     // Purge expired state before listing so the operator never sees a stale
     // PENDING entry.
     this.approvalStateManager.purgeExpired();
+
+    // Lazy expiry discovered here is a real state transition and must be
+    // committed to audit before the operator sees the list.
+    if (!(await this.flushLifecycleAudit())) {
+      return errorResponse('INTERNAL_ERROR');
+    }
 
     const approvals: AdminApprovalSummary[] = [];
     for (const snapshot of this.approvalStateManager.listActive()) {
@@ -668,14 +722,23 @@ export class AdminIpcServer {
     return { ok: true, result: { approvals } };
   }
 
-  private handleInspect(requestId: string): AdminResponse {
+  private async handleInspect(requestId: string): Promise<AdminResponse> {
     const snapshot = this.approvalStateManager.getRequest(requestId);
+    // getRequest() performs lazy expiry, which is a REAL state transition and
+    // queues APPROVAL_EXPIRED. It must be committed before ANY response is
+    // returned, including the not-pending response below.
+    if (!(await this.flushLifecycleAudit())) {
+      return errorResponse('INTERNAL_ERROR');
+    }
     // Terminal states are reported identically to unknown IDs so this method
     // does not become an existence oracle for non-pending records.
     if (snapshot === undefined || snapshot.state !== 'PENDING') {
       return errorResponse('NOT_FOUND_OR_NOT_PENDING');
     }
     const reviewMaterial = this.approvalStateManager.inspectPending(requestId) ?? '';
+    if (!(await this.flushLifecycleAudit())) {
+      return errorResponse('INTERNAL_ERROR');
+    }
     return {
       ok: true,
       result: {
@@ -696,9 +759,17 @@ export class AdminIpcServer {
     };
   }
 
-  private handleApprove(requestId: string): AdminResponse {
+  private async handleApprove(requestId: string): Promise<AdminResponse> {
     try {
       const grant = this.approvalStateManager.approve(requestId);
+
+      // APPROVAL_GRANTED must be durable BEFORE the raw token is disclosed. If
+      // the evidence cannot be written, no token is returned; the record may
+      // already be APPROVED and is left to expire naturally (rc04 §39).
+      if (!(await this.flushLifecycleAudit())) {
+        return errorResponse('INTERNAL_ERROR');
+      }
+
       // The raw token is returned exactly once, on this authenticated channel.
       // It is never logged, persisted, audited, or retained here.
       return {
@@ -712,17 +783,26 @@ export class AdminIpcServer {
         },
       };
     } catch (err: unknown) {
+      // A failure is not a reason to skip evidence: approve() runs lazy expiry
+      // first, so this path can have queued a real APPROVAL_EXPIRED. The action
+      // is already denied; commit what it discovered before answering.
+      await this.flushLifecycleAudit();
       return errorResponse(this.mapApprovalError(err));
     }
   }
 
-  private handleReject(requestId: string): AdminResponse {
+  private async handleReject(requestId: string): Promise<AdminResponse> {
     try {
       // The operator-supplied reason is validated by the caller but is NOT
-      // persisted: approval audit lifecycle integration belongs to Task 5.
+      // persisted: only its presence is recorded. The text itself never enters
+      // the audit chain.
       const snapshot = this.approvalStateManager.reject(requestId);
+      if (!(await this.flushLifecycleAudit())) {
+        return errorResponse('INTERNAL_ERROR');
+      }
       return { ok: true, result: { requestId: snapshot.requestId, state: snapshot.state } };
     } catch (err: unknown) {
+      await this.flushLifecycleAudit();
       return errorResponse(this.mapApprovalError(err));
     }
   }

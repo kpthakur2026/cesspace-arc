@@ -9,6 +9,9 @@ import {
   type ApprovalRedemptionInput,
   type ApprovalConsumptionResult,
   type ApprovalReviewSummary,
+  type ApprovalLifecycleEvent,
+  type ApprovalAuditEventType,
+  type ApprovalFailureReasonCode,
   APPROVAL_TTL_SECONDS,
   MAX_ACTIVE_APPROVALS_GLOBAL,
   MAX_ACTIVE_APPROVALS_PER_ACTOR,
@@ -21,6 +24,43 @@ import {
   MAX_TOKEN_BYTES,
   TERMINAL_APPROVAL_STATES,
 } from '@cesspace-arc/protocol';
+
+/**
+ * Narrow lifecycle observer contract.
+ *
+ * Implementations MUST NOT retain the event object beyond the call, and MUST NOT
+ * expect delivery to be anything other than a synchronous, bounded hand-off.
+ * packages/policy deliberately does NOT depend on packages/audit.
+ */
+export interface IApprovalLifecycleSink {
+  onApprovalLifecycleEvent(event: ApprovalLifecycleEvent): void;
+}
+
+/**
+ * Internal redemption diagnostic reasons.
+ *
+ * These are held OUT OF BAND from the ArcError so they can never be serialized
+ * into a client response, `details`, or `toJSON()`. The MCP client-facing result
+ * stays generic (anti-oracle, rc04 §13).
+ */
+const approvalFailureReasons = new WeakMap<object, ApprovalFailureReasonCode>();
+
+/** Attaches an internal diagnostic reason to an error, non-serializably. */
+export function attachApprovalFailureReason<T extends object>(
+  error: T,
+  reason: ApprovalFailureReasonCode,
+): T {
+  approvalFailureReasons.set(error, reason);
+  return error;
+}
+
+/** Reads the internal diagnostic reason for an error, if one was attached. */
+export function getApprovalFailureReason(error: unknown): ApprovalFailureReasonCode | undefined {
+  if (error === null || typeof error !== 'object') {
+    return undefined;
+  }
+  return approvalFailureReasons.get(error);
+}
 
 export {
   APPROVAL_TTL_SECONDS,
@@ -198,6 +238,9 @@ export class ApprovalStateManager {
   private readonly maxReviewBytesPerActor: number;
   private readonly maxReviewBytesGlobal: number;
 
+  /** Synchronous lifecycle observers. Bounded, no duplicates. */
+  private readonly lifecycleSinks: IApprovalLifecycleSink[] = [];
+
   private readonly recordsByRequestId = new Map<string, InternalApprovalRecord>();
   private readonly requestIdByDedupKey = new Map<string, string>();
   private readonly activeRequestIds = new Set<string>();
@@ -206,6 +249,70 @@ export class ApprovalStateManager {
   private readonly activeCountByActor = new Map<string, number>();
   private reviewBytesGlobal = 0;
   private readonly reviewBytesByActor = new Map<string, number>();
+
+  /**
+   * Registers a lifecycle observer. Duplicate registration is ignored.
+   *
+   * The event object handed to the sink is freshly constructed and defensively
+   * copied, so a sink can neither observe nor mutate internal approval state.
+   */
+  public registerLifecycleSink(sink: IApprovalLifecycleSink): void {
+    if (sink === null || typeof sink !== 'object') {
+      return;
+    }
+    if (this.lifecycleSinks.includes(sink)) {
+      return;
+    }
+    this.lifecycleSinks.push(sink);
+  }
+
+  /**
+   * Emits a lifecycle event AFTER the state transition is committed in memory
+   * (rc04 §37). A sink failure must never roll the state machine backward, so
+   * observer exceptions are contained here (rc04 §38).
+   */
+  private emitLifecycleEvent(
+    record: InternalApprovalRecord,
+    eventType: ApprovalAuditEventType,
+    reasonCode?: ApprovalFailureReasonCode,
+    operatorReasonProvided?: boolean,
+  ): void {
+    if (this.lifecycleSinks.length === 0) {
+      return;
+    }
+    // Defensively construct a fresh, bounded event. No token, digest, review
+    // material, or monotonic deadline is ever included.
+    for (const sink of this.lifecycleSinks) {
+      const event: ApprovalLifecycleEvent = {
+        eventType,
+        requestId: record.requestId,
+        state: record.state,
+        toolName: record.toolName,
+        actor: {
+          clientId: record.binding.actor.clientId,
+          clientType: record.binding.actor.clientType,
+          ...(record.binding.actor.sessionId === undefined
+            ? {}
+            : { sessionId: record.binding.actor.sessionId }),
+          ...(record.binding.actor.deviceId === undefined
+            ? {}
+            : { deviceId: record.binding.actor.deviceId }),
+        },
+        workspaceId: record.binding.workspace.workspaceId,
+        workspaceRootHash: record.binding.workspace.workspaceRootHash,
+        policyHash: record.binding.policyHash,
+        occurredAt: new Date(this.getWallTime()).toISOString(),
+        ...(reasonCode === undefined ? {} : { reasonCode }),
+        ...(operatorReasonProvided === undefined ? {} : { operatorReasonProvided }),
+      };
+      try {
+        sink.onApprovalLifecycleEvent(event);
+      } catch {
+        // Contained: audit delivery failure is handled by the control plane,
+        // which fails closed for critical boundaries. State truth is preserved.
+      }
+    }
+  }
 
   private validateLimit(name: string, value: unknown, max: number): number {
     if (
@@ -356,8 +463,11 @@ export class ApprovalStateManager {
   private transitionToTerminal(
     record: InternalApprovalRecord,
     terminalState: 'REJECTED' | 'EXPIRED' | 'CONSUMED' | 'INVALIDATED',
+    reasonCode?: ApprovalFailureReasonCode,
+    operatorReasonProvided?: boolean,
   ): void {
     if (record.state !== 'PENDING' && record.state !== 'APPROVED') {
+      // Already terminal: no second lifecycle event (rc04 §9).
       return;
     }
 
@@ -382,6 +492,17 @@ export class ApprovalStateManager {
 
     // Drop review material if still retained
     this.dropReviewMaterial(record);
+
+    // Emitted only after the transition and all accounting are committed.
+    const eventType: ApprovalAuditEventType =
+      terminalState === 'EXPIRED'
+        ? 'APPROVAL_EXPIRED'
+        : terminalState === 'REJECTED'
+          ? 'APPROVAL_REJECTED'
+          : terminalState === 'CONSUMED'
+            ? 'APPROVAL_CONSUMED'
+            : 'APPROVAL_INVALIDATED';
+    this.emitLifecycleEvent(record, eventType, reasonCode, operatorReasonProvided);
   }
 
   /**
@@ -588,6 +709,10 @@ export class ApprovalStateManager {
       this.reviewBytesByActor.set(actorQuotaKey, currentActorBytes + reviewBytes);
     }
 
+    // A lifecycle REQUEST was actually created. Deduplicated reuse returns
+    // earlier and therefore never reaches this point (rc04 §8).
+    this.emitLifecycleEvent(record, 'APPROVAL_REQUESTED');
+
     return this.toSnapshot(record);
   }
 
@@ -622,6 +747,9 @@ export class ApprovalStateManager {
     // Drop review material immediately upon approval
     this.dropReviewMaterial(record);
 
+    // Emitted after the state change is committed (rc04 §37).
+    this.emitLifecycleEvent(record, 'APPROVAL_GRANTED');
+
     return {
       token: tokenText,
       snapshot: this.toSnapshot(record),
@@ -631,7 +759,7 @@ export class ApprovalStateManager {
   /**
    * Rejects a PENDING request.
    */
-  public reject(requestId: string, _reason?: string): ApprovalRequestSnapshot {
+  public reject(requestId: string, reason?: string): ApprovalRequestSnapshot {
     if (typeof requestId !== 'string') {
       throw ArcError.approvalRejected();
     }
@@ -649,7 +777,9 @@ export class ApprovalStateManager {
       throw ArcError.approvalRejected();
     }
 
-    this.transitionToTerminal(record, 'REJECTED');
+    // The operator-supplied reason text is NEVER stored, audited, or logged: it
+    // can contain secrets or host paths. Only its presence is retained.
+    this.transitionToTerminal(record, 'REJECTED', undefined, reason !== undefined);
 
     return this.toSnapshot(record);
   }
@@ -691,8 +821,8 @@ export class ApprovalStateManager {
     if (record.state === 'PENDING') {
       // If policy hash mismatches, transition to INVALIDATED
       if (record.binding.policyHash !== policyHash) {
-        this.transitionToTerminal(record, 'INVALIDATED');
-        throw ArcError.approvalRejected();
+        this.transitionToTerminal(record, 'INVALIDATED', 'POLICY_BINDING_MISMATCH');
+        throw attachApprovalFailureReason(ArcError.approvalRejected(), 'POLICY_BINDING_MISMATCH');
       }
       throw ArcError.approvalRequired();
     }
@@ -710,7 +840,7 @@ export class ApprovalStateManager {
     }
 
     if (record.state === 'CONSUMED') {
-      throw ArcError.approvalRejected();
+      throw attachApprovalFailureReason(ArcError.approvalRejected(), 'ALREADY_CONSUMED');
     }
 
     if (record.state !== 'APPROVED') {
@@ -719,13 +849,13 @@ export class ApprovalStateManager {
 
     // Policy Binding Check: Mismatch permanently invalidates approval
     if (record.binding.policyHash !== policyHash) {
-      this.transitionToTerminal(record, 'INVALIDATED');
-      throw ArcError.approvalRejected();
+      this.transitionToTerminal(record, 'INVALIDATED', 'POLICY_BINDING_MISMATCH');
+      throw attachApprovalFailureReason(ArcError.approvalRejected(), 'POLICY_BINDING_MISMATCH');
     }
 
     // Execution Payload Binding Check
     if (record.executionPayloadHash !== executionPayloadHash) {
-      throw ArcError.approvalRejected();
+      throw attachApprovalFailureReason(ArcError.approvalRejected(), 'PAYLOAD_BINDING_MISMATCH');
     }
 
     // Actor Binding Check
@@ -738,7 +868,7 @@ export class ApprovalStateManager {
       record.binding.actor.sessionId !== actor.sessionId ||
       record.binding.actor.deviceId !== actor.deviceId
     ) {
-      throw ArcError.approvalRejected();
+      throw attachApprovalFailureReason(ArcError.approvalRejected(), 'ACTOR_BINDING_MISMATCH');
     }
 
     // Workspace Binding Check
@@ -749,18 +879,18 @@ export class ApprovalStateManager {
       record.binding.workspace.workspaceId !== workspace.workspaceId ||
       record.binding.workspace.workspaceRootHash !== workspace.workspaceRootHash
     ) {
-      throw ArcError.approvalRejected();
+      throw attachApprovalFailureReason(ArcError.approvalRejected(), 'WORKSPACE_BINDING_MISMATCH');
     }
 
     // Token Verification via 32-byte constant-time digest comparison
     if (!record.tokenDigest) {
-      throw ArcError.approvalRejected();
+      throw attachApprovalFailureReason(ArcError.approvalRejected(), 'TOKEN_MISMATCH');
     }
 
     const candidateDigest = createHash('sha256').update(token, 'utf8').digest();
     const isValid = timingSafeEqual(record.tokenDigest, candidateDigest);
     if (!isValid) {
-      throw ArcError.approvalRejected();
+      throw attachApprovalFailureReason(ArcError.approvalRejected(), 'TOKEN_MISMATCH');
     }
 
     // Atomic Consumption

@@ -921,6 +921,142 @@ describe('CesSpace ARC — RC-04 Task 3: Authenticated Local Admin Channel', () 
       assert.equal(manager.getRequest(seeded.requestId).state, 'PENDING');
     });
 
+    test('RC04-A-53b: admin approve commits APPROVAL_GRANTED before returning the token', async () => {
+      const audit = new AuditLogger();
+      const lifecycleManager = new ApprovalStateManager();
+      const lifecycleEndpoint = socketPathIn(makeSecureDir('lifedir'));
+      const lifecycleServer = new AdminIpcServer({
+        endpoint: lifecycleEndpoint,
+        operatorPublicKeyB64: operator.publicKeyB64,
+        approvalStateManager: lifecycleManager,
+        auditLogger: audit,
+      });
+      await lifecycleServer.start();
+      try {
+        const seededLifecycle = seedPending(lifecycleManager);
+        const response = await adminRequest(
+          lifecycleEndpoint,
+          operator.privateKey,
+          'approval.approve',
+          { requestId: seededLifecycle.requestId },
+        );
+        assert.equal(response.ok, true);
+        assert.match(response.result.token, /^[0-9a-f]{64}$/);
+
+        // APPROVAL_GRANTED is already on the chain when the token is returned.
+        const events = audit
+          .getRecords()
+          .filter((r) => r.approval?.eventType)
+          .map((r) => r.approval.eventType);
+        assert.deepEqual(events, ['APPROVAL_REQUESTED', 'APPROVAL_GRANTED']);
+        assert.equal(events.at(-1), 'APPROVAL_GRANTED', 'grant committed before the token');
+        assert.equal(await audit.verifyIntegrity(), true);
+
+        // Neither the raw token nor its digest appears anywhere in the chain.
+        const serialized = JSON.stringify(audit.getRecords());
+        assert.ok(!serialized.includes(response.result.token), 'raw token must never be audited');
+        assert.ok(
+          !serialized.includes(
+            crypto.createHash('sha256').update(response.result.token, 'utf8').digest('hex'),
+          ),
+          'token digest must never be audited',
+        );
+      } finally {
+        await lifecycleServer.stop();
+      }
+    });
+
+    test('RC04-A-53c: lazy expiry discovered by approve/reject/inspect is durable before the reply', async () => {
+      for (const method of ['approval.approve', 'approval.reject', 'approvals.inspect']) {
+        let nowMs = 1_000_000;
+        const audit = new AuditLogger();
+        const clockManager = new ApprovalStateManager({
+          getMonotonicTime: () => BigInt(nowMs) * 1_000_000n,
+        });
+        const clockDir = makeSecureDir(`lazy-${method.replace('.', '-')}`);
+        const clockEndpoint = socketPathIn(clockDir);
+        const clockServer = new AdminIpcServer({
+          endpoint: clockEndpoint,
+          operatorPublicKeyB64: operator.publicKeyB64,
+          approvalStateManager: clockManager,
+          auditLogger: audit,
+        });
+        await clockServer.start();
+        try {
+          const seeded = seedPending(clockManager);
+          nowMs += 301_000;
+
+          const response = await adminRequest(clockEndpoint, operator.privateKey, method, {
+            requestId: seeded.requestId,
+          });
+          assert.equal(response.ok, false, `${method} must not succeed on an expired request`);
+
+          // The state machine performed a REAL PENDING->EXPIRED transition while
+          // answering. Its evidence must already be committed, not merely queued.
+          const events = audit
+            .getRecords()
+            .filter((r) => r.approval?.eventType)
+            .map((r) => r.approval.eventType);
+          assert.deepEqual(
+            events,
+            ['APPROVAL_REQUESTED', 'APPROVAL_EXPIRED'],
+            `${method} must commit the expiry it discovered before replying`,
+          );
+          assert.equal(await audit.verifyIntegrity(), true);
+        } finally {
+          await clockServer.stop();
+          fs.rmSync(clockDir, { recursive: true, force: true });
+        }
+      }
+    });
+
+    test('RC04-A-53d: composing the admin channel does not double-write lifecycle evidence', async () => {
+      const wsDir = makeSecureDir('compose-ws');
+      const adminDir = makeSecureDir('compose-admin');
+      const composeEndpoint = socketPathIn(adminDir);
+
+      // The shipped entrypoint composes an MCP server AND an admin channel over
+      // ONE audit chain and ONE approval manager.
+      const composed = createArcMcpServer({
+        transport: 'stdio',
+        authorizedRoots: [{ id: 'ws', path: wsDir }],
+        defaultWorkspaceId: 'ws',
+        admin: {
+          endpoint: composeEndpoint,
+          operatorPublicKeyB64: operator.publicKeyB64,
+        },
+      });
+      await composed.adminIpcServer.start();
+      try {
+        const request = await composed.dispatchToolCall('create_file', {
+          path: 'composed.txt',
+          content: 'x',
+          workspaceId: 'ws',
+        });
+        const requestId = JSON.parse(request.content[0].text).details.approvalRequestId;
+
+        // An operator grant drives the admin channel's own flush.
+        const grant = await adminRequest(composeEndpoint, operator.privateKey, 'approval.approve', {
+          requestId,
+        });
+        assert.equal(grant.ok, true);
+
+        // Exactly one record per transition. A second observer would write each
+        // transition twice, and every duplicate is individually well-formed and
+        // correctly chained, so integrity verification cannot detect it.
+        const events = composed.auditLogger
+          .getRecords()
+          .filter((r) => r.approval?.eventType)
+          .map((r) => r.approval.eventType);
+        assert.deepEqual(events, ['APPROVAL_REQUESTED', 'APPROVAL_GRANTED']);
+        assert.equal(await composed.auditLogger.verifyIntegrity(), true);
+      } finally {
+        await composed.adminIpcServer.stop();
+        fs.rmSync(wsDir, { recursive: true, force: true });
+        fs.rmSync(adminDir, { recursive: true, force: true });
+      }
+    });
+
     test('RC04-A-54: approvals.list returns the safe target summary but no material or token', async () => {
       const reviewMaterial = 'RC04_ADMIN_LIST_MATERIAL_MARKER_1199';
       seedPending(manager, {

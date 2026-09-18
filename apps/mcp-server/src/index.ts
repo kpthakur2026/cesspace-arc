@@ -22,6 +22,7 @@ import {
   DeclarativePolicyEngine,
   SecurityKernel,
   WorkspaceRegistry,
+  getApprovalFailureReason,
   sha256Hex,
   type PolicyEffect,
   type PolicyMatchTarget,
@@ -29,6 +30,7 @@ import {
   RC03_MUTATION_TOOLS,
 } from '@cesspace-arc/policy';
 import { AdminIpcError, AdminIpcServer } from './admin-ipc.js';
+import { ApprovalAuditSink, getApprovalAuditSink } from './approval-audit.js';
 import {
   ARC_APPROVAL_KEY,
   computeExecutionPayloadHash,
@@ -1266,6 +1268,11 @@ export class ArcMcpServer implements IArcMcpServer {
   public processRegistry?: ProcessRegistry;
   /** Approval state manager. Always present; a fresh one is created if not injected. */
   public readonly approvalStateManager: ApprovalStateManager;
+  /**
+   * Bounded lifecycle audit sink. Buffers safe lifecycle events emitted by the
+   * state machine and flushes them into the one existing audit hash chain.
+   */
+  public readonly approvalAuditSink: ApprovalAuditSink;
   /** Immutable effective Layer-2 policy engine. Undefined only on fail-closed init. */
   public readonly effectivePolicyEngine?: DeclarativePolicyEngine;
   /** Safe failure category when an explicitly configured policy was invalid. */
@@ -1293,6 +1300,14 @@ export class ArcMcpServer implements IArcMcpServer {
   ) {
     // The approval state manager is mandatory for Task 4 authorization.
     this.approvalStateManager = approvalStateManager ?? new ApprovalStateManager();
+
+    // Lifecycle audit evidence: the manager emits synchronously, the sink
+    // buffers, and the control plane flushes into the existing audit chain.
+    // The sink is memoized per chain so a separately composed admin channel
+    // over the same logger cannot register a second observer (which would
+    // double-write every transition).
+    this.approvalAuditSink = getApprovalAuditSink(this.auditLogger);
+    this.approvalStateManager.registerLifecycleSink(this.approvalAuditSink);
 
     this.defaultWorkspaceId = config?.defaultWorkspaceId;
     this.processRegistry =
@@ -2086,6 +2101,22 @@ export class ArcMcpServer implements IArcMcpServer {
     // this invocation. It is never derived from parameters, actor input, a
     // policy ALLOW, or any request property.
     let approvalConsumedForExecution = false;
+    let consumedApprovalRequestId: string | undefined;
+    let consumedApprovalContext:
+      | {
+          requestId: string;
+          toolName: string;
+          actor: {
+            clientId: string;
+            clientType: string;
+            sessionId?: string;
+            deviceId?: string;
+          };
+          workspaceId: string;
+          workspaceRootHash: string;
+          policyHash: string;
+        }
+      | undefined;
 
     if (effectiveEffect === 'REQUIRE_APPROVAL') {
       const actorBinding = {
@@ -2141,6 +2172,21 @@ export class ArcMcpServer implements IArcMcpServer {
           },
         );
 
+        // Lifecycle evidence is committed BEFORE the request ID is returned.
+        // A failure here fails the initiating action closed rather than
+        // proceeding without required audit evidence.
+        try {
+          await this.approvalAuditSink.flush();
+        } catch {
+          return denyWith(
+            ArcError.internalError('Required approval audit evidence could not be recorded.'),
+            'approval-audit-failed',
+            'REQUIRE_APPROVAL',
+            auditParams,
+            { workspaceId: targetWorkspace.workspaceId, workspacePath: targetWorkspace.rootPath },
+          );
+        }
+
         await this.auditLogger.log({
           timestamp: startTime,
           actor: auditActor,
@@ -2157,12 +2203,18 @@ export class ArcMcpServer implements IArcMcpServer {
             decision: 'REQUIRE_APPROVAL',
             ruleId: effectiveRuleId,
             evaluationDurationMs: evalDuration,
+            approvalId: snapshot.requestId,
           },
           execution: {
             status: 'DENIED',
             startTime,
             endTime: new Date().toISOString(),
             durationMs: Date.now() - startMs,
+          },
+          approval: {
+            requestId: snapshot.requestId,
+            state: snapshot.state,
+            source: 'MCP',
           },
           error: { code: 'APPROVAL_REQUIRED', message: arcError.message },
         });
@@ -2186,9 +2238,35 @@ export class ArcMcpServer implements IArcMcpServer {
           workspace: workspaceBinding,
           policyHash: currentPolicyHash,
         });
-        // Consumption happened BEFORE any subsystem call.
+        // Consumption happened BEFORE any subsystem call. The CONSUMED
+        // lifecycle evidence must be committed before execution begins; if it
+        // cannot be recorded the subsystem MUST NOT run, and the approval
+        // remains CONSUMED (never rolled back to APPROVED).
+        try {
+          await this.approvalAuditSink.flush();
+        } catch {
+          return denyWith(
+            ArcError.internalError('Required approval audit evidence could not be recorded.'),
+            'approval-audit-failed',
+            'REQUIRE_APPROVAL',
+            auditParams,
+            {
+              workspaceId: targetWorkspace.workspaceId,
+              workspacePath: targetWorkspace.rootPath,
+            },
+            evalDuration,
+          );
+        }
         approvalConsumedForExecution = true;
-        void consumption;
+        consumedApprovalRequestId = consumption.requestId;
+        consumedApprovalContext = {
+          requestId: consumption.requestId,
+          toolName,
+          actor: actorBinding,
+          workspaceId: workspaceBinding.workspaceId,
+          workspaceRootHash: workspaceBinding.workspaceRootHash,
+          policyHash: currentPolicyHash,
+        };
       } catch (redemptionErr: unknown) {
         const code = (redemptionErr as { code?: string })?.code;
         const arcError =
@@ -2197,6 +2275,9 @@ export class ArcMcpServer implements IArcMcpServer {
             : ArcError.approvalRejected(
                 'Approval could not be redeemed. The request, token, or bindings are not valid.',
               );
+        // Internal diagnostic ONLY. It is written to the audit record, never to
+        // the ArcError, its details, toJSON(), or the MCP response (anti-oracle).
+        const internalReason = getApprovalFailureReason(redemptionErr);
 
         await this.auditLogger.log({
           timestamp: startTime,
@@ -2214,6 +2295,7 @@ export class ArcMcpServer implements IArcMcpServer {
             decision: 'REQUIRE_APPROVAL',
             ruleId: effectiveRuleId,
             evaluationDurationMs: evalDuration,
+            approvalId: extracted.control.requestId,
           },
           execution: {
             status: 'DENIED',
@@ -2221,8 +2303,21 @@ export class ArcMcpServer implements IArcMcpServer {
             endTime: new Date().toISOString(),
             durationMs: Date.now() - startMs,
           },
+          approval: {
+            requestId: extracted.control.requestId,
+            source: 'MCP',
+            ...(internalReason === undefined ? {} : { reasonCode: internalReason }),
+          },
           error: { code: arcError.code, message: arcError.message },
         });
+
+        // Expiry/invalidation discovered during redemption is lifecycle
+        // evidence too, and must be committed before the rejection is returned.
+        try {
+          await this.approvalAuditSink.flush();
+        } catch {
+          // Evidence could not be written: still fail closed, still generic.
+        }
 
         return {
           isError: true,
@@ -2537,7 +2632,19 @@ export class ArcMcpServer implements IArcMcpServer {
         decision: effectiveDecisionLabel,
         ruleId: effectiveRuleIdForAudit,
         evaluationDurationMs: evalDuration,
+        ...(consumedApprovalRequestId === undefined
+          ? {}
+          : { approvalId: consumedApprovalRequestId }),
       },
+      ...(consumedApprovalRequestId === undefined
+        ? {}
+        : {
+            approval: {
+              requestId: consumedApprovalRequestId,
+              state: 'CONSUMED' as const,
+              source: 'MCP' as const,
+            },
+          }),
       execution: {
         status: executionStatus,
         startTime,
@@ -2552,6 +2659,37 @@ export class ArcMcpServer implements IArcMcpServer {
           }
         : undefined,
     });
+
+    // Execution lifecycle evidence, emitted ONLY when this invocation actually
+    // consumed an approval. Ordered after the ordinary invocation record, and
+    // committed before the MCP response returns.
+    if (consumedApprovalContext !== undefined) {
+      this.approvalAuditSink.onApprovalLifecycleEvent({
+        eventType: arcError ? 'APPROVED_EXECUTION_FAILED' : 'APPROVED_EXECUTION_SUCCEEDED',
+        requestId: consumedApprovalContext.requestId,
+        state: 'CONSUMED',
+        toolName: consumedApprovalContext.toolName,
+        actor: consumedApprovalContext.actor,
+        workspaceId: consumedApprovalContext.workspaceId,
+        workspaceRootHash: consumedApprovalContext.workspaceRootHash,
+        policyHash: consumedApprovalContext.policyHash,
+        occurredAt: new Date().toISOString(),
+      });
+      try {
+        await this.approvalAuditSink.flush();
+      } catch {
+        // Required lifecycle evidence could not be committed. The subsystem
+        // call already happened, but a client MUST NOT receive a successful
+        // result for an approved execution whose evidence is missing: fail the
+        // invocation closed with a sanitized error instead of returning the
+        // result. An already-failing execution keeps its more specific error;
+        // the chain retains the queued evidence and keeps failing closed on
+        // every later flush. The execution fact stays truthfully recorded above.
+        arcError ??= ArcError.internalError(
+          'Required approval audit evidence could not be recorded.',
+        );
+      }
+    }
 
     // 6. Sanitized Response Formatting
     if (arcError) {
@@ -2608,6 +2746,7 @@ export class ArcMcpServer implements IArcMcpServer {
   }
 
   public async flushAudit(): Promise<void> {
+    await this.approvalAuditSink.flush();
     if (this.processRegistry) {
       await this.processRegistry.flushLifecycleEvents();
     }
@@ -2680,6 +2819,7 @@ export function createArcMcpServer(config?: Partial<ArcServerConfig>): ArcMcpSer
         endpoint: endpoint as string,
         operatorPublicKeyB64: operatorPublicKeyB64 as string,
         approvalStateManager,
+        auditLogger,
       });
     }
   }

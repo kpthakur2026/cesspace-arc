@@ -1,4 +1,20 @@
 import type { PolicyEffect } from './policy.js';
+import type {
+  ApprovalAuditEventType,
+  ApprovalFailureReasonCode,
+  ApprovalState,
+} from './approval.js';
+
+/** Bounded approval correlation metadata. Never raw material or a token. */
+export interface AuditApprovalMetadata {
+  eventType?: ApprovalAuditEventType;
+  requestId?: string;
+  state?: ApprovalState;
+  source?: 'MCP' | 'LOCAL_OPERATOR' | 'SYSTEM';
+  /** Internal diagnostic only. Never surfaced to an MCP client. */
+  reasonCode?: ApprovalFailureReasonCode;
+  operatorReasonProvided?: boolean;
+}
 
 /**
  * Structured audit record representing an immutable event in the control plane.
@@ -15,7 +31,13 @@ export interface AuditRecord {
   };
   target: {
     workspaceId: string;
+    /**
+     * Always empty in stored records: AuditLogger centrally replaces a raw
+     * absolute host path with its digest. Retained for protocol compatibility.
+     */
     workspacePath: string;
+    /** SHA-256 of the canonical supplied workspace path, when one was supplied. */
+    workspaceRootHash?: string;
   };
   invocation: {
     toolName: string;
@@ -42,6 +64,8 @@ export interface AuditRecord {
     code: string;
     message: string;
   };
+  /** Bounded approval correlation metadata. */
+  approval?: AuditApprovalMetadata;
   integrity: {
     previousRecordHash: string;
     recordHash: string;
