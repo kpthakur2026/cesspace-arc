@@ -15,17 +15,25 @@ import {
   type HealthResponse,
   type SystemStatusResponse,
   type PolicyEvaluationContext,
+  type RunCommandRequest,
 } from '@cesspace-arc/protocol';
 import { SecurityKernel, WorkspaceRegistry, type WorkspaceRecord } from '@cesspace-arc/policy';
 import { AuditLogger, computeSha256, canonicalJson } from '@cesspace-arc/audit';
 import { FilesystemSubsystem } from '@cesspace-arc/filesystem';
 import { GitSubsystem } from '@cesspace-arc/git';
+import {
+  ProcessRegistry,
+  type IProcessLifecycleSink,
+  type ProcessLifecycleEvent,
+} from '@cesspace-arc/processes';
+import { ControlledProcessRunner, type ITerminalSubsystem } from '@cesspace-arc/terminal';
 import { z } from 'zod';
 
 export interface ArcServerConfig {
   transport: 'stdio';
   authorizedRoots: Array<{ id: string; path: string }>;
   defaultWorkspaceId?: string;
+  stage?: string;
 }
 
 const WorkspaceIdSchema = z
@@ -82,8 +90,34 @@ const RevisionTargetSchema = z
   .trim()
   .min(1, 'revision or target must not be empty or whitespace-only');
 
+const ExecutableSchema = z
+  .string()
+  .max(128, 'executable exceeds maximum allowed length of 128 characters')
+  .trim()
+  .min(1, 'executable must not be empty or whitespace-only');
+
+const ProcessIdSchema = z
+  .string()
+  .max(128, 'processId exceeds maximum allowed length of 128 characters')
+  .trim()
+  .min(1, 'processId must not be empty or whitespace-only');
+
+const CommandArgSchema = z
+  .string()
+  .max(1024, 'command argument exceeds maximum allowed length of 1024 characters');
+
+const EnvKeySchema = z
+  .string()
+  .max(128, 'env key exceeds maximum allowed length of 128 characters')
+  .trim()
+  .min(1, 'env key must not be empty');
+
+const EnvValueSchema = z
+  .string()
+  .max(512, 'env value exceeds maximum allowed length of 512 characters');
+
 /**
- * Strict Zod validation schemas for all 9 permitted RC-01 tools.
+ * Strict Zod validation schemas for all permitted tools (RC-01 read-only + RC-02 controlled execution).
  * Enforces runtime schema pre-admission rejection and audit logging.
  */
 export const TOOL_SCHEMAS = {
@@ -145,7 +179,178 @@ export const TOOL_SCHEMAS = {
       workspaceId: WorkspaceIdSchema.optional(),
     })
     .strict(),
+  run_command: z
+    .object({
+      executable: ExecutableSchema,
+      args: z.array(CommandArgSchema).max(100).optional(),
+      cwd: OptionalPathSchema.optional(),
+      timeoutMs: z.number().int().min(100).max(300000).optional(),
+      env: z.record(EnvKeySchema, EnvValueSchema).optional(),
+      workspaceId: WorkspaceIdSchema.optional(),
+      runInBackground: z.boolean().optional(),
+    })
+    .strict(),
+  process_status: z
+    .object({
+      processId: ProcessIdSchema,
+      workspaceId: WorkspaceIdSchema.optional(),
+    })
+    .strict(),
+  process_output: z
+    .object({
+      processId: ProcessIdSchema,
+      offset: z.number().int().min(0).optional(),
+      stdoutCursor: z.number().int().min(0).optional(),
+      stderrCursor: z.number().int().min(0).optional(),
+      maxBytes: z.number().int().min(1).max(131072).optional(),
+      workspaceId: WorkspaceIdSchema.optional(),
+    })
+    .strict(),
+  terminate_process: z
+    .object({
+      processId: ProcessIdSchema,
+      signal: z.enum(['SIGTERM', 'SIGKILL']).optional(),
+      workspaceId: WorkspaceIdSchema.optional(),
+    })
+    .strict(),
 } as const;
+
+/**
+ * Definition of the 4 RC-02 MCP Tools (controlled terminal & process execution).
+ */
+export const RC02_TOOL_DEFINITIONS: Tool[] = [
+  {
+    name: 'run_command',
+    description:
+      'Execute an approved command within an authorized workspace under policy control (executable allowlist, output bounded at 512 KiB, default-deny security kernel).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        executable: {
+          type: 'string',
+          description:
+            'Basename of the executable to run (no path separators). Must be on the allowlist.',
+        },
+        args: {
+          type: 'array',
+          description: 'Array of argument strings (max 100). Each argument max 1024 characters.',
+          items: { type: 'string' },
+          maxItems: 100,
+        },
+        cwd: {
+          type: 'string',
+          description: 'Working directory relative path within the workspace root.',
+        },
+        timeoutMs: {
+          type: 'integer',
+          description: 'Execution timeout in milliseconds (100–300000, default: 30000).',
+          minimum: 100,
+          maximum: 300000,
+        },
+        env: {
+          type: 'object',
+          description: 'Optional extra environment variables (allowlisted keys only).',
+          additionalProperties: { type: 'string' },
+        },
+        workspaceId: {
+          type: 'string',
+          description: 'Registered workspace ID.',
+        },
+        runInBackground: {
+          type: 'boolean',
+          description: 'If true, returns a processId immediately without waiting for completion.',
+        },
+      },
+      required: ['executable'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'process_status',
+    description: 'Query the status of an ARC-managed process by its opaque process ID.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        processId: {
+          type: 'string',
+          description: 'Opaque ARC process identifier (arc-proc-*).',
+        },
+        workspaceId: {
+          type: 'string',
+          description: 'Optional registered workspace ID.',
+        },
+      },
+      required: ['processId'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'process_output',
+    description:
+      'Read buffered stdout/stderr output from an ARC-managed process (max 128 KiB per read, 512 KiB total buffer).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        processId: {
+          type: 'string',
+          description: 'Opaque ARC process identifier (arc-proc-*).',
+        },
+        offset: {
+          type: 'integer',
+          description: 'Byte offset into the combined output buffer (legacy/fallback).',
+          minimum: 0,
+        },
+        stdoutCursor: {
+          type: 'integer',
+          description: 'Independent byte cursor for the stdout stream.',
+          minimum: 0,
+        },
+        stderrCursor: {
+          type: 'integer',
+          description: 'Independent byte cursor for the stderr stream.',
+          minimum: 0,
+        },
+        maxBytes: {
+          type: 'integer',
+          description: 'Maximum bytes to return (max 131072).',
+          minimum: 1,
+          maximum: 131072,
+        },
+        workspaceId: {
+          type: 'string',
+          description: 'Optional registered workspace ID.',
+        },
+      },
+      required: ['processId'],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'terminate_process',
+    description:
+      'Send a termination signal to an ARC-managed process. Defaults to SIGTERM with a SIGKILL escalation after 1 second.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        processId: {
+          type: 'string',
+          description: 'Opaque ARC process identifier (arc-proc-*).',
+        },
+        signal: {
+          type: 'string',
+          description: 'Signal to send: SIGTERM (default) or SIGKILL.',
+          enum: ['SIGTERM', 'SIGKILL'],
+        },
+        workspaceId: {
+          type: 'string',
+          description: 'Optional registered workspace ID.',
+        },
+      },
+      required: ['processId'],
+      additionalProperties: false,
+    },
+  },
+];
 
 /**
  * Definition of the 9 RC-01 MCP Tools.
@@ -373,6 +578,7 @@ export const RC01_TOOL_DEFINITIONS: Tool[] = [
 export interface IArcMcpServer {
   start(): Promise<void>;
   stop(): Promise<void>;
+  flushAudit(): Promise<void>;
   dispatchToolCall(
     toolName: string,
     parameters: Record<string, unknown>,
@@ -380,10 +586,159 @@ export interface IArcMcpServer {
   ): Promise<{ isError?: boolean; content: Array<{ type: 'text'; text: string }> }>;
 }
 
+export class ProcessAuditSink implements IProcessLifecycleSink {
+  constructor(
+    private auditLogger: AuditLogger,
+    private workspaceRegistry: WorkspaceRegistry,
+  ) {}
+
+  public async onProcessEvent(event: ProcessLifecycleEvent): Promise<void> {
+    const ws = this.workspaceRegistry.getWorkspace(event.workspaceId);
+    const workspacePath = ws ? ws.rootPath : '';
+
+    const isFailure = event.eventType === 'PROCESS_SPAWN_FAILED';
+    const isTimeout = event.eventType === 'PROCESS_TIMEOUT';
+
+    await this.auditLogger.log({
+      timestamp: event.timestamp,
+      actor: {
+        clientId: event.actor.clientId,
+        clientType: event.actor.clientType || 'mcp-client',
+        deviceId: event.actor.deviceId || 'local-machine',
+        sessionId: event.actor.sessionId,
+      },
+      target: {
+        workspaceId: event.workspaceId,
+        workspacePath,
+      },
+      invocation: {
+        toolName: event.eventType,
+        parametersRedacted: {
+          eventType: event.eventType,
+          processId: event.processId,
+          executable: event.executable,
+          ...(event.signal ? { signal: event.signal } : {}),
+          ...(typeof event.exitCode === 'number' ? { exitCode: event.exitCode } : {}),
+          ...(typeof event.durationMs === 'number' ? { durationMs: event.durationMs } : {}),
+          ...(event.error ? { error: event.error } : {}),
+        },
+        payloadHash: computeSha256(
+          canonicalJson({ processId: event.processId, eventType: event.eventType }),
+        ),
+      },
+      policy: {
+        decision: 'ALLOW',
+        ruleId: 'process-lifecycle-event',
+        evaluationDurationMs: 0,
+      },
+      execution: {
+        status: isFailure ? 'ERROR' : isTimeout ? 'TIMEOUT' : 'SUCCESS',
+        startTime: event.timestamp,
+        endTime: event.timestamp,
+        durationMs: event.durationMs || 0,
+        exitCode: typeof event.exitCode === 'number' ? event.exitCode : undefined,
+      },
+      error: event.error ? { code: 'PROCESS_ERROR', message: event.error } : undefined,
+    });
+  }
+}
+
+/**
+ * Sanitizes parameters prior to schema validation for audit logging.
+ * Ensures raw arguments, environment values, and secrets are never stored in audit logs.
+ */
+export function sanitizePreValidationParameters(
+  toolName: string,
+  parameters: Record<string, unknown>,
+): Record<string, unknown> {
+  if (toolName === 'run_command') {
+    const sanitized: Record<string, unknown> = {};
+
+    // Executable: retain only safe alphanumeric/dash string without path separators
+    if (
+      typeof parameters.executable === 'string' &&
+      /^[a-zA-Z0-9_.-]+$/.test(parameters.executable)
+    ) {
+      sanitized.executable = parameters.executable;
+    } else if (parameters.executable !== undefined) {
+      sanitized.executable = `[UNSAFE_OR_NON_STRING_EXECUTABLE: ${typeof parameters.executable}]`;
+    }
+
+    // Args: retain ONLY argCount, argument types, and recognized safe flags (--version, -v, --help, -h)
+    // Never store raw argument values!
+    if (Array.isArray(parameters.args)) {
+      const safeFlags = parameters.args.filter(
+        (a) => typeof a === 'string' && /^(-v|--version|-h|--help)$/.test(a),
+      );
+      sanitized.args = {
+        argCount: parameters.args.length,
+        argTypes: parameters.args.map((a) => typeof a),
+        safeFlags,
+      };
+    } else if (parameters.args !== undefined) {
+      sanitized.args = { argType: typeof parameters.args };
+    }
+
+    // Env: env key names only, NEVER env values
+    if (parameters.env && typeof parameters.env === 'object' && !Array.isArray(parameters.env)) {
+      sanitized.envKeys = Object.keys(parameters.env);
+    } else if (parameters.env !== undefined) {
+      sanitized.env = `[INVALID_ENV_TYPE: ${typeof parameters.env}]`;
+    }
+
+    // Safe metadata
+    if (typeof parameters.workspaceId === 'string') {
+      sanitized.workspaceId = parameters.workspaceId;
+    }
+    if (typeof parameters.cwd === 'string') {
+      sanitized.cwd = parameters.cwd;
+    }
+    if (typeof parameters.timeoutMs === 'number') {
+      sanitized.timeoutMs = parameters.timeoutMs;
+    }
+    if (typeof parameters.runInBackground === 'boolean') {
+      sanitized.runInBackground = parameters.runInBackground;
+    }
+
+    // If extra properties were provided, record only their key names
+    const knownKeys = new Set([
+      'executable',
+      'args',
+      'cwd',
+      'timeoutMs',
+      'env',
+      'workspaceId',
+      'runInBackground',
+    ]);
+    const extraKeys = Object.keys(parameters).filter((k) => !knownKeys.has(k));
+    if (extraKeys.length > 0) {
+      sanitized.extraPropertyKeys = extraKeys;
+    }
+
+    return sanitized;
+  }
+
+  // Generic sanitizer for other tools: scrub raw args/env objects
+  const sanitized: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(parameters)) {
+    if (key === 'env' && typeof value === 'object' && value !== null) {
+      sanitized.envKeys = Object.keys(value);
+    } else if (key === 'args' && Array.isArray(value)) {
+      sanitized.argCount = value.length;
+    } else if (typeof value === 'string' && value.length > 256) {
+      sanitized[key] = `[STRING_EXCEEDS_LENGTH_BOUND: ${value.length} chars]`;
+    } else {
+      sanitized[key] = value;
+    }
+  }
+  return sanitized;
+}
+
 export class ArcMcpServer implements IArcMcpServer {
   private server: Server;
   private transport?: StdioServerTransport;
   private defaultWorkspaceId?: string;
+  public processRegistry?: ProcessRegistry;
 
   constructor(
     public readonly workspaceRegistry: WorkspaceRegistry,
@@ -392,8 +747,20 @@ export class ArcMcpServer implements IArcMcpServer {
     public readonly filesystemSubsystem: FilesystemSubsystem,
     public readonly gitSubsystem: GitSubsystem,
     config?: Partial<ArcServerConfig>,
+    public readonly terminalSubsystem?: ITerminalSubsystem,
+    processRegistry?: ProcessRegistry,
   ) {
     this.defaultWorkspaceId = config?.defaultWorkspaceId;
+    this.processRegistry =
+      processRegistry ||
+      (terminalSubsystem && 'processRegistry' in terminalSubsystem
+        ? (terminalSubsystem as ControlledProcessRunner).processRegistry
+        : undefined);
+
+    if (this.processRegistry) {
+      const sink = new ProcessAuditSink(this.auditLogger, this.workspaceRegistry);
+      this.processRegistry.registerLifecycleSink(sink);
+    }
 
     if (config?.authorizedRoots) {
       for (const root of config.authorizedRoots) {
@@ -407,7 +774,7 @@ export class ArcMcpServer implements IArcMcpServer {
     this.server = new Server(
       {
         name: 'cesspace-arc',
-        version: '0.1.0-rc01',
+        version: '0.2.0-rc02',
       },
       {
         capabilities: {
@@ -422,7 +789,7 @@ export class ArcMcpServer implements IArcMcpServer {
   private setupHandlers(): void {
     this.server.setRequestHandler(ListToolsRequestSchema, async () => {
       return {
-        tools: RC01_TOOL_DEFINITIONS,
+        tools: [...RC01_TOOL_DEFINITIONS, ...RC02_TOOL_DEFINITIONS],
       };
     });
 
@@ -449,10 +816,10 @@ export class ArcMcpServer implements IArcMcpServer {
 
     // 1. Authenticated / Local Caller Context
     const auditActor = {
-      clientId: actorOverride?.clientId || 'local-stdio-caller',
-      clientType: actorOverride?.clientType || 'mcp-client',
-      sessionId: actorOverride?.sessionId || 'stdio-session-01',
-      deviceId: actorOverride?.deviceId || 'local-machine',
+      clientId: actorOverride?.clientId ?? 'local-stdio-caller',
+      clientType: actorOverride?.clientType ?? 'mcp-client',
+      sessionId: actorOverride?.sessionId ?? 'stdio-session-01',
+      deviceId: actorOverride?.deviceId ?? 'local-machine',
     };
 
     const actor: PolicyEvaluationContext['actor'] = {
@@ -466,14 +833,15 @@ export class ArcMcpServer implements IArcMcpServer {
       const arcErr = ArcError.policyDenied(
         `Tool '${toolName}' is not permitted in RC-01 stage (read-only inspection core only).`,
       );
+      const preAuditParams = sanitizePreValidationParameters(toolName, parameters);
       await this.auditLogger.log({
         timestamp: startTime,
         actor: auditActor,
         target: { workspaceId: 'unbound', workspacePath: '' },
         invocation: {
           toolName,
-          parametersRedacted: parameters,
-          payloadHash: computeSha256(canonicalJson(parameters)),
+          parametersRedacted: preAuditParams,
+          payloadHash: computeSha256(canonicalJson(preAuditParams)),
         },
         policy: {
           decision: 'DENY',
@@ -513,14 +881,15 @@ export class ArcMcpServer implements IArcMcpServer {
         : ArcError.invalidRequestSchema(
             `Invalid parameters for tool '${toolName}': ${issueMessages}`,
           );
+      const preAuditParams = sanitizePreValidationParameters(toolName, parameters);
       await this.auditLogger.log({
         timestamp: startTime,
         actor: auditActor,
         target: { workspaceId: 'unbound', workspacePath: '' },
         invocation: {
           toolName,
-          parametersRedacted: parameters,
-          payloadHash: computeSha256(canonicalJson(parameters)),
+          parametersRedacted: preAuditParams,
+          payloadHash: computeSha256(canonicalJson(preAuditParams)),
         },
         policy: {
           decision: 'DENY',
@@ -588,7 +957,201 @@ export class ArcMcpServer implements IArcMcpServer {
     let workspaceConflict = false;
     let workspaceUnregistered = false;
 
-    if (toolName === 'health' || toolName === 'system_status') {
+    // Caller Identity Gate (P1): run_command must fail closed before execution unless clientId and sessionId are non-empty
+    if (toolName === 'run_command') {
+      if (
+        !actor.clientId ||
+        !actor.sessionId ||
+        actor.clientId.trim().length === 0 ||
+        actor.sessionId.trim().length === 0
+      ) {
+        const arcErr = ArcError.policyDenied(
+          'Access denied: run_command requires verified caller identity (clientId and sessionId).',
+        );
+        const preAuditParams = sanitizePreValidationParameters(toolName, parameters);
+        await this.auditLogger.log({
+          timestamp: startTime,
+          actor: auditActor,
+          target: { workspaceId: 'unbound', workspacePath: '' },
+          invocation: {
+            toolName,
+            parametersRedacted: preAuditParams,
+            payloadHash: computeSha256(canonicalJson(preAuditParams)),
+          },
+          policy: {
+            decision: 'DENY',
+            ruleId: 'deny-incomplete-caller-identity',
+            evaluationDurationMs: 0,
+          },
+          execution: {
+            status: 'DENIED',
+            startTime,
+            endTime: new Date().toISOString(),
+            durationMs: Date.now() - startMs,
+          },
+          error: {
+            code: arcErr.code,
+            message: arcErr.message,
+          },
+        });
+        return {
+          isError: true,
+          content: [{ type: 'text', text: JSON.stringify(arcErr.toJSON(), null, 2) }],
+        };
+      }
+    }
+
+    const isProcessLifecycleTool =
+      toolName === 'process_status' ||
+      toolName === 'process_output' ||
+      toolName === 'terminate_process';
+
+    if (isProcessLifecycleTool) {
+      if (!this.processRegistry) {
+        const arcErr = ArcError.policyDenied('Process ownership verifier is unavailable.');
+        const preAuditParams = sanitizePreValidationParameters(toolName, parameters);
+        await this.auditLogger.log({
+          timestamp: startTime,
+          actor: auditActor,
+          target: { workspaceId: 'unbound', workspacePath: '' },
+          invocation: {
+            toolName,
+            parametersRedacted: preAuditParams,
+            payloadHash: computeSha256(canonicalJson(preAuditParams)),
+          },
+          policy: {
+            decision: 'DENY',
+            ruleId: 'deny-missing-process-verifier',
+            evaluationDurationMs: 0,
+          },
+          execution: {
+            status: 'DENIED',
+            startTime,
+            endTime: new Date().toISOString(),
+            durationMs: Date.now() - startMs,
+          },
+          error: {
+            code: arcErr.code,
+            message: arcErr.message,
+          },
+        });
+        return {
+          isError: true,
+          content: [{ type: 'text', text: JSON.stringify(arcErr.toJSON(), null, 2) }],
+        };
+      }
+
+      const processId = validatedParams.processId as string;
+      const procRecord = this.processRegistry.getProcess(processId);
+      if (!procRecord) {
+        const arcErr = ArcError.processNotFound(`Process not found: '${processId}'.`);
+        const preAuditParams = sanitizePreValidationParameters(toolName, parameters);
+        await this.auditLogger.log({
+          timestamp: startTime,
+          actor: auditActor,
+          target: { workspaceId: 'unbound', workspacePath: '' },
+          invocation: {
+            toolName,
+            parametersRedacted: preAuditParams,
+            payloadHash: computeSha256(canonicalJson(preAuditParams)),
+          },
+          policy: {
+            decision: 'DENY',
+            ruleId: 'deny-process-not-found',
+            evaluationDurationMs: 0,
+          },
+          execution: {
+            status: 'DENIED',
+            startTime,
+            endTime: new Date().toISOString(),
+            durationMs: Date.now() - startMs,
+          },
+          error: {
+            code: arcErr.code,
+            message: arcErr.message,
+          },
+        });
+        return {
+          isError: true,
+          content: [{ type: 'text', text: JSON.stringify(arcErr.toJSON(), null, 2) }],
+        };
+      }
+
+      const procWs = this.workspaceRegistry.getWorkspace(procRecord.workspaceId);
+      if (!procWs) {
+        const arcErr = ArcError.policyDenied(
+          `Target workspace '${procRecord.workspaceId}' for process is not registered.`,
+        );
+        const preAuditParams = sanitizePreValidationParameters(toolName, parameters);
+        await this.auditLogger.log({
+          timestamp: startTime,
+          actor: auditActor,
+          target: { workspaceId: procRecord.workspaceId, workspacePath: '' },
+          invocation: {
+            toolName,
+            parametersRedacted: preAuditParams,
+            payloadHash: computeSha256(canonicalJson(preAuditParams)),
+          },
+          policy: {
+            decision: 'DENY',
+            ruleId: 'deny-unregistered-workspace',
+            evaluationDurationMs: 0,
+          },
+          execution: {
+            status: 'DENIED',
+            startTime,
+            endTime: new Date().toISOString(),
+            durationMs: Date.now() - startMs,
+          },
+          error: {
+            code: arcErr.code,
+            message: arcErr.message,
+          },
+        });
+        return {
+          isError: true,
+          content: [{ type: 'text', text: JSON.stringify(arcErr.toJSON(), null, 2) }],
+        };
+      }
+
+      if (validatedParams.workspaceId && validatedParams.workspaceId !== procRecord.workspaceId) {
+        const arcErr = ArcError.policyDenied(
+          'Access denied: Caller workspace does not match process workspace.',
+        );
+        const preAuditParams = sanitizePreValidationParameters(toolName, parameters);
+        await this.auditLogger.log({
+          timestamp: startTime,
+          actor: auditActor,
+          target: { workspaceId: procRecord.workspaceId, workspacePath: procWs.rootPath },
+          invocation: {
+            toolName,
+            parametersRedacted: preAuditParams,
+            payloadHash: computeSha256(canonicalJson(preAuditParams)),
+          },
+          policy: {
+            decision: 'DENY',
+            ruleId: 'deny-process-ownership-mismatch',
+            evaluationDurationMs: 0,
+          },
+          execution: {
+            status: 'DENIED',
+            startTime,
+            endTime: new Date().toISOString(),
+            durationMs: Date.now() - startMs,
+          },
+          error: {
+            code: arcErr.code,
+            message: arcErr.message,
+          },
+        });
+        return {
+          isError: true,
+          content: [{ type: 'text', text: JSON.stringify(arcErr.toJSON(), null, 2) }],
+        };
+      }
+
+      targetWorkspaceRecord = procWs;
+    } else if (toolName === 'health' || toolName === 'system_status') {
       targetWorkspaceRecord = this.defaultWorkspaceId
         ? this.workspaceRegistry.getWorkspace(this.defaultWorkspaceId)
         : undefined;
@@ -624,12 +1187,14 @@ export class ArcMcpServer implements IArcMcpServer {
         }
       } else {
         // Neither selector provided: fall back to defaultWorkspaceId or single registered workspace
-        if (this.defaultWorkspaceId) {
-          targetWorkspaceRecord = this.workspaceRegistry.getWorkspace(this.defaultWorkspaceId);
-        } else {
-          const allWorkspaces = this.workspaceRegistry.getWorkspaces();
-          if (allWorkspaces.length === 1) {
-            targetWorkspaceRecord = allWorkspaces[0];
+        if (!targetWorkspaceRecord) {
+          if (this.defaultWorkspaceId) {
+            targetWorkspaceRecord = this.workspaceRegistry.getWorkspace(this.defaultWorkspaceId);
+          } else {
+            const allWorkspaces = this.workspaceRegistry.getWorkspaces();
+            if (allWorkspaces.length === 1) {
+              targetWorkspaceRecord = allWorkspaces[0];
+            }
           }
         }
       }
@@ -657,6 +1222,25 @@ export class ArcMcpServer implements IArcMcpServer {
       },
     };
 
+    // Safe audit parameters for data minimization (P1-01):
+    // For run_command, replace raw arguments with safe metadata (argCount, safeFlags)
+    let auditParams: Record<string, unknown> = validatedParams;
+    if (toolName === 'run_command') {
+      const rawArgs = Array.isArray(validatedParams.args) ? (validatedParams.args as string[]) : [];
+      const safeFlags = rawArgs.filter(
+        (a) =>
+          typeof a === 'string' &&
+          (a === '--version' || a === '-v' || a === '--help' || a === '-h' || a === '-V'),
+      );
+      auditParams = {
+        ...validatedParams,
+        args: {
+          argCount: rawArgs.length,
+          safeFlags,
+        },
+      };
+    }
+
     // 3. Minimal Security Kernel Policy Admission (Default-Deny)
     const evalStart = Date.now();
     const decision = await this.securityKernel.evaluate(context);
@@ -675,7 +1259,7 @@ export class ArcMcpServer implements IArcMcpServer {
         },
         invocation: {
           toolName,
-          parametersRedacted: validatedParams,
+          parametersRedacted: auditParams,
           payloadHash: computeSha256(canonicalJson(validatedParams)),
         },
         policy: {
@@ -718,8 +1302,8 @@ export class ArcMcpServer implements IArcMcpServer {
         case 'health': {
           const health: HealthResponse = {
             status: 'HEALTHY',
-            version: '0.1.0-rc01',
-            stage: 'RC-01',
+            version: '0.2.0-rc02',
+            stage: 'RC-02',
             policyEngineActive: true,
             auditActive: true,
             authorizedWorkspacesCount: this.workspaceRegistry.getWorkspaces().length,
@@ -825,6 +1409,80 @@ export class ArcMcpServer implements IArcMcpServer {
           break;
         }
 
+        case 'run_command': {
+          if (!this.terminalSubsystem) {
+            throw ArcError.policyDenied(
+              'Terminal subsystem is not available in this configuration.',
+            );
+          }
+          if (!validatedParams.executable) {
+            throw ArcError.invalidRequestSchema(
+              'Executable parameter is required for run_command.',
+            );
+          }
+          const cmdRes = await this.terminalSubsystem.executeCommand(
+            validatedParams as unknown as RunCommandRequest,
+            actor,
+            targetWorkspace,
+          );
+          result = cmdRes;
+          break;
+        }
+
+        case 'process_status': {
+          if (!this.terminalSubsystem) {
+            throw ArcError.policyDenied(
+              'Terminal subsystem is not available in this configuration.',
+            );
+          }
+          const psRes = this.terminalSubsystem.getProcessStatus(
+            validatedParams.processId as string,
+            actor,
+            targetWorkspace,
+          );
+          result = psRes;
+          break;
+        }
+
+        case 'process_output': {
+          if (!this.terminalSubsystem) {
+            throw ArcError.policyDenied(
+              'Terminal subsystem is not available in this configuration.',
+            );
+          }
+          const outputRes = this.terminalSubsystem.getProcessOutput(
+            validatedParams.processId as string,
+            {
+              offset: validatedParams.offset as number | undefined,
+              stdoutCursor: validatedParams.stdoutCursor as number | undefined,
+              stderrCursor: validatedParams.stderrCursor as number | undefined,
+              maxBytes: validatedParams.maxBytes as number | undefined,
+              workspaceId: validatedParams.workspaceId as string | undefined,
+            },
+            validatedParams.maxBytes as number | undefined,
+            actor,
+            targetWorkspace,
+          );
+          result = outputRes;
+          break;
+        }
+
+        case 'terminate_process': {
+          if (!this.terminalSubsystem) {
+            throw ArcError.policyDenied(
+              'Terminal subsystem is not available in this configuration.',
+            );
+          }
+          const termRes = await this.terminalSubsystem.terminateProcess(
+            validatedParams.processId as string,
+            validatedParams.signal as 'SIGTERM' | 'SIGKILL' | undefined,
+            actor,
+            targetWorkspace,
+          );
+          result = termRes;
+          break;
+        }
+
         default:
           throw ArcError.policyDenied(`Tool '${toolName}' execution route not configured.`);
       }
@@ -850,7 +1508,7 @@ export class ArcMcpServer implements IArcMcpServer {
       },
       invocation: {
         toolName,
-        parametersRedacted: validatedParams,
+        parametersRedacted: auditParams,
         payloadHash: computeSha256(canonicalJson(validatedParams)),
       },
       policy: {
@@ -911,7 +1569,14 @@ export class ArcMcpServer implements IArcMcpServer {
     await this.server.connect(this.transport);
   }
 
+  public async flushAudit(): Promise<void> {
+    if (this.processRegistry) {
+      await this.processRegistry.flushLifecycleEvents();
+    }
+  }
+
   public async stop(): Promise<void> {
+    await this.flushAudit();
     if (this.transport) {
       await this.transport.close();
     }
@@ -945,10 +1610,12 @@ export function sanitizeClientErrorMessage(msg: string): string {
  */
 export function createArcMcpServer(config?: Partial<ArcServerConfig>): ArcMcpServer {
   const workspaceRegistry = new WorkspaceRegistry();
-  const securityKernel = new SecurityKernel(workspaceRegistry);
+  const processRegistry = new ProcessRegistry();
+  const securityKernel = new SecurityKernel(workspaceRegistry, processRegistry);
   const auditLogger = new AuditLogger();
   const filesystemSubsystem = new FilesystemSubsystem();
   const gitSubsystem = new GitSubsystem();
+  const terminalSubsystem = new ControlledProcessRunner(processRegistry);
 
   return new ArcMcpServer(
     workspaceRegistry,
@@ -957,6 +1624,8 @@ export function createArcMcpServer(config?: Partial<ArcServerConfig>): ArcMcpSer
     filesystemSubsystem,
     gitSubsystem,
     config,
+    terminalSubsystem,
+    processRegistry,
   );
 }
 

@@ -136,18 +136,73 @@ export interface SystemStatusResponse {
 // ============================================================================
 
 export interface RunCommandRequest {
-  command: string;
-  args: string[];
+  executable: string;
+  args?: string[];
   cwd?: string;
-  timeoutSeconds?: number;
+  timeoutMs?: number;
+  env?: Record<string, string>;
+  workspaceId?: string;
+  runInBackground?: boolean;
 }
 
 export interface RunCommandResponse {
-  taskId: string;
-  exitCode?: number;
+  processId: string;
+  state: 'RUNNING' | 'COMPLETED' | 'FAILED' | 'TIMED_OUT' | 'TERMINATED';
+  exitCode?: number | null;
+  signal?: string | null;
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  durationMs: number;
+}
+
+export interface ProcessStatusRequest {
+  processId: string;
+  workspaceId?: string;
+}
+
+export interface ProcessStatusResponse {
+  processId: string;
+  state: 'RUNNING' | 'COMPLETED' | 'FAILED' | 'TIMED_OUT' | 'TERMINATED';
+  startedAt: string;
+  durationMs: number;
+  exitCode?: number | null;
+  signal?: string | null;
+  timedOut: boolean;
+  outputAvailable: boolean;
+  truncated: boolean;
+}
+
+export interface ProcessOutputRequest {
+  processId: string;
+  offset?: number;
+  stdoutCursor?: number;
+  stderrCursor?: number;
+  maxBytes?: number;
+  workspaceId?: string;
+}
+
+export interface ProcessOutputResponse {
+  processId: string;
+  stdoutChunk: string;
+  stderrChunk: string;
+  nextOffset: number;
+  stdoutCursor: number;
+  stderrCursor: number;
+  complete: boolean;
+  truncated: boolean;
+}
+
+export interface TerminateProcessRequest {
+  processId: string;
+  signal?: 'SIGTERM' | 'SIGKILL';
+  workspaceId?: string;
+}
+
+export interface TerminateProcessResponse {
+  processId: string;
+  terminated: boolean;
+  signal: string;
 }
 
 export interface WriteFileRequest {

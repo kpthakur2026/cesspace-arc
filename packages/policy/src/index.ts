@@ -6,6 +6,9 @@ import {
   type PolicyEvaluationContext,
   type PolicyDecisionResult,
   type PolicyRule,
+  validateCommandRequest,
+  RC02_PERMITTED_EXECUTABLES,
+  RC02_FORBIDDEN_EXECUTABLES,
 } from '@cesspace-arc/protocol';
 
 /**
@@ -18,7 +21,6 @@ export interface IPolicyEngine {
 
 /**
  * The 9 tools explicitly allowed in RC-01.
- * All other tools are denied at admission by the Minimal Security Kernel.
  */
 export const RC01_ALLOWED_TOOLS = [
   'health',
@@ -33,6 +35,30 @@ export const RC01_ALLOWED_TOOLS = [
 ] as const;
 
 export type Rc01AllowedTool = (typeof RC01_ALLOWED_TOOLS)[number];
+
+/**
+ * The 13 tools explicitly allowed in RC-02 (RC-01 read-only core + controlled execution).
+ */
+export const RC02_ALLOWED_TOOLS = [
+  ...RC01_ALLOWED_TOOLS,
+  'run_command',
+  'process_status',
+  'process_output',
+  'terminate_process',
+] as const;
+
+export type Rc02AllowedTool = (typeof RC02_ALLOWED_TOOLS)[number];
+
+export const ALLOWED_COMMANDS = RC02_PERMITTED_EXECUTABLES;
+
+export const DENIED_COMMANDS = RC02_FORBIDDEN_EXECUTABLES;
+
+export interface IProcessOwnershipVerifier {
+  assertOwnership(
+    processId: string,
+    owner?: { clientId: string; sessionId: string; workspaceId?: string },
+  ): unknown;
+}
 
 /**
  * Registered workspace record.
@@ -138,7 +164,10 @@ export class WorkspaceRegistry {
 export class SecurityKernel implements IPolicyEngine {
   private rules: PolicyRule[] = [];
 
-  constructor(private workspaceRegistry: WorkspaceRegistry) {}
+  constructor(
+    private workspaceRegistry: WorkspaceRegistry,
+    private processVerifier?: IProcessOwnershipVerifier,
+  ) {}
 
   public loadPolicy(rules: PolicyRule[]): void {
     this.rules = [...rules];
@@ -153,13 +182,13 @@ export class SecurityKernel implements IPolicyEngine {
     const toolName = request.toolName;
 
     // 1. Mandatory Tool Allowlist Gate (Default-Deny)
-    const isAllowedTool = (RC01_ALLOWED_TOOLS as readonly string[]).includes(toolName);
+    const isAllowedTool = (RC02_ALLOWED_TOOLS as readonly string[]).includes(toolName);
     if (!isAllowedTool) {
       return {
         outcome: PolicyOutcome.DENY,
         effect: 'DENY',
         matchingRuleId: 'default-deny-unregistered-tool',
-        reason: `Tool '${toolName}' is not permitted in RC-01 stage (read-only inspection core only).`,
+        reason: `Tool '${toolName}' is not permitted in RC-02 stage (read-only inspection and controlled execution only).`,
       };
     }
 
@@ -173,13 +202,73 @@ export class SecurityKernel implements IPolicyEngine {
       };
     }
 
-    // 3. System Tools Exemption from Workspace Target
+    // 3. System Tools & Process Supervision Exemption from Workspace Target
     if (toolName === 'health' || toolName === 'system_status') {
       return {
         outcome: PolicyOutcome.ALLOW,
         effect: 'ALLOW',
         matchingRuleId: 'allow-system-read',
         reason: 'Safe read-only system inspection allowed.',
+      };
+    }
+
+    if (
+      toolName === 'process_status' ||
+      toolName === 'process_output' ||
+      toolName === 'terminate_process'
+    ) {
+      const processId = request.parameters.processId;
+      if (!processId || typeof processId !== 'string' || !processId.startsWith('arc-proc-')) {
+        return {
+          outcome: PolicyOutcome.DENY,
+          effect: 'DENY',
+          matchingRuleId: 'deny-invalid-process-id',
+          reason: 'Invalid or missing process identifier.',
+        };
+      }
+
+      if (!this.processVerifier) {
+        return {
+          outcome: PolicyOutcome.DENY,
+          effect: 'DENY',
+          matchingRuleId: 'deny-missing-process-verifier',
+          reason: 'Process ownership verifier is unavailable.',
+        };
+      }
+
+      if (
+        request.parameters.workspaceId &&
+        request.parameters.workspaceId !== targetWorkspace.workspaceId
+      ) {
+        return {
+          outcome: PolicyOutcome.DENY,
+          effect: 'DENY',
+          matchingRuleId: 'deny-process-ownership-mismatch',
+          reason: 'Access denied: Requested workspaceId does not match process workspace.',
+        };
+      }
+
+      try {
+        this.processVerifier.assertOwnership(processId, {
+          clientId: actor.clientId,
+          sessionId: actor.sessionId || '',
+          workspaceId: targetWorkspace.workspaceId,
+        });
+      } catch (err: unknown) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        return {
+          outcome: PolicyOutcome.DENY,
+          effect: 'DENY',
+          matchingRuleId: 'deny-process-ownership-mismatch',
+          reason: errMsg,
+        };
+      }
+
+      return {
+        outcome: PolicyOutcome.ALLOW,
+        effect: 'ALLOW',
+        matchingRuleId: 'allow-process-lifecycle',
+        reason: `Controlled process lifecycle operation '${toolName}' admitted for authenticated caller.`,
       };
     }
 
@@ -310,7 +399,35 @@ export class SecurityKernel implements IPolicyEngine {
       }
     }
 
-    // 7. Admitted by Default Allow for Read-Only Inspection
+    // 7. Command Policy Validation for Controlled Execution (RC-02)
+    if (toolName === 'run_command') {
+      const executable = String(request.parameters.executable || '');
+      const args = Array.isArray(request.parameters.args)
+        ? (request.parameters.args as string[])
+        : [];
+      const env = request.parameters.env as Record<string, string> | undefined;
+      const cwd = request.parameters.cwd as string | undefined;
+
+      const validation = validateCommandRequest(executable, args, env, cwd, registeredWs.rootPath);
+
+      if (!validation.valid) {
+        return {
+          outcome: PolicyOutcome.DENY,
+          effect: 'DENY',
+          matchingRuleId: validation.ruleId || 'deny-command-policy',
+          reason: validation.reason || 'Command violates security policy.',
+        };
+      }
+
+      return {
+        outcome: PolicyOutcome.ALLOW,
+        effect: 'ALLOW',
+        matchingRuleId: 'allow-controlled-command',
+        reason: `Command '${executable.trim().toLowerCase()}' admitted under controlled execution policy for workspace '${registeredWs.id}'.`,
+      };
+    }
+
+    // 8. Admitted by Default Allow for Read-Only Inspection
     return {
       outcome: PolicyOutcome.ALLOW,
       effect: 'ALLOW',

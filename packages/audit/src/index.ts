@@ -58,6 +58,26 @@ export function redactRecord(payload: Record<string, unknown>): Record<string, u
       result[key] = `[FILE_CONTENT_OMITTED: ${val.length} bytes]`;
       continue;
     }
+    if (
+      key.toLowerCase() === 'env' &&
+      val !== null &&
+      typeof val === 'object' &&
+      !Array.isArray(val)
+    ) {
+      const redactedEnv: Record<string, string> = {};
+      for (const envKey of Object.keys(val as Record<string, unknown>)) {
+        redactedEnv[envKey] = '[REDACTED_ENV_VALUE]';
+      }
+      result[key] = redactedEnv;
+      continue;
+    }
+    if (
+      (key.toLowerCase() === 'stdout' || key.toLowerCase() === 'stderr') &&
+      typeof val === 'string'
+    ) {
+      result[key] = `[OUTPUT_OMITTED: ${val.length} bytes]`;
+      continue;
+    }
     const isSensitiveKey = SENSITIVE_KEY_PATTERNS.some((p) => p.test(key));
     if (isSensitiveKey) {
       result[key] = '[REDACTED_BY_NAME]';
