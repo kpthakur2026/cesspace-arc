@@ -30,6 +30,7 @@ import { canonicalJson, sha256Hex } from '@cesspace-arc/policy';
 import {
   MAX_REVIEW_SUMMARY_PATHS,
   type ApprovalActorBinding,
+  type ApprovalRequestSnapshot,
   type ApprovalReviewSummary,
 } from '@cesspace-arc/protocol';
 import { parseUnifiedPatch } from '@cesspace-arc/filesystem';
@@ -223,6 +224,9 @@ function asString(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
+/** Windows-style absolute path, e.g. `C:/x`. Backslashes are rejected separately. */
+const WINDOWS_ABSOLUTE_PATH = /^[a-zA-Z]:[\\/]/;
+
 /**
  * Normalizes a caller-supplied target path into canonical workspace-relative
  * form for Layer-2 matching (rc04 §15: Task 4 provides the normalized path).
@@ -235,11 +239,12 @@ function asString(value: unknown): string | undefined {
  * `./secret/key.txt` while a `secret/**` rule would not match it.
  *
  * Returns:
- * - a canonical relative path (e.g. `a/b.txt`) when the target resolves inside
- *   the workspace root,
+ * - a non-empty canonical relative path (e.g. `a/b.txt`) when the target
+ *   resolves inside the workspace root,
+ * - `''` when the candidate safely denotes the WORKSPACE ROOT itself,
  * - `undefined` when the caller supplied no path at all,
- * - `null` when the path is unsafe or has no canonical relative form (the
- *   workspace root itself). The caller MUST treat null as fail-closed.
+ * - `null` when the path is unsafe or unrepresentable (traversal, absolute,
+ *   NUL, backslash). The caller MUST treat null as fail-closed.
  */
 export function normalizeTargetPathForPolicy(
   workspaceRoot: string,
@@ -252,19 +257,27 @@ export function normalizeTargetPathForPolicy(
     return null;
   }
   // Reject NUL and Windows-style separators outright.
-  if (candidate.includes(' ') || candidate.includes('\\')) {
+  if (candidate.includes('\u0000') || candidate.includes('\\')) {
     return null;
   }
   if (workspaceRoot.length === 0) {
+    return null;
+  }
+  // An ABSOLUTE path must never be reinterpreted into an approvable relative
+  // target, even when it happens to point inside the workspace root. Otherwise
+  // an approval could be created for an operation the RC-03 filesystem will
+  // later reject as an absolute path, and review metadata could expose the host
+  // path. Checked BEFORE any resolution.
+  if (path.isAbsolute(candidate) || WINDOWS_ABSOLUTE_PATH.test(candidate)) {
     return null;
   }
 
   const resolved = path.resolve(workspaceRoot, candidate);
   const relative = path.relative(workspaceRoot, resolved);
   if (relative.length === 0) {
-    // The workspace root has no canonical relative representation in the frozen
-    // policy grammar. Fail closed rather than dropping the path.
-    return null;
+    // A safe workspace-root selector. The frozen v1 policy grammar has no
+    // representation for the root, so the caller decides per policy mode.
+    return '';
   }
   if (relative.startsWith('..') || path.isAbsolute(relative)) {
     return null;
@@ -296,18 +309,28 @@ export function extractPolicyTargets(
   params: Record<string, unknown>,
   workspaceRoot: string,
   patchTargetPaths?: readonly string[],
+  policyMode: 'BUILTIN' | 'EXTERNAL' = 'EXTERNAL',
 ): PolicyMatchTarget[] {
   const base: PolicyMatchTarget = { toolName };
 
   /**
-   * Adds a normalized path target. `null` from the normalizer means the path has
-   * no safe canonical relative form; the caller fails the whole request closed,
-   * which is signalled by returning `null` from this function.
+   * Adds a normalized path target.
+   *
+   * `null` means the path has no safe canonical relative form at all; the whole
+   * request fails closed, signalled by returning `null` here.
+   *
+   * `''` means the candidate safely denotes the WORKSPACE ROOT. The frozen v1
+   * external grammar cannot represent the root, so an EXTERNAL policy keeps
+   * failing it closed; the BUILTIN compatibility policy falls back to the
+   * tool-only base target, preserving the verified RC-01 behaviour.
    */
   const withPath = (candidate: unknown): PolicyMatchTarget | null | undefined => {
     const normalized = normalizeTargetPathForPolicy(workspaceRoot, candidate);
     if (normalized === null) return null;
     if (normalized === undefined) return undefined;
+    if (normalized === '') {
+      return policyMode === 'BUILTIN' ? base : null;
+    }
     return { ...base, path: normalized };
   };
 
@@ -615,18 +638,15 @@ export function parsePatchTargetPaths(patch: unknown): string[] {
 // 6. Admin surface projection
 // ---------------------------------------------------------------------------
 
-/** Projects a snapshot into the bounded admin summary shape. */
-export function toAdminSummary(snapshot: {
-  requestId: string;
-  toolName: string;
-  state: string;
-  binding: { workspace: { workspaceId: string }; actor: ApprovalActorBinding };
-  createdAt: string;
-  expiresAt: string;
-  remainingSeconds: number;
-  reviewMaterialBytes: number;
-  reviewSummary?: ApprovalReviewSummary;
-}): AdminApprovalSummary & { reviewSummary?: ApprovalReviewSummary } {
+/**
+ * The ONE authoritative projection from an approval snapshot to the bounded
+ * admin summary shape. Used by the admin IPC list method; there is deliberately
+ * no second, divergent projection.
+ *
+ * Raw review material is never included. The safe `reviewSummary` is included so
+ * an operator can see the target parameters being approved.
+ */
+export function toAdminSummary(snapshot: ApprovalRequestSnapshot): AdminApprovalSummary {
   return {
     requestId: snapshot.requestId,
     toolName: snapshot.toolName,

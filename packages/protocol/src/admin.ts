@@ -18,6 +18,7 @@
  */
 
 import { createHash, createPrivateKey, createPublicKey, sign, verify } from 'node:crypto';
+import type { ApprovalReviewSummary } from './approval.js';
 import type { KeyObject } from 'node:crypto';
 
 /** Wire protocol identifier. Binds every signature to this protocol version. */
@@ -127,6 +128,11 @@ export interface AdminApprovalSummary {
   expiresAt: string;
   remainingSeconds: number;
   reviewMaterialBytes: number;
+  /**
+   * Safe bounded review metadata (target paths, content/patch/hash summaries).
+   * Never raw material, never a token, never an absolute host path.
+   */
+  reviewSummary?: ApprovalReviewSummary;
 }
 
 export interface AdminApprovalsListResult {
@@ -146,6 +152,9 @@ export interface AdminApprovalsInspectResult {
   createdAt: string;
   expiresAt: string;
   remainingSeconds: number;
+  /** Safe bounded review metadata. Never a token, never an absolute host path. */
+  reviewSummary?: ApprovalReviewSummary;
+  /** Operator-only raw material, returned only while PENDING. */
   reviewMaterial: string;
 }
 

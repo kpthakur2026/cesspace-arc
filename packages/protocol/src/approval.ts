@@ -109,6 +109,13 @@ export interface ApprovalReviewSummary {
 export const MAX_REVIEW_SUMMARY_PATHS = 10;
 /** Maximum length of any single string retained in a review summary. */
 export const MAX_REVIEW_SUMMARY_STRING_LENGTH = 512;
+/**
+ * Maximum length of a workspace-relative target path retained in a review
+ * summary. Deliberately matches the business path bound (1024) rather than the
+ * generic string bound, so a legal target path is never silently dropped from
+ * operator review.
+ */
+export const MAX_REVIEW_SUMMARY_PATH_LENGTH = 1024;
 
 /**
  * Reserved client control object for token redemption.

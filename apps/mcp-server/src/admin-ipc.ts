@@ -46,6 +46,7 @@ import {
   type AdminResponse,
 } from '@cesspace-arc/protocol';
 import type { ApprovalStateManager } from '@cesspace-arc/policy';
+import { toAdminSummary } from './approval-gate.js';
 
 /**
  * Conservative bound on a Unix socket path.
@@ -659,22 +660,10 @@ export class AdminIpcServer {
       if (snapshot.state !== 'PENDING') {
         continue;
       }
-      // Deliberately no review material, no token, no token digest, no
-      // monotonic deadline.
-      approvals.push({
-        requestId: snapshot.requestId,
-        toolName: snapshot.toolName,
-        state: snapshot.state,
-        workspaceId: snapshot.binding.workspace.workspaceId,
-        clientId: snapshot.binding.actor.clientId,
-        clientType: snapshot.binding.actor.clientType,
-        sessionId: snapshot.binding.actor.sessionId,
-        deviceId: snapshot.binding.actor.deviceId,
-        createdAt: snapshot.createdAt,
-        expiresAt: snapshot.expiresAt,
-        remainingSeconds: snapshot.remainingSeconds,
-        reviewMaterialBytes: snapshot.reviewMaterialBytes,
-      });
+      // One authoritative projection (approval-gate.toAdminSummary). It carries
+      // the safe review summary -- including target paths -- but never raw
+      // review material, a token, a token digest, or a monotonic deadline.
+      approvals.push(toAdminSummary(snapshot));
     }
     return { ok: true, result: { approvals } };
   }
@@ -701,6 +690,7 @@ export class AdminIpcServer {
         createdAt: snapshot.createdAt,
         expiresAt: snapshot.expiresAt,
         remainingSeconds: snapshot.remainingSeconds,
+        reviewSummary: snapshot.reviewSummary,
         reviewMaterial,
       },
     };

@@ -16,6 +16,7 @@ import {
   MAX_REVIEW_BYTES_PER_ACTOR,
   MAX_REVIEW_BYTES_GLOBAL,
   MAX_REVIEW_SUMMARY_PATHS,
+  MAX_REVIEW_SUMMARY_PATH_LENGTH,
   MAX_REVIEW_SUMMARY_STRING_LENGTH,
   MAX_TOKEN_BYTES,
   TERMINAL_APPROVAL_STATES,
@@ -66,7 +67,8 @@ function sanitizeReviewSummary(input: unknown): ApprovalReviewSummary | undefine
     for (const entry of source.targetPaths) {
       if (paths.length >= MAX_REVIEW_SUMMARY_PATHS) break;
       if (typeof entry !== 'string' || entry.length === 0) continue;
-      if (entry.length > MAX_REVIEW_SUMMARY_STRING_LENGTH) continue;
+      // Paths use the business path bound, not the generic string bound.
+      if (entry.length > MAX_REVIEW_SUMMARY_PATH_LENGTH) continue;
       paths.push(entry);
     }
     if (paths.length > 0) out.targetPaths = paths;

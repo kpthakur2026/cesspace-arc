@@ -81,6 +81,7 @@ function seedPending(manager, overrides = {}) {
     executionPayloadHash: overrides.executionPayloadHash ?? 'a'.repeat(64),
     binding: overrides.binding ?? makeBinding(),
     reviewMaterial: overrides.reviewMaterial ?? '--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n',
+    ...(overrides.reviewSummary === undefined ? {} : { reviewSummary: overrides.reviewSummary }),
   });
 }
 
@@ -918,6 +919,57 @@ describe('CesSpace ARC — RC-04 Task 3: Authenticated Local Admin Channel', () 
         assert.equal(response.error.code, 'AUTHENTICATION_FAILED');
       }
       assert.equal(manager.getRequest(seeded.requestId).state, 'PENDING');
+    });
+
+    test('RC04-A-54: approvals.list returns the safe target summary but no material or token', async () => {
+      const reviewMaterial = 'RC04_ADMIN_LIST_MATERIAL_MARKER_1199';
+      seedPending(manager, {
+        toolName: 'create_file',
+        reviewMaterial,
+        reviewSummary: {
+          targetPaths: ['src/app.ts'],
+          contentBytes: 42,
+          contentHash: 'd'.repeat(64),
+        },
+      });
+
+      const response = await adminRequest(endpoint, operator.privateKey, 'approvals.list');
+      assert.equal(response.ok, true);
+      const entry = response.result.approvals[0];
+
+      // The operator can see the target parameters being approved.
+      assert.deepEqual(entry.reviewSummary.targetPaths, ['src/app.ts']);
+      assert.equal(entry.reviewSummary.contentBytes, 42);
+      assert.equal(entry.reviewSummary.contentHash, 'd'.repeat(64));
+
+      // ...but never the raw material, a token, or a digest.
+      const serialized = JSON.stringify(response);
+      assert.ok(!serialized.includes(reviewMaterial), 'review material leaked into list');
+      assert.equal(entry.reviewMaterial, undefined);
+      assert.equal(entry.token, undefined);
+      assert.equal(entry.tokenDigest, undefined);
+    });
+
+    test('RC04-A-55: approvals.inspect returns the safe summary plus PENDING material, never a token', async () => {
+      const reviewMaterial = 'RC04_ADMIN_INSPECT_MATERIAL_MARKER_2200';
+      const seeded = seedPending(manager, {
+        toolName: 'move_file',
+        reviewMaterial,
+        reviewSummary: {
+          targetPaths: ['from.txt', 'to.txt'],
+          expectedSourceHash: 'e'.repeat(64),
+        },
+      });
+
+      const response = await adminRequest(endpoint, operator.privateKey, 'approvals.inspect', {
+        requestId: seeded.requestId,
+      });
+      assert.equal(response.ok, true);
+      assert.deepEqual(response.result.reviewSummary.targetPaths, ['from.txt', 'to.txt']);
+      assert.equal(response.result.reviewSummary.expectedSourceHash, 'e'.repeat(64));
+      assert.equal(response.result.reviewMaterial, reviewMaterial);
+      assert.equal(response.result.token, undefined);
+      assert.ok(!JSON.stringify(response).includes('"token"'));
     });
   });
 

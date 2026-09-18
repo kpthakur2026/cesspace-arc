@@ -1013,5 +1013,86 @@ rules: []
       assert.equal(result.exitCode, EXIT_FAILURE);
       assert.match(result.err, /could not be read/);
     });
+
+    test('RC04-C-39: approvals list renders the safe target details', async () => {
+      const result = await run(
+        ['approvals', 'list', '--admin-socket', '/tmp/x.sock', '--admin-key-fd', '3'],
+        {
+          readPrivateKeyFromFd: () => ({}),
+          createAdminClient: fakeClient({
+            ok: true,
+            result: {
+              approvals: [
+                {
+                  requestId: REQUEST_ID,
+                  toolName: 'move_file',
+                  state: 'PENDING',
+                  workspaceId: 'primary',
+                  clientId: 'agent-alice',
+                  clientType: 'claude-code',
+                  createdAt: '2026-09-18T12:00:00.000Z',
+                  expiresAt: '2026-09-18T12:05:00.000Z',
+                  remainingSeconds: 120,
+                  reviewMaterialBytes: 0,
+                  reviewSummary: {
+                    targetPaths: ['from.txt', 'to.txt'],
+                    expectedSourceHash: 'a'.repeat(64),
+                  },
+                },
+              ],
+            },
+          }),
+        },
+      );
+      assert.equal(result.exitCode, EXIT_OK);
+      assert.ok(result.out.includes('from.txt'), 'source path must be visible');
+      assert.ok(result.out.includes('to.txt'), 'destination path must be visible');
+      assert.ok(result.out.includes('a'.repeat(64)), 'expectedSourceHash must be visible');
+    });
+
+    test('RC04-C-40: approvals inspect renders the safe target details and material', async () => {
+      const material = '--- a/app.ts\n+++ b/app.ts\n@@ -1 +1 @@\n-old\n+new\n';
+      const result = await run(
+        [
+          'approvals',
+          'inspect',
+          REQUEST_ID,
+          '--admin-socket',
+          '/tmp/x.sock',
+          '--admin-key-fd',
+          '3',
+        ],
+        {
+          readPrivateKeyFromFd: () => ({}),
+          createAdminClient: fakeClient({
+            ok: true,
+            result: {
+              requestId: REQUEST_ID,
+              toolName: 'apply_patch',
+              state: 'PENDING',
+              workspaceId: 'primary',
+              clientId: 'agent-alice',
+              clientType: 'claude-code',
+              createdAt: '2026-09-18T12:00:00.000Z',
+              expiresAt: '2026-09-18T12:05:00.000Z',
+              remainingSeconds: 120,
+              reviewSummary: {
+                targetPaths: ['app.ts'],
+                patchBytes: 48,
+                patchHash: 'b'.repeat(64),
+                dryRun: false,
+              },
+              reviewMaterial: material,
+            },
+          }),
+        },
+      );
+      assert.equal(result.exitCode, EXIT_OK);
+      assert.ok(result.out.includes('app.ts'), 'patch target must be visible');
+      assert.ok(result.out.includes('b'.repeat(64)), 'patchHash must be visible');
+      assert.ok(result.out.includes('patchBytes: 48'), 'patchBytes must be visible');
+      assert.ok(result.out.includes(material), 'review material must be visible');
+      assert.ok(!result.out.includes('"token"'), 'no token may be rendered');
+    });
   });
 });

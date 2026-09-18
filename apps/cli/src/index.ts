@@ -223,6 +223,32 @@ function formatSeconds(value: unknown): string {
   return typeof value === 'number' && Number.isFinite(value) ? String(value) : 'unknown';
 }
 
+/** Renders the safe review summary. Never raw material, never a token. */
+function renderReviewSummary(io: CliIo, summary: unknown, indent = '  '): void {
+  if (summary === null || typeof summary !== 'object') {
+    return;
+  }
+  const s = summary as Record<string, unknown>;
+  const line = (label: string, value: unknown): void => {
+    io.stdout(`${indent}${label}: ${String(value)}\n`);
+  };
+
+  if (Array.isArray(s.targetPaths) && s.targetPaths.length > 0) {
+    io.stdout(`${indent}Target paths:\n`);
+    for (const target of s.targetPaths) {
+      io.stdout(`${indent}  - ${String(target)}\n`);
+    }
+  }
+  for (const key of ['contentBytes', 'contentHash', 'patchBytes', 'patchHash']) {
+    if (s[key] !== undefined) line(key, s[key]);
+  }
+  for (const key of ['expectedHash', 'expectedSourceHash', 'overwrite', 'dryRun', 'fuzz']) {
+    if (s[key] !== undefined) line(key, s[key]);
+  }
+  if (s.executable !== undefined) line('executable', s.executable);
+  if (s.argumentCount !== undefined) line('argumentCount', s.argumentCount);
+}
+
 /** `arc approvals list` — bounded metadata only, never review material. */
 function renderList(io: CliIo, result: unknown): number {
   const approvals = (result as { approvals?: unknown })?.approvals;
@@ -250,7 +276,9 @@ function renderList(io: CliIo, result: unknown): number {
     io.stdout(`  Created:   ${String(approval.createdAt)}\n`);
     io.stdout(`  Expires:   ${String(approval.expiresAt)}\n`);
     io.stdout(`  Remaining: ${formatSeconds(approval.remainingSeconds)}s\n`);
-    io.stdout(`  Review:    ${String(approval.reviewMaterialBytes)} bytes\n\n`);
+    io.stdout(`  Review:    ${String(approval.reviewMaterialBytes)} bytes\n`);
+    renderReviewSummary(io, approval.reviewSummary);
+    io.stdout('\n');
   }
   io.stdout('Run `arc approvals inspect <requestId>` to review a request.\n');
   return EXIT_OK;
@@ -273,6 +301,7 @@ function renderInspect(io: CliIo, result: unknown): number {
   io.stdout(`Created:   ${String(detail.createdAt)}\n`);
   io.stdout(`Expires:   ${String(detail.expiresAt)}\n`);
   io.stdout(`Remaining: ${formatSeconds(detail.remainingSeconds)}s\n`);
+  renderReviewSummary(io, detail.reviewSummary, '');
   io.stdout('\nReview Material:\n');
   io.stdout(`${typeof detail.reviewMaterial === 'string' ? detail.reviewMaterial : ''}\n`);
   return EXIT_OK;

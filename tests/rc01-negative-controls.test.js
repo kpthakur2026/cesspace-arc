@@ -340,11 +340,11 @@ describe('CesSpace ARC — RC-01 Mandatory Security Negative & Positive Controls
   });
 
   test('Positive 2: list_directory returns entries in authorized workspace', async () => {
-    // Omitting `path` addresses the workspace root by default. An explicit
-    // `path: '.'` is deliberately NOT used: the frozen RC-04 policy grammar has
-    // no representation for the root itself, and RC-04 fails such a target
-    // closed rather than letting a `paths` rule silently miss.
+    // An explicit workspace-root selector must keep working under the built-in
+    // compatibility policy: Layer 2 falls back to the tool-only base target for
+    // a safely proven root selector.
     const res = await server.dispatchToolCall('list_directory', {
+      path: '.',
       recursive: true,
       maxDepth: 2,
     });

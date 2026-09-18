@@ -358,7 +358,23 @@ describe('CesSpace ARC — RC-04 Task 4: MCP Approval, Redemption & Controlled M
       assert.equal(normalizeTargetPathForPolicy('/ws', 'a/../b.txt'), 'b.txt');
       assert.equal(normalizeTargetPathForPolicy('/ws', 'a/b.txt/'), 'a/b.txt');
       assert.equal(normalizeTargetPathForPolicy('/ws', undefined), undefined);
-      for (const bad of ['../x', '../../etc/passwd', '/etc/passwd', 'a\\b', 'a b', '.', './']) {
+
+      // A safe workspace-root selector yields the root sentinel, not a denial.
+      assert.equal(normalizeTargetPathForPolicy('/ws', '.'), '');
+      assert.equal(normalizeTargetPathForPolicy('/ws', './'), '');
+
+      // Unsafe targets still fail closed, including ABSOLUTE paths that happen
+      // to point inside the workspace root.
+      const unsafe = [
+        '../x',
+        '../../etc/passwd',
+        '/etc/passwd',
+        '/ws/a.txt',
+        'a' + String.fromCharCode(0) + 'b',
+        'a\\b',
+        'C:/ws/a.txt',
+      ];
+      for (const bad of unsafe) {
         assert.equal(normalizeTargetPathForPolicy('/ws', bad), null, `expected unsafe: ${bad}`);
       }
     });
@@ -1366,6 +1382,306 @@ rules:
         assert.equal(body(res).code, 'APPROVAL_REJECTED');
       }
       assert.equal(approvals.listActive().length, before, 'no request may be created');
+    });
+  });
+  // =========================================================================
+  // 11. Task 4.1 blocker regressions
+  // =========================================================================
+
+  describe('Startup order, review visibility, root compatibility', () => {
+    test('RC04-M-46: createArcMcpServer initializes the external policy AFTER registering configured roots', () => {
+      const dir = fs.mkdtempSync(path.join(tempRoot, 'factory-ok-'));
+      fs.writeFileSync(path.join(dir, 'README.md'), 'hello\n');
+      const canonicalRoot = fs.realpathSync(dir);
+      const rootHash = sha256Hex(canonicalRoot);
+
+      const policy = `version: '1.0'
+workspaces:
+  - id: 'ws'
+    rootHash: '${rootHash}'
+rules:
+  - id: 'allow-read'
+    effect: 'ALLOW'
+    tools: ['read_file']
+`;
+      // The REAL factory, not a helper with a pre-populated registry.
+      const server = createArcMcpServer({
+        transport: 'stdio',
+        authorizedRoots: [{ id: 'ws', path: dir }],
+        defaultWorkspaceId: 'ws',
+        policy: { sourceText: policy, format: 'yaml' },
+      });
+
+      assert.ok(server.effectivePolicyEngine, 'external policy must load');
+      assert.equal(server.effectivePolicyEngine.getSourceMode(), 'EXTERNAL');
+      assert.equal(server.policyInitializationFailure, undefined);
+      assert.equal(server.workspaceRegistry.getWorkspace('ws').rootPath, canonicalRoot);
+    });
+
+    test('RC04-M-47: a factory-loaded external policy governs execution and health', async () => {
+      const dir = fs.mkdtempSync(path.join(tempRoot, 'factory-run-'));
+      fs.writeFileSync(path.join(dir, 'README.md'), 'external\n');
+      const rootHash = sha256Hex(fs.realpathSync(dir));
+
+      const server = createArcMcpServer({
+        transport: 'stdio',
+        authorizedRoots: [{ id: 'ws', path: dir }],
+        defaultWorkspaceId: 'ws',
+        policy: {
+          sourceText: `version: '1.0'
+workspaces:
+  - id: 'ws'
+    rootHash: '${rootHash}'
+rules:
+  - id: 'allow-health'
+    effect: 'ALLOW'
+    tools: ['health']
+  - id: 'allow-read'
+    effect: 'ALLOW'
+    tools: ['read_file']
+`,
+          format: 'yaml',
+        },
+      });
+
+      const health = await server.dispatchToolCall('health', {});
+      const healthBody = JSON.parse(health.content[0].text);
+      assert.equal(healthBody.status, 'HEALTHY');
+      assert.equal(healthBody.policyEngineActive, true);
+      assert.equal(healthBody.stage, 'RC-04');
+
+      // The external rule permits the read...
+      const read = await server.dispatchToolCall('read_file', {
+        path: 'README.md',
+        workspaceId: 'ws',
+      });
+      assert.equal(read.isError, undefined, JSON.stringify(read.content[0].text));
+      // ...and does not permit anything it does not name.
+      const other = await server.dispatchToolCall('list_directory', { workspaceId: 'ws' });
+      assert.equal(JSON.parse(other.content[0].text).code, 'POLICY_DENIED');
+      fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    test('RC04-M-48: a factory workspace rootHash mismatch stays fail-closed with no fallback', async () => {
+      const dir = fs.mkdtempSync(path.join(tempRoot, 'factory-bad-'));
+      fs.writeFileSync(path.join(dir, 'README.md'), 'x\n');
+      const server = createArcMcpServer({
+        transport: 'stdio',
+        authorizedRoots: [{ id: 'ws', path: dir }],
+        defaultWorkspaceId: 'ws',
+        policy: {
+          sourceText: `version: '1.0'
+workspaces:
+  - id: 'ws'
+    rootHash: '${'0'.repeat(64)}'
+rules: []
+`,
+          format: 'yaml',
+        },
+      });
+
+      assert.equal(server.effectivePolicyEngine, undefined, 'no engine on failure');
+      assert.equal(server.policyInitializationFailure.reason, 'POLICY_LOAD_ERROR');
+
+      const health = await server.dispatchToolCall('health', {});
+      const healthBody = JSON.parse(health.content[0].text);
+      assert.equal(healthBody.status, 'UNHEALTHY');
+      assert.equal(healthBody.policyEngineActive, false);
+
+      // Every non-diagnostic operation fails closed, with no built-in fallback.
+      const read = await server.dispatchToolCall('read_file', {
+        path: 'README.md',
+        workspaceId: 'ws',
+      });
+      assert.equal(JSON.parse(read.content[0].text).code, 'POLICY_LOAD_ERROR');
+      const mutation = await server.dispatchToolCall('create_file', {
+        path: 'n.txt',
+        content: 'x',
+        workspaceId: 'ws',
+      });
+      assert.equal(JSON.parse(mutation.content[0].text).code, 'POLICY_LOAD_ERROR');
+      assert.equal(server.approvalStateManager.listActive().length, 0);
+      assert.equal(fs.existsSync(path.join(dir, 'n.txt')), false);
+      fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    test('RC04-M-49: the operator can see the target path for create/write before approving', async () => {
+      const { server, approvals } = makeServer({ workspaceName: 'vis-create' });
+      const res = await server.dispatchToolCall('create_file', {
+        path: 'visible.txt',
+        content: 'body',
+        workspaceId: 'ws',
+      });
+      const requestId = body(res).details.approvalRequestId;
+      const summary = approvals.getRequest(requestId).reviewSummary;
+
+      assert.deepEqual(summary.targetPaths, ['visible.txt']);
+      assert.equal(summary.contentBytes, 4);
+      assert.match(summary.contentHash, /^[0-9a-f]{64}$/);
+      assert.ok(!JSON.stringify(summary).includes('body'), 'summary must not carry raw content');
+      assert.equal(approvals.inspectPending(requestId), 'body');
+    });
+
+    test('RC04-M-50: the operator can see the delete target path and expected hash', async () => {
+      const { server, approvals } = makeServer({ workspaceName: 'vis-delete' });
+      const hash = 'a'.repeat(64);
+      const res = await server.dispatchToolCall('delete_file', {
+        path: 'gone.txt',
+        expectedHash: hash,
+        workspaceId: 'ws',
+      });
+      const requestId = body(res).details.approvalRequestId;
+      const summary = approvals.getRequest(requestId).reviewSummary;
+      assert.deepEqual(summary.targetPaths, ['gone.txt']);
+      assert.equal(summary.expectedHash, hash);
+    });
+
+    test('RC04-M-51: the operator can see both move paths and the source hash', async () => {
+      const { server, approvals } = makeServer({ workspaceName: 'vis-move' });
+      const hash = 'b'.repeat(64);
+      const res = await server.dispatchToolCall('move_file', {
+        sourcePath: 'from.txt',
+        destinationPath: 'to.txt',
+        expectedSourceHash: hash,
+        workspaceId: 'ws',
+      });
+      const requestId = body(res).details.approvalRequestId;
+      const summary = approvals.getRequest(requestId).reviewSummary;
+      assert.deepEqual(summary.targetPaths, ['from.txt', 'to.txt']);
+      assert.equal(summary.expectedSourceHash, hash);
+    });
+
+    test('RC04-M-52: the operator can see every apply_patch target before approving', async () => {
+      const { server, approvals, dir } = makeServer({ workspaceName: 'vis-patch' });
+      fs.writeFileSync(path.join(dir, 'one.txt'), 'line1\nline2\nline3\n');
+      fs.writeFileSync(path.join(dir, 'two.txt'), 'line1\nline2\nline3\n');
+      const patch =
+        '--- a/one.txt\n+++ b/one.txt\n@@ -1,3 +1,3 @@\n-line1\n+ONE\n line2\n line3\n' +
+        '--- a/two.txt\n+++ b/two.txt\n@@ -1,3 +1,3 @@\n-line1\n+TWO\n line2\n line3\n';
+
+      const res = await server.dispatchToolCall('apply_patch', { patch, workspaceId: 'ws' });
+      const requestId = body(res).details.approvalRequestId;
+      const summary = approvals.getRequest(requestId).reviewSummary;
+      assert.deepEqual(summary.targetPaths, ['one.txt', 'two.txt']);
+      assert.equal(typeof summary.patchBytes, 'number');
+      assert.match(summary.patchHash, /^[0-9a-f]{64}$/);
+      assert.ok(!JSON.stringify(summary).includes('line1'), 'summary must not carry patch text');
+      assert.equal(approvals.inspectPending(requestId), patch);
+    });
+
+    test('RC04-M-53: a valid workspace-relative target longer than 512 characters stays visible', async () => {
+      const { server, approvals } = makeServer({ workspaceName: 'vis-long' });
+      // Multiple short segments so no OS component limit is approached.
+      const longPath = Array.from(
+        { length: 100 },
+        (_, i) => `seg${String(i).padStart(3, '0')}`,
+      ).join('/');
+      assert.ok(longPath.length > 512 && longPath.length <= 1024, `length ${longPath.length}`);
+
+      const res = await server.dispatchToolCall('create_file', {
+        path: longPath,
+        content: 'x',
+        workspaceId: 'ws',
+      });
+      const parsed = body(res);
+      assert.equal(parsed.code, 'APPROVAL_REQUIRED');
+      const summary = approvals.getRequest(parsed.details.approvalRequestId).reviewSummary;
+      assert.deepEqual(summary.targetPaths, [longPath], 'a legal long path must not be dropped');
+    });
+
+    test('RC04-M-54: an absolute mutation path creates no approval and executes nothing', async () => {
+      const { server, approvals, filesystem, dir } = makeServer({ workspaceName: 'abs-path' });
+      const absoluteInside = path.join(dir, 'abs.txt');
+      for (const candidate of [absoluteInside, `/etc/passwd`, `C:/ws/abs.txt`]) {
+        const res = await server.dispatchToolCall('create_file', {
+          path: candidate,
+          content: 'x',
+          workspaceId: 'ws',
+        });
+        const parsed = body(res);
+        assert.equal(parsed.code, 'POLICY_DENIED', `expected denial for ${candidate}`);
+        assert.ok(
+          !JSON.stringify(parsed).includes(candidate),
+          'the absolute input must not be echoed',
+        );
+        assert.ok(!JSON.stringify(parsed).includes(dir), 'the host path must not be echoed');
+      }
+      assert.equal(approvals.listActive().length, 0, 'zero pending approvals');
+      assert.equal(filesystem.calls.length, 0, 'zero subsystem execution');
+      assert.equal(fs.existsSync(absoluteInside), false);
+    });
+
+    test('RC04-M-55: BUILTIN accepts an explicit workspace-root selector, traversal stays denied', async () => {
+      const { server, dir } = makeServer({ workspaceName: 'root-compat' });
+      fs.writeFileSync(path.join(dir, 'a.txt'), 'x\n');
+
+      const listing = await server.dispatchToolCall('list_directory', {
+        path: '.',
+        recursive: true,
+        maxDepth: 2,
+        workspaceId: 'ws',
+      });
+      assert.equal(listing.isError, undefined, JSON.stringify(listing.content[0].text));
+      const entries = JSON.parse(listing.content[0].text).entries;
+      assert.ok(entries.some((e) => e.name === 'a.txt'));
+
+      // Traversal and other unsafe targets remain denied.
+      for (const bad of ['../outside', '../../etc/passwd', 'a\\b']) {
+        const res = await server.dispatchToolCall('list_directory', {
+          path: bad,
+          workspaceId: 'ws',
+        });
+        assert.equal(body(res).code, 'POLICY_DENIED', `expected denial for ${bad}`);
+      }
+    });
+
+    test('RC04-M-56: an EXTERNAL policy still fails an explicit root selector closed', async () => {
+      const { server } = makeServer({
+        workspaceName: 'root-external',
+        policy: {
+          sourceText: `version: '1.0'\nrules:\n  - id: 'allow-list'\n    effect: 'ALLOW'\n    tools: ['list_directory']\n`,
+          format: 'yaml',
+        },
+      });
+      // The frozen v1 external grammar cannot express the workspace root, so the
+      // target is unrepresentable and the request fails closed rather than
+      // silently dropping the path (which would let a `paths` rule miss).
+      const res = await server.dispatchToolCall('list_directory', { path: '.', workspaceId: 'ws' });
+      assert.equal(body(res).code, 'POLICY_DENIED');
+    });
+
+    test('RC04-M-57: reviewSummary never carries raw material, a token, or a host path', async () => {
+      const contentMarker = 'RC04_SUMMARY_LEAK_MARKER_7733';
+      const patchMarker = 'RC04_SUMMARY_PATCH_MARKER_8844';
+      const { server, approvals } = makeServer({ workspaceName: 'summary-leak' });
+
+      const create = await server.dispatchToolCall('create_file', {
+        path: 'leak.txt',
+        content: contentMarker,
+        workspaceId: 'ws',
+      });
+      const createId = body(create).details.approvalRequestId;
+      const patch = `--- a/README.md\n+++ b/README.md\n@@ -1,3 +1,3 @@\n-line1\n+${patchMarker}\n line2\n line3\n`;
+      const patchRes = await server.dispatchToolCall('apply_patch', { patch, workspaceId: 'ws' });
+      const patchId = body(patchRes).details.approvalRequestId;
+
+      for (const requestId of [createId, patchId]) {
+        const snapshot = approvals.getRequest(requestId);
+        const serialized = JSON.stringify(snapshot.reviewSummary);
+        assert.ok(!serialized.includes(contentMarker), 'raw content must not appear');
+        assert.ok(!serialized.includes(patchMarker), 'raw patch text must not appear');
+        assert.ok(!serialized.includes(tempRoot), 'an absolute host path must not appear');
+        assert.ok(!serialized.includes('token'), 'no token field may appear');
+        // Only the two documented digest fields may be 64-hex values.
+        for (const [key, value] of Object.entries(snapshot.reviewSummary)) {
+          if (typeof value === 'string' && /^[0-9a-f]{64}$/.test(value)) {
+            assert.ok(
+              ['contentHash', 'patchHash'].includes(key),
+              `unexpected 64-hex field '${key}' in reviewSummary`,
+            );
+          }
+        }
+      }
     });
   });
 });

@@ -1293,7 +1293,35 @@ export class ArcMcpServer implements IArcMcpServer {
     // The approval state manager is mandatory for Task 4 authorization.
     this.approvalStateManager = approvalStateManager ?? new ApprovalStateManager();
 
+    this.defaultWorkspaceId = config?.defaultWorkspaceId;
+    this.processRegistry =
+      processRegistry ||
+      (terminalSubsystem && 'processRegistry' in terminalSubsystem
+        ? (terminalSubsystem as ControlledProcessRunner).processRegistry
+        : undefined);
+
+    if (this.processRegistry) {
+      const sink = new ProcessAuditSink(this.auditLogger, this.workspaceRegistry);
+      this.processRegistry.registerLifecycleSink(sink);
+    }
+
+    if (config?.authorizedRoots) {
+      for (const root of config.authorizedRoots) {
+        this.workspaceRegistry.registerWorkspace(root.id, root.path);
+        if (!this.defaultWorkspaceId) {
+          this.defaultWorkspaceId = root.id;
+        }
+      }
+    }
+
     // Layer 2: one immutable effective policy engine, built once at startup.
+    //
+    // Startup order matters: the trusted configured roots MUST already be
+    // registered before workspace assertions are verified, otherwise a valid
+    // external policy naming a configured workspace would fail
+    // UNKNOWN_WORKSPACE_ID. Policy workspaces still only ASSERT expected
+    // registry identity; they never authorize or register a root.
+    //
     // An explicitly configured but INVALID external policy fails closed with no
     // fallback to the built-in compatibility policy (rc04 §12, §44).
     const policyConfig = config?.policy;
@@ -1314,27 +1342,6 @@ export class ArcMcpServer implements IArcMcpServer {
     } else {
       this.effectivePolicyEngine = DeclarativePolicyEngine.builtIn(this.workspaceRegistry);
       this.policyInitializationFailure = undefined;
-    }
-
-    this.defaultWorkspaceId = config?.defaultWorkspaceId;
-    this.processRegistry =
-      processRegistry ||
-      (terminalSubsystem && 'processRegistry' in terminalSubsystem
-        ? (terminalSubsystem as ControlledProcessRunner).processRegistry
-        : undefined);
-
-    if (this.processRegistry) {
-      const sink = new ProcessAuditSink(this.auditLogger, this.workspaceRegistry);
-      this.processRegistry.registerLifecycleSink(sink);
-    }
-
-    if (config?.authorizedRoots) {
-      for (const root of config.authorizedRoots) {
-        this.workspaceRegistry.registerWorkspace(root.id, root.path);
-        if (!this.defaultWorkspaceId) {
-          this.defaultWorkspaceId = root.id;
-        }
-      }
     }
 
     this.server = new Server(
@@ -2004,6 +2011,9 @@ export class ArcMcpServer implements IArcMcpServer {
       validatedParams,
       targetWorkspace.rootPath,
       patchTargetPaths,
+      // With no engine (fail-closed diagnostic path) the mode is irrelevant;
+      // EXTERNAL keeps the strictest target semantics.
+      policyEngine?.getSourceMode() ?? 'EXTERNAL',
     );
 
     // An empty target list means a supplied path had no safe canonical
