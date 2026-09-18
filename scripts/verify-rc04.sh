@@ -161,13 +161,55 @@ echo "--> Gate 15: Security-Scanner Suppression Check (inline scanner markers)"
 # The forbidden marker is assembled at runtime so this script's own source does
 # not itself contain the literal it searches for.
 SUPPRESSION_PATTERN="gitleaks:"'allow'
-SUPPRESSION_MATCHES=$(git grep -n -- "$SUPPRESSION_PATTERN" . || true)
-if [[ -n "$SUPPRESSION_MATCHES" ]]; then
+SUPPRESSION_OUTPUT=""
+SUPPRESSION_STATUS=0
+
+set +e
+SUPPRESSION_OUTPUT=$(git grep -n -- "$SUPPRESSION_PATTERN" . 2>&1)
+SUPPRESSION_STATUS=$?
+set -e
+
+if [[ $SUPPRESSION_STATUS -eq 0 ]]; then
   echo "    [FAIL] Inline scanner suppression markers found:"
-  echo "$SUPPRESSION_MATCHES"
+  echo "$SUPPRESSION_OUTPUT"
+  exit 1
+elif [[ $SUPPRESSION_STATUS -eq 1 ]]; then
+  echo "    [PASS] Zero inline scanner suppressions."
+elif [[ $SUPPRESSION_STATUS -eq 128 ]]; then
+  echo "    [FAIL] git grep could not run inside a repository:"
+  echo "$SUPPRESSION_OUTPUT"
+  exit 1
+else
+  echo "    [FAIL] git grep failed with unexpected status $SUPPRESSION_STATUS:"
+  echo "$SUPPRESSION_OUTPUT"
   exit 1
 fi
-echo "    [PASS] Zero inline scanner suppressions."
+echo ""
+
+# 15b. Verification-script self-check
+echo "--> Gate 15b: Verification Script Self-Check (no error-masking fallback)"
+
+# Assembled from pieces so this check does not find its own pattern text.
+FALSE_FALLBACK_PATTERN='||'' true'
+SELF_OUTPUT=""
+SELF_STATUS=0
+
+set +e
+SELF_OUTPUT=$(grep -nF -- "$FALSE_FALLBACK_PATTERN" "scripts/verify-rc04.sh" 2>&1)
+SELF_STATUS=$?
+set -e
+
+if [[ $SELF_STATUS -eq 0 ]]; then
+  echo "    [FAIL] An error-masking fallback is present in scripts/verify-rc04.sh:"
+  echo "$SELF_OUTPUT"
+  exit 1
+elif [[ $SELF_STATUS -eq 1 ]]; then
+  echo "    [PASS] No error-masking fallback in the verification script."
+else
+  echo "    [FAIL] Self-check could not read scripts/verify-rc04.sh:"
+  echo "$SELF_OUTPUT"
+  exit 1
+fi
 echo ""
 
 # 16. Required RC-04 artifacts

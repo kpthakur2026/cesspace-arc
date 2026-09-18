@@ -820,53 +820,100 @@ describe('CesSpace ARC — RC-04 Final Acceptance Negative Controls', () => {
       );
     });
 
-    test('RC04-NEG-28: an embedded ** inside a path segment is rejected', () => {
-      const text = policyText({
-        extraRule: ``,
-      }).replace("tools: ['read_file']", "tools: ['read_file']\n    paths: ['src/a**b.ts']");
+    test('RC04-NEG-28: an embedded ** inside a path segment is rejected by the glob grammar', () => {
+      // A VALID surrounding schema: `paths.patterns` is the real matcher shape,
+      // so any rejection must come from the path-pattern grammar itself and not
+      // from a malformed `paths` node.
+      const validPolicy = policyText({
+        extraRule: `    paths:\n      patterns:\n        - 'src/**'\n`,
+      });
+      assert.match(hashOf(validPolicy), /^[0-9a-f]{64}$/, 'the surrounding schema must load');
 
+      // `**` is only legal as a complete segment; embedded inside one it is not.
+      const embedded = policyText({
+        extraRule: `    paths:\n      patterns:\n        - 'src/a**b.ts'\n`,
+      });
       assert.throws(
-        () => hashOf(text),
-        (err) => err.code === 'POLICY_PARSE_ERROR' && err.details.reason === 'INVALID_MATCHER',
+        () => hashOf(embedded),
+        (err) => err.code === 'POLICY_PARSE_ERROR' && err.details.reason === 'INVALID_PATH_PATTERN',
       );
     });
 
-    test('RC04-NEG-29: unsupported glob syntax is rejected', () => {
-      const patterns = [
-        'src/{a,b}.ts', // brace expansion
-        'src/@(a|b).ts', // extglob
-        '/[a-z]+\\.ts/', // regex literal
-        '/etc/passwd', // leading slash
-        '../secret', // traversal
+    test('RC04-NEG-29: unsupported glob syntax is rejected by the path-pattern validator', () => {
+      // Baseline: supported wildcard forms load through the SAME schema, so the
+      // rejections below are about the glob grammar and nothing else.
+      const supported = ['src/**', 'src/*.ts', '**/*.ts', 'src/*'].map(
+        (pattern) => `    paths:\n      patterns:\n        - '${pattern}'\n`,
+      );
+      for (const extraRule of supported) {
+        assert.match(hashOf(policyText({ extraRule })), /^[0-9a-f]{64}$/);
+      }
+
+      const unsupported = [
+        ['src/{a,b}.ts', 'brace expansion'],
+        ['src/@(a|b).ts', 'extglob'],
+        ['src/[a-z]+.ts', 'regex-like character class and quantifier'],
+        ['/etc/passwd', 'leading slash'],
+        ['../secret', 'parent traversal'],
       ];
-      for (const pattern of patterns) {
-        const text = policyText({}).replace(
-          "tools: ['read_file']",
-          `tools: ['read_file']\n    paths: ['${pattern}']`,
-        );
+      for (const [pattern, label] of unsupported) {
+        const text = policyText({
+          extraRule: `    paths:\n      patterns:\n        - '${pattern}'\n`,
+        });
         assert.throws(
           () => hashOf(text),
-          (err) => err.code === 'POLICY_PARSE_ERROR' && err.details.reason === 'INVALID_MATCHER',
-          `${pattern} must be rejected`,
+          (err) =>
+            err.code === 'POLICY_PARSE_ERROR' && err.details.reason === 'INVALID_PATH_PATTERN',
+          `${label} (${pattern}) must be rejected by the path-pattern validator`,
         );
       }
     });
 
-    test('RC04-NEG-30: specifying allowedBinaries and blockedBinaries together is rejected', () => {
-      const text = `version: '1.0'
+    test('RC04-NEG-30: allowedBinaries and blockedBinaries together are rejected by the command matcher', () => {
+      const commandsPolicy = (effect, body) => `version: '1.0'
 metadata:
-  name: 'both'
+  name: 'cmd'
 rules:
   - id: 'rule-a'
-    effect: 'DENY'
+    effect: '${effect}'
     tools: ['run_command']
-    allowedBinaries: ['ls']
-    blockedBinaries: ['rm']
+    commands:
+${body}
 `;
 
+      // Positive matcher: valid on a non-DENY rule, through the real schema.
+      assert.match(
+        hashOf(commandsPolicy('REQUIRE_APPROVAL', `      allowedBinaries:\n        - 'ls'\n`)),
+        /^[0-9a-f]{64}$/,
+      );
+      // Negative matcher: valid on a DENY rule, through the real schema.
+      assert.match(
+        hashOf(commandsPolicy('DENY', `      blockedBinaries:\n        - 'rm'\n`)),
+        /^[0-9a-f]{64}$/,
+      );
+
+      // Combined: the matcher is genuinely ambiguous and must be refused.
       assert.throws(
-        () => hashOf(text),
-        (err) => err.code === 'POLICY_PARSE_ERROR',
+        () =>
+          hashOf(
+            commandsPolicy(
+              'DENY',
+              `      allowedBinaries:\n        - 'ls'\n      blockedBinaries:\n        - 'rm'\n`,
+            ),
+          ),
+        (err) =>
+          err.code === 'POLICY_PARSE_ERROR' && err.details.reason === 'INVALID_COMMAND_MATCHER',
+      );
+      assert.throws(
+        () =>
+          hashOf(
+            commandsPolicy(
+              'REQUIRE_APPROVAL',
+              `      allowedBinaries:\n        - 'ls'\n      blockedBinaries:\n        - 'rm'\n`,
+            ),
+          ),
+        (err) =>
+          err.code === 'POLICY_PARSE_ERROR' && err.details.reason === 'INVALID_COMMAND_MATCHER',
       );
     });
   });

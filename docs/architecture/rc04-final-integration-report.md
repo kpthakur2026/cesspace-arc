@@ -176,6 +176,24 @@ exercised rather than satisfied incidentally:
   central content/patch omission in the audit layer. It was verified to fail only
   when both are disabled.
 
+### 4.2 Corrected policy controls (NEG-28, NEG-29, NEG-30)
+
+An earlier revision of these three controls asserted rejection through a policy
+document that was **already malformed**, so the parser rejected the document for a
+shape reason rather than for the frozen condition being tested. The controls have
+been corrected to use the real matcher schema, and each now carries an in-test
+baseline proving the surrounding schema is valid:
+
+| Control     | Earlier (false positive)                                                                                | Corrected                                                                                                                                                                      |
+| :---------- | :------------------------------------------------------------------------------------------------------ | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| RC04-NEG-28 | `paths: ['src/a**b.ts']` — rejected as `INVALID_MATCHER` because `paths` was not an object.             | `paths.patterns: ['src/a**b.ts']` — rejected as `INVALID_PATH_PATTERN` by the glob grammar; baseline `src/**` loads.                                                           |
+| RC04-NEG-29 | `paths: ['src/{a,b}.ts']` etc. — same shape rejection.                                                  | `paths.patterns: [...]` — each form rejected as `INVALID_PATH_PATTERN`; baselines `src/**`, `src/*.ts`, `**/*.ts`, `src/*` load.                                               |
+| RC04-NEG-30 | Rule-level `allowedBinaries` / `blockedBinaries` — rejected as `UNKNOWN_PROPERTY` by the closed schema. | `commands.allowedBinaries` alone loads on a non-DENY rule, `commands.blockedBinaries` alone loads on a DENY rule, and both together are rejected as `INVALID_COMMAND_MATCHER`. |
+
+The corrected controls therefore fail for the reason the frozen contract names,
+and each was confirmed to pass only because its valid baseline also passes — a
+rejection assertion that no longer depends on an unrelated schema error.
+
 ---
 
 ## 5. Final Quality Gates
@@ -198,9 +216,16 @@ Executed from the final tree via `pnpm run verify:rc04` (`scripts/verify-rc04.sh
 | 12   | `pnpm audit`                                                                 | PASS         |
 | 13   | All 38 frozen negative-control IDs present                                   | PASS         |
 | 14   | No `test.skip` / `test.todo` / `describe.skip` / `it.skip`                   | PASS         |
-| 15   | Zero inline scanner suppressions                                             | PASS         |
+| 15   | Zero inline scanner suppressions (explicit grep exit-code handling)          | PASS         |
+| 15b  | Verification script contains no error-masking `\|\| true` fallback           | PASS         |
 | 16   | All required RC-04 artifacts exist                                           | PASS         |
 | 17   | Version and health consistency (`0.4.0-rc04` / `RC-04`)                      | PASS         |
+
+The suppression and self-check gates distinguish all three `git grep` / `grep`
+outcomes explicitly: `0` means a match was found and the gate fails, `1` means no
+match and the gate passes, and any other status — including a failure to read the
+repository or the file — fails the gate rather than being masked as a pass. No
+`\|\| true` fallback exists anywhere in the verification script.
 
 ### 5.1 Test totals
 
