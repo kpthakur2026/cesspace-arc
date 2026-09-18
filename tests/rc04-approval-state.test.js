@@ -1072,4 +1072,636 @@ describe('CesSpace ARC — RC-04 Task 1: Approval State Machine Core', () => {
       (err) => err.code === 'APPROVAL_REJECTED',
     );
   });
+
+  // --- Task 1.1 Hardening Regressions ---
+
+  test('Group 1: Injected limit overrides strictly reject NaN, Infinity, negative, non-integer, and non-number values', () => {
+    // Specifically prove NaN fails construction
+    assert.throws(
+      () => new ApprovalStateManager({ maxActiveApprovalsGlobal: Number.NaN }),
+      /maxActiveApprovalsGlobal/,
+    );
+    assert.throws(
+      () => new ApprovalStateManager({ maxActiveApprovalsPerActor: Number.NaN }),
+      /maxActiveApprovalsPerActor/,
+    );
+    assert.throws(
+      () => new ApprovalStateManager({ maxReviewBytesPerRecord: Number.NaN }),
+      /maxReviewBytesPerRecord/,
+    );
+    assert.throws(
+      () => new ApprovalStateManager({ maxReviewBytesPerActor: Number.NaN }),
+      /maxReviewBytesPerActor/,
+    );
+    assert.throws(
+      () => new ApprovalStateManager({ maxReviewBytesGlobal: Number.NaN }),
+      /maxReviewBytesGlobal/,
+    );
+
+    // Reject Infinity and -Infinity
+    for (const inf of [Infinity, -Infinity]) {
+      assert.throws(
+        () => new ApprovalStateManager({ maxActiveApprovalsGlobal: inf }),
+        /maxActiveApprovalsGlobal/,
+      );
+      assert.throws(
+        () => new ApprovalStateManager({ maxActiveApprovalsPerActor: inf }),
+        /maxActiveApprovalsPerActor/,
+      );
+      assert.throws(
+        () => new ApprovalStateManager({ maxReviewBytesPerRecord: inf }),
+        /maxReviewBytesPerRecord/,
+      );
+      assert.throws(
+        () => new ApprovalStateManager({ maxReviewBytesPerActor: inf }),
+        /maxReviewBytesPerActor/,
+      );
+      assert.throws(
+        () => new ApprovalStateManager({ maxReviewBytesGlobal: inf }),
+        /maxReviewBytesGlobal/,
+      );
+    }
+
+    // Reject negative numbers (-1)
+    assert.throws(
+      () => new ApprovalStateManager({ maxActiveApprovalsGlobal: -1 }),
+      /maxActiveApprovalsGlobal/,
+    );
+    assert.throws(
+      () => new ApprovalStateManager({ maxActiveApprovalsPerActor: -1 }),
+      /maxActiveApprovalsPerActor/,
+    );
+    assert.throws(
+      () => new ApprovalStateManager({ maxReviewBytesPerRecord: -1 }),
+      /maxReviewBytesPerRecord/,
+    );
+    assert.throws(
+      () => new ApprovalStateManager({ maxReviewBytesPerActor: -1 }),
+      /maxReviewBytesPerActor/,
+    );
+    assert.throws(
+      () => new ApprovalStateManager({ maxReviewBytesGlobal: -1 }),
+      /maxReviewBytesGlobal/,
+    );
+
+    // Reject non-integers (1.5)
+    assert.throws(
+      () => new ApprovalStateManager({ maxActiveApprovalsGlobal: 1.5 }),
+      /maxActiveApprovalsGlobal/,
+    );
+    assert.throws(
+      () => new ApprovalStateManager({ maxActiveApprovalsPerActor: 1.5 }),
+      /maxActiveApprovalsPerActor/,
+    );
+    assert.throws(
+      () => new ApprovalStateManager({ maxReviewBytesPerRecord: 1.5 }),
+      /maxReviewBytesPerRecord/,
+    );
+    assert.throws(
+      () => new ApprovalStateManager({ maxReviewBytesPerActor: 1.5 }),
+      /maxReviewBytesPerActor/,
+    );
+    assert.throws(
+      () => new ApprovalStateManager({ maxReviewBytesGlobal: 1.5 }),
+      /maxReviewBytesGlobal/,
+    );
+
+    // Reject non-number runtime types
+    for (const badVal of ['10', null, {}, [], true]) {
+      assert.throws(
+        () => new ApprovalStateManager({ maxActiveApprovalsGlobal: badVal }),
+        /maxActiveApprovalsGlobal/,
+      );
+    }
+
+    // Zero is allowed as strictest fail-closed limit
+    const zeroManager = new ApprovalStateManager({
+      maxActiveApprovalsGlobal: 0,
+      maxActiveApprovalsPerActor: 0,
+      maxReviewBytesPerRecord: 0,
+      maxReviewBytesPerActor: 0,
+      maxReviewBytesGlobal: 0,
+    });
+    assert.ok(zeroManager);
+    assert.throws(
+      () => zeroManager.createOrReusePending(createSampleInput()),
+      (err) => err.code === 'RESOURCE_EXHAUSTED',
+    );
+  });
+
+  test('Group 6: Actor quota key canonical tuple encoding prevents delimiter collisions (Section 2 regression)', () => {
+    const manager = new ApprovalStateManager({
+      maxActiveApprovalsPerActor: 1,
+      maxActiveApprovalsGlobal: 2,
+    });
+
+    const actorA = { clientId: 'a::b', clientType: 'c' };
+    const actorB = { clientId: 'a', clientType: 'b::c' };
+
+    const snapA = manager.createOrReusePending(
+      createSampleInput({
+        executionPayloadHash: '1'.repeat(64),
+        binding: { ...createSampleInput().binding, actor: actorA },
+      }),
+    );
+    assert.ok(snapA);
+
+    // Under delimiter concatenation, Actor B collides with Actor A and fails.
+    // Under canonical tuple JSON encoding, Actor B is distinct and must succeed.
+    const snapB = manager.createOrReusePending(
+      createSampleInput({
+        executionPayloadHash: '2'.repeat(64),
+        binding: { ...createSampleInput().binding, actor: actorB },
+      }),
+    );
+    assert.ok(snapB);
+    assert.notEqual(snapA.requestId, snapB.requestId);
+    assert.equal(manager.listActive().length, 2);
+  });
+
+  test('Group 6: Automatic synchronous reclamation of expired records restores global active capacity', () => {
+    let fakeNowMono = 10_000_000_000n;
+    let fakeNowWall = 1_700_000_000_000;
+    const manager = new ApprovalStateManager({
+      maxActiveApprovalsGlobal: 1,
+      getMonotonicTime: () => fakeNowMono,
+      getWallTime: () => fakeNowWall,
+    });
+
+    // 1. Create request A
+    const snapA = manager.createOrReusePending(
+      createSampleInput({ executionPayloadHash: 'a'.repeat(64) }),
+    );
+    assert.equal(snapA.state, 'PENDING');
+
+    // Attempting another creation immediately fails due to global quota
+    assert.throws(
+      () =>
+        manager.createOrReusePending(createSampleInput({ executionPayloadHash: 'b'.repeat(64) })),
+      (err) => err.code === 'RESOURCE_EXHAUSTED',
+    );
+
+    // 2. Advance clock exactly 300 seconds
+    fakeNowMono += 300_000_000_000n;
+    fakeNowWall += 300_000;
+
+    // 3. WITHOUT calling purgeExpired, listActive, or getRequest:
+    // 4. Create different request B
+    const snapB = manager.createOrReusePending(
+      createSampleInput({ executionPayloadHash: 'b'.repeat(64) }),
+    );
+    assert.ok(snapB);
+    assert.equal(snapB.state, 'PENDING');
+    assert.notEqual(snapA.requestId, snapB.requestId);
+
+    // A is now EXPIRED
+    const recordA = manager.getRequest(snapA.requestId);
+    assert.equal(recordA.state, 'EXPIRED');
+
+    // Active count reflects only B
+    const active = manager.listActive();
+    assert.equal(active.length, 1);
+    assert.equal(active[0].requestId, snapB.requestId);
+  });
+
+  test('Group 6: Automatic synchronous reclamation of expired records restores per-actor active capacity', () => {
+    let fakeNowMono = 10_000_000_000n;
+    let fakeNowWall = 1_700_000_000_000;
+    const manager = new ApprovalStateManager({
+      maxActiveApprovalsPerActor: 1,
+      maxActiveApprovalsGlobal: 10,
+      getMonotonicTime: () => fakeNowMono,
+      getWallTime: () => fakeNowWall,
+    });
+
+    const actor = { clientId: 'alice', clientType: 'cli' };
+
+    // 1. Create request A for actor
+    const snapA = manager.createOrReusePending(
+      createSampleInput({
+        executionPayloadHash: 'a'.repeat(64),
+        binding: { ...createSampleInput().binding, actor },
+      }),
+    );
+
+    // 2. Advance clock 300 seconds
+    fakeNowMono += 300_000_000_000n;
+    fakeNowWall += 300_000;
+
+    // 3. Create request B for same actor without manual purge
+    const snapB = manager.createOrReusePending(
+      createSampleInput({
+        executionPayloadHash: 'b'.repeat(64),
+        binding: { ...createSampleInput().binding, actor },
+      }),
+    );
+    assert.ok(snapB);
+    assert.equal(snapB.state, 'PENDING');
+    assert.equal(manager.getRequest(snapA.requestId).state, 'EXPIRED');
+    assert.equal(manager.listActive().length, 1);
+  });
+
+  test('Group 6: Zero-byte review material admission leaves no map tombstones and behaves correctly across many actors', () => {
+    const manager = new ApprovalStateManager({
+      maxReviewBytesPerActor: 50,
+      maxReviewBytesGlobal: 100,
+      maxActiveApprovalsPerActor: 2,
+      maxActiveApprovalsGlobal: 50,
+    });
+
+    // Create 30 requests for 30 distinct actors with NO review material (0 bytes)
+    const snaps = [];
+    for (let i = 0; i < 30; i++) {
+      const actor = { clientId: `actor-${i}`, clientType: 'cli' };
+      const snap = manager.createOrReusePending(
+        createSampleInput({
+          executionPayloadHash: i.toString(16).padStart(64, '0'),
+          binding: { ...createSampleInput().binding, actor },
+          reviewMaterial: undefined,
+        }),
+      );
+      assert.equal(snap.reviewMaterialBytes, 0);
+      snaps.push(snap);
+    }
+
+    // Transition all 30 through terminal states
+    for (let i = 0; i < 30; i++) {
+      if (i % 2 === 0) {
+        manager.reject(snaps[i].requestId);
+      } else {
+        const grant = manager.approve(snaps[i].requestId);
+        manager.redeemAndConsume({
+          requestId: snaps[i].requestId,
+          token: grant.token,
+          executionPayloadHash: snaps[i].executionPayloadHash,
+          actor: snaps[i].binding.actor,
+          workspace: snaps[i].binding.workspace,
+          policyHash: snaps[i].binding.policyHash,
+        });
+      }
+    }
+
+    assert.equal(manager.listActive().length, 0);
+
+    // Verify subsequent requests with review material consume full quotas without tombstone leaks
+    const actorTest = { clientId: 'actor-0', clientType: 'cli' };
+    const snapFull = manager.createOrReusePending(
+      createSampleInput({
+        executionPayloadHash: 'f'.repeat(64),
+        binding: { ...createSampleInput().binding, actor: actorTest },
+        reviewMaterial: 'r'.repeat(50), // exact maxReviewBytesPerActor limit
+      }),
+    );
+    assert.equal(snapFull.reviewMaterialBytes, 50);
+  });
+
+  test('Group 6: Cross-actor global review byte quota exhaustion and release', () => {
+    const manager = new ApprovalStateManager({
+      maxReviewBytesPerRecord: 100,
+      maxReviewBytesPerActor: 200,
+      maxReviewBytesGlobal: 150,
+    });
+
+    const actorA = { clientId: 'actor-a', clientType: 'cli' };
+    const actorB = { clientId: 'actor-b', clientType: 'cli' };
+
+    // Actor A submits 80 bytes (succeeds, global = 80 / 150)
+    const snapA = manager.createOrReusePending(
+      createSampleInput({
+        executionPayloadHash: '1'.repeat(64),
+        binding: { ...createSampleInput().binding, actor: actorA },
+        reviewMaterial: 'a'.repeat(80),
+      }),
+    );
+    assert.equal(snapA.reviewMaterialBytes, 80);
+
+    // Actor B submits 80 bytes (80 + 80 = 160 > 150 global limit -> RESOURCE_EXHAUSTED)
+    assert.throws(
+      () =>
+        manager.createOrReusePending(
+          createSampleInput({
+            executionPayloadHash: '2'.repeat(64),
+            binding: { ...createSampleInput().binding, actor: actorB },
+            reviewMaterial: 'b'.repeat(80),
+          }),
+        ),
+      (err) =>
+        err.code === 'RESOURCE_EXHAUSTED' &&
+        err.message.includes('Global review material byte quota exceeded'),
+    );
+
+    // Release Actor A's review material via approval
+    manager.approve(snapA.requestId);
+
+    // Now Actor B can admit 80 bytes successfully
+    const snapB = manager.createOrReusePending(
+      createSampleInput({
+        executionPayloadHash: '2'.repeat(64),
+        binding: { ...createSampleInput().binding, actor: actorB },
+        reviewMaterial: 'b'.repeat(80),
+      }),
+    );
+    assert.equal(snapB.reviewMaterialBytes, 80);
+  });
+
+  test('Group 6: Failed admission leaves all resource counters, dedup, and storage completely uncorrupted', () => {
+    const manager = new ApprovalStateManager({
+      maxReviewBytesPerRecord: 50,
+      maxReviewBytesPerActor: 75,
+      maxReviewBytesGlobal: 100,
+      maxActiveApprovalsPerActor: 2,
+      maxActiveApprovalsGlobal: 3,
+    });
+
+    const actorA = { clientId: 'alice', clientType: 'cli' };
+
+    // Baseline: Actor A admits 1 record with 25 bytes
+    const snap1 = manager.createOrReusePending(
+      createSampleInput({
+        executionPayloadHash: '1'.repeat(64),
+        binding: { ...createSampleInput().binding, actor: actorA },
+        reviewMaterial: 'm'.repeat(25),
+      }),
+    );
+    assert.equal(snap1.reviewMaterialBytes, 25);
+    assert.equal(manager.listActive().length, 1);
+
+    // 1. Failure on per-record review-byte limit (60 > 50)
+    assert.throws(
+      () =>
+        manager.createOrReusePending(
+          createSampleInput({
+            executionPayloadHash: 'f1'.padEnd(64, '0'),
+            binding: { ...createSampleInput().binding, actor: actorA },
+            reviewMaterial: 'r'.repeat(60),
+          }),
+        ),
+      (err) => err.code === 'RESOURCE_EXHAUSTED',
+    );
+    // Counter check: actor can still admit up to 50 bytes (25 + 50 = 75 <= 75)
+    // If counters had leaked, admitting 50 bytes would fail
+    const snap2 = manager.createOrReusePending(
+      createSampleInput({
+        executionPayloadHash: '2'.repeat(64),
+        binding: { ...createSampleInput().binding, actor: actorA },
+        reviewMaterial: 'm'.repeat(50),
+      }),
+    );
+    assert.equal(snap2.reviewMaterialBytes, 50);
+    assert.equal(manager.listActive().length, 2);
+
+    // 2. Failure on per-actor review-byte limit (actor A is at 75, adding 1 byte fails)
+    assert.throws(
+      () =>
+        manager.createOrReusePending(
+          createSampleInput({
+            executionPayloadHash: 'f2'.padEnd(64, '0'),
+            binding: { ...createSampleInput().binding, actor: actorA },
+            reviewMaterial: 'x',
+          }),
+        ),
+      (err) => err.code === 'RESOURCE_EXHAUSTED',
+    );
+
+    // 3. Failure on per-actor active record limit (actor A is at 2 / 2 records, adding 0-byte record fails)
+    assert.throws(
+      () =>
+        manager.createOrReusePending(
+          createSampleInput({
+            executionPayloadHash: 'f3'.padEnd(64, '0'),
+            binding: { ...createSampleInput().binding, actor: actorA },
+            reviewMaterial: undefined,
+          }),
+        ),
+      (err) => err.code === 'RESOURCE_EXHAUSTED',
+    );
+
+    // 4. Failure on global review-byte limit (global is at 75 / 100, actor B adding 30 fails)
+    const actorB = { clientId: 'bob', clientType: 'cli' };
+    assert.throws(
+      () =>
+        manager.createOrReusePending(
+          createSampleInput({
+            executionPayloadHash: 'f4'.padEnd(64, '0'),
+            binding: { ...createSampleInput().binding, actor: actorB },
+            reviewMaterial: 'b'.repeat(30),
+          }),
+        ),
+      (err) => err.code === 'RESOURCE_EXHAUSTED',
+    );
+
+    // Actor B can admit exactly 25 bytes (75 + 25 = 100 <= 100) and reaching global active limit 3/3
+    const snap3 = manager.createOrReusePending(
+      createSampleInput({
+        executionPayloadHash: '3'.repeat(64),
+        binding: { ...createSampleInput().binding, actor: actorB },
+        reviewMaterial: 'b'.repeat(25),
+      }),
+    );
+    assert.equal(snap3.reviewMaterialBytes, 25);
+    assert.equal(manager.listActive().length, 3);
+
+    // 5. Failure on global active record limit (global is at 3 / 3)
+    const actorC = { clientId: 'charlie', clientType: 'cli' };
+    assert.throws(
+      () =>
+        manager.createOrReusePending(
+          createSampleInput({
+            executionPayloadHash: 'f5'.padEnd(64, '0'),
+            binding: { ...createSampleInput().binding, actor: actorC },
+            reviewMaterial: undefined,
+          }),
+        ),
+      (err) => err.code === 'RESOURCE_EXHAUSTED',
+    );
+
+    // Verify failed payload hashes were not registered in dedup or records map
+    for (const failHash of ['f1', 'f2', 'f3', 'f4', 'f5']) {
+      const fullHash = failHash.padEnd(64, '0');
+      assert.equal(manager.getRequest(fullHash), undefined);
+    }
+  });
+
+  test('Group 6: Raw review material release and byte capacity recovery across all terminal transitions (APPROVED, REJECTED, EXPIRED, INVALIDATED)', () => {
+    let fakeNowMono = 10_000_000_000n;
+    let fakeNowWall = 1_700_000_000_000;
+    const manager = new ApprovalStateManager({
+      maxReviewBytesPerActor: 50,
+      maxReviewBytesGlobal: 50,
+      getMonotonicTime: () => fakeNowMono,
+      getWallTime: () => fakeNowWall,
+    });
+
+    const marker = 'RC04_REVIEW_MATERIAL_MARKER_4817';
+    assert.equal(marker.length, 32);
+
+    function verifyTransition(transitionFn, payloadHash) {
+      const snap = manager.createOrReusePending(
+        createSampleInput({
+          executionPayloadHash: payloadHash,
+          reviewMaterial: marker,
+        }),
+      );
+      assert.equal(manager.inspectPending(snap.requestId), marker);
+      assert.equal(snap.reviewMaterialBytes, 32);
+
+      // Attempting another 32-byte request fails (32 + 32 > 50)
+      assert.throws(
+        () =>
+          manager.createOrReusePending(
+            createSampleInput({
+              executionPayloadHash: '9'.repeat(64),
+              reviewMaterial: marker,
+            }),
+          ),
+        (err) => err.code === 'RESOURCE_EXHAUSTED',
+      );
+
+      transitionFn(snap);
+
+      // Invariants after transition:
+      assert.equal(manager.inspectPending(snap.requestId), undefined);
+      const retrieved = manager.getRequest(snap.requestId);
+      assert.equal(retrieved.reviewMaterialBytes, 0);
+      assert.equal(JSON.stringify(retrieved).includes(marker), false);
+
+      // Capacity released: next 32-byte request succeeds
+      const nextSnap = manager.createOrReusePending(
+        createSampleInput({
+          executionPayloadHash: '8'.repeat(64),
+          reviewMaterial: marker,
+        }),
+      );
+      assert.equal(nextSnap.reviewMaterialBytes, 32);
+      // Clean up nextSnap for next test iteration
+      manager.reject(nextSnap.requestId);
+    }
+
+    // 1. PENDING -> APPROVED
+    verifyTransition((snap) => {
+      manager.approve(snap.requestId);
+    }, '1'.repeat(64));
+
+    // 2. PENDING -> REJECTED
+    verifyTransition((snap) => {
+      manager.reject(snap.requestId);
+    }, '2'.repeat(64));
+
+    // 3. PENDING -> EXPIRED
+    verifyTransition((snap) => {
+      fakeNowMono += 300_000_000_000n;
+      fakeNowWall += 300_000;
+      manager.getRequest(snap.requestId);
+    }, '3'.repeat(64));
+
+    // 4. PENDING -> INVALIDATED (redemption with mismatched policyHash while PENDING)
+    verifyTransition((snap) => {
+      assert.throws(
+        () =>
+          manager.redeemAndConsume({
+            requestId: snap.requestId,
+            token: 'a'.repeat(64),
+            executionPayloadHash: snap.executionPayloadHash,
+            actor: snap.binding.actor,
+            workspace: snap.binding.workspace,
+            policyHash: 'f'.repeat(64),
+          }),
+        (err) => err.code === 'APPROVAL_REJECTED',
+      );
+      assert.equal(manager.getRequest(snap.requestId).state, 'INVALIDATED');
+    }, '4'.repeat(64));
+  });
+
+  test('Group 6: APPROVED to EXPIRED releases active slot without double-decrementing review byte accounting', () => {
+    let fakeNowMono = 10_000_000_000n;
+    let fakeNowWall = 1_700_000_000_000;
+    const manager = new ApprovalStateManager({
+      maxActiveApprovalsGlobal: 1,
+      maxReviewBytesGlobal: 100,
+      getMonotonicTime: () => fakeNowMono,
+      getWallTime: () => fakeNowWall,
+    });
+
+    const snap = manager.createOrReusePending(
+      createSampleInput({
+        executionPayloadHash: '1'.repeat(64),
+        reviewMaterial: 'test-review-material',
+      }),
+    );
+    assert.equal(snap.reviewMaterialBytes, 20);
+
+    // PENDING -> APPROVED drops review bytes immediately
+    manager.approve(snap.requestId);
+    assert.equal(manager.getRequest(snap.requestId).reviewMaterialBytes, 0);
+
+    // Advance past TTL (300 seconds)
+    fakeNowMono += 300_000_000_000n;
+    fakeNowWall += 300_000;
+
+    // APPROVED -> EXPIRED happens lazily or via purge/reclaim
+    manager.purgeExpired();
+    assert.equal(manager.getRequest(snap.requestId).state, 'EXPIRED');
+
+    // Slot is recovered and review byte quota is exactly 100 (can admit 100 bytes)
+    const nextSnap = manager.createOrReusePending(
+      createSampleInput({
+        executionPayloadHash: '2'.repeat(64),
+        reviewMaterial: 'x'.repeat(100),
+      }),
+    );
+    assert.equal(nextSnap.reviewMaterialBytes, 100);
+    assert.equal(manager.listActive().length, 1);
+  });
+
+  test('Group 3: Internal invariant prevents double-decrementing accounting on repeated terminal transitions', () => {
+    const manager = new ApprovalStateManager({
+      maxActiveApprovalsGlobal: 2,
+    });
+
+    const snap = manager.createOrReusePending(
+      createSampleInput({
+        executionPayloadHash: '1'.repeat(64),
+      }),
+    );
+
+    // Transition PENDING -> REJECTED
+    manager.reject(snap.requestId);
+    assert.equal(manager.getRequest(snap.requestId).state, 'REJECTED');
+
+    // Attempting reject or redeemAndConsume again on terminal record throws without touching accounting
+    assert.throws(
+      () => manager.reject(snap.requestId),
+      (err) => err.code === 'APPROVAL_REJECTED',
+    );
+    assert.throws(
+      () =>
+        manager.redeemAndConsume({
+          requestId: snap.requestId,
+          token: 'a'.repeat(64),
+          executionPayloadHash: snap.executionPayloadHash,
+          actor: snap.binding.actor,
+          workspace: snap.binding.workspace,
+          policyHash: snap.binding.policyHash,
+        }),
+      (err) => err.code === 'APPROVAL_REJECTED',
+    );
+
+    // Exactly 2 slots can still be admitted
+    const snapA = manager.createOrReusePending(
+      createSampleInput({ executionPayloadHash: 'a'.repeat(64) }),
+    );
+    const snapB = manager.createOrReusePending(
+      createSampleInput({ executionPayloadHash: 'b'.repeat(64) }),
+    );
+    assert.ok(snapA);
+    assert.ok(snapB);
+    assert.equal(manager.listActive().length, 2);
+
+    // 3rd attempt exceeds quota
+    assert.throws(
+      () =>
+        manager.createOrReusePending(createSampleInput({ executionPayloadHash: 'c'.repeat(64) })),
+      (err) => err.code === 'RESOURCE_EXHAUSTED',
+    );
+  });
 });

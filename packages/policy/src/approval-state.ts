@@ -104,73 +104,89 @@ export class ApprovalStateManager {
 
   private readonly recordsByRequestId = new Map<string, InternalApprovalRecord>();
   private readonly requestIdByDedupKey = new Map<string, string>();
+  private readonly activeRequestIds = new Set<string>();
 
   private activeCountGlobal = 0;
   private readonly activeCountByActor = new Map<string, number>();
   private reviewBytesGlobal = 0;
   private readonly reviewBytesByActor = new Map<string, number>();
 
+  private validateLimit(name: string, value: unknown, max: number): number {
+    if (
+      typeof value !== 'number' ||
+      !Number.isFinite(value) ||
+      !Number.isInteger(value) ||
+      value < 0 ||
+      value > max
+    ) {
+      throw new Error(
+        `${name} cannot exceed production maximum of ${max} and must be an integer between 0 and ${max}`,
+      );
+    }
+    return value;
+  }
+
   constructor(options: ApprovalStateManagerOptions = {}) {
     this.getMonotonicTime = options.getMonotonicTime ?? (() => process.hrtime.bigint());
     this.getWallTime = options.getWallTime ?? (() => Date.now());
 
-    // Validate that injected test limits never exceed production maximums (fail-closed)
-    if (
-      options.maxActiveApprovalsGlobal !== undefined &&
-      options.maxActiveApprovalsGlobal > MAX_ACTIVE_APPROVALS_GLOBAL
-    ) {
-      throw new Error(
-        `maxActiveApprovalsGlobal cannot exceed production maximum of ${MAX_ACTIVE_APPROVALS_GLOBAL}`,
-      );
-    }
-    if (
-      options.maxActiveApprovalsPerActor !== undefined &&
-      options.maxActiveApprovalsPerActor > MAX_ACTIVE_APPROVALS_PER_ACTOR
-    ) {
-      throw new Error(
-        `maxActiveApprovalsPerActor cannot exceed production maximum of ${MAX_ACTIVE_APPROVALS_PER_ACTOR}`,
-      );
-    }
-    if (
-      options.maxReviewBytesPerRecord !== undefined &&
-      options.maxReviewBytesPerRecord > MAX_REVIEW_BYTES_PER_RECORD
-    ) {
-      throw new Error(
-        `maxReviewBytesPerRecord cannot exceed production maximum of ${MAX_REVIEW_BYTES_PER_RECORD}`,
-      );
-    }
-    if (
-      options.maxReviewBytesPerActor !== undefined &&
-      options.maxReviewBytesPerActor > MAX_REVIEW_BYTES_PER_ACTOR
-    ) {
-      throw new Error(
-        `maxReviewBytesPerActor cannot exceed production maximum of ${MAX_REVIEW_BYTES_PER_ACTOR}`,
-      );
-    }
-    if (
-      options.maxReviewBytesGlobal !== undefined &&
-      options.maxReviewBytesGlobal > MAX_REVIEW_BYTES_GLOBAL
-    ) {
-      throw new Error(
-        `maxReviewBytesGlobal cannot exceed production maximum of ${MAX_REVIEW_BYTES_GLOBAL}`,
-      );
-    }
+    this.maxActiveApprovalsGlobal =
+      options.maxActiveApprovalsGlobal !== undefined
+        ? this.validateLimit(
+            'maxActiveApprovalsGlobal',
+            options.maxActiveApprovalsGlobal,
+            MAX_ACTIVE_APPROVALS_GLOBAL,
+          )
+        : MAX_ACTIVE_APPROVALS_GLOBAL;
 
-    this.maxActiveApprovalsGlobal = options.maxActiveApprovalsGlobal ?? MAX_ACTIVE_APPROVALS_GLOBAL;
     this.maxActiveApprovalsPerActor =
-      options.maxActiveApprovalsPerActor ?? MAX_ACTIVE_APPROVALS_PER_ACTOR;
-    this.maxReviewBytesPerRecord = options.maxReviewBytesPerRecord ?? MAX_REVIEW_BYTES_PER_RECORD;
-    this.maxReviewBytesPerActor = options.maxReviewBytesPerActor ?? MAX_REVIEW_BYTES_PER_ACTOR;
-    this.maxReviewBytesGlobal = options.maxReviewBytesGlobal ?? MAX_REVIEW_BYTES_GLOBAL;
+      options.maxActiveApprovalsPerActor !== undefined
+        ? this.validateLimit(
+            'maxActiveApprovalsPerActor',
+            options.maxActiveApprovalsPerActor,
+            MAX_ACTIVE_APPROVALS_PER_ACTOR,
+          )
+        : MAX_ACTIVE_APPROVALS_PER_ACTOR;
+
+    this.maxReviewBytesPerRecord =
+      options.maxReviewBytesPerRecord !== undefined
+        ? this.validateLimit(
+            'maxReviewBytesPerRecord',
+            options.maxReviewBytesPerRecord,
+            MAX_REVIEW_BYTES_PER_RECORD,
+          )
+        : MAX_REVIEW_BYTES_PER_RECORD;
+
+    this.maxReviewBytesPerActor =
+      options.maxReviewBytesPerActor !== undefined
+        ? this.validateLimit(
+            'maxReviewBytesPerActor',
+            options.maxReviewBytesPerActor,
+            MAX_REVIEW_BYTES_PER_ACTOR,
+          )
+        : MAX_REVIEW_BYTES_PER_ACTOR;
+
+    this.maxReviewBytesGlobal =
+      options.maxReviewBytesGlobal !== undefined
+        ? this.validateLimit(
+            'maxReviewBytesGlobal',
+            options.maxReviewBytesGlobal,
+            MAX_REVIEW_BYTES_GLOBAL,
+          )
+        : MAX_REVIEW_BYTES_GLOBAL;
   }
 
   /**
-   * Generates a deterministic, collision-safe actor quota key.
+   * Generates a deterministic, collision-safe canonical tuple encoding for actor identity.
+   * Uses JSON array encoding to prevent delimiter concatenation collisions.
    */
   private getActorQuotaKey(actor: ApprovalActorBinding): string {
-    const sess = actor.sessionId !== undefined ? `sess:${actor.sessionId}` : 'no-sess';
-    const dev = actor.deviceId !== undefined ? `dev:${actor.deviceId}` : 'no-dev';
-    return `${actor.clientId}::${actor.clientType}::${sess}::${dev}`;
+    return JSON.stringify([
+      actor.clientId,
+      actor.clientType,
+      actor.sessionId === undefined ? null : actor.sessionId,
+      actor.deviceId === undefined ? null : actor.deviceId,
+    ]);
   }
 
   /**
@@ -238,12 +254,20 @@ export class ApprovalStateManager {
 
   /**
    * Transitions an active record to a terminal state atomically, releasing dedup and quotas.
+   * Internal invariant: Only active PENDING and APPROVED records can perform accounting release.
    */
   private transitionToTerminal(
     record: InternalApprovalRecord,
     terminalState: 'REJECTED' | 'EXPIRED' | 'CONSUMED' | 'INVALIDATED',
   ): void {
+    const previousState = record.state;
+    if (previousState !== 'PENDING' && previousState !== 'APPROVED') {
+      record.state = terminalState;
+      return;
+    }
+
     record.state = terminalState;
+    this.activeRequestIds.delete(record.requestId);
 
     // Release deduplication slot
     if (this.requestIdByDedupKey.get(record.executionPayloadHash) === record.requestId) {
@@ -251,12 +275,14 @@ export class ApprovalStateManager {
     }
 
     // Decrement active counts
-    this.activeCountGlobal = Math.max(0, this.activeCountGlobal - 1);
-    const actorActive = this.activeCountByActor.get(record.actorQuotaKey) ?? 1;
-    if (actorActive <= 1) {
-      this.activeCountByActor.delete(record.actorQuotaKey);
-    } else {
-      this.activeCountByActor.set(record.actorQuotaKey, actorActive - 1);
+    this.activeCountGlobal--;
+    const actorActive = this.activeCountByActor.get(record.actorQuotaKey);
+    if (actorActive !== undefined) {
+      if (actorActive <= 1) {
+        this.activeCountByActor.delete(record.actorQuotaKey);
+      } else {
+        this.activeCountByActor.set(record.actorQuotaKey, actorActive - 1);
+      }
     }
 
     // Drop review material if still retained
@@ -267,17 +293,34 @@ export class ApprovalStateManager {
    * Drops raw review material buffer and decrements byte quota counters.
    */
   private dropReviewMaterial(record: InternalApprovalRecord): void {
-    if (record.reviewBytes > 0) {
-      this.reviewBytesGlobal = Math.max(0, this.reviewBytesGlobal - record.reviewBytes);
-      const actorBytes = this.reviewBytesByActor.get(record.actorQuotaKey) ?? record.reviewBytes;
-      const remaining = Math.max(0, actorBytes - record.reviewBytes);
-      if (remaining === 0) {
-        this.reviewBytesByActor.delete(record.actorQuotaKey);
-      } else {
-        this.reviewBytesByActor.set(record.actorQuotaKey, remaining);
+    const bytes = record.reviewBytes;
+    if (bytes > 0) {
+      this.reviewBytesGlobal -= bytes;
+      const currentActorBytes = this.reviewBytesByActor.get(record.actorQuotaKey);
+      if (currentActorBytes !== undefined) {
+        const remaining = currentActorBytes - bytes;
+        if (remaining <= 0) {
+          this.reviewBytesByActor.delete(record.actorQuotaKey);
+        } else {
+          this.reviewBytesByActor.set(record.actorQuotaKey, remaining);
+        }
       }
       record.reviewMaterial = undefined;
       record.reviewBytes = 0;
+    }
+  }
+
+  /**
+   * Synchronously transitions all due active records to EXPIRED before new admissions.
+   * Bounded to at most the active-record population.
+   */
+  private reclaimExpiredActiveRecords(): void {
+    const nowMono = this.getMonotonicTime();
+    for (const reqId of Array.from(this.activeRequestIds)) {
+      const record = this.recordsByRequestId.get(reqId);
+      if (record && nowMono >= record.monotonicDeadline) {
+        this.transitionToTerminal(record, 'EXPIRED');
+      }
     }
   }
 
@@ -358,6 +401,9 @@ export class ApprovalStateManager {
       throw ArcError.invalidRequestSchema('reviewMaterial must be a string when provided.');
     }
 
+    // Synchronously reclaim any expired active records before dedup and quota evaluation
+    this.reclaimExpiredActiveRecords();
+
     const dedupKey = executionPayloadHash;
 
     // Check for deduplication of active PENDING or APPROVED records
@@ -436,12 +482,15 @@ export class ApprovalStateManager {
 
     this.recordsByRequestId.set(requestId, record);
     this.requestIdByDedupKey.set(dedupKey, requestId);
+    this.activeRequestIds.add(requestId);
 
     // Increment resource accounting counters
     this.activeCountGlobal++;
     this.activeCountByActor.set(actorQuotaKey, currentActorActive + 1);
-    this.reviewBytesGlobal += reviewBytes;
-    this.reviewBytesByActor.set(actorQuotaKey, currentActorBytes + reviewBytes);
+    if (reviewBytes > 0) {
+      this.reviewBytesGlobal += reviewBytes;
+      this.reviewBytesByActor.set(actorQuotaKey, currentActorBytes + reviewBytes);
+    }
 
     return this.toSnapshot(record);
   }
@@ -694,13 +743,12 @@ export class ApprovalStateManager {
    */
   public purgeExpired(): number {
     let purged = 0;
-    for (const record of this.recordsByRequestId.values()) {
-      if (record.state === 'PENDING' || record.state === 'APPROVED') {
-        const nowMono = this.getMonotonicTime();
-        if (nowMono >= record.monotonicDeadline) {
-          this.transitionToTerminal(record, 'EXPIRED');
-          purged++;
-        }
+    const nowMono = this.getMonotonicTime();
+    for (const reqId of Array.from(this.activeRequestIds)) {
+      const record = this.recordsByRequestId.get(reqId);
+      if (record && nowMono >= record.monotonicDeadline) {
+        this.transitionToTerminal(record, 'EXPIRED');
+        purged++;
       }
     }
     return purged;
@@ -712,6 +760,7 @@ export class ApprovalStateManager {
   public clear(): void {
     this.recordsByRequestId.clear();
     this.requestIdByDedupKey.clear();
+    this.activeRequestIds.clear();
     this.activeCountGlobal = 0;
     this.activeCountByActor.clear();
     this.reviewBytesGlobal = 0;
