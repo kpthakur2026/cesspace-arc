@@ -1363,7 +1363,7 @@ export class ArcMcpServer implements IArcMcpServer {
     this.server = new Server(
       {
         name: 'cesspace-arc',
-        version: '0.3.0-rc03',
+        version: '0.4.0-rc04',
       },
       {
         capabilities: {

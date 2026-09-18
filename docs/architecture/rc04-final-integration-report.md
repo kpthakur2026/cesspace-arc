@@ -231,14 +231,22 @@ repository or the file — fails the gate rather than being masked as a pass. No
 
 | Metric  | Value |
 | :------ | :---- |
-| Tests   | 821   |
+| Tests   | 822   |
 | Suites  | 82    |
-| Passed  | 821   |
+| Passed  | 822   |
 | Failed  | 0     |
 | Skipped | 0     |
 | Todo    | 0     |
 
-The dedicated acceptance suite contributes 38 tests across 4 suites.
+The dedicated acceptance suite contributes 38 tests across 4 suites. The total
+includes the post-merge metadata regression described in §8.
+
+### 5.1.1 Post-merge test total history
+
+| Tree                                       | Tests | Suites |
+| :----------------------------------------- | :---- | :----- |
+| Pre-merge feature head                     | 821   | 82     |
+| Post-merge remediation (`RC04-M-69` added) | 822   | 82     |
 
 ### 5.2 Benchmark
 
@@ -304,3 +312,35 @@ This report records what the repository itself can demonstrate: the frozen
 contract, the implementation, the executed controls, and the gate output. It
 does not assert independent review, PR approval, or merge. Those are external
 GitHub state and must be verified there against the exact head commit.
+
+---
+
+## 8. Post-Merge Remediation
+
+PR #5 merged successfully into `main` as merge commit
+`5de8184fcb66343cd918f28a418c41acc3d85211`, with post-merge push CI green at
+`attempt=1`.
+
+Post-merge review then found one metadata defect: the MCP SDK `Server` identity
+constructed in `apps/mcp-server/src/index.ts` still advertised
+`version: '0.3.0-rc03'`. That value is the server metadata returned to every MCP
+client in the `initialize` result, so the server advertised the previous stage
+even though the `health` tool already reported `0.4.0-rc04` / `RC-04`. The two
+surfaces disagreed.
+
+The advertised server metadata was corrected to `0.4.0-rc04`, and `health` is
+unchanged at `version: '0.4.0-rc04'`, `stage: 'RC-04'`.
+
+- **No authorization, policy, approval, audit, authentication, filesystem,
+  terminal, process, or protocol behaviour was changed.** The correction is a
+  single metadata literal.
+- A narrow regression (`RC04-M-69` in `tests/rc04-mcp-approval.test.js`) asserts
+  the runtime metadata carried by the constructed SDK server instance is
+  `0.4.0-rc04` and is not `0.3.0-rc03`. It was verified to fail when the value is
+  reverted.
+- This correction is **independently gated** before RC-04 closure: it is carried
+  on a separate hotfix branch and must pass its own review and CI. It is not
+  self-certified by this report.
+
+The architecture description, the 38-control coverage table, and the frozen
+invariants above are unaffected by this remediation.
