@@ -173,12 +173,7 @@ describe('CesSpace ARC — RC-03 Safe File Mutation Primitives', () => {
     const realDir = path.join(workspaceDir, 'real-dir');
     fs.mkdirSync(realDir, { recursive: true });
     const symlinkDir = path.join(workspaceDir, 'symlink-dir');
-    try {
-      fs.symlinkSync(realDir, symlinkDir);
-    } catch {
-      // If symlinks not supported, skip
-      return;
-    }
+    fs.symlinkSync(realDir, symlinkDir);
 
     await assert.rejects(
       async () => {
@@ -195,15 +190,11 @@ describe('CesSpace ARC — RC-03 Safe File Mutation Primitives', () => {
     );
   });
 
-  test('RC03-N-08: create_file where target is existing symlink fails with ALREADY_EXISTS', async () => {
+  test('RC03-N-08: create_file where target is existing symlink fails with UNSAFE_SYMLINK', async () => {
     const targetReal = path.join(workspaceDir, 'real-target.txt');
     fs.writeFileSync(targetReal, 'real');
     const targetSymlink = path.join(workspaceDir, 'symlink-target.txt');
-    try {
-      fs.symlinkSync(targetReal, targetSymlink);
-    } catch {
-      return;
-    }
+    fs.symlinkSync(targetReal, targetSymlink);
 
     await assert.rejects(
       async () => {
@@ -214,7 +205,7 @@ describe('CesSpace ARC — RC-03 Safe File Mutation Primitives', () => {
       },
       (err) => {
         assert.ok(err instanceof ArcError);
-        assert.equal(err.code, 'ALREADY_EXISTS');
+        assert.equal(err.code, 'UNSAFE_SYMLINK');
         return true;
       },
     );
@@ -419,11 +410,7 @@ describe('CesSpace ARC — RC-03 Safe File Mutation Primitives', () => {
     const realFile = path.join(workspaceDir, 'symlink-source-for-write.txt');
     fs.writeFileSync(realFile, 'data');
     const symlinkPath = path.join(workspaceDir, 'symlink-for-write.txt');
-    try {
-      fs.symlinkSync(realFile, symlinkPath);
-    } catch {
-      return;
-    }
+    fs.symlinkSync(realFile, symlinkPath);
 
     await assert.rejects(
       async () => {
@@ -446,11 +433,7 @@ describe('CesSpace ARC — RC-03 Safe File Mutation Primitives', () => {
     const origFile = path.join(workspaceDir, 'hardlinked-orig.txt');
     fs.writeFileSync(origFile, 'hardlinked content');
     const linkFile = path.join(workspaceDir, 'hardlinked-link.txt');
-    try {
-      fs.linkSync(origFile, linkFile);
-    } catch {
-      return;
-    }
+    fs.linkSync(origFile, linkFile);
 
     const contentHash = crypto.createHash('sha256').update('hardlinked content').digest('hex');
 
@@ -630,11 +613,7 @@ describe('CesSpace ARC — RC-03 Safe File Mutation Primitives', () => {
     const real = path.join(workspaceDir, 'real-for-del-symlink.txt');
     fs.writeFileSync(real, 'content');
     const symlinkPath = path.join(workspaceDir, 'symlink-for-delete.txt');
-    try {
-      fs.symlinkSync(real, symlinkPath);
-    } catch {
-      return;
-    }
+    fs.symlinkSync(real, symlinkPath);
 
     const hash = crypto.createHash('sha256').update('content').digest('hex');
 
@@ -657,11 +636,7 @@ describe('CesSpace ARC — RC-03 Safe File Mutation Primitives', () => {
     const f1 = path.join(workspaceDir, 'hardlink-del-1.txt');
     const f2 = path.join(workspaceDir, 'hardlink-del-2.txt');
     fs.writeFileSync(f1, 'link content');
-    try {
-      fs.linkSync(f1, f2);
-    } catch {
-      return;
-    }
+    fs.linkSync(f1, f2);
 
     const hash = crypto.createHash('sha256').update('link content').digest('hex');
 
@@ -836,11 +811,7 @@ describe('CesSpace ARC — RC-03 Safe File Mutation Primitives', () => {
     const real = path.join(workspaceDir, 'real-src.txt');
     fs.writeFileSync(real, 'real content');
     const symlinkSrc = path.join(workspaceDir, 'symlink-src.txt');
-    try {
-      fs.symlinkSync(real, symlinkSrc);
-    } catch {
-      return;
-    }
+    fs.symlinkSync(real, symlinkSrc);
 
     const hash = crypto.createHash('sha256').update('real content').digest('hex');
 
@@ -941,7 +912,8 @@ describe('CesSpace ARC — RC-03 Safe File Mutation Primitives', () => {
         });
       },
       (err) => {
-        assert.equal(err.code, 'EPERM');
+        assert.ok(err instanceof ArcError);
+        assert.equal(err.code, 'ACCESS_DENIED');
         return true;
       },
     );
@@ -986,53 +958,78 @@ describe('CesSpace ARC — RC-03 Safe File Mutation Primitives', () => {
   });
 
   // ==========================================================================
-  // 5. Locking & General Invariants
+  // 5. Locking & Concurrency Invariants
   // ==========================================================================
 
-  test('RC03-L-01: same-path ARC mutations are serialized in-process without races', async () => {
-    const f = path.join(workspaceDir, 'locked-file.txt');
-    fs.writeFileSync(f, 'start');
-    let currentHash = crypto.createHash('sha256').update('start').digest('hex');
+  test('RC03-L-01: ProcessWideLockManager coordinates concurrent callers with barrier contention and cleans up state', async () => {
+    const lm = new ProcessWideLockManager();
+    let action1Entered = false;
+    let action2Entered = false;
 
-    const executionOrder = [];
-    const lockManager = new ProcessWideLockManager();
-
-    const sub1 = new FilesystemSubsystem(undefined, undefined, lockManager);
-    const sub2 = new FilesystemSubsystem(undefined, undefined, lockManager);
-
-    // Schedule two concurrent operations through two subsystem instances sharing lock manager
-    const op1 = sub1
-      .writeFile(workspaceDir, {
-        path: 'locked-file.txt',
-        content: 'from-op1',
-        expectedHash: currentHash,
-        overwrite: true,
-      })
-      .then((res) => {
-        executionOrder.push('op1');
-        return res;
-      });
-
-    const op2 = op1.then((res1) => {
-      return sub2
-        .writeFile(workspaceDir, {
-          path: 'locked-file.txt',
-          content: 'from-op2',
-          expectedHash: res1.contentHash,
-          overwrite: true,
-        })
-        .then((res) => {
-          executionOrder.push('op2');
-          return res;
-        });
+    let releaseAction1;
+    const barrier = new Promise((resolve) => {
+      releaseAction1 = resolve;
     });
 
-    await Promise.all([op1, op2]);
-    assert.deepEqual(executionOrder, ['op1', 'op2']);
-    assert.equal(fs.readFileSync(f, 'utf8'), 'from-op2');
+    const p1 = lm.withLocks(['test-key'], async () => {
+      action1Entered = true;
+      await barrier;
+    });
+
+    while (!action1Entered) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+
+    const p2 = lm.withLocks(['test-key'], async () => {
+      action2Entered = true;
+    });
+
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(
+      action2Entered,
+      false,
+      'Action 2 must not enter critical section while Action 1 holds lock',
+    );
+
+    releaseAction1();
+    await Promise.all([p1, p2]);
+
+    assert.equal(action2Entered, true, 'Action 2 entered critical section after Action 1 released');
+    assert.equal(lm.activeLockCount, 0, 'Locks map cleaned up completely');
   });
 
-  test('RC03-L-02: multi-path locking in move_file is deterministic and deadlock-free across reversed pairs', async () => {
+  test('RC03-L-02: two FilesystemSubsystem instances without explicit lockManager coordinate via defaultLockManager', async () => {
+    const fs1 = new FilesystemSubsystem();
+    const fs2 = new FilesystemSubsystem();
+
+    const targetRel = 'default-lock-test.txt';
+    const targetAbs = path.join(workspaceDir, targetRel);
+    fs.writeFileSync(targetAbs, 'init');
+    const hash = crypto.createHash('sha256').update('init').digest('hex');
+
+    const p1 = fs1.writeFile(workspaceDir, {
+      path: targetRel,
+      content: 'fs1 write',
+      expectedHash: hash,
+      overwrite: true,
+    });
+    const p2 = fs2.writeFile(workspaceDir, {
+      path: targetRel,
+      content: 'fs2 write',
+      expectedHash: hash,
+      overwrite: true,
+    });
+
+    const results = await Promise.allSettled([p1, p2]);
+    const fulfilled = results.filter((r) => r.status === 'fulfilled');
+    const rejected = results.filter((r) => r.status === 'rejected');
+
+    assert.equal(fulfilled.length, 1);
+    assert.equal(rejected.length, 1);
+    assert.equal(rejected[0].reason.code, 'CONFLICT_PRECONDITION_FAILED');
+  });
+
+  test('RC03-L-03: multi-path locking in move_file is deterministic and deadlock-free across reversed pairs', async () => {
     const fA = path.join(workspaceDir, 'pair-a.txt');
     const fB = path.join(workspaceDir, 'pair-b.txt');
     fs.writeFileSync(fA, 'data A');
@@ -1063,6 +1060,36 @@ describe('CesSpace ARC — RC-03 Safe File Mutation Primitives', () => {
     assert.equal(r2.code, 'ALREADY_EXISTS');
   });
 
+  test('RC03-L-04: multi-key locking with reverse key requests executes without deadlock', async () => {
+    const lm = new ProcessWideLockManager();
+    const keyA = '/canonical/dir/a.txt';
+    const keyB = '/canonical/dir/b.txt';
+
+    const order = [];
+
+    const op1 = lm.withLocks([keyA, keyB], async () => {
+      order.push('op1-start');
+      await new Promise((r) => setTimeout(r, 10));
+      order.push('op1-end');
+    });
+
+    const op2 = lm.withLocks([keyB, keyA], async () => {
+      order.push('op2-start');
+      await new Promise((r) => setTimeout(r, 10));
+      order.push('op2-end');
+    });
+
+    await Promise.all([op1, op2]);
+
+    assert.equal(lm.activeLockCount, 0);
+    const op1First = order[0] === 'op1-start';
+    if (op1First) {
+      assert.deepEqual(order, ['op1-start', 'op1-end', 'op2-start', 'op2-end']);
+    } else {
+      assert.deepEqual(order, ['op2-start', 'op2-end', 'op1-start', 'op1-end']);
+    }
+  });
+
   test('RC03-N-46: error messages never leak host absolute paths, usernames, or temp file names', async () => {
     try {
       await fsSubsystem.createFile(workspaceDir, {
@@ -1089,5 +1116,437 @@ describe('CesSpace ARC — RC-03 Safe File Mutation Primitives', () => {
       path: '.',
     });
     assert.ok(listResult.entries.length > 0);
+  });
+
+  // ==========================================================================
+  // 6. Security Remediations & Failure Boundary Hardening
+  // ==========================================================================
+
+  test('RC03-REM-01: partial write correctness persists complete buffer across multiple writes and fails closed on zero progress', async () => {
+    class FragmentedWriteFsOps extends NodeFilesystemOps {
+      write(fd, buffer, offset = 0, length = buffer.length - offset, position = null) {
+        const chunk = Math.min(length, 7);
+        return super.write(fd, buffer, offset, chunk, position);
+      }
+    }
+
+    const customFs = new FilesystemSubsystem(undefined, new FragmentedWriteFsOps());
+    const content =
+      'This is a long test payload that must be safely written in small 7-byte chunks!';
+    const res = await customFs.createFile(workspaceDir, {
+      path: 'fragmented-write.txt',
+      content,
+    });
+
+    assert.equal(res.created, true);
+    assert.equal(res.bytesWritten, Buffer.byteLength(content, 'utf8'));
+
+    const readBack = fs.readFileSync(path.join(workspaceDir, 'fragmented-write.txt'), 'utf8');
+    assert.equal(readBack, content);
+
+    class ZeroProgressFsOps extends NodeFilesystemOps {
+      write(_fd, _buffer, _offset, _length, _position) {
+        return 0;
+      }
+    }
+    const zeroFs = new FilesystemSubsystem(undefined, new ZeroProgressFsOps());
+    await assert.rejects(
+      async () => {
+        await zeroFs.createFile(workspaceDir, {
+          path: 'zero-progress.txt',
+          content: 'fail me',
+        });
+      },
+      (err) => {
+        assert.ok(err instanceof ArcError);
+        assert.equal(err.code, 'INTERNAL_ERROR');
+        return true;
+      },
+    );
+  });
+
+  test('RC03-REM-02: write_file preserves exact original mode bits via fchmod (bypassing umask)', async () => {
+    const targetFile = path.join(workspaceDir, 'mode-preserve.txt');
+    fs.writeFileSync(targetFile, 'original content');
+    fs.chmodSync(targetFile, 0o666);
+    const origSt = fs.statSync(targetFile);
+    const origMode = origSt.mode & 0o777;
+
+    const origHash = crypto.createHash('sha256').update('original content').digest('hex');
+
+    const res = await fsSubsystem.writeFile(workspaceDir, {
+      path: 'mode-preserve.txt',
+      content: 'replacement content',
+      expectedHash: origHash,
+      overwrite: true,
+    });
+
+    assert.ok(res.contentHash);
+    const newSt = fs.statSync(targetFile);
+    const newMode = newSt.mode & 0o777;
+    assert.equal(
+      newMode,
+      origMode,
+      `Preserved mode ${newMode.toString(8)} must equal original mode ${origMode.toString(8)}`,
+    );
+  });
+
+  test('RC03-REM-03: create_file temp unlink failure after link triggers destination rollback and throws sanitized internalError', async () => {
+    let linkCalled = false;
+    class TempUnlinkFailFsOps extends NodeFilesystemOps {
+      link(tmp, target) {
+        super.link(tmp, target);
+        linkCalled = true;
+      }
+      unlink(targetPath) {
+        if (linkCalled && targetPath.includes('.arc-tmp-')) {
+          const err = new Error('Injected temp unlink failure');
+          err.code = 'EIO';
+          throw err;
+        }
+        super.unlink(targetPath);
+      }
+    }
+
+    const customFs = new FilesystemSubsystem(undefined, new TempUnlinkFailFsOps());
+    const targetRel = 'rollback-create-success.txt';
+    const targetAbs = path.join(workspaceDir, targetRel);
+
+    await assert.rejects(
+      async () => {
+        await customFs.createFile(workspaceDir, {
+          path: targetRel,
+          content: 'rollback test content',
+        });
+      },
+      (err) => {
+        assert.ok(err instanceof ArcError);
+        assert.equal(err.code, 'INTERNAL_ERROR');
+        assert.ok(!err.message.includes('.arc-tmp-'));
+        return true;
+      },
+    );
+
+    assert.equal(fs.existsSync(targetAbs), false);
+  });
+
+  test('RC03-REM-04: create_file temp unlink failure with destination rollback failure throws ROLLBACK_FAILED with safe metadata', async () => {
+    let linkCalled = false;
+    class DoubleUnlinkFailFsOps extends NodeFilesystemOps {
+      link(tmp, target) {
+        super.link(tmp, target);
+        linkCalled = true;
+      }
+      unlink(targetPath) {
+        if (linkCalled) {
+          const err = new Error('Injected unlink failure');
+          err.code = 'EIO';
+          throw err;
+        }
+        super.unlink(targetPath);
+      }
+    }
+
+    const customFs = new FilesystemSubsystem(undefined, new DoubleUnlinkFailFsOps());
+    const targetRel = 'rollback-create-fail.txt';
+
+    await assert.rejects(
+      async () => {
+        await customFs.createFile(workspaceDir, {
+          path: targetRel,
+          content: 'unrollable content',
+        });
+      },
+      (err) => {
+        assert.ok(err instanceof ArcError);
+        assert.equal(err.code, 'ROLLBACK_FAILED');
+        assert.deepEqual(err.details, {
+          path: targetRel,
+          committed: true,
+        });
+        assert.ok(!JSON.stringify(err.details).includes('.arc-tmp-'));
+        return true;
+      },
+    );
+  });
+
+  test('RC03-REM-05: create_file temp unlink failure does not unlink changed destination inode', async () => {
+    let linkCalled = false;
+    const targetRel = 'rollback-inode-mismatch.txt';
+    const targetAbs = path.join(workspaceDir, targetRel);
+
+    class InodeChangeFsOps extends NodeFilesystemOps {
+      link(tmp, target) {
+        super.link(tmp, target);
+        linkCalled = true;
+      }
+      unlink(targetPath) {
+        if (linkCalled && targetPath.includes('.arc-tmp-')) {
+          fs.unlinkSync(targetAbs);
+          fs.writeFileSync(targetAbs, 'replaced content');
+          const err = new Error('Injected temp unlink failure');
+          err.code = 'EIO';
+          throw err;
+        }
+        super.unlink(targetPath);
+      }
+    }
+
+    const customFs = new FilesystemSubsystem(undefined, new InodeChangeFsOps());
+    await assert.rejects(
+      async () => {
+        await customFs.createFile(workspaceDir, {
+          path: targetRel,
+          content: 'original staged content',
+        });
+      },
+      (err) => {
+        assert.ok(err instanceof ArcError);
+        assert.equal(err.code, 'ROLLBACK_FAILED');
+        return true;
+      },
+    );
+
+    assert.equal(fs.existsSync(targetAbs), true);
+    assert.equal(fs.readFileSync(targetAbs, 'utf8'), 'replaced content');
+  });
+
+  test('RC03-REM-06: move_file source unlink failure rolls back destination when dev/ino matches', async () => {
+    const srcRel = 'move-rollback-src.txt';
+    const destRel = 'move-rollback-dest.txt';
+    const srcAbs = path.join(workspaceDir, srcRel);
+    const destAbs = path.join(workspaceDir, destRel);
+    fs.writeFileSync(srcAbs, 'move rollback content');
+    const hash = crypto.createHash('sha256').update('move rollback content').digest('hex');
+
+    class UnlinkSrcFailFsOps extends NodeFilesystemOps {
+      unlink(targetPath) {
+        if (targetPath === srcAbs) {
+          const err = new Error('Injected source unlink error');
+          err.code = 'EACCES';
+          throw err;
+        }
+        super.unlink(targetPath);
+      }
+    }
+
+    const customFs = new FilesystemSubsystem(undefined, new UnlinkSrcFailFsOps());
+    await assert.rejects(
+      async () => {
+        await customFs.moveFile(workspaceDir, {
+          sourcePath: srcRel,
+          destinationPath: destRel,
+          expectedSourceHash: hash,
+        });
+      },
+      (err) => {
+        assert.ok(err instanceof ArcError);
+        assert.equal(err.code, 'ACCESS_DENIED');
+        return true;
+      },
+    );
+
+    assert.equal(fs.existsSync(destAbs), false);
+    assert.equal(fs.existsSync(srcAbs), true);
+  });
+
+  test('RC03-REM-07: move_file source unlink failure does not unlink changed destination inode', async () => {
+    const srcRel = 'move-changed-dest-src.txt';
+    const destRel = 'move-changed-dest-dest.txt';
+    const srcAbs = path.join(workspaceDir, srcRel);
+    const destAbs = path.join(workspaceDir, destRel);
+    fs.writeFileSync(srcAbs, 'content for move');
+    const hash = crypto.createHash('sha256').update('content for move').digest('hex');
+
+    class DestChangedFsOps extends NodeFilesystemOps {
+      unlink(targetPath) {
+        if (targetPath === srcAbs) {
+          fs.unlinkSync(destAbs);
+          fs.writeFileSync(destAbs, 'unrelated replaced content');
+          const err = new Error('Injected source unlink failure');
+          err.code = 'EIO';
+          throw err;
+        }
+        super.unlink(targetPath);
+      }
+    }
+
+    const customFs = new FilesystemSubsystem(undefined, new DestChangedFsOps());
+    await assert.rejects(
+      async () => {
+        await customFs.moveFile(workspaceDir, {
+          sourcePath: srcRel,
+          destinationPath: destRel,
+          expectedSourceHash: hash,
+        });
+      },
+      (err) => {
+        assert.ok(err instanceof ArcError);
+        assert.equal(err.code, 'ROLLBACK_FAILED');
+        return true;
+      },
+    );
+
+    assert.equal(fs.existsSync(destAbs), true);
+    assert.equal(fs.readFileSync(destAbs, 'utf8'), 'unrelated replaced content');
+  });
+
+  test('RC03-REM-08: move_file post-link identity mismatch does not unlink destination and throws CONFLICT_PRECONDITION_FAILED', async () => {
+    const srcRel = 'move-mismatch-src.txt';
+    const destRel = 'move-mismatch-dest.txt';
+    const srcAbs = path.join(workspaceDir, srcRel);
+    const destAbs = path.join(workspaceDir, destRel);
+    fs.writeFileSync(srcAbs, 'mismatch content');
+    const hash = crypto.createHash('sha256').update('mismatch content').digest('hex');
+
+    class PostLinkMismatchFsOps extends NodeFilesystemOps {
+      link(_src, dest) {
+        fs.writeFileSync(dest, 'different inode file');
+      }
+    }
+
+    const customFs = new FilesystemSubsystem(undefined, new PostLinkMismatchFsOps());
+    await assert.rejects(
+      async () => {
+        await customFs.moveFile(workspaceDir, {
+          sourcePath: srcRel,
+          destinationPath: destRel,
+          expectedSourceHash: hash,
+        });
+      },
+      (err) => {
+        assert.ok(err instanceof ArcError);
+        assert.equal(err.code, 'CONFLICT_PRECONDITION_FAILED');
+        return true;
+      },
+    );
+
+    assert.equal(fs.existsSync(destAbs), true);
+    assert.equal(fs.readFileSync(destAbs, 'utf8'), 'different inode file');
+  });
+
+  test('RC03-REM-09: stale ARC write: two callers with same expectedHash - only first commits, second fails with CONFLICT_PRECONDITION_FAILED', async () => {
+    const targetRel = 'stale-arc-write.txt';
+    const targetAbs = path.join(workspaceDir, targetRel);
+    const initialContent = 'initial state content';
+    fs.writeFileSync(targetAbs, initialContent);
+    const initialHash = crypto.createHash('sha256').update(initialContent).digest('hex');
+
+    const call1 = fsSubsystem.writeFile(workspaceDir, {
+      path: targetRel,
+      content: 'first mutation won',
+      expectedHash: initialHash,
+      overwrite: true,
+    });
+
+    const call2 = fsSubsystem.writeFile(workspaceDir, {
+      path: targetRel,
+      content: 'second mutation stale',
+      expectedHash: initialHash,
+      overwrite: true,
+    });
+
+    const [res1, res2] = await Promise.allSettled([call1, call2]);
+
+    const winner = res1.status === 'fulfilled' ? res1 : res2;
+    const loser = res1.status === 'rejected' ? res1 : res2;
+
+    assert.equal(winner.status, 'fulfilled');
+    assert.equal(loser.status, 'rejected');
+    assert.equal(loser.reason.code, 'CONFLICT_PRECONDITION_FAILED');
+
+    const diskContent = fs.readFileSync(targetAbs, 'utf8');
+    assert.ok(diskContent === 'first mutation won' || diskContent === 'second mutation stale');
+  });
+
+  test('RC03-REM-10: injected errors containing sensitive absolute and temp paths never leak to caller across operation classes', async () => {
+    const sensitiveMsg =
+      'CRITICAL_LEAK: /home/secretuser/project/.arc-tmp-99999 failed at /sys/kernel';
+
+    class LeakingFsOps extends NodeFilesystemOps {
+      open() {
+        const err = new Error(sensitiveMsg);
+        err.code = 'EIO';
+        throw err;
+      }
+      unlink() {
+        const err = new Error(sensitiveMsg);
+        err.code = 'EIO';
+        throw err;
+      }
+      link() {
+        const err = new Error(sensitiveMsg);
+        err.code = 'EIO';
+        throw err;
+      }
+    }
+
+    const leakFs = new FilesystemSubsystem(undefined, new LeakingFsOps());
+
+    // 1. createFile
+    await assert.rejects(
+      async () => {
+        await leakFs.createFile(workspaceDir, {
+          path: 'leak-create.txt',
+          content: 'data',
+        });
+      },
+      (err) => {
+        assert.ok(err instanceof ArcError);
+        const errStr = `${err.message} ${JSON.stringify(err.details ?? {})}`;
+        assert.ok(!errStr.includes('/home/secretuser'));
+        assert.ok(!errStr.includes('.arc-tmp-'));
+        assert.ok(!errStr.includes('secretuser'));
+        assert.ok(!errStr.includes('CRITICAL_LEAK'));
+        return true;
+      },
+    );
+
+    // 2. deleteFile
+    const existingFile = path.join(workspaceDir, 'leak-del.txt');
+    fs.writeFileSync(existingFile, 'del');
+    const delHash = crypto.createHash('sha256').update('del').digest('hex');
+
+    await assert.rejects(
+      async () => {
+        await leakFs.deleteFile(workspaceDir, {
+          path: 'leak-del.txt',
+          expectedHash: delHash,
+        });
+      },
+      (err) => {
+        assert.ok(err instanceof ArcError);
+        const errStr = `${err.message} ${JSON.stringify(err.details ?? {})}`;
+        assert.ok(!errStr.includes('/home/secretuser'));
+        assert.ok(!errStr.includes('.arc-tmp-'));
+        assert.ok(!errStr.includes('secretuser'));
+        assert.ok(!errStr.includes('CRITICAL_LEAK'));
+        return true;
+      },
+    );
+
+    // 3. moveFile
+    const moveSrc = path.join(workspaceDir, 'leak-move.txt');
+    fs.writeFileSync(moveSrc, 'move');
+    const moveHash = crypto.createHash('sha256').update('move').digest('hex');
+
+    await assert.rejects(
+      async () => {
+        await leakFs.moveFile(workspaceDir, {
+          sourcePath: 'leak-move.txt',
+          destinationPath: 'leak-move-dest.txt',
+          expectedSourceHash: moveHash,
+        });
+      },
+      (err) => {
+        assert.ok(err instanceof ArcError);
+        const errStr = `${err.message} ${JSON.stringify(err.details ?? {})}`;
+        assert.ok(!errStr.includes('/home/secretuser'));
+        assert.ok(!errStr.includes('.arc-tmp-'));
+        assert.ok(!errStr.includes('secretuser'));
+        assert.ok(!errStr.includes('CRITICAL_LEAK'));
+        return true;
+      },
+    );
   });
 });

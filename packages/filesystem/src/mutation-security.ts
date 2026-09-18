@@ -161,11 +161,14 @@ export function validateMutationPath(
         );
       }
     } catch (err: unknown) {
+      if (err instanceof ArcError) {
+        throw err;
+      }
       if ((err as { code?: string }).code === 'ENOENT') {
         // Component does not exist yet; stopped traversal
         break;
       }
-      throw err;
+      sanitizeFsError(err);
     }
   }
 
@@ -177,4 +180,57 @@ export function validateMutationPath(
     relativePath: relFromRoot,
     parentDir,
   };
+}
+
+/**
+ * Maps raw filesystem errors to sanitized, deterministic ArcError instances.
+ * Completely strips raw message text, host paths, temp paths, usernames, and internal stacks.
+ */
+export function sanitizeFsError(err: unknown): never {
+  if (err instanceof ArcError) {
+    throw err;
+  }
+  const code = (err as { code?: string })?.code;
+  switch (code) {
+    case 'ENOENT':
+      throw ArcError.fileNotFound('Target file or directory not found.');
+    case 'EEXIST':
+      throw ArcError.alreadyExists('Target file or directory already exists.');
+    case 'EISDIR':
+      throw ArcError.isADirectory('Target path is a directory, not a file.');
+    case 'ENOTDIR':
+      throw ArcError.notADirectory('Target path component is not a directory.');
+    case 'EXDEV':
+      throw ArcError.crossDeviceMoveUnsupported('Cross-device move is not supported.');
+    case 'EACCES':
+    case 'EPERM':
+    case 'EROFS':
+      throw ArcError.accessDenied('Filesystem access denied.');
+    default:
+      throw ArcError.internalError('Filesystem operation failed.');
+  }
+}
+
+/**
+ * Authoritative write-all loop that persists the entire buffer to the open file descriptor.
+ * Continues writing from current offset until buffer is completely persisted.
+ * Fails closed if write makes zero or negative progress.
+ */
+export function writeAll(fsOps: IFilesystemOps, fd: number, buffer: Buffer): number {
+  let offset = 0;
+  while (offset < buffer.length) {
+    const bytesRemaining = buffer.length - offset;
+    let written: number;
+    try {
+      written = fsOps.write(fd, buffer, offset, bytesRemaining, null);
+    } catch (err: unknown) {
+      sanitizeFsError(err);
+    }
+
+    if (typeof written !== 'number' || written <= 0) {
+      throw ArcError.internalError('Filesystem write failed to make progress.');
+    }
+    offset += written;
+  }
+  return offset;
 }

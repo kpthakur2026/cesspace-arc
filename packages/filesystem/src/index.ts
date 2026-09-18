@@ -1,4 +1,12 @@
-import { realpathSync, statSync, readdirSync, openSync, readSync, closeSync } from 'node:fs';
+import {
+  realpathSync,
+  statSync,
+  readdirSync,
+  openSync,
+  readSync,
+  closeSync,
+  type Stats,
+} from 'node:fs';
 import { resolve, normalize, sep, relative, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import {
@@ -30,7 +38,12 @@ export * from './file-identity.js';
 
 import { type IFilesystemOps, NodeFilesystemOps } from './fs-ops.js';
 import { type ILockManager, defaultLockManager } from './locks.js';
-import { MAX_MUTATION_BYTES, validateMutationPath } from './mutation-security.js';
+import {
+  MAX_MUTATION_BYTES,
+  validateMutationPath,
+  writeAll,
+  sanitizeFsError,
+} from './mutation-security.js';
 import {
   captureFileIdentity,
   verifyPrecommitIdentity,
@@ -474,15 +487,18 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
     );
 
     // Immediate parent directory must already exist
-    let parentSt;
+    let parentSt: Stats;
     try {
       parentSt = this.fsOps.lstat(parentDir);
     } catch (err: unknown) {
+      if (err instanceof ArcError) {
+        throw err;
+      }
       const code = (err as { code?: string }).code;
       if (code === 'ENOENT') {
         throw ArcError.parentNotFound('Immediate parent directory does not exist.');
       }
-      throw err;
+      sanitizeFsError(err);
     }
 
     if (!parentSt.isDirectory()) {
@@ -496,6 +512,9 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
       try {
         const existing = this.fsOps.lstat(absolutePath);
         if (existing) {
+          if (existing.isSymbolicLink()) {
+            throw ArcError.unsafeSymlink('Target path is an existing symbolic link.');
+          }
           throw ArcError.alreadyExists('Target file already exists.');
         }
       } catch (err: unknown) {
@@ -504,34 +523,107 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
         }
         const code = (err as { code?: string }).code;
         if (code !== 'ENOENT') {
-          throw err;
+          sanitizeFsError(err);
         }
       }
 
       const tmpPath = join(parentDir, `.arc-tmp-${randomUUID()}`);
       let tmpCreated = false;
       let fd: number | undefined;
+      let tmpDev = 0;
+      let tmpIno = 0;
 
       try {
-        fd = this.fsOps.open(tmpPath, 'wx', 0o644);
-        tmpCreated = true;
-        this.fsOps.write(fd, contentBuffer);
-        this.fsOps.fsync(fd);
-        this.fsOps.close(fd);
-        fd = undefined;
+        try {
+          fd = this.fsOps.open(tmpPath, 'wx', 0o644);
+          tmpCreated = true;
+        } catch (err: unknown) {
+          sanitizeFsError(err);
+        }
+
+        writeAll(this.fsOps, fd, contentBuffer);
+
+        try {
+          this.fsOps.fsync(fd);
+        } catch (err: unknown) {
+          sanitizeFsError(err);
+        }
+
+        try {
+          const tmpSt = this.fsOps.lstat(tmpPath);
+          tmpDev = tmpSt.dev;
+          tmpIno = tmpSt.ino;
+        } catch (err: unknown) {
+          sanitizeFsError(err);
+        }
+
+        try {
+          this.fsOps.close(fd);
+          fd = undefined;
+        } catch (err: unknown) {
+          sanitizeFsError(err);
+        }
 
         try {
           this.fsOps.link(tmpPath, absolutePath);
         } catch (linkErr: unknown) {
+          if (linkErr instanceof ArcError) {
+            throw linkErr;
+          }
           const code = (linkErr as { code?: string }).code;
           if (code === 'EEXIST') {
+            try {
+              const raceSt = this.fsOps.lstat(absolutePath);
+              if (raceSt.isSymbolicLink()) {
+                throw ArcError.unsafeSymlink('Target path is an existing symbolic link.');
+              }
+            } catch (stErr: unknown) {
+              if (stErr instanceof ArcError) {
+                throw stErr;
+              }
+            }
             throw ArcError.alreadyExists('Target file already exists.');
           }
-          throw linkErr;
+          sanitizeFsError(linkErr);
         }
 
-        this.fsOps.unlink(tmpPath);
-        tmpCreated = false;
+        try {
+          this.fsOps.unlink(tmpPath);
+          tmpCreated = false;
+        } catch {
+          // Temp cleanup failed after destination link succeeded.
+          // Truthful recovery: attempt safe rollback ONLY if destination still refers to staged inode.
+          let destSt: Stats | undefined;
+          try {
+            destSt = this.fsOps.lstat(absolutePath);
+          } catch {
+            destSt = undefined;
+          }
+
+          let rollbackSucceeded = false;
+          if (destSt && destSt.dev === tmpDev && destSt.ino === tmpIno) {
+            try {
+              this.fsOps.unlink(absolutePath);
+              rollbackSucceeded = true;
+            } catch {
+              rollbackSucceeded = false;
+            }
+          }
+
+          if (rollbackSucceeded) {
+            throw ArcError.internalError(
+              'Failed to clean up temporary file; file creation was rolled back.',
+            );
+          } else {
+            throw ArcError.rollbackFailed(
+              'File creation committed but temporary cleanup failed and destination rollback could not be completed.',
+              {
+                path: relativePath,
+                committed: true,
+              },
+            );
+          }
+        }
       } finally {
         if (fd !== undefined) {
           try {
@@ -590,17 +682,39 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
         throw ArcError.conflictPreconditionFailed('Current file hash does not match expectedHash.');
       }
 
+      const targetMode = initial.mode & 0o777;
       const tmpPath = join(parentDir, `.arc-tmp-${randomUUID()}`);
       let tmpCreated = false;
       let fd: number | undefined;
 
       try {
-        fd = this.fsOps.open(tmpPath, 'wx', initial.mode);
-        tmpCreated = true;
-        this.fsOps.write(fd, contentBuffer);
-        this.fsOps.fsync(fd);
-        this.fsOps.close(fd);
-        fd = undefined;
+        try {
+          fd = this.fsOps.open(tmpPath, 'wx', targetMode);
+          tmpCreated = true;
+        } catch (err: unknown) {
+          sanitizeFsError(err);
+        }
+
+        writeAll(this.fsOps, fd, contentBuffer);
+
+        try {
+          this.fsOps.fchmod(fd, targetMode);
+        } catch (err: unknown) {
+          sanitizeFsError(err);
+        }
+
+        try {
+          this.fsOps.fsync(fd);
+        } catch (err: unknown) {
+          sanitizeFsError(err);
+        }
+
+        try {
+          this.fsOps.close(fd);
+          fd = undefined;
+        } catch (err: unknown) {
+          sanitizeFsError(err);
+        }
 
         verifyPrecommitIdentity(this.fsOps, absolutePath, {
           dev: initial.dev,
@@ -608,8 +722,12 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
           hash: expectedHash,
         });
 
-        this.fsOps.rename(tmpPath, absolutePath);
-        tmpCreated = false;
+        try {
+          this.fsOps.rename(tmpPath, absolutePath);
+          tmpCreated = false;
+        } catch (err: unknown) {
+          sanitizeFsError(err);
+        }
       } finally {
         if (fd !== undefined) {
           try {
@@ -663,7 +781,11 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
         hash: expectedHash,
       });
 
-      this.fsOps.unlink(absolutePath);
+      try {
+        this.fsOps.unlink(absolutePath);
+      } catch (err: unknown) {
+        sanitizeFsError(err);
+      }
 
       return {
         path: relativePath,
@@ -693,15 +815,18 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
     }
 
     // Destination parent directory must exist
-    let destParentSt;
+    let destParentSt: Stats;
     try {
       destParentSt = this.fsOps.lstat(dest.parentDir);
     } catch (err: unknown) {
+      if (err instanceof ArcError) {
+        throw err;
+      }
       const code = (err as { code?: string }).code;
       if (code === 'ENOENT') {
         throw ArcError.parentNotFound('Destination parent directory does not exist.');
       }
-      throw err;
+      sanitizeFsError(err);
     }
 
     if (!destParentSt.isDirectory()) {
@@ -722,6 +847,9 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
       try {
         const destSt = this.fsOps.lstat(dest.absolutePath);
         if (destSt) {
+          if (destSt.isSymbolicLink()) {
+            throw ArcError.unsafeSymlink('Destination path is an existing symbolic link.');
+          }
           throw ArcError.alreadyExists('Destination file already exists.');
         }
       } catch (err: unknown) {
@@ -730,7 +858,7 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
         }
         const code = (err as { code?: string }).code;
         if (code !== 'ENOENT') {
-          throw err;
+          sanitizeFsError(err);
         }
       }
 
@@ -743,6 +871,9 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
       try {
         this.fsOps.link(src.absolutePath, dest.absolutePath);
       } catch (err: unknown) {
+        if (err instanceof ArcError) {
+          throw err;
+        }
         const code = (err as { code?: string }).code;
         if (code === 'EEXIST') {
           throw ArcError.alreadyExists('Destination file already exists.');
@@ -750,16 +881,18 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
         if (code === 'EXDEV') {
           throw ArcError.crossDeviceMoveUnsupported('Cross-device move is not supported.');
         }
-        throw err;
+        sanitizeFsError(err);
       }
 
-      const destSt = this.fsOps.lstat(dest.absolutePath);
+      let destSt: Stats;
+      try {
+        destSt = this.fsOps.lstat(dest.absolutePath);
+      } catch (err: unknown) {
+        sanitizeFsError(err);
+      }
+
       if (destSt.dev !== srcInitial.dev || destSt.ino !== srcInitial.ino) {
-        try {
-          this.fsOps.unlink(dest.absolutePath);
-        } catch {
-          // ignore
-        }
+        // Destination identity does not match source. Do NOT blindly unlink unrelated replacement!
         throw ArcError.conflictPreconditionFailed(
           'Destination link identity does not match source file.',
         );
@@ -768,18 +901,37 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
       try {
         this.fsOps.unlink(src.absolutePath);
       } catch (unlinkErr: unknown) {
+        // Source unlink failed. Before rollback unlink:
+        // lstat destination and prove destination dev/inode still equals captured source identity!
+        let rollDestSt: Stats | undefined;
         try {
-          this.fsOps.unlink(dest.absolutePath);
+          rollDestSt = this.fsOps.lstat(dest.absolutePath);
         } catch {
+          rollDestSt = undefined;
+        }
+
+        let rollbackSucceeded = false;
+        if (rollDestSt && rollDestSt.dev === srcInitial.dev && rollDestSt.ino === srcInitial.ino) {
+          try {
+            this.fsOps.unlink(dest.absolutePath);
+            rollbackSucceeded = true;
+          } catch {
+            rollbackSucceeded = false;
+          }
+        }
+
+        if (!rollbackSucceeded) {
           throw ArcError.rollbackFailed(
-            'Move failed and rollback could not remove linked destination.',
+            'Move failed: source file could not be removed and destination rollback could not be verified or completed.',
             {
               sourcePath: src.relativePath,
               destinationPath: dest.relativePath,
+              sourceExists: true,
             },
           );
         }
-        throw unlinkErr;
+
+        sanitizeFsError(unlinkErr);
       }
 
       return {

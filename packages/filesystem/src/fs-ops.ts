@@ -2,6 +2,7 @@ import {
   openSync,
   closeSync,
   writeSync,
+  fchmodSync,
   fsyncSync,
   lstatSync,
   statSync,
@@ -24,7 +25,14 @@ export interface IFilesystemOps {
   readFile(path: string): Buffer;
   open(path: string, flags: string | number, mode?: number): number;
   close(fd: number): void;
-  write(fd: number, buffer: Buffer): number;
+  write(
+    fd: number,
+    buffer: Buffer,
+    offset?: number,
+    length?: number,
+    position?: number | null,
+  ): number;
+  fchmod(fd: number, mode: number): void;
   fsync(fd: number): void;
   unlink(path: string): void;
   link(existingPath: string, newPath: string): void;
@@ -59,8 +67,18 @@ export class NodeFilesystemOps implements IFilesystemOps {
     closeSync(fd);
   }
 
-  public write(fd: number, buffer: Buffer): number {
-    return writeSync(fd, buffer, 0, buffer.length);
+  public write(
+    fd: number,
+    buffer: Buffer,
+    offset: number = 0,
+    length: number = buffer.length - offset,
+    position: number | null = null,
+  ): number {
+    return writeSync(fd, buffer, offset, length, position);
+  }
+
+  public fchmod(fd: number, mode: number): void {
+    fchmodSync(fd, mode);
   }
 
   public fsync(fd: number): void {

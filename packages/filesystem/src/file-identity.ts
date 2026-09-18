@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { ArcError } from '@cesspace-arc/protocol';
 import type { IFilesystemOps } from './fs-ops.js';
+import { sanitizeFsError } from './mutation-security.js';
 
 export interface FileIdentity {
   dev: number;
@@ -41,11 +42,14 @@ export function captureFileIdentity(fsOps: IFilesystemOps, canonicalPath: string
   try {
     st = fsOps.lstat(canonicalPath);
   } catch (err: unknown) {
+    if (err instanceof ArcError) {
+      throw err;
+    }
     const code = (err as { code?: string }).code;
     if (code === 'ENOENT') {
       throw ArcError.fileNotFound('Target file does not exist.');
     }
-    throw err;
+    sanitizeFsError(err);
   }
 
   if (st.isDirectory()) {
@@ -66,7 +70,13 @@ export function captureFileIdentity(fsOps: IFilesystemOps, canonicalPath: string
     );
   }
 
-  const content = fsOps.readFile(canonicalPath);
+  let content: Buffer;
+  try {
+    content = fsOps.readFile(canonicalPath);
+  } catch (err: unknown) {
+    sanitizeFsError(err);
+  }
+
   const hash = computeSha256(content);
 
   return {
@@ -91,11 +101,14 @@ export function verifyPrecommitIdentity(
   try {
     st = fsOps.lstat(canonicalPath);
   } catch (err: unknown) {
+    if (err instanceof ArcError) {
+      throw err;
+    }
     const code = (err as { code?: string }).code;
     if (code === 'ENOENT') {
       throw ArcError.conflictPreconditionFailed('Target file was removed before commit.');
     }
-    throw err;
+    sanitizeFsError(err);
   }
 
   if (st.isDirectory()) {
@@ -118,7 +131,13 @@ export function verifyPrecommitIdentity(
     throw ArcError.conflictPreconditionFailed('Target file identity changed before commit.');
   }
 
-  const content = fsOps.readFile(canonicalPath);
+  let content: Buffer;
+  try {
+    content = fsOps.readFile(canonicalPath);
+  } catch (err: unknown) {
+    sanitizeFsError(err);
+  }
+
   const currentHash = computeSha256(content);
   if (currentHash !== expected.hash) {
     throw ArcError.conflictPreconditionFailed('Target file content changed before commit.');
