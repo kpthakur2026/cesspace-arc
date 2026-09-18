@@ -554,7 +554,7 @@ To completely eliminate token-format ambiguities and second secret-management sy
    const tokenDigest = crypto.createHash('sha256').update(tokenText, 'utf8').digest();
    ```
    Stored internally strictly as a **32-byte binary Buffer**. ARC does NOT store an alternate hex-string representation internally.
-3. **No HMAC Secret Required:** Because the raw token already possesses 256 bits of cryptographic entropy, an unkeyed SHA-256 digest is cryptographically irreversible and prevents token recovery even from memory dumps.
+3. **No HMAC Secret Required:** Because the raw token already possesses 256 bits of cryptographic entropy, an unkeyed SHA-256 digest is cryptographically irreversible and prevents token recovery from the stored digest alone. While the raw token necessarily exists transiently during generation and delivery (and could theoretically be captured by a runtime memory dump during that brief window since JavaScript runtime memory zeroization is not guaranteed), ARC itself does not intentionally retain, persist, or log the raw token.
 4. **Timing-Safe Verification Algorithm:**
    During redemption:
    ```typescript

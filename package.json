@@ -18,7 +18,7 @@
     "format": "prettier --write .",
     "lint": "eslint .",
     "typecheck": "tsc --build",
-    "test": "node --test tests/protocol-contracts.test.js tests/rc01-negative-controls.test.js tests/rc02-negative-controls.test.js tests/rc03-filesystem-mutations.test.js tests/rc03-patch.test.js tests/rc03-mcp-policy-audit.test.js",
+    "test": "node --test tests/protocol-contracts.test.js tests/rc01-negative-controls.test.js tests/rc02-negative-controls.test.js tests/rc03-filesystem-mutations.test.js tests/rc03-patch.test.js tests/rc03-mcp-policy-audit.test.js tests/rc04-approval-state.test.js",
     "bench:rc01": "node benchmarks/rc01-benchmark.js",
     "bench:rc02": "node benchmarks/rc02-benchmark.js",
     "check:docs": "bash scripts/check-docs.sh",

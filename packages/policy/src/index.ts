@@ -520,3 +520,5 @@ export {
   type PolicyDecisionResult,
   type PolicyRule,
 };
+
+export * from './approval-state.js';
