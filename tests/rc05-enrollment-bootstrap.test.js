@@ -12,8 +12,9 @@
  * directory and removed with it; no certificate, key, or trust store is
  * committed and no scanner suppression is used.
  *
- * The ONLY injected seam is the internal durable-write adapter used to prove the
- * atomic-activation rollback. It is a gateway constructor option and is
+ * The ONLY injected seam is the internal durable-storage adapter used to prove
+ * the atomic-activation rollback, including the case where the durable write
+ * COMMITS and then reports failure. It is a gateway constructor option and is
  * unreachable from ArcServerConfig, RemoteConfig, the environment, and the
  * network.
  */
@@ -212,7 +213,18 @@ function httpsRequest(port, options = {}) {
     client = clientMaterial(),
     headers = {},
     chunked = false,
+    // When true, the request declares its own explicit `Content-Length` header
+    // equal to the body's real byte length, so the framing under test is
+    // unambiguously a declared-length request rather than a chunked one.
+    declareContentLength = false,
   } = options;
+
+  const requestHeaders = { ...headers };
+  if (declareContentLength) {
+    assert.equal(chunked, false, 'a request cannot both declare a length and stream');
+    assert.equal(typeof body, 'string', 'a declared length requires a concrete body');
+    requestHeaders['content-length'] = String(Buffer.byteLength(body, 'utf8'));
+  }
 
   return new Promise((resolve) => {
     let settled = false;
@@ -235,7 +247,7 @@ function httpsRequest(port, options = {}) {
         // already covered by the Task-3 suite.
         rejectUnauthorized: false,
         ...(client ?? {}),
-        headers,
+        headers: requestHeaders,
       },
       (res) => {
         let data = '';
@@ -262,6 +274,42 @@ function httpsRequest(port, options = {}) {
     }
     req.end();
   });
+}
+
+/**
+ * A trust-store storage adapter that performs a REAL Task-1 atomic save and
+ * THEN throws, simulating a failure observed after the candidate has already
+ * reached the destination path.
+ *
+ * This is exactly what the production persistence path can do: it renames the
+ * temporary file over the destination and only afterwards opens and fsyncs the
+ * parent directory, propagating an operational failure at that point.
+ */
+function committedThenThrowingStorage({ failFollowingRollback = false } = {}) {
+  const calls = [];
+  return {
+    calls,
+    save(store, filePath) {
+      calls.push('save');
+      // The candidate genuinely lands on disk through production persistence.
+      store.saveToFile(filePath);
+      if (calls.length === 1) {
+        throw new Error('injected failure after the rename committed');
+      }
+      if (failFollowingRollback) {
+        throw new Error('injected rollback persistence failure');
+      }
+    },
+  };
+}
+
+/** A storage adapter whose durable write always fails before writing. */
+function preWriteFailingStorage() {
+  return {
+    save() {
+      throw new Error('injected pre-write persistence failure');
+    },
+  };
 }
 
 /** Completes a bootstrap proof and returns the raw HTTP outcome. */
@@ -529,11 +577,21 @@ describe('CesSpace ARC — RC-05 Task 4: Enrollment Bootstrap Endpoint', () => {
       const created = await operatorCreateEnrollment(harness);
 
       // The certificate chains to the configured client CA, so the handshake
-      // succeeds; only its identity differs from the pending pin.
+      // succeeds; only its identity differs from the pending pin. The body is
+      // CLEAN — exactly `{"secret":"<the correct secret>"}` — so this control
+      // isolates trusted selection to the mTLS certificate and nothing else.
       const other = pki.issueTrustedClientCert({ commonName: 'client-mismatch' });
       assert.notEqual(pinOf(other.certPath), clientPin, 'the control needs a different SPKI');
 
-      const outcome = await completeEnrollment(harness.port, created.secret, {
+      const cleanBody = JSON.stringify({ secret: created.secret });
+      assert.deepEqual(
+        Object.keys(JSON.parse(cleanBody)),
+        ['secret'],
+        'the control body is the closed schema and nothing else',
+      );
+
+      const outcome = await completeEnrollment(harness.port, undefined, {
+        rawBody: cleanBody,
         client: otherClientMaterial(other.certPath, other.keyPath),
       });
       assertUniformFailure(outcome);
@@ -605,22 +663,81 @@ describe('CesSpace ARC — RC-05 Task 4: Enrollment Bootstrap Endpoint', () => {
       assert.equal(after.findDeviceByPin(clientPin)?.deviceId, firstDeviceId);
     });
 
-    test('RC05-ENR-302: a malformed secret reaches the constant-time verifier and is counted', async () => {
+    test('RC05-ENR-302: malformed STRING secrets reach the verifier and lock out on the third', async () => {
       const harness = track(await startPaired());
       const created = await operatorCreateEnrollment(harness);
+      const id = created.enrollment.enrollmentId;
 
-      // Well-formed JSON carrying an unusable secret: a genuine proof attempt,
-      // spent against the challenge exactly like a wrong secret.
-      for (const malformed of ['', 'not-hex', 'a'.repeat(63), 'A'.repeat(64)]) {
-        assertUniformFailure(await completeEnrollment(harness.port, malformed));
-      }
+      const attempts = () => harness.enrollmentManager.get(id)?.failedAttempts;
+
+      // The EMPTY string is a string, so it is a proof attempt: the closed
+      // schema passes it through verbatim and Task-2 owns its validity.
+      assertUniformFailure(await completeEnrollment(harness.port, ''));
+      assert.equal(attempts(), 1, '{"secret":""} increments 0 -> 1');
+
+      assertUniformFailure(await completeEnrollment(harness.port, 'not-hex'));
+      assert.equal(attempts(), 2, 'a second malformed string increments 1 -> 2');
+
+      // The third malformed STRING purges the challenge immediately, in the
+      // same request. No fourth request is required.
+      assertUniformFailure(await completeEnrollment(harness.port, 'A'.repeat(64)));
       assert.equal(
-        harness.enrollmentManager.get(created.enrollment.enrollmentId),
+        harness.enrollmentManager.get(id),
         undefined,
-        'four malformed proofs are four counted attempts and purge the challenge',
+        'the third malformed string locks the challenge out immediately',
       );
+      assert.equal(harness.enrollmentManager.getPendingCount(), 0);
+
+      // The correct secret can no longer revive it, and nothing was enrolled.
       assertUniformFailure(await completeEnrollment(harness.port, created.secret));
       assert.equal(DeviceTrustStore.loadFromFile(harness.trustStorePath).getDeviceCount(), 0);
+    });
+
+    test('RC05-ENR-302b: exactly three malformed STRING proofs lock a fresh challenge', async () => {
+      const harness = track(await startPaired());
+      const created = await operatorCreateEnrollment(harness);
+      const id = created.enrollment.enrollmentId;
+
+      // Three distinct malformed STRING shapes, each a real submission.
+      const malformedStrings = ['', 'a'.repeat(63), 'ZZZZ'];
+      const observed = [];
+      for (const malformed of malformedStrings) {
+        assertUniformFailure(await completeEnrollment(harness.port, malformed));
+        const view = harness.enrollmentManager.get(id);
+        observed.push(view === undefined ? 'purged' : view.failedAttempts);
+      }
+
+      assert.deepEqual(
+        observed,
+        [1, 2, 'purged'],
+        'exactly three malformed strings are three counted attempts and the third purges',
+      );
+      assert.equal(harness.enrollmentManager.getPendingCount(), 0);
+      assert.equal(DeviceTrustStore.loadFromFile(harness.trustStorePath).getDeviceCount(), 0);
+    });
+
+    test('RC05-ENR-302c: non-string secret values are schema failures, not proof attempts', async () => {
+      const harness = track(await startPaired());
+      const created = await operatorCreateEnrollment(harness);
+      const id = created.enrollment.enrollmentId;
+
+      for (const rawBody of [
+        JSON.stringify({ secret: 42 }),
+        JSON.stringify({ secret: null }),
+        JSON.stringify({ secret: [] }),
+        JSON.stringify({ secret: {} }),
+        JSON.stringify({ secret: true }),
+      ]) {
+        assertUniformFailure(await completeEnrollment(harness.port, undefined, { rawBody }));
+      }
+
+      // A wrong JSON type never reaches the verifier, so no attempt is spent.
+      assert.equal(harness.enrollmentManager.get(id)?.failedAttempts, 0);
+      assert.equal(
+        (await completeEnrollment(harness.port, created.secret)).status,
+        200,
+        'the genuine proof is unaffected',
+      );
     });
 
     test('RC05-ENR-303: a challenge cancelled locally can no longer be completed remotely', async () => {
@@ -665,26 +782,50 @@ describe('CesSpace ARC — RC-05 Task 4: Enrollment Bootstrap Endpoint', () => {
   // =========================================================================
 
   describe('Trusted SPKI selection (Task 4 §5, §20)', () => {
-    test('RC05-ENR-304: extra identity fields cannot influence selection or activation', async () => {
+    test('RC05-ENR-304: extra identity fields are a CLOSED-SCHEMA rejection', async () => {
       const harness = track(await startPaired());
       const created = await operatorCreateEnrollment(harness);
+      const id = created.enrollment.enrollmentId;
+      const before = fs.readFileSync(harness.trustStorePath);
 
-      const body = JSON.stringify({
-        secret: created.secret,
-        spkiPin: clientPin,
-        clientId: 'attacker-client',
-        clientType: 'attacker-type',
-        deviceId: 'f'.repeat(32),
-        operatorId: 'e'.repeat(64),
-        enrollmentId: 'd'.repeat(32),
-      });
-      assert.equal(
-        (await completeEnrollment(harness.port, undefined, { rawBody: body })).status,
-        200,
-      );
+      // Every one of these carries the CORRECT secret. Under a closed schema
+      // they are still schema failures: the body contract is exactly
+      // {"secret":"..."} and no identity field may accompany it.
+      const rejectedBodies = [
+        { secret: created.secret, spkiPin: clientPin },
+        { secret: created.secret, clientId: 'attacker-client' },
+        { secret: created.secret, clientType: 'attacker-type' },
+        { secret: created.secret, deviceId: 'f'.repeat(32) },
+        { secret: created.secret, operatorId: 'e'.repeat(64) },
+        { secret: created.secret, enrollmentId: 'd'.repeat(32) },
+        {
+          secret: created.secret,
+          spkiPin: clientPin,
+          clientId: 'attacker-client',
+          clientType: 'attacker-type',
+          deviceId: 'f'.repeat(32),
+          operatorId: 'e'.repeat(64),
+          enrollmentId: 'd'.repeat(32),
+        },
+      ];
 
-      // The enrolled record carries the OPERATOR-declared metadata and the
-      // mTLS-derived pin — never a field the client submitted.
+      for (const body of rejectedBodies) {
+        assertUniformFailure(
+          await completeEnrollment(harness.port, undefined, { rawBody: JSON.stringify(body) }),
+        );
+      }
+
+      // Schema rejection never reaches the verifier, so no attempt is spent.
+      const view = harness.enrollmentManager.get(id);
+      assert.ok(view, 'the pending challenge remains');
+      assert.equal(view.failedAttempts, 0, 'a schema rejection is not a proof attempt');
+      assert.equal(view.spkiPin, clientPin, 'the pending pin is unchanged');
+      assert.deepEqual(fs.readFileSync(harness.trustStorePath), before, 'trust store unchanged');
+
+      // A subsequent CLEAN body with the correct secret succeeds, and the
+      // enrolled record carries the operator metadata and the mTLS-derived pin.
+      const clean = await completeEnrollment(harness.port, created.secret);
+      assert.equal(clean.status, 200);
       const reloaded = DeviceTrustStore.loadFromFile(harness.trustStorePath);
       assert.equal(reloaded.getDeviceCount(), 1);
       const device = reloaded.findDeviceByPin(clientPin);
@@ -695,20 +836,40 @@ describe('CesSpace ARC — RC-05 Task 4: Enrollment Bootstrap Endpoint', () => {
       assert.equal(device.pins.length, 1);
     });
 
-    test('RC05-ENR-305: a body-supplied pin cannot substitute for the mTLS identity', async () => {
+    test('RC05-ENR-305: identity comes only from the certificate, never from the body', async () => {
       const harness = track(await startPaired());
       const created = await operatorCreateEnrollment(harness);
+      const id = created.enrollment.enrollmentId;
 
-      // A CA-valid client whose SPKI is NOT the pending one names the pending
-      // pin in the body. The body is ignored, so selection uses the certificate.
+      // (a) The CORRECT client names the pending pin in the body. The closed
+      // schema rejects the extra field outright, so the body can never be used
+      // to state an identity — not even the right one.
+      assertUniformFailure(
+        await completeEnrollment(harness.port, undefined, {
+          rawBody: JSON.stringify({ secret: created.secret, spkiPin: clientPin }),
+        }),
+      );
+      assert.equal(harness.enrollmentManager.get(id)?.failedAttempts, 0);
+
+      // (b) A DIFFERENT CA-valid client presents a CLEAN body carrying the
+      // correct secret. Selection uses the certificate's SPKI, which has no
+      // pending challenge, so the outcome is the uniform failure and the
+      // matching challenge is untouched — the body contributed nothing.
       const other = pki.issueTrustedClientCert({ commonName: 'client-body-pin' });
-      const outcome = await completeEnrollment(harness.port, undefined, {
-        rawBody: JSON.stringify({ secret: created.secret, spkiPin: clientPin }),
-        client: otherClientMaterial(other.certPath, other.keyPath),
-      });
-      assertUniformFailure(outcome);
-      assert.equal(harness.enrollmentManager.getPendingCount(), 1, 'the challenge survives');
+      assert.notEqual(pinOf(other.certPath), clientPin);
+      assertUniformFailure(
+        await completeEnrollment(harness.port, created.secret, {
+          client: otherClientMaterial(other.certPath, other.keyPath),
+        }),
+      );
+      const afterOther = harness.enrollmentManager.get(id);
+      assert.ok(afterOther, 'the matching challenge survives');
+      assert.equal(afterOther.failedAttempts, 0, 'another identity never spends an attempt');
       assert.equal(DeviceTrustStore.loadFromFile(harness.trustStorePath).getDeviceCount(), 0);
+
+      // (c) The genuine certificate with the genuine secret still succeeds.
+      assert.equal((await completeEnrollment(harness.port, created.secret)).status, 200);
+      assert.equal(DeviceTrustStore.loadFromFile(harness.trustStorePath).getDeviceCount(), 1);
     });
 
     test('RC05-ENR-306: a secret in the query string or a header is never accepted', async () => {
@@ -795,16 +956,13 @@ describe('CesSpace ARC — RC-05 Task 4: Enrollment Bootstrap Endpoint', () => {
       const before = fs.readFileSync(trustStorePath);
       const enrollmentManager = new EnrollmentManager();
 
-      const failingWriter = {
-        save() {
-          throw new Error('injected durable-write failure');
-        },
-      };
       const failing = track(
         await startPaired({
           enrollmentManager,
           trustStorePath,
-          gatewayOptions: { bootstrap: { trustStoreWriterForTests: failingWriter } },
+          gatewayOptions: {
+            bootstrap: { trustStoreStorageForTests: preWriteFailingStorage() },
+          },
         }),
       );
       const created = await operatorCreateEnrollment(failing);
@@ -819,12 +977,146 @@ describe('CesSpace ARC — RC-05 Task 4: Enrollment Bootstrap Endpoint', () => {
       assert.equal(view.expiresAt, created.enrollment.expiresAt);
       assert.deepEqual(fs.readFileSync(trustStorePath), before, 'the file is byte-identical');
       assert.equal(failing.gateway.getEnrolledDeviceCount(), 0, 'in-memory state is unchanged');
+      assert.equal(
+        failing.gateway.isEnrollmentStorageFailed(),
+        false,
+        'a failure that provably wrote nothing does not latch the gateway',
+      );
 
       // A retry against a healthy writer succeeds, and the failure left no trace.
       const healthy = track(await startPaired({ enrollmentManager, trustStorePath }));
       assert.equal((await completeEnrollment(healthy.port, created.secret)).status, 200);
       assert.equal(DeviceTrustStore.loadFromFile(trustStorePath).getDeviceCount(), 1);
       assert.equal(enrollmentManager.getPendingCount(), 0);
+    });
+
+    test('RC05-ENR-323: a COMMITTED-THEN-THROW failure restores the pre-transaction trust state', async () => {
+      const trustStorePath = freshStore('committed-then-throw');
+      const enrollmentManager = new EnrollmentManager();
+      const before = fs.readFileSync(trustStorePath);
+
+      // The adapter performs the REAL Task-1 atomic save — so the candidate
+      // genuinely reaches the destination path — and only then throws. This is
+      // the shape of a production parent-directory open/fsync failure, which is
+      // reported AFTER the rename has already installed the candidate.
+      const storage = committedThenThrowingStorage();
+
+      const harness = track(
+        await startPaired({
+          enrollmentManager,
+          trustStorePath,
+          gatewayOptions: { bootstrap: { trustStoreStorageForTests: storage } },
+        }),
+      );
+      const created = await operatorCreateEnrollment(harness);
+
+      assertUniformFailure(await completeEnrollment(harness.port, created.secret));
+
+      // The forward save really did commit before failing, and the bootstrap
+      // then performed a rollback write: two writes, in that order.
+      assert.deepEqual(storage.calls, ['save', 'save'], 'the rollback write must have happened');
+
+      // The destination is back at its PRE-TRANSACTION state, compared as
+      // VALIDATED trust-store state rather than by file existence.
+      const reloaded = DeviceTrustStore.loadFromFile(trustStorePath);
+      assert.equal(reloaded.getDeviceCount(), 0, 'the candidate device was rolled back');
+      assert.equal(
+        reloaded.findDeviceByPin(clientPin),
+        undefined,
+        'no device is enrolled after a failed completion',
+      );
+      assert.deepEqual(fs.readFileSync(trustStorePath), before, 'the file is byte-identical');
+
+      // The authoritative in-memory store never adopted the candidate either.
+      assert.equal(harness.gateway.getEnrolledDeviceCount(), 0);
+      assert.equal(harness.gateway.isEnrollmentStorageFailed(), false, 'restoration was proven');
+
+      // The pending challenge is retained, unspent.
+      const view = enrollmentManager.get(created.enrollment.enrollmentId);
+      assert.ok(view, 'the challenge remains live');
+      assert.equal(view.failedAttempts, 0);
+      assert.equal(view.expiresAt, created.enrollment.expiresAt);
+
+      // Retry after successful restoration: the SAME secret succeeds.
+      const healthy = track(await startPaired({ enrollmentManager, trustStorePath }));
+      assert.equal((await completeEnrollment(healthy.port, created.secret)).status, 200);
+      const afterRetry = DeviceTrustStore.loadFromFile(trustStorePath);
+      assert.equal(afterRetry.getDeviceCount(), 1, 'exactly one device after the retry');
+      assert.equal(afterRetry.getDevices().length, 1, 'no duplicate device');
+      assert.ok(afterRetry.findDeviceByPin(clientPin));
+      assert.equal(enrollmentManager.getPendingCount(), 0);
+    });
+
+    test('RC05-ENR-324: an unprovable rollback latches fail-closed and never returns 200', async () => {
+      const trustStorePath = freshStore('rollback-failure');
+      const enrollmentManager = new EnrollmentManager();
+
+      // The forward save commits then throws; the rollback write ALSO fails, so
+      // the candidate is left installed and the pre-transaction state cannot be
+      // proven restored.
+      const storage = committedThenThrowingStorage({ failFollowingRollback: true });
+
+      const harness = track(
+        await startPaired({
+          enrollmentManager,
+          trustStorePath,
+          gatewayOptions: { bootstrap: { trustStoreStorageForTests: storage } },
+        }),
+      );
+      const created = await operatorCreateEnrollment(harness);
+
+      assertUniformFailure(await completeEnrollment(harness.port, created.secret));
+      assert.equal(
+        harness.gateway.isEnrollmentStorageFailed(),
+        true,
+        'an unprovable restoration latches the gateway',
+      );
+
+      // The latch is terminal for completions: the gateway refuses further
+      // attempts rather than repeatedly writing against an authentication root
+      // whose contents it cannot vouch for.
+      //
+      // The second challenge necessarily uses a different pin, because Task 2
+      // allows only one live challenge per SPKI and the first is still live.
+      const secondPin = crypto.createHash('sha256').update('latch-second').digest('hex');
+      const second = await operatorCreateEnrollment(harness, {
+        clientId: 'second-client',
+        spkiPin: secondPin,
+      });
+      assertUniformFailure(await completeEnrollment(harness.port, second.secret));
+      assertUniformFailure(await completeEnrollment(harness.port, created.secret));
+      assertUniformFailure(await completeEnrollment(harness.port, 'a'.repeat(64)));
+
+      // No completion is attempted at all once latched, so the second challenge
+      // is not even reached.
+      assert.equal(
+        enrollmentManager.get(second.enrollment.enrollmentId)?.failedAttempts,
+        0,
+        'a latched gateway does not spend attempts',
+      );
+
+      // The refusal is indistinguishable from any other bootstrap failure: the
+      // storage reason is never disclosed.
+      assert.deepEqual(JSON.parse((await completeEnrollment(harness.port, created.secret)).body), {
+        error: 'Enrollment failed',
+      });
+
+      // Both latched requests wrote nothing further: the second writer call was
+      // the failed rollback and there is no third.
+      assert.deepEqual(storage.calls, ['save', 'save'], 'no repeated retry after the latch');
+
+      // Honest statement of the remaining ambiguity: because the rollback could
+      // not be proven, the destination MAY still hold the candidate. That is
+      // exactly why the gateway latched instead of reporting a retryable
+      // failure — it stops serving completions rather than pretending the
+      // authentication root is known. The HTTP responses were all failures and
+      // the authoritative in-memory store never adopted the candidate.
+      assert.equal(harness.gateway.getEnrolledDeviceCount(), 0, 'in-memory state never adopted it');
+      assert.equal(
+        harness.gateway.isEnrollmentStorageFailed(),
+        true,
+        'the uncertainty is recorded internally rather than resolved optimistically',
+      );
     });
 
     test('RC05-ENR-310: an activation resource failure leaves nothing partially enrolled', async () => {
@@ -1013,16 +1305,29 @@ describe('CesSpace ARC — RC-05 Task 4: Enrollment Bootstrap Endpoint', () => {
     test('RC05-ENR-315: an oversized bootstrap body is refused without invoking the manager', async () => {
       const harness = track(await startPaired());
       const created = await operatorCreateEnrollment(harness);
+      const id = created.enrollment.enrollmentId;
+      const before = fs.readFileSync(harness.trustStorePath);
 
-      // 1. Declared Content-Length above the 4 KiB endpoint bound.
+      // 1. A request that DECLARES `Content-Length` equal to its real byte
+      // length, which is above the 4 KiB endpoint bound. The explicit header is
+      // what makes this unambiguously a declared-length request rather than a
+      // chunked one, and it is rejected on the header alone, before any body
+      // byte is buffered.
+      const declaredBody = JSON.stringify({ secret: created.secret, pad: 'x'.repeat(5000) });
+      assert.ok(
+        Buffer.byteLength(declaredBody, 'utf8') > 4096,
+        'the control needs a body genuinely above the bound',
+      );
       const declared = await httpsRequest(harness.port, {
         requestPath: '/enroll/complete',
-        body: JSON.stringify({ secret: created.secret, pad: 'x'.repeat(5000) }),
+        body: declaredBody,
+        declareContentLength: true,
       });
       assert.equal(declared.status, 413);
       assert.deepEqual(JSON.parse(declared.body), { error: 'Payload too large' });
 
-      // 2. A chunked body that grows past the bound with NO Content-Length.
+      // 2. Separately, a CHUNKED body with NO Content-Length that grows past
+      // the bound is aborted during the read.
       const chunked = await httpsRequest(harness.port, {
         requestPath: '/enroll/complete',
         chunked: true,
@@ -1030,26 +1335,36 @@ describe('CesSpace ARC — RC-05 Task 4: Enrollment Bootstrap Endpoint', () => {
       assert.equal(chunked.status, 413);
       assert.deepEqual(JSON.parse(chunked.body), { error: 'Payload too large' });
 
-      // 3. A bootstrap body exactly AT the bound is not rejected as oversized;
-      // it is simply a malformed proof.
+      // Neither framing reached the enrollment manager.
+      const view = harness.enrollmentManager.get(id);
+      assert.ok(view, 'the challenge remains');
+      assert.equal(view.failedAttempts, 0, 'an oversized request is not a proof attempt');
+      assert.deepEqual(fs.readFileSync(harness.trustStorePath), before, 'trust store unchanged');
+      assert.equal(DeviceTrustStore.loadFromFile(harness.trustStorePath).getDeviceCount(), 0);
+
+      // 3. A bootstrap body exactly AT the bound is not rejected as oversized.
       const atBound = JSON.stringify({ secret: created.secret }).padEnd(4096, ' ');
       assert.equal(atBound.length, 4096);
       const atBoundOutcome = await completeEnrollment(harness.port, undefined, {
         rawBody: atBound,
+        declareContentLength: true,
       });
       // Trailing whitespace is legal JSON padding, so this is the real proof and
       // it consumes the challenge: that is the correct, non-oversized outcome.
       assert.equal(atBoundOutcome.status, 200);
 
-      // No oversized attempt was counted anywhere along the way.
       assert.equal(harness.enrollmentManager.getPendingCount(), 0);
       assert.equal(DeviceTrustStore.loadFromFile(harness.trustStorePath).getDeviceCount(), 1);
     });
 
-    test('RC05-ENR-316: malformed JSON and wrong-shaped bodies are the uniform failure', async () => {
+    test('RC05-ENR-316: malformed JSON and non-string schemas are the uniform failure', async () => {
       const harness = track(await startPaired());
       const created = await operatorCreateEnrollment(harness);
 
+      // Every entry here is a SCHEMA failure: not JSON, not an object, no
+      // `secret`, or a `secret` that is not a string. Note that `{"secret":""}`
+      // is deliberately absent — an empty STRING is a proof attempt and is
+      // covered by ENR-302, not a schema failure.
       for (const rawBody of [
         '',
         '{',
@@ -1059,12 +1374,13 @@ describe('CesSpace ARC — RC-05 Task 4: Enrollment Bootstrap Endpoint', () => {
         '"secret"',
         '42',
         '{}',
+        '{"other":"value"}',
         '{"secret":null}',
         '{"secret":42}',
-        '{"secret":""}',
         '{"secret":["a"]}',
         '{"secret":{"v":"a"}}',
         '{"secret":true}',
+        '{"secret"}',
       ]) {
         const outcome = await completeEnrollment(harness.port, undefined, { rawBody });
         assertUniformFailure(outcome);
@@ -1155,6 +1471,211 @@ describe('CesSpace ARC — RC-05 Task 4: Enrollment Bootstrap Endpoint', () => {
   });
 
   // =========================================================================
+  // The single pending-enrollment authority is a structural invariant
+  // =========================================================================
+
+  describe('Shared EnrollmentManager composition is enforced, not conventional', () => {
+    /** Builds the direct (non-factory) ArcMcpServer composition under test. */
+    async function directServer({ adminManager, argumentManager, adminEndpoint, port, store }) {
+      const { ArcMcpServer } = await import('../apps/mcp-server/dist/index.js');
+      const { WorkspaceRegistry, SecurityKernel } =
+        await import('../packages/policy/dist/index.js');
+      const { AuditLogger } = await import('../packages/audit/dist/index.js');
+      const { FilesystemSubsystem } = await import('../packages/filesystem/dist/index.js');
+      const { GitSubsystem } = await import('../packages/git/dist/index.js');
+
+      const registry = new WorkspaceRegistry();
+      let adminIpcServer;
+      if (adminManager !== undefined) {
+        adminIpcServer = new AdminIpcServer({
+          endpoint: adminEndpoint,
+          operatorPublicKeyB64: generateOperator().publicKeyB64,
+          approvalStateManager: new ApprovalStateManager(),
+          auditLogger: new AuditLogger(),
+          enrollmentManager: adminManager,
+        });
+      }
+
+      const server = new ArcMcpServer(
+        registry,
+        new SecurityKernel(registry),
+        new AuditLogger(),
+        new FilesystemSubsystem(),
+        new GitSubsystem(),
+        {
+          transport: 'remote',
+          authorizedRoots: [],
+          remote: await remoteConfig(store, { port }),
+        },
+        undefined,
+        undefined,
+        new ApprovalStateManager(),
+        adminIpcServer,
+        argumentManager,
+      );
+      return { server, adminIpcServer };
+    }
+
+    test('RC05-ENR-325: a direct composition passing the SAME manager is accepted and works', async () => {
+      const store = freshStore('composition-ok');
+      const port = await freePort();
+      const endpoint = path.join(freshAdminDir('composition-ok'), 'admin.sock');
+      const enrollmentManager = new EnrollmentManager();
+      const operator = generateOperator();
+
+      const { ArcMcpServer } = await import('../apps/mcp-server/dist/index.js');
+      const { WorkspaceRegistry, SecurityKernel } =
+        await import('../packages/policy/dist/index.js');
+      const { AuditLogger } = await import('../packages/audit/dist/index.js');
+      const { FilesystemSubsystem } = await import('../packages/filesystem/dist/index.js');
+      const { GitSubsystem } = await import('../packages/git/dist/index.js');
+
+      const registry = new WorkspaceRegistry();
+      const adminIpcServer = new AdminIpcServer({
+        endpoint,
+        operatorPublicKeyB64: operator.publicKeyB64,
+        approvalStateManager: new ApprovalStateManager(),
+        auditLogger: new AuditLogger(),
+        enrollmentManager,
+      });
+      const server = new ArcMcpServer(
+        registry,
+        new SecurityKernel(registry),
+        new AuditLogger(),
+        new FilesystemSubsystem(),
+        new GitSubsystem(),
+        { transport: 'remote', authorizedRoots: [], remote: await remoteConfig(store, { port }) },
+        undefined,
+        undefined,
+        new ApprovalStateManager(),
+        adminIpcServer,
+        enrollmentManager,
+      );
+
+      // The server provably adopted exactly that instance.
+      assert.equal(server.enrollmentManager, enrollmentManager);
+      assert.equal(server.adminIpcServer.getEnrollmentManager(), enrollmentManager);
+
+      await server.start();
+      try {
+        const created = await operatorCreateEnrollment({ endpoint, operator });
+        assert.equal(server.enrollmentManager.getPendingCount(), 1);
+        assert.equal(
+          (await completeEnrollment(port, created.secret)).status,
+          200,
+          'a correctly composed server completes the enrollment end to end',
+        );
+        assert.equal(DeviceTrustStore.loadFromFile(store).getDeviceCount(), 1);
+      } finally {
+        await server.stop();
+      }
+    });
+
+    test('RC05-ENR-326: two different managers fail closed before any listener is usable', async () => {
+      const store = freshStore('composition-mismatch');
+      const port = await freePort();
+      const endpoint = path.join(freshAdminDir('composition-mismatch'), 'admin.sock');
+
+      const adminManager = new EnrollmentManager();
+      const argumentManager = new EnrollmentManager();
+      assert.notEqual(adminManager, argumentManager);
+
+      await assert.rejects(
+        () =>
+          directServer({
+            adminManager,
+            argumentManager,
+            adminEndpoint: endpoint,
+            port,
+            store,
+          }),
+        /enrollment manager must be the same instance/,
+      );
+
+      // Fail-closed means nothing was bound: the remote port is still free and
+      // the admin endpoint was never created.
+      const probe = net.createConnection({ host: '127.0.0.1', port });
+      const refused = await new Promise((resolve) => {
+        probe.once('connect', () => resolve(false));
+        probe.once('error', () => resolve(true));
+        setTimeout(() => resolve(false), 500).unref();
+      });
+      probe.destroy();
+      assert.equal(refused, true, 'no remote listener exists after the refused composition');
+      assert.equal(fs.existsSync(endpoint), false, 'the admin endpoint was never created');
+    });
+
+    test('RC05-ENR-327: a composed admin channel is adopted, never shadowed by a second table', async () => {
+      // Supplying ONLY an admin channel means the server must ADOPT that
+      // channel's manager. A silent fallback that created its own manager would
+      // leave the running server with two pending tables: one the operator
+      // writes to and one the remote endpoint completes against.
+      const store = freshStore('composition-adopt');
+      const port = await freePort();
+      const endpoint = path.join(freshAdminDir('composition-adopt'), 'admin.sock');
+      const adminManager = new EnrollmentManager();
+
+      const { server, adminIpcServer } = await directServer({
+        adminManager,
+        argumentManager: undefined,
+        adminEndpoint: endpoint,
+        port,
+        store,
+      });
+
+      assert.equal(
+        server.enrollmentManager,
+        adminManager,
+        'the admin channel manager is adopted, not replaced',
+      );
+      assert.equal(server.enrollmentManager, adminIpcServer.getEnrollmentManager());
+
+      // There is exactly one challenge table: a challenge created on the admin
+      // side is the one the remote completion resolves.
+      const created = adminManager.create({
+        clientId: 'adopted-client',
+        clientType: 'claude-code',
+        spkiPin: clientPin,
+        operatorId: crypto.createHash('sha256').update('adopted-operator').digest('hex'),
+      });
+      assert.equal(server.enrollmentManager.getPendingCount(), 1);
+      assert.equal(
+        server.enrollmentManager.get(created.enrollment.enrollmentId)?.clientId,
+        'adopted-client',
+      );
+    });
+
+    test('RC05-ENR-328: the factory composition is unchanged and still shares one instance', async () => {
+      const { createArcMcpServer } = await import('../apps/mcp-server/dist/index.js');
+      const store = freshStore('composition-factory');
+      const endpoint = path.join(freshAdminDir('composition-factory'), 'admin.sock');
+      const operator = generateOperator();
+      const port = await freePort();
+
+      const server = createArcMcpServer({
+        transport: 'remote',
+        authorizedRoots: [],
+        admin: { endpoint, operatorPublicKeyB64: operator.publicKeyB64 },
+        remote: await remoteConfig(store, { port }),
+      });
+
+      assert.ok(server.enrollmentManager, 'the factory always provides one manager');
+      assert.equal(
+        server.enrollmentManager,
+        server.adminIpcServer?.getEnrollmentManager(),
+        'both consumers reference the identical object before startup',
+      );
+      await server.start();
+      try {
+        const created = await operatorCreateEnrollment({ endpoint, operator });
+        assert.equal((await completeEnrollment(port, created.secret)).status, 200);
+      } finally {
+        await server.stop();
+      }
+    });
+  });
+
+  // =========================================================================
   // Trust-store startup requirements
   // =========================================================================
 
@@ -1216,8 +1737,10 @@ describe('CesSpace ARC — RC-05 Task 4: Enrollment Bootstrap Endpoint', () => {
       const config = await remoteConfig(trustStorePath);
 
       for (const seam of [
+        'trustStoreStorageForTests',
         'trustStoreWriterForTests',
         'trustStoreWriter',
+        'trustStoreStorage',
         'bootstrap',
         'enrollmentManager',
       ]) {
@@ -1238,13 +1761,13 @@ describe('CesSpace ARC — RC-05 Task 4: Enrollment Bootstrap Endpoint', () => {
         {
           ...config,
           bootstrap: {
-            trustStoreWriterForTests: {
+            trustStoreStorageForTests: {
               save: () => {
                 writerWasCalled = true;
               },
             },
           },
-          trustStoreWriterForTests: {
+          trustStoreStorageForTests: {
             save: () => {
               writerWasCalled = true;
             },

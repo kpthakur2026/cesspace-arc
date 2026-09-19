@@ -266,6 +266,18 @@ export class AdminIpcServer {
     this.operatorId = deriveOperatorId(publicKey);
   }
 
+  /**
+   * The pending-enrollment authority this channel writes to (RC-05 Task 4).
+   *
+   * Returns the exact instance, never a copy. A composing owner uses this to
+   * prove that the local operator channel and the remote bootstrap endpoint
+   * share ONE challenge table: two instances would mean a challenge created
+   * locally could never be observed by a remote completion.
+   */
+  public getEnrollmentManager(): EnrollmentManager {
+    return this.enrollmentManager;
+  }
+
   /** Starts listening. Rejects if the endpoint already exists for any reason. */
   public async start(): Promise<void> {
     if (this.started) {

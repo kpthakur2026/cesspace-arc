@@ -1298,6 +1298,15 @@ export class ArcMcpServer implements IArcMcpServer {
   public readonly effectivePolicyEngine?: DeclarativePolicyEngine;
   /** Safe failure category when an explicitly configured policy was invalid. */
   public readonly policyInitializationFailure?: PolicyInitializationFailure;
+  /**
+   * The ONE pending-enrollment authority for this process (RC-05 Task 4).
+   *
+   * Always present. When an admin IPC channel is composed in, this IS that
+   * channel's manager — the constructor adopts it or refuses the composition —
+   * so the object the remote gateway completes against is provably the same
+   * object the operator channel creates challenges in.
+   */
+  public readonly enrollmentManager: EnrollmentManager;
 
   constructor(
     public readonly workspaceRegistry: WorkspaceRegistry,
@@ -1326,8 +1335,12 @@ export class ArcMcpServer implements IArcMcpServer {
      * through the SAME object. There is exactly one instance per process: no
      * copy, no synchronization, no second remote manager, and no persistence of
      * pending challenges, which stay volatile and die with the process.
+     *
+     * This is not merely a convention: when an admin channel is composed in, the
+     * constructor ADOPTS or VERIFIES its manager, so an invalid composition
+     * cannot reach a running state.
      */
-    public readonly enrollmentManager?: EnrollmentManager,
+    enrollmentManager?: EnrollmentManager,
   ) {
     // Transport mode is resolved once, at construction, and is immutable. A
     // remote configuration supplied alongside stdio is NOT activated.
@@ -1344,6 +1357,27 @@ export class ArcMcpServer implements IArcMcpServer {
     // double-write every transition).
     this.approvalAuditSink = getApprovalAuditSink(this.auditLogger);
     this.approvalStateManager.registerLifecycleSink(this.approvalAuditSink);
+
+    // RC-05 Task 4 composition invariant: ONE pending-enrollment authority.
+    //
+    // The local operator channel and the remote bootstrap endpoint must observe
+    // the same challenge table, and this is enforced STRUCTURALLY rather than by
+    // convention. When an admin channel is composed in, its manager is adopted
+    // (or must be the exact instance supplied). Supplying two different
+    // instances is a construction failure, so a server with an active admin IPC
+    // channel can never silently run a SECOND pending table beside it, and a
+    // remote listener can never be bound against the wrong one.
+    const composedAdminManager = this.adminIpcServer?.getEnrollmentManager();
+    if (composedAdminManager !== undefined) {
+      if (enrollmentManager !== undefined && enrollmentManager !== composedAdminManager) {
+        throw new Error(
+          'Invalid composition: the admin IPC channel and the enrollment manager must be the same instance.',
+        );
+      }
+      this.enrollmentManager = composedAdminManager;
+    } else {
+      this.enrollmentManager = enrollmentManager ?? new EnrollmentManager();
+    }
 
     this.defaultWorkspaceId = config?.defaultWorkspaceId;
     this.processRegistry =

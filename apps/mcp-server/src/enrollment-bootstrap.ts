@@ -26,6 +26,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
   DeviceTrustStore,
+  type DeviceTrustStoreData,
   type EnrollmentManager,
   type PendingEnrollmentView,
 } from '@cesspace-arc/auth';
@@ -77,32 +78,68 @@ export const NOT_FOUND_BODY = JSON.stringify({ error: 'Not found' });
 export const ENROLLED_BODY = JSON.stringify({ status: 'enrolled' });
 
 /**
- * Trust-store persistence seam.
+ * Durable trust-store storage used by the bootstrap transaction.
  *
- * The default is the Task-1 atomic persistence used by `DeviceTrustStore.saveToFile`.
- * A test replaces it to inject a durable-write failure.
+ * Both operations default to the Task-1 production primitives — the atomic
+ * persister behind `DeviceTrustStore.saveToFile` and the validating loader
+ * behind `DeviceTrustStore.loadFromFile`. The pair is injected together because
+ * rollback must be able to WRITE and then VERIFY what actually reached disk.
  *
  * @internal Reachable ONLY through an internal option object constructed by a
  * test. It is deliberately absent from ArcServerConfig, RemoteConfig, the
  * environment, and every network-reachable surface, so no launch configuration
  * and no request can weaken or bypass durable persistence.
  */
-export interface TrustStoreWriter {
+export interface TrustStoreStorage {
   save(store: DeviceTrustStore, filePath: string): void;
+  load(filePath: string): DeviceTrustStore;
 }
 
 /** @internal Internal seams for the bootstrap controller. */
 export interface EnrollmentBootstrapOptions {
   /**
-   * @internal Test-only durable-write injection. Defaults to Task-1 atomic
-   * persistence. Never populated from configuration, environment, or a request.
+   * @internal Test-only durable-storage injection. Defaults to Task-1 atomic
+   * persistence and the Task-1 validating loader. Never populated from
+   * configuration, environment, or a request.
    */
-  trustStoreWriterForTests?: TrustStoreWriter;
+  trustStoreStorageForTests?: Partial<TrustStoreStorage>;
+}
+
+/**
+ * Order-insensitive, content-exact fingerprint of a validated trust store.
+ *
+ * Used to answer "is what is on disk the state I expected?" by comparing
+ * VALIDATED trust-store state, never file existence or raw bytes: the
+ * persistence path is a rename plus a directory fsync, so the bytes that reach
+ * the destination are produced by the validator and re-reading them through the
+ * loader is the only comparison that means anything.
+ */
+function trustStateFingerprint(store: DeviceTrustStore): string {
+  const devices = Array.from(store.toData().devices)
+    .map((device) => ({
+      deviceId: device.deviceId,
+      clientId: device.clientId,
+      clientType: device.clientType,
+      pins: Array.from(device.pins).sort(),
+      enrolledAt: device.enrolledAt,
+      displayLabel: device.displayLabel,
+      revoked: device.revoked,
+    }))
+    .sort((a, b) => (a.deviceId < b.deviceId ? -1 : a.deviceId > b.deviceId ? 1 : 0));
+  return JSON.stringify({ version: 1, devices });
 }
 
 /** Controller driving one gateway's bootstrap HTTP surface. */
 export class EnrollmentBootstrap {
-  private readonly writer: TrustStoreWriter;
+  private readonly storage: TrustStoreStorage;
+  /**
+   * Terminal latch for an uncertain durable authentication root.
+   *
+   * Set when a failed activation could not be proven rolled back. Once set, no
+   * further completion is attempted: the gateway will not keep retrying a write
+   * against a trust store whose contents it can no longer vouch for.
+   */
+  private storageLatched = false;
 
   constructor(
     private readonly enrollmentManager: EnrollmentManager,
@@ -110,14 +147,30 @@ export class EnrollmentBootstrap {
     private readonly trustStorePath: string,
     options: EnrollmentBootstrapOptions = {},
   ) {
-    this.writer = options.trustStoreWriterForTests ?? {
-      save: (store, filePath) => store.saveToFile(filePath),
+    this.storage = {
+      save:
+        options.trustStoreStorageForTests?.save ??
+        ((store, filePath) => store.saveToFile(filePath)),
+      load:
+        options.trustStoreStorageForTests?.load ??
+        ((filePath) => DeviceTrustStore.loadFromFile(filePath)),
     };
   }
 
   /** Enrolled device count, for bounded reporting. Never a device list. */
   public getEnrolledDeviceCount(): number {
     return this.authoritativeTrustStore.getDeviceCount();
+  }
+
+  /**
+   * True once durable trust storage could not be proven restored.
+   *
+   * @internal Deliberately NOT part of the bounded gateway status: the storage
+   * reason is never disclosed remotely, and the only observable client-facing
+   * effect is that completions keep failing.
+   */
+  public isStorageFailureLatched(): boolean {
+    return this.storageLatched;
   }
 
   /**
@@ -163,6 +216,15 @@ export class EnrollmentBootstrap {
     res: ServerResponse,
     spkiPin: string,
   ): Promise<void> {
+    // Fail closed BEFORE any work: once durable storage is uncertain, the
+    // gateway stops attempting completions entirely rather than repeatedly
+    // writing against an authentication root it cannot vouch for. The response
+    // is the same uniform body, so nothing about the storage state escapes.
+    if (this.storageLatched) {
+      this.failClosed(res);
+      return;
+    }
+
     let body: string;
     try {
       body = await readBoundedBody(req, MAX_ENROLL_BODY_BYTES);
@@ -209,13 +271,16 @@ export class EnrollmentBootstrap {
    * other request can interleave between a verified proof and its commit.
    *
    * The authoritative in-memory store is never mutated directly: a candidate is
-   * built from a snapshot, persisted, and only then swapped in. A throw from any
-   * step leaves the authoritative store, the file, and the pending challenge
-   * exactly as they were.
+   * built from a snapshot, persisted, and only then swapped in.
+   *
+   * A throw from this method propagates to `completeBySpki`, which converts it
+   * into ACTIVATION_FAILED without consuming the challenge — so the contract
+   * this method owes its caller is: on ANY throw, the destination trust store is
+   * back at the pre-transaction state, or the fail-closed latch is set.
    */
   private activateDevice(challenge: PendingEnrollmentView): void {
-    const snapshot = this.authoritativeTrustStore.toData();
-    const candidate = DeviceTrustStore.fromData(snapshot);
+    const before = this.authoritativeTrustStore.toData();
+    const candidate = DeviceTrustStore.fromData(before);
     // Duplicate-enrollment semantics are Task-1's (§8): the same pin under the
     // same clientId reuses the existing deviceId, and a pin already bound to a
     // different clientId fails closed here, before anything is persisted.
@@ -226,12 +291,79 @@ export class EnrollmentBootstrap {
       displayLabel: challenge.displayLabel,
     });
 
-    // Durable first. A throw here propagates to completeBySpki, which converts
-    // it into ACTIVATION_FAILED without consuming the challenge.
-    this.writer.save(candidate, this.trustStorePath);
+    try {
+      this.storage.save(candidate, this.trustStorePath);
+    } catch {
+      // A reported failure does NOT mean the destination is unchanged.
+      //
+      // Task-1 persistence renames the temporary file over the destination and
+      // only THEN opens and fsyncs the parent directory, propagating an
+      // operational open/fsync failure at that point. A save can therefore
+      // throw while the destination already holds the candidate, which would
+      // leave a device enrolled on disk after a failed HTTP request and
+      // diverge from the authoritative in-memory state.
+      //
+      // Reconcile before reporting the activation as retryable.
+      this.restorePreTransactionState(before);
+      throw new Error('Enrollment activation could not be persisted.');
+    }
 
     // Only now does the new state become authoritative.
     this.authoritativeTrustStore = candidate;
+  }
+
+  /**
+   * Proves the destination trust store is back at the pre-transaction state.
+   *
+   * Compares VALIDATED trust-store state through the Task-1 loader, never file
+   * existence: a rename that landed and a rename that never happened are
+   * indistinguishable to `existsSync`, and only the loader can say what the
+   * authentication root actually contains.
+   *
+   * If the pre-transaction state is already present, there is nothing to undo.
+   * Otherwise the snapshot is written back through the same persistence path and
+   * then re-read AND re-compared. If any step of that fails, or the comparison
+   * still disagrees, the latch is set: the gateway must not keep serving
+   * completions against a trust store it cannot vouch for.
+   */
+  private restorePreTransactionState(before: DeviceTrustStoreData): void {
+    const expected = trustStateFingerprint(DeviceTrustStore.fromData(before));
+
+    let installed: string;
+    try {
+      installed = trustStateFingerprint(this.storage.load(this.trustStorePath));
+    } catch {
+      // The destination cannot even be read and validated, so its contents are
+      // unknown. Nothing can be proven restored.
+      this.storageLatched = true;
+      return;
+    }
+
+    if (installed === expected) {
+      // The candidate never reached the destination: the pre-transaction state
+      // is intact and the operation is cleanly retryable.
+      return;
+    }
+
+    // The candidate (or some other state) reached the destination. Restore the
+    // snapshot through trusted persistence, then VERIFY by reloading.
+    try {
+      this.storage.save(DeviceTrustStore.fromData(before), this.trustStorePath);
+    } catch {
+      this.storageLatched = true;
+      return;
+    }
+
+    try {
+      const restored = trustStateFingerprint(this.storage.load(this.trustStorePath));
+      if (restored !== expected) {
+        // A write reported success but the destination still disagrees: the
+        // authentication root is not provably back to its prior state.
+        this.storageLatched = true;
+      }
+    } catch {
+      this.storageLatched = true;
+    }
   }
 
   private failClosed(res: ServerResponse): void {
@@ -343,16 +475,26 @@ export function readBoundedBody(req: IncomingMessage, maxBytes: number): Promise
 }
 
 /**
- * Extracts the one-time secret from the closed bootstrap schema.
+ * Extracts the one-time secret from the CLOSED bootstrap schema.
  *
- * Returns null for anything that is not a JSON object carrying a usable
- * `secret` string. Any other field — enrollmentId, spkiPin, clientId,
- * clientType, deviceId, operatorId — is ignored and can never influence
- * selection or activation.
+ * The frozen body contract is exactly `{"secret":"..."}` and nothing else. The
+ * parser therefore accepts a JSON object whose ONLY own enumerable key is
+ * `secret`, whose value is a string of any content.
  *
- * The submitted value is returned verbatim (it is NOT validated to the 64-hex
- * shape here) so that a malformed secret still reaches Task-2's constant-time
- * dummy-digest path and is counted exactly like any other wrong secret.
+ * Returns null — a schema failure — for anything else: malformed JSON, a
+ * non-object, an array, a missing `secret` own property, a non-string `secret`
+ * (number, null, array, object, boolean), or ANY additional field such as
+ * enrollmentId, spkiPin, clientId, clientType, deviceId, or operatorId.
+ *
+ * A schema failure is decided HERE and never reaches the enrollment verifier, so
+ * it spends no failed attempt. Identity fields are not merely ignored; a body
+ * carrying one is rejected outright, and no identity is ever read from a body.
+ *
+ * The submitted string is returned VERBATIM — including the empty string, short
+ * strings, uppercase, and non-hex — so that Task-2 remains the single owner of
+ * secret validity: its regex, dummy digest, SHA-256, `timingSafeEqual`,
+ * failed-attempt increment, and third-attempt purge. Re-checking the shape here
+ * would silently exempt malformed submissions from the lockout counters.
  */
 export function extractSecret(body: string): string | null {
   let parsed: unknown;
@@ -364,8 +506,16 @@ export function extractSecret(body: string): string | null {
   if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
     return null;
   }
-  const secret = (parsed as Record<string, unknown>).secret;
-  if (typeof secret !== 'string' || secret.length === 0) {
+  const record = parsed as Record<string, unknown>;
+  if (!Object.prototype.hasOwnProperty.call(record, 'secret')) {
+    return null;
+  }
+  const keys = Object.keys(record);
+  if (keys.length !== 1 || keys[0] !== 'secret') {
+    return null;
+  }
+  const secret = record.secret;
+  if (typeof secret !== 'string') {
     return null;
   }
   return secret;

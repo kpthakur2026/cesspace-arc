@@ -115,8 +115,14 @@ export interface RemoteGatewayOptions {
    * this option is not reachable from RemoteConfig, the environment, or the
    * network.
    *
-   * When omitted the gateway creates its own instance, which is correct only
-   * for admission-only tests that never complete an enrollment.
+   * `ArcMcpServer` ALWAYS supplies the process-wide instance it owns, and its
+   * constructor refuses to compose an admin IPC channel over a different one,
+   * so a running server can never complete against a second pending table.
+   *
+   * When omitted — only reachable by constructing a `RemoteGateway` directly —
+   * the gateway creates its own instance. That is correct for admission-only
+   * tests and for a standalone gateway with no composed admin channel; it is
+   * never how a composed `ArcMcpServer` behaves.
    */
   enrollmentManager?: EnrollmentManager;
   /**
@@ -646,6 +652,16 @@ export class RemoteGateway {
   /** Enrolled device count held by this gateway's trust store. */
   public getEnrolledDeviceCount(): number {
     return this.bootstrap.getEnrolledDeviceCount();
+  }
+
+  /**
+   * True once the bootstrap could not prove durable trust storage restored.
+   *
+   * @internal Deliberately NOT part of {@link RemoteGatewayStatus}: the storage
+   * reason is never disclosed remotely, and completions simply keep failing.
+   */
+  public isEnrollmentStorageFailed(): boolean {
+    return this.bootstrap.isStorageFailureLatched();
   }
 
   /**
