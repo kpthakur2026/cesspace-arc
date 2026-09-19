@@ -4,7 +4,7 @@
 | :------------ | :---------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Stage**     | RC-05                                                                                                                                                       |
 | **Title**     | Secure Remote Gateway                                                                                                                                       |
-| **Status**    | **Task-0 Scope Candidate — Frozen Architecture Specification (Task 0.2 Final Security Corrections)**                                                        |
+| **Status**    | **Task-0 Scope Candidate — Frozen Architecture Specification**                                                                                              |
 | **Base main** | `f70a5efea4018079de1ac1ee423b7e51574b1262`                                                                                                                  |
 | **Branch**    | `feat/rc-05-secure-remote-gateway`                                                                                                                          |
 | **Purpose**   | Freeze remote transport, authentication, device identity, session, rate-limit, audit, failure, and trust-boundary semantics **before** any code is written. |
@@ -26,44 +26,13 @@ Where a historical document states something this contract contradicts, the
 specific rule is restated in §37 (Historical Documentation Reconciliation) with
 the new normative rule named explicitly.
 
-All architectural blockers and security boundaries identified across Task 0.1
-and Task 0.2 are normatively resolved in this specification:
-
-1. **Enrollment Secret Digest-Only Storage:** Pending enrollment records store
-   only `SHA-256(UTF8(rawSecret))` as a 32-byte binary digest; raw secret is
-   never persisted, logged, or retained. Verification uses `timingSafeEqual`
-   over fixed 32-byte digests with bounded input (≤ 128 UTF-8 bytes).
-2. **Same-OS-Principal Trust-Material Threat Model:** Recognizes that same OS
-   UID != trusted operator. Filesystem permissions alone are not the
-   authentication root. Persistent device records are cryptographically authorized
-   by the trusted local operator's Ed25519 key at pending creation (`deviceId`
-   generated at pending creation) and verified on startup.
-3. **Filesystem Defense-in-Depth & Safe-Open:** Preserves regular file, mode 0600,
-   and ownership checks using descriptor/`fstat`-style validation to prevent
-   TOCTOU symlink swaps.
-4. **Client CA / Trust-Root Protection:** Eliminates process-UID writable CA
-   files; requires root/launcher ownership or an inherited read-only file descriptor.
-5. **Server Private Key Loading:** Prioritizes an inherited file descriptor from
-   the trusted launcher, removing reliance on same-UID filesystem boundaries.
-6. **Three-Phase Durability Failure Semantics:** Pre-rename failure keeps the
-   original file authoritative; post-rename parent-fsync failure enters a fatal
-   fail-closed state rather than reporting success.
-7. **Generic Enrollment Failure:** Unifies all application failures on
-   `POST /enroll/complete` to generic HTTP 400 `{"error":"Enrollment failed"}`
-   without oracles.
-8. **Duplicate Pending Enrollment Semantics:** Enforces at most one active pending
-   enrollment per expected SPKI pin with exact record reuse and no TTL reset.
-9. **Deterministic Bounded Token-Bucket Rate Limiter:** Replaces qualitative
-   sliding-window wording with exact token-bucket parameters and monotonic time
-   for Layers A, B, and C.
-10. **Runtime Certificate Expiry & Connection Drain:** Enforces maximum 60-second
-    drain for established connections on cert expiry before force-closing sockets
-    and revoking sessions.
-11. **Normal Shutdown Drain:** Bounds shutdown drain to maximum 60 seconds before
-    force-closing sockets and flushing audit evidence.
-12. **Implementation Breakdown Separation:** Isolates Task 5 to pure session
-    state core in `packages/auth/**` and assigns wire bootstrap/HTTP headers
-    to Task 8 in `apps/mcp-server`.
+All 15 architectural blockers identified during Task 0.1 review (enrollment
+bootstrap deadlock, numeric bounds, session bootstrap wire protocol, session ID
+unification, trust store and CA file integrity, anti-oracle error consistency,
+three-layer rate limiting, rate limiter memory bounds, TLS server certificate
+validation, runtime certificate expiry, resource caps, positive flows, threat
+matrix expansion, and task breakdown decomposition) are normatively resolved in
+this specification.
 
 ---
 
@@ -154,41 +123,23 @@ and instead receive generic `UNAUTHENTICATED` to prevent device enumeration.
 
 ```text
 UNTRUSTED REMOTE CLIENT
-  │
-  ▼
-[ Layer A: TCP/TLS Connection Admission ] (Token bucket: cap 20, refill 1/s, peer IP)
-  │ (Drop connection on token exhaustion or handshake limit)
-  ▼
-[ In-Process TLS 1.3 Handshake ] (mTLS: client cert chains to immutable client CA root)
-  │
-  ▼
-[ Layer B: Secure HTTP Pre-Session Admission ] (Token bucket: cap 30, refill 2/s, peer IP)
-  │ (HTTP 429 Too Many Requests on token exhaustion)
-  ▼
-[ Endpoint Router ]
-  ├── IF POST /enroll/complete:
-  │     → Verify pending enrollment by expected SPKI pin
-  │     → Verify one-time secret via timingSafeEqual over 32-byte digests
-  │     → Atomically commit operator-signed device record to trust store
-  │     → Return HTTP 200 OK (terminate connection, no MCP session minted)
-  │
-  └── IF /mcp:
-        → Extract client SPKI digest from TLS session
-        → Enrolled device lookup & Ed25519 operator signature check
-        │   (Mismatch / unverified ⇒ generic UNAUTHENTICATED)
+  → Layer A: TCP/TLS connection admission (peer IP, connection/handshake caps)
+  → In-process TLS 1.3 handshake (mTLS: client cert chains to configured client CA)
+  → Layer B: Secure HTTP pre-session admission (peer IP rate limiter, max 120 req/min)
+  → Endpoint router:
+      IF POST /enroll/complete:
+        → Bootstrap proof-of-possession verification
+        → Atomic trust-store update & HTTP 200 response (no MCP session created)
+      IF /mcp:
+        → Enrolled device & SPKI pin lookup (generic UNAUTHENTICATED on mismatch)
         → Gateway session authentication:
-            IF initial tokenless initialize:
-              → Mint gateway session record & server-controlled Mcp-Session-Id
-              → Return Arc-Session-Token header in response
-            IF ordinary request:
-              → Require BOTH Mcp-Session-Id AND Authorization: Bearer <token>
-              → Verify session digest, SPKI binding, monotonic TTL, revocation
-              → Mismatch / expired ⇒ generic INVALID_SESSION_TOKEN
-        → Layer C: Authenticated Session/Device Limiter (Token bucket: cap 60, refill 5/s)
-            (MCP JSON-RPC Error: RATE_LIMIT_EXCEEDED)
-        → Derive trusted actor context (clientId, clientType, deviceId, sessionId)
-        → Dispatch to shared RC-04 pipeline:
-            Schema Admission → Workspace Jailing → Layer 1 Policy → Layer 2 Policy → Approval Gate → Audit Hash Chain → Subsystem Execution
+            IF initial initialize: mint session & Mcp-Session-Id, issue Arc-Session-Token header
+            IF ordinary request: require Mcp-Session-Id + Authorization: Bearer <token>
+        → Layer C: Authenticated session/device rate limiting (max 300 req/min)
+        → Server-derived actor context (clientId, clientType, deviceId, sessionId)
+        → Existing schema / workspace / Layer 1 / Layer 2 / approval pipeline
+        → Append-only audit hash chain
+        → Subsystem execution
 ```
 
 **Remote transport must NEVER create an alternate authorization path.**
@@ -253,7 +204,7 @@ Any other HTTP request path produces `404` and terminates immediately.
 The remote gateway is explicitly permitted to start with:
 
 - Valid server TLS configuration (certificate, private key, SAN match).
-- Valid client CA / trust roots (root/launcher-owned or inherited FD).
+- Valid client CA / trust roots (regular file, restricted permissions).
 - **Zero enrolled devices** in the trust store (`enrolledDevicesCount: 0`).
 
 In this zero-device state:
@@ -270,18 +221,16 @@ The bootstrap sequence on `/mcp` operates as follows:
 
 A. **mTLS Handshake:** Client connects and completes TLS 1.3 + mTLS. ARC
 verifies that the client certificate chains to the configured client CA.
-B. **Device Resolution & Operator Signature Verification:** ARC computes the
-SHA-256 SPKI digest of the presented client certificate and looks up the
-enrolled device record. ARC verifies the cryptographic Ed25519 operator
-signature covering the record (§16.1). If not found, unverified, or revoked,
-authentication fails with generic `UNAUTHENTICATED` (§25).
+B. **Device Resolution:** ARC computes the SHA-256 SPKI digest of the presented
+client certificate and looks up the enrolled device record. If not found or
+revoked, authentication fails with generic `UNAUTHENTICATED` (§25).
 C. **Tokenless Initialize:** The **ONLY** tokenless MCP request permitted on
 `/mcp` is the initial MCP `initialize` request for a connection that has no
 existing MCP session. Any ordinary tool invocation or request missing a token
 is rejected with generic `UNAUTHENTICATED`.
-D. **Session ID Generation:** The server generates the `Mcp-Session-Id`. If an
+D. **Session ID Generation:** The SDK generates the `Mcp-Session-Id`. If an
 attacker presents a client-supplied `Mcp-Session-Id` on initial `initialize`,
-it is **never adopted**; the server generates a fresh, opaque, server-controlled
+it is **never adopted**; the SDK generates a fresh, opaque, server-controlled
 session ID.
 E. **Gateway Session Minting:** Upon successful `initialize` processing, ARC
 creates the gateway session record and mints a 256-bit CSPRNG opaque session
@@ -349,19 +298,19 @@ To eliminate ambiguity across RC-04 approval binding and remote session tracking
 
 ## 6. TLS Contract
 
-| Rule | Normative statement                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| :--- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| T-1  | **Minimum TLS version: 1.3. Maximum: 1.3.** TLS 1.2 and below are refused at handshake.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| T-2  | **Plaintext HTTP is never accepted.** No listener, no upgrade, no fallback.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| T-3  | **TLS termination MUST occur inside the ARC process.** Delegated/reverse-proxy termination is **OUT OF SCOPE** for baseline RC-05 (§33).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| T-4  | If the TLS listener cannot start (missing/unreadable key or cert, key/cert mismatch, unsupported version), the **server fails to start**. It does not start without the listener and it does not fall back to plaintext.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| T-5  | **Server certificate validation:** ARC startup verifies that its configured certificate is currently valid (not expired, not before valid) and that its Subject Alternative Name (SAN) matches the configured public hostname. ARC presents this certificate during TLS. Server-side code does not claim to prove client-side validation occurred; compliant client profiles must validate chain and hostname.                                                                                                                                                                                                                                                                                                                                                                                                         |
-| T-6  | Client certificate identity is the **SPKI digest** of the device certificate (§7).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| T-7  | **Runtime server-cert expiry & 60 s connection drain:** server certificate validity is verified at startup and re-checked before establishing each new TLS session. Once expired: no new TLS handshakes are accepted, health reports degraded gateway state (`remoteGatewayActive: false`, `authenticationActive: false`, `degradedReason: 'certificate_expired'`), and existing established connections enter a maximum **60-second drain window**. After 60 seconds, all remaining connections are force-closed, associated sessions are revoked, and no reconnection succeeds until valid certificate configuration is loaded on restart.                                                                                                                                                                           |
-| T-8  | **Malformed certificate / unknown CA:** rejected during handshake, before any HTTP or MCP byte is parsed.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| T-9  | **Revocation (CRL/OCSP):** baseline RC-05 does **not** perform network revocation checking. Revocation is enforced by ARC's authoritative local device trust store (§8, §16).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| T-10 | **Rotation:** server key/cert rotation is a restart-time operation (reload on restart). Device certificate rotation is handled by re-enrollment plus a pin overlap window (§7).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| T-11 | **Client CA trust-root same-UID protection:** Configured client CA roots establish who may reach mTLS bootstrap. A process-UID-owned writable CA file is **strictly rejected** under the same-UID threat model. Accepted mechanisms are: (A) root/trusted-launcher-owned CA file that is NOT writable by the ARC service UID (`mode & 0022 === 0`, owner != service UID or root) opened through descriptor-based no-symlink validation (`O_NOFOLLOW`/`fstat`), OR (B) inherited read-only file descriptor from a trusted launcher parsed once at startup with its SHA-256 digest retained. Size capped at 64 KiB, max 4 roots. Empty CA set fails startup in remote mode. The parsed CA material is copied into immutable in-process TLS configuration; later pathname replacement cannot alter the active trust root. |
+| Rule | Normative statement                                                                                                                                                                                                                                                                                                                                                                                            |
+| :--- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| T-1  | **Minimum TLS version: 1.3. Maximum: 1.3.** TLS 1.2 and below are refused at handshake.                                                                                                                                                                                                                                                                                                                        |
+| T-2  | **Plaintext HTTP is never accepted.** No listener, no upgrade, no fallback.                                                                                                                                                                                                                                                                                                                                    |
+| T-3  | **TLS termination MUST occur inside the ARC process.** Delegated/reverse-proxy termination is **OUT OF SCOPE** for baseline RC-05 (§33).                                                                                                                                                                                                                                                                       |
+| T-4  | If the TLS listener cannot start (missing/unreadable key or cert, key/cert mismatch, unsupported version), the **server fails to start**. It does not start without the listener and it does not fall back to plaintext.                                                                                                                                                                                       |
+| T-5  | **Server certificate validation:** ARC startup verifies that its configured certificate is currently valid (not expired, not before valid) and that its Subject Alternative Name (SAN) matches the configured public hostname. ARC presents this certificate during TLS. Server-side code does not claim to prove client-side validation occurred; compliant client profiles must validate chain and hostname. |
+| T-6  | Client certificate identity is the **SPKI digest** of the device certificate (§7).                                                                                                                                                                                                                                                                                                                             |
+| T-7  | **Runtime server-cert expiry:** server certificate validity is verified at startup and re-checked before establishing each new TLS session. Once expired, new TLS handshakes are refused, health reports degraded gateway state (§19), and existing connections drain gracefully within connection TTL. Expired client certs are rejected at handshake.                                                        |
+| T-8  | **Malformed certificate / unknown CA:** rejected during handshake, before any HTTP or MCP byte is parsed.                                                                                                                                                                                                                                                                                                      |
+| T-9  | **Revocation (CRL/OCSP):** baseline RC-05 does **not** perform network revocation checking. Revocation is enforced by ARC's authoritative local device trust store (§8).                                                                                                                                                                                                                                       |
+| T-10 | **Rotation:** server key/cert rotation is a restart-time operation (reload on restart). Device certificate rotation is handled by re-enrollment plus a pin overlap window (§7).                                                                                                                                                                                                                                |
+| T-11 | **Client CA trust-root integrity:** configured client CA files must be regular files (`S_ISREG`), not symlinks, owned by the process UID or root, and not group/world writable (`mode & 0022 === 0`). Size capped at 64 KiB, max 4 roots. Empty CA set fails startup in remote mode.                                                                                                                           |
 
 ### 6.1 Why in-process TLS
 
@@ -381,16 +330,16 @@ define.
 **Decision: mTLS is MANDATORY for remote mode, and pinning is ADDITIONAL to
 normal chain validation — never a replacement for it.**
 
-| Rule | Normative statement                                                                                                                                                                                                                                                                                                                                                                      |
-| :--- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| P-1  | **mTLS is mandatory.** A remote connection without a client certificate is rejected during handshake.                                                                                                                                                                                                                                                                                    |
-| P-2  | **Server trust** is established by the client validating the server certificate against its configured trust anchor and the configured hostname. Client validation compliance is verified in client profile test fixtures.                                                                                                                                                               |
-| P-3  | **Client/device trust** requires **both**: (a) the certificate chains to a configured CA/trust root, **and** (b) its SPKI digest is pinned to an enrolled device. Failing either fails authentication.                                                                                                                                                                                   |
-| P-4  | **Pinned object: the certificate's SubjectPublicKeyInfo (SPKI) digest** — not the whole certificate. Pinning the SPKI survives certificate re-issuance with the same key and avoids pinning CA-specific encoding.                                                                                                                                                                        |
-| P-5  | **Digest algorithm: SHA-256**, rendered as **64 lowercase hexadecimal characters**. `sha256(DER(SubjectPublicKeyInfo))`.                                                                                                                                                                                                                                                                 |
-| P-6  | **Mismatch behaviour:** authentication fails with a sanitized `UNAUTHENTICATED` (§25). The response MUST NOT reveal that a pin nearly matched, which pin failed, whether the device exists, or whether the presented certificate chains to a known CA.                                                                                                                                   |
-| P-7  | **Rotation:** a device record may hold **at most 2 active pins** (1 primary + 1 rotation overlap window). A pin is only ever added or removed through the authenticated local operator path (§9, §16.1), carrying a valid operator Ed25519 signature. The overlap window must be explicitly closed by removing the old pin; an unused pin never expires silently into a "no pins" state. |
-| P-8  | **Malformed pin configuration** (wrong length, non-hex, duplicates that collapse) is a **startup failure** (§18). Empty pin sets for an enrolled device are invalid.                                                                                                                                                                                                                     |
+| Rule | Normative statement                                                                                                                                                                                                                                                                                                                                  |
+| :--- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| P-1  | **mTLS is mandatory.** A remote connection without a client certificate is rejected during handshake.                                                                                                                                                                                                                                                |
+| P-2  | **Server trust** is established by the client validating the server certificate against its configured trust anchor and the configured hostname. Client validation compliance is verified in client profile test fixtures.                                                                                                                           |
+| P-3  | **Client/device trust** requires **both**: (a) the certificate chains to a configured CA/trust root, **and** (b) its SPKI digest is pinned to an enrolled device. Failing either fails authentication.                                                                                                                                               |
+| P-4  | **Pinned object: the certificate's SubjectPublicKeyInfo (SPKI) digest** — not the whole certificate. Pinning the SPKI survives certificate re-issuance with the same key and avoids pinning CA-specific encoding.                                                                                                                                    |
+| P-5  | **Digest algorithm: SHA-256**, rendered as **64 lowercase hexadecimal characters**. `sha256(DER(SubjectPublicKeyInfo))`.                                                                                                                                                                                                                             |
+| P-6  | **Mismatch behaviour:** authentication fails with a sanitized `UNAUTHENTICATED` (§25). The response MUST NOT reveal that a pin nearly matched, which pin failed, whether the device exists, or whether the presented certificate chains to a known CA.                                                                                               |
+| P-7  | **Rotation:** a device record may hold **at most 2 active pins** (1 primary + 1 rotation overlap window). A pin is only ever added through the authenticated local operator path (§9). The overlap window is operator-controlled and MUST be explicitly closed by removing the old pin; an unused pin never expires silently into a "no pins" state. |
+| P-8  | **Malformed pin configuration** (wrong length, non-hex, duplicates that collapse) is a **startup failure** (§18). Empty pin sets for an enrolled device are invalid.                                                                                                                                                                                 |
 
 ---
 
@@ -399,14 +348,14 @@ normal chain validation — never a replacement for it.**
 | Field / rule                       | Normative statement                                                                                                                                                                                                                                 |
 | :--------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **`deviceId` format**              | **32 lowercase hexadecimal characters** (16 random bytes). Fixed length, no separators, no caller-supplied form.                                                                                                                                    |
-| **Generation authority**           | **ARC generates `deviceId` at pending-enrollment creation** (§9). A client never proposes, supplies, or influences it.                                                                                                                              |
-| **Cryptographic binding**          | A device record binds `deviceId` ↔ enrolled pin(s) (§7), signed by the trusted operator's Ed25519 key (§16.1). Knowing a `deviceId` grants nothing, and a valid client certificate that is not enrolled and signed is rejected.                     |
+| **Generation authority**           | **ARC generates `deviceId`** at enrollment. A client never proposes, supplies, or influences it.                                                                                                                                                    |
+| **Cryptographic binding**          | A device record binds `deviceId` ↔ enrolled pin(s) (§7). Neither half is meaningful without the other: knowing a `deviceId` grants nothing, and a valid client certificate that is not enrolled is rejected.                                        |
 | **`clientId` vs `deviceId`**       | **Distinct.** `clientId` is the logical client identity (which agent/tool integration); `deviceId` is the physical enrolled credential holder.                                                                                                      |
 | **Multiplicity**                   | One `clientId` **may** have multiple `deviceId`s. One `deviceId` belongs to **exactly one** `clientId`.                                                                                                                                             |
 | **Resource caps**                  | Max enrolled devices: **256**. Max active pins per device: **2**. Max display label: **64 UTF-8 bytes**. Max serialized trust store size: **256 KiB**. Exceeding any cap rejects enrollment closed with `RESOURCE_EXHAUSTED`.                       |
 | **Duplicate enrollment**           | Enrolling a certificate whose pin already exists **reuses the existing `deviceId`** and does not create a second record. If it is bound to a different `clientId`, enrollment is **rejected**.                                                      |
 | **Disabled/revoked**               | A revoked device fails authentication on the **next** request with generic `UNAUTHENTICATED` (pre-session) or `INVALID_SESSION_TOKEN` (existing session), and live sessions are revoked immediately (§11). Client never sees `DEVICE_NOT_ENROLLED`. |
-| **Persisted metadata**             | `deviceId`, `clientId`, `clientType`, pin set (max 2), enrollment timestamp, operator display label (max 64 bytes), revocation state, and operator Ed25519 cryptographic authorization signature (§16.1).                                           |
+| **Persisted metadata**             | `deviceId`, `clientId`, `clientType`, pin set (max 2), enrollment timestamp, operator display label (max 64 bytes), revocation state.                                                                                                               |
 | **Never trusted from caller JSON** | `deviceId`, `clientId`, `clientType`, `sessionId`, pin values, revocation state, enrollment time. These are **always** derived server-side from the authenticated connection (§13).                                                                 |
 | **Impersonation bar**              | A remote client **cannot** choose an arbitrary `deviceId`, present another device's `deviceId`, or assert another `clientId`. Any request carrying such a field in JSON-RPC is refused at schema admission (§13, §27).                              |
 
@@ -422,88 +371,36 @@ bootstrap endpoint for pending records. There is NO remote self-enrollment.**
 
 To resolve the enrollment bootstrap deadlock without bypassing authentication:
 
-1. **Local Operator Initiation & Cryptographic Authorization:**
-   - The authenticated local operator initiates enrollment via local admin IPC
-     (Unix socket).
-   - At pending-enrollment creation, ARC generates the `deviceId` (32 lowercase hex
-     chars) immediately.
-   - The operator's authenticated client creates an Ed25519 signature over a
-     canonical JSON authorization payload covering:
-     `schemaVersion`, `deviceId`, `clientId`, `clientType`, expected SPKI pin set,
-     display label (if present), and a 256-bit authorization nonce/id.
-     Domain separation string: `CESSPACE_ARC_RC05_DEVICE_TRUST_V1`.
-   - The server stores the operator signature, expected SPKI, and metadata in the
-     pending enrollment record. The operator private key is **never** stored in
-     the server.
-2. **One-Time Enrollment Secret Verifier Model:**
-   - Generated using `crypto.randomBytes(32).toString('hex')` (64 lowercase hex
-     characters, 256 bits entropy).
-   - The raw secret is returned/disclosed **exactly once** to the authenticated
-     local operator over admin IPC.
-   - The server **never intentionally retains** the raw secret after issuance. It
-     is **never persisted**, **never logged**, **never audited**, and **never
-     included in error responses**.
-   - Pending enrollment stores **ONLY** the binary SHA-256 digest:
-     ```text
-     expectedSecretDigest = SHA-256(UTF8(rawSecret))
-     ```
-     as an exact 32-byte binary Buffer.
-   - **Bounded Runtime Memory Zeroization Claim:** JavaScript runtime engines
-     (V8) do not guarantee immediate cryptographic memory zeroization because of
-     garbage collector string interning and object relocation. CesSpace ARC bounds
-     and minimizes memory exposure by handling secrets in ephemeral Buffers,
-     avoiding storing raw secret strings on persistent objects, and clearing
-     secret Buffers immediately after hashing.
-3. **Duplicate Pending Enrollment Semantics:**
-   - At most **one active pending enrollment** may exist for a given expected SPKI
-     pin.
-   - Attempting to create another pending enrollment for an expected SPKI that
-     already has an active pending challenge **does not create another secret**,
-     **does not reset the monotonic TTL**, and **does not alter identity fields**.
-   - It reuses and returns the existing pending record identifier with its
-     original expiration deadline, preventing challenge duplication and TTL
-     extension attacks (consistent with RC-04 approval deduplication).
-   - Concurrency control ensures two simultaneous creations cannot produce two
-     pending records for the same SPKI.
-4. **Completion Endpoint (`POST /enroll/complete`):**
+1. **Local Initiation:** The authenticated local operator creates a pending
+   enrollment via the local admin IPC (Unix socket). The pending record records
+   the expected `clientId`, `clientType`, expected SPKI pin, a high-entropy
+   256-bit one-time enrollment secret (64 hex characters), and monotonic expiry.
+2. **Completion Endpoint:** Remote completion is exposed strictly on
+   `POST /enroll/complete`.
    - **Bootstrap only:** This is an ARC gateway bootstrap endpoint, NOT an MCP
-     endpoint and NOT an MCP tool. It does NOT create an MCP session, does NOT
-     issue an `Arc-Session-Token`, and does NOT reach policy or subsystems.
+     endpoint and NOT an MCP tool.
+   - **Pre-session isolation:** It does NOT create an MCP session, does NOT issue
+     an `Arc-Session-Token`, and does NOT reach policy or subsystems.
    - **mTLS Requirement:** The client connects over TLS 1.3 mTLS. The client
      certificate MUST chain to the configured client trust root.
    - **Proof of Possession:** The presented certificate's SPKI digest MUST
      exactly match the pending enrollment's expected SPKI pin. This proves
      private-key possession via successful TLS 1.3 handshake.
-   - **Secret Verification:** The client transmits the secret in the JSON request
-     body: `{"secret": "<secret-string>"}`. Input is strictly bounded to a
-     **maximum of 128 UTF-8 bytes**; oversized or malformed input fails bounded
-     admission immediately. The supplied text is hashed directly as UTF-8, and
-     the resulting 32-byte digest is compared against `expectedSecretDigest` using
-     `crypto.timingSafeEqual`. Raw-string equality comparison is strictly forbidden.
+   - **Secret Verification:** The client transmits the one-time secret in the
+     JSON request body: `{"secret": "<64-hex-secret>"}` (bounded ≤ 4 KiB).
+     Comparison is constant-time (`timingSafeEqual`).
    - **Atomic Single-Use Activation:** Upon match, the pending record is
-     consumed and the pre-signed device record is committed to the persistent trust
-     store (§16). ARC returns HTTP `200 OK`.
-   - **Remote Completion Authority Boundary:** Remote completion MUST NOT gain
-     power to alter `clientId`, `clientType`, `deviceId`, or pins; it can only
-     activate the identity already authorized by the operator.
+     consumed and the enrolled device record is atomically committed to the
+     persistent trust store (§16). ARC returns HTTP `200 OK`.
    - **Post-Enrollment Normal Authentication:** The device must then authenticate
      normally on `/mcp` via mTLS and tokenless `initialize` (§5.3).
-5. **Generic Enrollment Failure (Anti-Oracle):**
-   - After TLS completes, all application-level completion failures are
-     **externally indistinguishable**:
-     (a) no pending enrollment for presented SPKI,
-     (b) pending enrollment expired,
-     (c) wrong enrollment secret,
-     (d) expected SPKI mismatch,
-     (e) cancelled challenge,
-     (f) already-consumed challenge.
-   - All return strictly **HTTP 400 Bad Request** with one constant generic body:
-     ```json
-     { "error": "Enrollment failed" }
-     ```
-   - No pending-record existence, secret mismatch, or diagnostic information is
-     disclosed to the remote client. Operator audit retains a sanitized internal
-     reason code.
+   - **Failure Paths:** All application-level bootstrap failures on
+     `POST /enroll/complete` (no matching pending record, expired challenge,
+     SPKI mismatch, incorrect secret, or replay of a consumed secret) fail
+     closed with a uniform, indistinguishable **HTTP 400 Bad Request**
+     response (`{"error":"Enrollment failed"}`). The endpoint does not expose
+     whether the pending record existed, expired, had the wrong SPKI, or had
+     the wrong secret. The trust store state remains completely unchanged.
 
 ### 9.2 Frozen Enrollment Numeric Bounds
 
@@ -524,19 +421,16 @@ All numeric bounds are concrete, testable constants:
 | :--- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | E-1  | **Who may enroll:** only the authenticated local operator, through the RC-04 admin IPC channel (Ed25519 challenge–response over a Unix socket).                                                                                                          |
 | E-2  | **Trusted authorising channel:** the local admin IPC. The remote gateway is **never** an enrollment authority.                                                                                                                                           |
-| E-3  | **Local-operator initiated & signed:** yes. Operator generates `deviceId` and signs the canonical authorization; device completes remotely.                                                                                                              |
+| E-3  | **Local-operator initiated:** yes. The operator creates a pending enrollment; the device then completes it.                                                                                                                                              |
 | E-4  | **Proof of possession:** device proves private key possession by completing mTLS with the pending SPKI certificate and presenting the one-time secret on `POST /enroll/complete`. A certificate presented without its private key can never be enrolled. |
 | E-5  | **Challenge lifetime:** 300 s monotonic TTL. Unconsumed enrollments are purged at expiry. Expiration never extends on inspection or retry.                                                                                                               |
-| E-6  | **One-time / replay:** an enrollment secret is single-use. Replay attempts fail with generic HTTP 400 and MUST NOT mint a second device or mutate state.                                                                                                 |
+| E-6  | **One-time / replay:** an enrollment secret is single-use. Replay attempts fail and MUST NOT mint a second device or mutate state.                                                                                                                       |
 | E-7  | **Pending quotas:** max 16 global, max 4 per operator. Exceeding quotas fails closed without mutating state.                                                                                                                                             |
 | E-8  | **Cancellation / rejection:** operator may cancel pending enrollment; secret becomes unusable immediately.                                                                                                                                               |
 | E-9  | **Duplicate enrollment:** per §8 — same pin ⇒ same `deviceId`, no duplicate record; pin already bound to another `clientId` ⇒ rejected.                                                                                                                  |
 | E-10 | **Credential issuance/import:** ARC **does not** generate or export device private keys. The operator supplies a public key/pin; the private key never enters ARC.                                                                                       |
 | E-11 | **Failure/restart:** pending enrollments are volatile and purged on restart (§16). **Completed enrollments survive restart** via atomic trust store persistence.                                                                                         |
 | E-12 | **Failed attempt lockout:** maximum 3 failed secret submissions per challenge before immediate challenge purging.                                                                                                                                        |
-| E-13 | **Digest-only retention:** pending enrollments store only `SHA-256(UTF8(rawSecret))` (32-byte Buffer). Raw secret is never persisted, logged, or audited.                                                                                                |
-| E-14 | **Generic failure response:** all application-level completion failures return uniform HTTP 400 `{"error":"Enrollment failed"}` without oracle disclosure.                                                                                               |
-| E-15 | **Duplicate pending deduplication:** re-requesting a pending enrollment for an active expected SPKI reuses the existing record without TTL reset or secret regeneration.                                                                                 |
 
 ---
 
@@ -601,39 +495,39 @@ approval tokens (§28). Neither is accepted in the other's position.
 Exact order of evaluation for remote operations:
 
 ```text
-1. Layer A — TCP/TLS token-bucket admission (peer IP, capacity 20, refill 1/s; connection/handshake caps)
-2. TLS 1.3 handshake (client cert verified against immutable client CA trust root)
-3. Layer B — Secure HTTP pre-session token-bucket limiter (peer IP, capacity 30, refill 2/s)
+1. Layer A — TCP/TLS connection admission (peer IP, connection cap, handshake cap)
+2. TLS 1.3 handshake (client cert verified against configured CA trust root)
+3. Layer B — Secure HTTP pre-session rate limiting (peer IP, max 120 req/min)
 4. Endpoint router:
      IF POST /enroll/complete:
-       → Verify pending enrollment by expected SPKI pin
-       → Verify one-time secret via timingSafeEqual over 32-byte digests
-       → Atomically commit operator-signed device record to trust store
+       → Verify pending enrollment by expected SPKI
+       → Verify one-time secret (constant-time)
+       → Atomically commit enrolled device to trust store
        → Return HTTP 200 OK (terminate connection, no MCP session created)
      IF /mcp:
        → SPKI digest extracted from TLS client cert
-       → Enrolled device lookup & Ed25519 operator signature check (mismatch ⇒ generic UNAUTHENTICATED)
+       → Enrolled device lookup (mismatch ⇒ generic UNAUTHENTICATED)
        → Session authentication:
            IF tokenless initialize:
              → Mint gateway session record & Mcp-Session-Id
              → Return Arc-Session-Token header in response
            IF ordinary request:
              → Require BOTH Mcp-Session-Id AND Authorization: Bearer <token>
-             → Verify session digest, SPKI binding, monotonic TTL, revocation
+             → Verify session digest, SPKI binding, TTL, revocation
              → Mismatch/expired ⇒ generic INVALID_SESSION_TOKEN
-5. Layer C — Authenticated session/device token-bucket limiter (capacity 60, refill 5/s)
+5. Layer C — Authenticated session/device rate limiting (max 300 req/min)
 6. Derive trusted actor context (clientId, clientType, deviceId, sessionId)
 7. Dispatch to shared RC-04 pipeline (schema → workspace → Layer 1 → Layer 2 → approval → audit → subsystem)
 ```
 
 | Check                                                        | Frequency                            | Refusal result                  |
 | :----------------------------------------------------------- | :----------------------------------- | :------------------------------ |
-| Layer A: TCP/TLS token bucket                                | Once per connection attempt          | TCP drop / reset                |
+| Layer A: TCP/TLS admission                                   | Once per connection                  | TCP drop / close                |
 | TLS 1.3 + CA chain validation                                | Once per connection                  | TLS alert / handshake close     |
-| Layer B: Pre-session HTTP token bucket                       | Every HTTP request                   | HTTP 429 Too Many Requests      |
-| Enrolled device lookup & operator signature verification     | Once per connection / session init   | generic `UNAUTHENTICATED`       |
+| Layer B: Pre-session HTTP limiter                            | Every HTTP request                   | HTTP 429 Too Many Requests      |
+| Enrolled device lookup                                       | Once per connection / session init   | generic `UNAUTHENTICATED`       |
 | Session token validity (digest, expiry, revocation, binding) | **Every request**                    | generic `INVALID_SESSION_TOKEN` |
-| Layer C: Authenticated token bucket                          | **Every request**                    | MCP `RATE_LIMIT_EXCEEDED`       |
+| Layer C: Authenticated limiter                               | **Every request**                    | MCP `RATE_LIMIT_EXCEEDED`       |
 | Actor context derivation                                     | **Every request**                    | Internal server-side            |
 | Policy / approval / subsystem                                | Every request (unchanged from RC-04) | `POLICY_DENIED` etc.            |
 
@@ -701,94 +595,41 @@ decided by the same code path that decides it for stdio.
 
 ## 16. Persistence Model
 
-| State class                       | Volatile / Persistent | Storage authority                          | Restart behaviour                                                                   | Corruption / failure behaviour                                                                       |
-| :-------------------------------- | :-------------------- | :----------------------------------------- | :---------------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------- |
-| **Enrolled device trust**         | **Persistent**        | ARC-owned trust store, operator-authorized | Survives restart                                                                    | Unreadable/invalid/unverified store ⇒ **startup failure**, no listener. Never silently starts empty. |
-| **Session tokens**                | **Volatile**          | In-memory                                  | **All revoked on restart**                                                          | Corrupt entry ⇒ that session fails closed.                                                           |
-| **Active connections**            | **Volatile**          | In-memory                                  | Closed on restart                                                                   | n/a                                                                                                  |
-| **Rate-limit state**              | **Volatile**          | In-memory                                  | Reset on restart (a restart is an operator action, not an attacker-reachable reset) | Corrupt entry ⇒ treated as over-limit for that key.                                                  |
-| **Pending enrollment challenges** | **Volatile**          | In-memory                                  | **Purged on restart**; the operator re-initiates                                    | Corrupt entry ⇒ challenge unusable.                                                                  |
-| **Audit chain**                   | **Volatile (RC-05)**  | In-memory hash chain, unchanged from RC-04 | Lost on restart                                                                     | Unchanged from RC-04. **RC-06 owns persistence/anchoring.**                                          |
+| State class                       | Volatile / Persistent | Storage authority                          | Restart behaviour                                                                   | Corruption / failure behaviour                                                                          |
+| :-------------------------------- | :-------------------- | :----------------------------------------- | :---------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------ |
+| **Enrolled device trust**         | **Persistent**        | ARC-owned trust store, operator-managed    | Survives restart                                                                    | Unreadable/invalid store ⇒ **startup failure**, no listener. Never silently starts with an empty store. |
+| **Session tokens**                | **Volatile**          | In-memory                                  | **All revoked on restart**                                                          | Corrupt entry ⇒ that session fails closed.                                                              |
+| **Active connections**            | **Volatile**          | In-memory                                  | Closed on restart                                                                   | n/a                                                                                                     |
+| **Rate-limit state**              | **Volatile**          | In-memory                                  | Reset on restart (a restart is an operator action, not an attacker-reachable reset) | Corrupt entry ⇒ treated as over-limit for that key.                                                     |
+| **Pending enrollment challenges** | **Volatile**          | In-memory                                  | **Purged on restart**; the operator re-initiates                                    | Corrupt entry ⇒ challenge unusable.                                                                     |
+| **Audit chain**                   | **Volatile (RC-05)**  | In-memory hash chain, unchanged from RC-04 | Lost on restart                                                                     | Unchanged from RC-04. **RC-06 owns persistence/anchoring.**                                             |
 
-### 16.1 Same-OS-Principal Trust-Material Threat Model & Cryptographic Operator Authorization
+### 16.1 Security-Critical Trust Store Integrity
 
-RC-04 established that **same OS UID != automatically trusted operator**. In
-remote gateway mode, if an attacker executes code or achieves partial compromise
-under the service UID, filesystem permissions (`0600`) alone **do not protect**
-`devices.json` from modification. Therefore, **filesystem permissions alone are
-NOT the authentication integrity root**.
+The enrolled-device trust store (`devices.json`) is an authentication root. Its
+integrity requirements are enforced strictly:
 
-To enforce cryptographic integrity under the same-UID threat model:
-
-1. **Operator Ed25519 Authorization:** Every security-relevant persistent device
-   record must be cryptographically authorized by the trusted local operator's
-   Ed25519 signing key. The operator private key is **never stored in the server**;
-   signatures are produced exclusively on the local admin client and submitted over
-   the authenticated admin IPC.
-2. **Canonical Signed Authorization:** At pending-enrollment creation, the operator
-   signs a canonical authorization over:
-   - `schemaVersion` (integer, e.g. `1`)
-   - `deviceId` (32 hex characters, generated at pending creation)
-   - `clientId` (string)
-   - `clientType` (string)
-   - `spkiPins` (sorted array of 64-hex lowercase SPKI digests)
-   - `displayLabel` (string or null)
-   - `authorizationId` (256-bit unique nonce)
-     Using the domain separation prefix: `CESSPACE_ARC_RC05_DEVICE_TRUST_V1`.
-3. **Canonical Serialization:** Fields are serialized using canonical JSON (recursive
-   lexicographical key sort, no unescaped whitespace, UTF-8 encoded).
-4. **Startup Signature Verification:** On startup, ARC loads the trusted operator
-   public key from immutable server configuration. **Every** persistent device record
-   in `devices.json` must successfully verify against this operator public key. Any
-   unsigned record, forged record, tampered field (`clientId`, pin set, `deviceId`),
-   or invalid signature causes immediate **startup failure**.
-5. **Mutation Capability:** Device revocation, adding or removing a rotation pin,
-   and removing a device record must carry a signed operator capability from admin
-   IPC. A same-UID attacker who modifies `devices.json` without the operator private
-   key cannot manufacture a device, revive a revoked device, or alter bindings.
-
-### 16.2 Filesystem Defense-in-Depth & Safe-Open Semantics
-
-Filesystem protections remain active as defense in depth:
-
-- **Regular File Only:** The trust-store path MUST be a regular file (`S_ISREG`).
-- **Safe-Open Descriptor Validation:** Opening `devices.json` must use safe-open
-  descriptor validation: `open(O_RDONLY | O_NOFOLLOW | O_CLOEXEC)` followed by
-  `fstat(fd)` to verify file type (`S_ISREG`), ownership (`stat.uid === process.getuid()`),
-  and permissions (`mode & 0077 === 0`). This eliminates TOCTOU races inherent in
-  `lstat(path)` followed by `open(path)`.
-- **Parent Directory Integrity:** Parent directory must be owned by the process
-  UID or root, not world-writable (`mode & 0022 === 0`), and contain no symlinks.
-- **Bounded Size:** Maximum **256 KiB** on disk.
-- **Strict Closed Schema:** Unknown fields, malformed JSON, or duplicates cause
-  startup failure.
-
-### 16.3 Three-Phase Durability Failure Semantics
-
-The claim that persistence failures always leave previous on-disk state intact
-is physically impossible across multi-step filesystem operations. CesSpace ARC
-freezes exact three-phase durability failure semantics:
-
-1. **Phase 1 — Pre-Rename Failure:**
-   - Occurs during temporary file write, data flush, or `fsync(tempFd)`.
-   - The original trust-store pathname remains completely unmodified and authoritative.
-   - The admin IPC operation reports failure to the operator.
-   - Authoritative in-memory security state remains unchanged.
-2. **Phase 2 — Successful Durable Commit:**
-   - Atomic `rename(tempPath, targetPath)` succeeds AND parent directory
-     `fsync(parentFd)` succeeds.
-   - Only upon successful parent directory fsync may ARC report success to the
-     operator.
-3. **Phase 3 — Post-Rename Durability Failure:**
-   - `rename()` succeeds, but parent directory `fsync()` fails (e.g. disk I/O error).
-   - On-disk durability is now uncertain.
-   - ARC **MUST NOT report success** to the operator.
-   - ARC **MUST NOT continue normal security administration** with in-memory state
-     diverging from uncertain persistent disk state.
-   - The gateway enters a **fatal fail-closed trust-store state**: no further
-     enrollment, revocation, or pin mutations are admitted.
-   - The operator must restart/recover the service, where full startup validation
-     and operator signature verification determine the authoritative persistent state.
+1. **Regular File Only:** The trust-store path MUST be a regular file (`S_ISREG`).
+   Symlinks are **strictly rejected** via `O_NOFOLLOW` / `lstat` checks.
+2. **File Ownership:** Must be owned by the ARC process UID (`stat.uid === process.getuid()`).
+3. **Strict Permissions:** Permissions must be mode `0600` (`mode & 0077 === 0`).
+   Any group or world readable/writable trust store is a **startup failure**.
+4. **Parent Directory Integrity:** Parent directory must be owned by the process
+   UID or root, and must not be world-writable (`mode & 0022 === 0`). Path
+   traversal sequences (`..`) or ambiguous paths are rejected.
+5. **Bounded File Size:** Total serialized file size on disk MUST NOT exceed
+   **256 KiB**. Exceeding 256 KiB fails startup or enrollment.
+6. **Strict Closed Schema:** Parsing is strict JSON. Unknown fields, malformed
+   data, non-hex pins, duplicate device IDs, or duplicate pins are rejected as
+   corruption and trigger **startup failure**.
+7. **Atomic Persistence Protocol:**
+   - Serialize device records to a temporary file in the same directory (`.devices.json.tmp.<pid>.<timestamp>`).
+   - Flush bytes and sync to disk via `fsync(fd)`.
+   - Atomically rename the temporary file over the trust store path via `rename(2)`.
+   - `fsync` the containing parent directory after rename where supported by the OS.
+8. **Fail-Closed Write Contract:** If any write or sync step fails, the operation
+   MUST NOT report success to the operator. Trust store updates fail closed;
+   partial or corrupt updates leave the pre-existing trust state intact.
 
 **Explicit non-regression:** RC-04 approvals remain **volatile**. RC-05 must not
 make approval state persistent as a side effect of persisting device trust.
@@ -797,19 +638,19 @@ make approval state persistent as a side effect of persisting device trust.
 
 ## 17. Private Key and Certificate Handling
 
-| Rule | Normative statement                                                                                                                                                                                                                                                                                                                                                                                                    |
-| :--- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| K-1  | **Zero real keys/certificates in the repository.** Public examples use generated or clearly-sanitized placeholders.                                                                                                                                                                                                                                                                                                    |
-| K-2  | **Zero secret defaults** and **zero credentials embedded in source**.                                                                                                                                                                                                                                                                                                                                                  |
-| K-3  | **No secret material in logs, audit records, or errors.**                                                                                                                                                                                                                                                                                                                                                              |
-| K-4  | **No private key passed via an ordinary command-line argument.**                                                                                                                                                                                                                                                                                                                                                       |
-| K-5  | **No private key intentionally echoed** to stdout/stderr, ever.                                                                                                                                                                                                                                                                                                                                                        |
-| K-6  | **Server private key loading:** Under the same-UID threat model, a `0600` process-owned file does not protect private keys from other processes running as the same UID. The **preferred baseline** is loading from an **inherited file descriptor** supplied by the trusted launcher. Pathname loading is approved only when the host deployment boundary guarantees no untrusted process shares the ARC service UID. |
-| K-7  | **Environment variables are not approved for long-lived private key _material_.** They are readable via `/proc/<pid>/environ`, are dumped by crash reporters, and easily leaked. Environment may carry only non-secret selectors (path or FD number).                                                                                                                                                                  |
-| K-8  | Client/device private keys **never enter ARC** (§9 E-10).                                                                                                                                                                                                                                                                                                                                                              |
-| K-9  | Session-token verifier material is derived, not configured: the verifier is a SHA-256 digest computed from the presented token (§11), so there is **no server-side signing or verifier secret to store**.                                                                                                                                                                                                              |
-| K-10 | CA/enrollment signing material: RC-05 baseline needs **no ARC-operated CA** (§9). If a future stage introduces one, it requires its own scope review.                                                                                                                                                                                                                                                                  |
-| K-11 | **Client CA file integrity & same-UID protection:** Client CA roots must be root/launcher-owned, not writable by the service UID, opened via descriptor-based safe-open validation (`O_NOFOLLOW`/`fstat`), OR supplied as an inherited read-only FD. Process-UID writable CA roots are rejected. Size ≤ 64 KiB, max 4 roots.                                                                                           |
+| Rule | Normative statement                                                                                                                                                                                                                                                                                                             |
+| :--- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| K-1  | **Zero real keys/certificates in the repository.** Public examples use generated or clearly-sanitized placeholders.                                                                                                                                                                                                             |
+| K-2  | **Zero secret defaults** and **zero credentials embedded in source**.                                                                                                                                                                                                                                                           |
+| K-3  | **No secret material in logs, audit records, or errors.**                                                                                                                                                                                                                                                                       |
+| K-4  | **No private key passed via an ordinary command-line argument.**                                                                                                                                                                                                                                                                |
+| K-5  | **No private key intentionally echoed** to stdout/stderr, ever.                                                                                                                                                                                                                                                                 |
+| K-6  | Server private key runtime loading: from a **file path with strict permission validation** (must not be group/world readable, must not be a symlink, must be a regular file owned by the process uid) **or** from an **inherited file descriptor**. Both are approved; the FD form is preferred where the launcher supports it. |
+| K-7  | **Environment variables are not approved for long-lived private key _material_.** They are readable by same-uid processes via `/proc/<pid>/environ`, are commonly dumped by crash reporters, and are easy to leak into logs. Environment may carry only non-secret selectors (e.g. a path or an FD number).                     |
+| K-8  | Client/device private keys **never enter ARC** (§9 E-10).                                                                                                                                                                                                                                                                       |
+| K-9  | Session-token verifier material is derived, not configured: the verifier is a SHA-256 digest computed from the presented token (§11), so there is **no server-side signing or verifier secret to store**.                                                                                                                       |
+| K-10 | CA/enrollment signing material: RC-05 baseline needs **no ARC-operated CA** (§9). If a future stage introduces one, it requires its own scope review.                                                                                                                                                                           |
+| K-11 | **Client CA file integrity:** Configured client CA files must be regular files (`S_ISREG`), not symlinks, owned by process UID or root, and not group/world writable (`mode & 0022 === 0`). Size ≤ 64 KiB, max 4 roots. Empty set fails startup in remote mode.                                                                 |
 
 ---
 
@@ -827,7 +668,7 @@ disabled but server running" unless stated.
 | Key/cert mismatch                                           | **Startup failure** |
 | Server certificate expired or not yet valid                 | **Startup failure** |
 | Server certificate SAN does not match configured hostname   | **Startup failure** |
-| Client CA file missing, symlink, or writable by service UID | **Startup failure** |
+| Client CA file is missing, symlink, or group/world-writable | **Startup failure** |
 | Client CA file exceeds 64 KiB or contains unparseable PEM   | **Startup failure** |
 | Empty client CA / trust-root set in remote mode             | **Startup failure** |
 | Trust store path is a symlink or group/world-writable       | **Startup failure** |
@@ -835,8 +676,6 @@ disabled but server running" unless stated.
 | Trust store exceeds 256 KiB on disk                         | **Startup failure** |
 | Malformed pin (length/charset/duplicate)                    | **Startup failure** |
 | Corrupt / invalid / unparseable device trust store          | **Startup failure** |
-| Persisted device record lacking valid operator signature    | **Startup failure** |
-| Persisted record signature mismatch or tampered fields      | **Startup failure** |
 | Unsupported TLS version configured                          | **Startup failure** |
 | Invalid listener port or address                            | **Startup failure** |
 | Remote mode with authentication disabled                    | **Startup failure** |
@@ -894,70 +733,71 @@ Counts are safe; material is not.
 
 ---
 
-## 21. Rate Limiting — Deterministic Bounded Token Bucket
+## 21. Rate Limiting
 
-**Three explicit admission layers governed by an exact bounded token-bucket
-algorithm using monotonic time (`process.hrtime.bigint()`).**
+**Three explicit admission layers with independent keys and boundaries, because
+cryptography and HTTP parsing must be protected before they execute.**
 
 ```text
 INCOMING TCP CONNECTION
   │
   ▼
-[ Layer A: TCP/TLS Token Bucket ]
-  • Key: Normalized Peer IP | Max Keys: 4096
-  • Capacity = 20 tokens | Refill = 1 token/sec (60/min) | Cost = 1 token / connection
+[ Layer A: TCP/TLS Admission Limiter ]
+  • Key: Normalized Peer IP
+  • 60 conn/min (burst 20) | Max 32 conn/IP | Max 512 global conn | Max 64 handshakes
   • Refusal: Immediate TCP reset / connection drop (NO HTTP/MCP body)
   │
   ▼ (TLS 1.3 mTLS Handshake completes)
   │
-[ Layer B: Secure HTTP Pre-Session Token Bucket ]
-  • Key: Normalized Peer IP | Max Keys: 2048
-  • Capacity = 30 tokens | Refill = 2 tokens/sec (120/min) | Cost = 1 token / HTTP request
+[ Layer B: Secure HTTP Pre-Session Limiter ]
+  • Key: Normalized Peer IP
+  • 120 req/min (burst 30)
   • Refusal: HTTP 429 Too Many Requests (sanitized plaintext, NO MCP body)
   │
   ▼ (Session authenticated: deviceId & Mcp-Session-Id derived)
   │
-[ Layer C: Authenticated Session/Device Token Bucket ]
-  • Key: Server-derived deviceId / sessionId | Max Keys: 1024
-  • Capacity = 60 tokens | Refill = 5 tokens/sec (300/min) | Cost = 1 token / MCP request
+[ Layer C: Authenticated Session/Device Limiter ]
+  • Key: Server-derived deviceId / sessionId
+  • 300 req/min (burst 60)
   • Refusal: MCP JSON-RPC Error: RATE_LIMIT_EXCEEDED
 ```
 
-### 21.1 Deterministic Token-Bucket Algorithm
+### 21.1 Three Admission Layers
 
-For each key, the limiter stores strictly two values:
+1. **Layer A — TCP/TLS admission:**
+   - Runs before and during TLS handshake.
+   - Keyed on normalized peer network identity.
+   - Max 60 connection attempts / min (burst 20).
+   - Max 32 concurrent live connections per peer IP.
+   - Max 512 concurrent live connections globally.
+   - Max 64 concurrent in-flight TLS handshakes.
+   - Refusal action: Drop connection / abort socket immediately. No HTTP or MCP
+     body is possible or required here. Protects TLS CPU budget.
+2. **Layer B — Secure HTTP pre-session admission:**
+   - Runs after successful TLS handshake, before session-token lookup, MCP
+     JSON-RPC parsing, policy evaluation, or subsystem invocation.
+   - Keyed on normalized peer network identity.
+   - Max 120 HTTP requests / min (burst 30).
+   - Refusal action: HTTP 429 Too Many Requests with sanitized headers and no
+     MCP JSON-RPC body. Protects JSON parsing and token verifier budget.
+3. **Layer C — Authenticated session/device admission:**
+   - Runs after identity and session credentials are authenticated.
+   - Keyed on server-derived `deviceId` and `sessionId`.
+   - Max 300 MCP requests / min (burst 60).
+   - Refusal action: MCP JSON-RPC error with `RATE_LIMIT_EXCEEDED`.
 
-```typescript
-interface TokenBucketEntry {
-  tokens: number;
-  lastRefillMonotonic: bigint; // nanoseconds from process.hrtime.bigint()
-}
-```
+### 21.2 Rate Limiter Memory Bounds
 
-- **Refill Evaluation:** On each attempt:
-  $$\Delta t = 	ext{nowMonotonic} - 	ext{lastRefillMonotonic}$$
-  $$ ext{tokensToAdd} = \lfloor \Delta t 	imes 	ext{refillRate}
-  $$
+Limiter memory is strictly bounded against source-IP churn attacks:
 
-floor$$
-  $$ ext{tokens} = \min( ext{capacity}, ext{tokens} + ext{tokensToAdd})$$
+| Limiter Layer | Maximum Retained Keys | Entry Representation              | Idle Eviction Timeout | Capacity Saturation Behavior                                               |
+| :------------ | :-------------------- | :-------------------------------- | :-------------------- | :------------------------------------------------------------------------- |
+| **Layer A**   | **4096** keys         | Compact fixed-size struct (~64 B) | **60 s** monotonic    | LRU eviction of expired keys; if full, fail-closed (reject connection)     |
+| **Layer B**   | **2048** keys         | Compact fixed-size struct (~64 B) | **60 s** monotonic    | LRU eviction of expired keys; if full, fail-closed (HTTP 429)              |
+| **Layer C**   | **1024** keys         | Compact fixed-size struct (~64 B) | **60 s** monotonic    | LRU eviction of expired keys; if full, fail-closed (`RATE_LIMIT_EXCEEDED`) |
 
-- **Monotonic Clock Only:** Wall-clock time is never used; clock adjustments or
-  rollbacks cannot grant tokens or bypass the limiter.
-- **Strict Capacity Clamp:** Refill never accumulates beyond `capacity`.
-- **Zero Negative Borrowing:** Requests are refused immediately if `tokens < cost`.
-  Negative token balances are forbidden.
-- **Fixed O(1) Memory:** No timestamp arrays or request logs are retained.
-
-### 21.2 Rate Limiter Parameters & Memory Bounds
-
-| Layer       | Key Type                       | Capacity | Refill Rate  | Cost / Request | Max Keys | Idle Eviction | Capacity Saturation Behavior                               |
-| :---------- | :----------------------------- | :------- | :----------- | :------------- | :------- | :------------ | :--------------------------------------------------------- |
-| **Layer A** | Normalized Peer IP             | **20**   | 1 token / s  | 1 token        | **4096** | 60 s mono     | LRU eviction; if full, fail-closed (drop connection)       |
-| **Layer B** | Normalized Peer IP             | **30**   | 2 tokens / s | 1 token        | **2048** | 60 s mono     | LRU eviction; if full, fail-closed (HTTP 429)              |
-| **Layer C** | Derived `deviceId`/`sessionId` | **60**   | 5 tokens / s | 1 token        | **1024** | 60 s mono     | LRU eviction; if full, fail-closed (`RATE_LIMIT_EXCEEDED`) |
-
-Total limiter memory across all layers is strictly capped under source-IP churn.
+Under source-key churn, limiter memory cannot grow beyond the key ceiling.
+At capacity, untracked new keys fail closed without allocating memory.
 
 ### 21.3 Peer IP Normalization
 
@@ -967,8 +807,8 @@ Peer network identity is normalized deterministically:
 - **IPv4-Mapped IPv6:** Unmapped to canonical IPv4 (`::ffff:192.0.2.1` → `192.0.2.1`).
   An attacker cannot bypass IPv4 limits by presenting an IPv4-mapped IPv6 address.
 - **IPv6 Grouping:** Grouped by canonical lowercase zero-compressed **/64 CIDR
-  prefix** (e.g. `2001:db8:abcd:0012::/64`). Rotating interface identifiers within
-  the `/64` subnet shares one bucket.
+  prefix** (e.g. `2001:db8:abcd:0012::/64`). An attacker rotating interface
+  identifiers within the same `/64` subnet shares one bucket.
 
 ---
 
@@ -976,37 +816,35 @@ Peer network identity is normalized deterministically:
 
 Frozen controls, by attack:
 
-| Attack                               | Control                                                                                                                          |
-| :----------------------------------- | :------------------------------------------------------------------------------------------------------------------------------- |
-| Unauthenticated connection flood     | Layer A token bucket (capacity 20, refill 1/s); connection dropped before TLS (§21).                                             |
-| TLS handshake flood                  | 5 s handshake timeout + max 64 concurrent handshakes (§20, §26).                                                                 |
-| HTTP pre-session flood               | Layer B token bucket (capacity 30, refill 2/s); returns HTTP 429 before MCP parsing (§21).                                       |
-| Limiter-key churn memory exhaustion  | Hard key ceilings (4096 / 2048 / 1024), 60 s idle eviction, LRU fail-closed at capacity (§21.2).                                 |
-| IP normalization bypass              | IPv4-mapped IPv6 unmapped; IPv6 grouped under `/64` CIDR prefix (§21.3).                                                         |
-| Slowloris / partial body             | 10 s body read timeout, 60 s request timeout, header/URL bounds (§20).                                                           |
-| Oversized payload                    | 4 MiB enforced during read; connection aborted (§20).                                                                            |
-| Malformed JSON-RPC                   | Rejected by schema admission; no policy reached.                                                                                 |
-| Malformed MCP session ID             | Rejected before identity derivation; sanitized generic response (§5, §25).                                                       |
-| Header abuse                         | 16 KiB header bound; `Host`/`X-Forwarded-*` never establish identity (§6.1).                                                     |
-| Request smuggling assumptions        | Single explicit HTTP parser path via SDK transport; `Content-Length`/`Transfer-Encoding` ambiguity is rejected.                  |
-| Credential stuffing / token guessing | 256-bit tokens; constant-time digest comparison; pre-auth rate limiting; anti-oracle responses.                                  |
-| Session fixation                     | Session IDs and tokens are **server-generated only**; client-supplied value is never adopted (§5.3).                             |
-| Session hijacking                    | Token bound to `(deviceId, SPKI, clientId)`; token unusable from another TLS identity (§11).                                     |
-| Token replay                         | Idle/absolute expiry + explicit revocation; replay after revocation rejected.                                                    |
-| Cross-device token replay            | Binding check fails; generic `INVALID_SESSION_TOKEN` returned (§11, §25).                                                        |
-| Certificate replay/cloning           | Cloning requires the private key; a cloned certificate without the key fails the handshake.                                      |
-| Expired certificate                  | Rejected at handshake (§6 T-7); runtime server cert expiry enters 60 s drain then force-closes sockets.                          |
-| Revoked device                       | Live sessions revoked immediately; subsequent requests return generic `UNAUTHENTICATED` or `INVALID_SESSION_TOKEN` (§8, §25).    |
-| Enrollment replay                    | Single-use secrets on `POST /enroll/complete` (§9).                                                                              |
-| Enrollment challenge lockout         | 3 failed secret attempts immediately purges challenge (§9).                                                                      |
-| First-device bootstrap bypass        | `/mcp` rejects all sessions when zero devices are enrolled; only valid `/enroll/complete` accepted (§5.2).                       |
-| Attacker-writable trust store / CA   | Mode 0600 (trust store), root/launcher ownership (CA), safe-open descriptor checks, atomic write with fsync (§6 T-11, §16).      |
-| Same-UID trust-store forgery         | Every persisted record verified against operator Ed25519 public key at startup; unsigned or forged records fail startup (§16.1). |
-| Durability uncertainty after rename  | Parent directory fsync failure enters fatal fail-closed state; never reports false success (§16.3).                              |
-| Wildcard bind exposure               | Explicit opt-in flag required, else startup failure (§18).                                                                       |
-| Proxy-header identity spoofing       | No proxy header establishes identity; in-process TLS only (§6.1).                                                                |
-| DNS rebinding / browser-origin       | Origin allowlist default-deny; `Host` validated against configured hostname (§23).                                               |
-| Abrupt disconnect during execution   | In-flight work completes or aborts per RC-04 semantics; audit records disconnect.                                                |
+| Attack                               | Control                                                                                                                       |
+| :----------------------------------- | :---------------------------------------------------------------------------------------------------------------------------- |
+| Unauthenticated connection flood     | Layer A TCP admission limiter (§21) + global/per-IP connection caps; connection dropped before TLS.                           |
+| TLS handshake flood                  | 5 s handshake timeout + max 64 concurrent handshakes (§20, §21).                                                              |
+| HTTP pre-session flood               | Layer B secure HTTP limiter (120 req/min); returns HTTP 429 before MCP parsing (§21).                                         |
+| Limiter-key churn memory exhaustion  | Hard key ceilings (4096 / 2048 / 1024), 60 s idle eviction, LRU fail-closed at capacity (§21.2).                              |
+| IP normalization bypass              | IPv4-mapped IPv6 unmapped; IPv6 grouped under `/64` CIDR prefix (§21.3).                                                      |
+| Slowloris / partial body             | 10 s body read timeout, 60 s request timeout, header/URL bounds (§20).                                                        |
+| Oversized payload                    | 4 MiB enforced during read; connection aborted (§20).                                                                         |
+| Malformed JSON-RPC                   | Rejected by schema admission; no policy reached.                                                                              |
+| Malformed MCP session ID             | Rejected before identity derivation; sanitized generic response (§5, §25).                                                    |
+| Header abuse                         | 16 KiB header bound; `Host`/`X-Forwarded-*` never establish identity (§6.1).                                                  |
+| Request smuggling assumptions        | Single explicit HTTP parser path via SDK transport; `Content-Length`/`Transfer-Encoding` ambiguity is rejected.               |
+| Credential stuffing / token guessing | 256-bit tokens; constant-time digest comparison; pre-auth rate limiting; anti-oracle responses.                               |
+| Session fixation                     | Session IDs and tokens are **server-generated only**; client-supplied value is never adopted (§5.3).                          |
+| Session hijacking                    | Token bound to `(deviceId, SPKI, clientId)`; token unusable from another TLS identity (§11).                                  |
+| Token replay                         | Idle/absolute expiry + explicit revocation; replay after revocation rejected.                                                 |
+| Cross-device token replay            | Binding check fails; generic `INVALID_SESSION_TOKEN` returned (§11, §25).                                                     |
+| Certificate replay/cloning           | Cloning requires the private key; a cloned certificate without the key fails the handshake.                                   |
+| Expired certificate                  | Rejected at handshake (§6 T-7); runtime server cert expiry refuses new sessions.                                              |
+| Revoked device                       | Live sessions revoked immediately; subsequent requests return generic `UNAUTHENTICATED` or `INVALID_SESSION_TOKEN` (§8, §25). |
+| Enrollment replay                    | Single-use secrets on `POST /enroll/complete` (§9).                                                                           |
+| Enrollment challenge lockout         | 3 failed secret attempts immediately purges challenge (§9).                                                                   |
+| First-device bootstrap bypass        | `/mcp` rejects all sessions when zero devices are enrolled; only valid `/enroll/complete` accepted (§5.2).                    |
+| Attacker-writable trust store / CA   | Mode 0600 (trust store), mode 0644/root (CA), UID checks, no symlinks, atomic write with fsync (§6 T-11, §16).                |
+| Wildcard bind exposure               | Explicit opt-in flag required, else startup failure (§18).                                                                    |
+| Proxy/header spoofing                | No proxy header establishes identity; in-process TLS only (§6.1).                                                             |
+| DNS rebinding / browser-origin       | Origin allowlist default-deny; `Host` validated against configured hostname (§23).                                            |
+| Abrupt disconnect during execution   | In-flight work completes or aborts per RC-04 semantics; audit records disconnect.                                             |
 
 ---
 
@@ -1067,27 +905,35 @@ RC-04**. RC-06 owns external persistence and anchoring.
 To eliminate enumeration oracles:
 
 1. **Pre-Session Indistinguishability (`/mcp`):** Before an authenticated gateway
-   session exists, **all application-level device authentication failures return strictly**:
+   session exists on `/mcp`, **all application-level device authentication failures return strictly**:
    ```json
    { "code": "UNAUTHENTICATED", "message": "Authentication failed" }
    ```
-   (Covers: unenrolled device, revoked device pre-session, pin mismatch, binding
-   mismatch, zero devices enrolled). `DEVICE_NOT_ENROLLED` is strictly an
-   **internal diagnostic and operator audit reason**; ordinary remote clients
-   **NEVER** receive it.
-2. **Generic Bootstrap Failure (`POST /enroll/complete`):** All application-level
-   completion failures (no pending challenge, expired challenge, wrong secret, SPKI
-   mismatch, cancelled challenge, already-consumed challenge) return strictly:
+   This rule is strictly scoped to `/mcp` device and session admission and covers:
+   - Certificate not enrolled in trust store.
+   - Known device has been revoked.
+   - Pin matches but `clientId` binding differs.
+   - Zero devices enrolled in trust store.
+     The error code `DEVICE_NOT_ENROLLED` is strictly an **internal diagnostic and
+     operator audit reason**; ordinary remote clients **NEVER** receive it.
+2. **Bootstrap Endpoint Indistinguishability (`POST /enroll/complete`):**
+   `POST /enroll/complete` is explicitly an ARC bootstrap endpoint, not an MCP
+   transport endpoint. All invalid bootstrap proofs (no matching pending record,
+   expired challenge, SPKI mismatch, incorrect one-time secret, or replay of a
+   consumed secret) return a single, uniform, indistinguishable HTTP response:
    ```json
    { "error": "Enrollment failed" }
    ```
-   with **HTTP 400 Bad Request**. No existence information is disclosed.
+   with HTTP status **400 Bad Request**. The endpoint never leaks whether the
+   pending record existed, expired, had the wrong SPKI, or had the wrong secret.
 3. **Post-Session Indistinguishability:** After a session previously existed, any
    session lookup, expiration, revocation, token digest mismatch, or binding
    mismatch returns strictly:
    ```json
    { "code": "INVALID_SESSION_TOKEN", "message": "Invalid or expired session token" }
    ```
+   The client receives no information on whether expiry, revocation, or a bad
+   token caused the failure.
 4. **Transport/Admission Responses:** Failures occurring before application
    evaluation are returned at the HTTP/TCP layer with no MCP JSON-RPC body:
    - Layer A TCP refusal: Connection dropped / reset.
@@ -1096,33 +942,32 @@ To eliminate enumeration oracles:
    - Invalid HTTP method: HTTP 405 Method Not Allowed.
    - Payload > 4 MiB: HTTP 413 Payload Too Large.
 
-| Situation                         | Protocol Layer                   | Observable Error Code          | Response Framing      |
-| :-------------------------------- | :------------------------------- | :----------------------------- | :-------------------- |
-| Layer A TCP connection refused    | Network                          | None (TCP close/reset)         | No HTTP response      |
-| TLS handshake rejection           | TLS                              | TLS alert                      | No HTTP response      |
-| Layer B HTTP pre-session limit    | HTTP                             | HTTP 429 Too Many Requests     | Plaintext HTTP        |
-| Enrollment completion failure     | Bootstrap (`/enroll/complete`)   | HTTP 400 `Enrollment failed`   | Plaintext JSON        |
-| Device not enrolled / revoked     | Auth (pre-session `/mcp`)        | `UNAUTHENTICATED`              | MCP JSON-RPC Error    |
-| Pin mismatch / binding mismatch   | Auth (pre-session `/mcp`)        | `UNAUTHENTICATED`              | MCP JSON-RPC Error    |
-| Session expired/revoked/malformed | Session (post-session `/mcp`)    | `INVALID_SESSION_TOKEN`        | MCP JSON-RPC Error    |
-| Layer C Authenticated rate limit  | Rate Limiting                    | `RATE_LIMIT_EXCEEDED`          | MCP JSON-RPC Error    |
-| Oversized request body (> 4 MiB)  | Bounds                           | `PAYLOAD_TOO_LARGE` / HTTP 413 | HTTP 413 or MCP Error |
-| Authorization denial              | Authorization (RC-04, unchanged) | `POLICY_DENIED` etc.           | MCP JSON-RPC Error    |
+| Situation                         | Protocol Layer                   | Observable Error Code          | Response Framing                 |
+| :-------------------------------- | :------------------------------- | :----------------------------- | :------------------------------- |
+| Layer A TCP connection refused    | Network                          | None (TCP close/reset)         | No HTTP response                 |
+| TLS handshake rejection           | TLS                              | TLS alert                      | No HTTP response                 |
+| Layer B HTTP pre-session limit    | HTTP                             | HTTP 429 Too Many Requests     | Standard HTTP over TLS (non-MCP) |
+| Device not enrolled / revoked     | Auth (pre-session)               | `UNAUTHENTICATED`              | MCP JSON-RPC Error               |
+| Pin mismatch / binding mismatch   | Auth (pre-session)               | `UNAUTHENTICATED`              | MCP JSON-RPC Error               |
+| Session expired/revoked/malformed | Session (post-session)           | `INVALID_SESSION_TOKEN`        | MCP JSON-RPC Error               |
+| Layer C Authenticated rate limit  | Rate Limiting                    | `RATE_LIMIT_EXCEEDED`          | MCP JSON-RPC Error               |
+| Oversized request body (> 4 MiB)  | Bounds                           | `PAYLOAD_TOO_LARGE` / HTTP 413 | HTTP 413 or MCP Error            |
+| Authorization denial              | Authorization (RC-04, unchanged) | `POLICY_DENIED` etc.           | MCP JSON-RPC Error               |
 
 ---
 
 ## 26. Session and Connection Concurrency
 
-| Rule | Bound / behaviour                                                                                                                                                                                                                                                                                                                                                                                    |
-| :--- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| C-1  | Max **512** simultaneous connections globally; max **32** per peer IP; max **64** in-flight handshakes.                                                                                                                                                                                                                                                                                              |
-| C-2  | Max **8** live sessions per device; **64** per client; **1024** globally.                                                                                                                                                                                                                                                                                                                            |
-| C-3  | Max **4** outstanding MCP requests per session.                                                                                                                                                                                                                                                                                                                                                      |
-| C-4  | **Duplicate session ID:** a request presenting a session ID with a mismatched identity is rejected, not adopted.                                                                                                                                                                                                                                                                                     |
-| C-5  | **Connection takeover:** not supported. A new connection authenticates as the same device but does not inherit another connection's session state.                                                                                                                                                                                                                                                   |
-| C-6  | **Concurrent use of one session token** is permitted within C-3 only.                                                                                                                                                                                                                                                                                                                                |
-| C-7  | **Backpressure:** exceeding any bound produces a sanitized refusal; the gateway never queues unbounded work.                                                                                                                                                                                                                                                                                         |
-| C-8  | **Normal shutdown 60-second drain:** On shutdown, the listener stops accepting new connections immediately. In-flight requests are allowed to complete up to their deadline, bounded by a **maximum 60-second drain window**. At 60 seconds, all remaining remote connections are force-closed, volatile sessions are revoked, and required lifecycle audit records are flushed before process exit. |
+| Rule | Bound / behaviour                                                                                                                                             |
+| :--- | :------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| C-1  | Max **512** simultaneous connections globally; max **32** per peer IP; max **64** in-flight handshakes.                                                       |
+| C-2  | Max **8** live sessions per device; **64** per client; **1024** globally.                                                                                     |
+| C-3  | Max **4** outstanding MCP requests per session.                                                                                                               |
+| C-4  | **Duplicate session ID:** a request presenting a session ID with a mismatched identity is rejected, not adopted.                                              |
+| C-5  | **Connection takeover:** not supported. A new connection authenticates as the same device but does not inherit another connection's session state.            |
+| C-6  | **Concurrent use of one session token** is permitted within C-3 only.                                                                                         |
+| C-7  | **Backpressure:** exceeding any bound produces a sanitized refusal; the gateway never queues unbounded work.                                                  |
+| C-8  | **Shutdown/drain:** on shutdown the listener stops accepting, in-flight requests get a bounded grace period, then connections close and sessions are revoked. |
 
 ---
 
@@ -1163,8 +1008,8 @@ To eliminate enumeration oracles:
 | Connections         | All closed.                                                                                  |
 | Sessions            | **All revoked.**                                                                             |
 | Session tokens      | **All invalid.**                                                                             |
-| Device enrollment   | **Survives** (persistent trust store, operator Ed25519 signature verified).                  |
-| Revocations         | **Survive** (persisted, operator Ed25519 signature verified).                                |
+| Device enrollment   | **Survives** (persistent trust store).                                                       |
+| Revocations         | **Survive** (persisted).                                                                     |
 | Rate-limit state    | Reset.                                                                                       |
 | Pending enrollment  | Purged.                                                                                      |
 | **RC-04 approvals** | **Still invalidated by restart — unchanged.** RC-05 must not make approval state persistent. |
@@ -1175,13 +1020,13 @@ To eliminate enumeration oracles:
 
 Respecting documented ownership (`docs/architecture/package-ownership.md`):
 
-| Package / app                | RC-05 responsibility                                                                                                                                                |
-| :--------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `packages/auth`              | Identity, device enrollment, pin verification, operator signature verification, session store core (tokens, digests, TTLs, quotas). **Pure logic; no network I/O.** |
-| `apps/mcp-server`            | MCP transports and listeners (stdio **or** remote), TLS/mTLS admission, rate limiters, session wire headers, gateway composition, health.                           |
-| `packages/protocol`          | Data contracts only (`AuthInfo`-equivalent DTOs, gateway event types, error codes). No logic.                                                                       |
-| `packages/audit`             | Audit structures and the existing hash chain. **No change to chain semantics.**                                                                                     |
-| `apps/cli` + local admin IPC | Operator administration of devices and sessions (§15).                                                                                                              |
+| Package / app                | RC-05 responsibility                                                                                                                  |
+| :--------------------------- | :------------------------------------------------------------------------------------------------------------------------------------ |
+| `packages/auth`              | Identity, device enrollment, pin verification, session issuance/validation, actor-context derivation. **Pure logic; no network I/O.** |
+| `apps/mcp-server`            | MCP transports and listeners (stdio **or** remote), TLS/mTLS admission, rate limiters, gateway composition, health.                   |
+| `packages/protocol`          | Data contracts only (`AuthInfo`-equivalent DTOs, gateway event types, error codes). No logic.                                         |
+| `packages/audit`             | Audit structures and the existing hash chain. **No change to chain semantics.**                                                       |
+| `apps/cli` + local admin IPC | Operator administration of devices and sessions (§15).                                                                                |
 
 ---
 
@@ -1192,7 +1037,7 @@ Respecting documented ownership (`docs/architecture/package-ownership.md`):
 | Node built-ins (`node:tls`, `node:net`, `node:http`, `node:crypto`) | **Sufficient and preferred** for TLS, mTLS, binding, pinning, CSPRNG, timing-safe comparison, and the rate limiter. |
 | `@modelcontextprotocol/sdk` `StreamableHTTPServerTransport`         | **Already a dependency.** Provides the MCP Streamable HTTP transport.                                               |
 | X.509 parsing for SPKI extraction                                   | **Prefer Node built-ins** (`crypto.X509Certificate.publicKey` → DER SPKI), avoiding a new parsing dependency.       |
-| Rate limiting library                                               | **Not proposed.** Token-bucket algorithm is small, testable, and avoids a supply-chain addition.                    |
+| Rate limiting library                                               | **Not proposed.** Fixed-memory sliding window is small, testable, and avoids a supply-chain addition.               |
 | JWT/JOSE library                                                    | **Not proposed.** Session tokens are opaque and opaque tokens need no JOSE.                                         |
 | OAuth/OIDC/SAML libraries                                           | **Not proposed.** Those capabilities are deferred (§10).                                                            |
 
@@ -1236,7 +1081,7 @@ Explicitly out of scope for RC-05 baseline:
 
 ## 34. Negative Security Control Catalog
 
-`N = 96`. Every material invariant in this scope has at least one direct,
+`N = 79`. Every material invariant in this scope has at least one direct,
 code-testable control. Each control states the attack/input, the expected
 rejection/result, and the critical no-side-effect assertion.
 
@@ -1251,211 +1096,186 @@ rejection/result, and the critical no-side-effect assertion.
 | RC05-NEG-05 | Wildcard bind without opt-in flag                  | **Startup failure**               | No listener bound                 |
 | RC05-NEG-06 | Stateless transport (`sessionIdGenerator` omitted) | Configuration rejected            | No listener bound                 |
 
-### TLS, CA & Private Key Loading (RC05-NEG-07 … 18)
+### TLS & CA Integrity (RC05-NEG-07 … 15)
 
-| ID          | Attack / input                                        | Expected result                  | Critical no-side-effect                       |
-| :---------- | :---------------------------------------------------- | :------------------------------- | :-------------------------------------------- |
-| RC05-NEG-07 | TLS 1.2 handshake attempt                             | Handshake refused                | No MCP bytes parsed                           |
-| RC05-NEG-08 | Connection with no client certificate                 | Handshake refused                | No device lookup; no session                  |
-| RC05-NEG-09 | Client certificate from an unknown CA                 | Handshake refused                | Trust store not mutated                       |
-| RC05-NEG-10 | Expired client certificate                            | Handshake refused                | No session minted                             |
-| RC05-NEG-11 | Malformed certificate                                 | Handshake refused                | No MCP parse                                  |
-| RC05-NEG-12 | Server cert/key mismatch at startup                   | **Startup failure**              | No listener bound                             |
-| RC05-NEG-13 | Server certificate expired at startup                 | **Startup failure**              | No listener bound                             |
-| RC05-NEG-14 | Server certificate SAN does not match hostname        | **Startup failure**              | No listener bound                             |
-| RC05-NEG-15 | Server certificate expires during runtime             | New TLS sessions refused         | Health degraded; existing enter drain window  |
-| RC05-NEG-16 | Runtime cert expiry connection drain exceeds 60 s     | Connections force-closed at 60 s | Live sessions revoked; sockets destroyed      |
-| RC05-NEG-17 | Configured client CA file writable by ARC service UID | **Startup failure**              | Insecure CA rejected; no listener bound       |
-| RC05-NEG-18 | CA path or parent directory swapped via symlink       | **Startup failure**              | Descriptor/safe-open fails; no listener bound |
+| ID          | Attack / input                                 | Expected result          | Critical no-side-effect                    |
+| :---------- | :--------------------------------------------- | :----------------------- | :----------------------------------------- |
+| RC05-NEG-07 | TLS 1.2 handshake attempt                      | Handshake refused        | No MCP bytes parsed                        |
+| RC05-NEG-08 | Connection with no client certificate          | Handshake refused        | No device lookup; no session               |
+| RC05-NEG-09 | Client certificate from an unknown CA          | Handshake refused        | Trust store not mutated                    |
+| RC05-NEG-10 | Expired client certificate                     | Handshake refused        | No session minted                          |
+| RC05-NEG-11 | Malformed certificate                          | Handshake refused        | No MCP parse                               |
+| RC05-NEG-12 | Server cert/key mismatch at startup            | **Startup failure**      | No listener bound                          |
+| RC05-NEG-13 | Server certificate expired at startup          | **Startup failure**      | No listener bound                          |
+| RC05-NEG-14 | Server certificate SAN does not match hostname | **Startup failure**      | No listener bound                          |
+| RC05-NEG-15 | Server certificate expires during runtime      | New TLS sessions refused | Health degraded; existing drain gracefully |
 
-### mTLS, Pinning & Device Resource Bounds (RC05-NEG-19 … 25)
+### mTLS, Pinning & Device Resource Bounds (RC05-NEG-16 … 22)
 
 | ID          | Attack / input                                         | Expected result                  | Critical no-side-effect                     |
 | :---------- | :----------------------------------------------------- | :------------------------------- | :------------------------------------------ |
-| RC05-NEG-19 | Valid chain, but SPKI not pinned to any device         | `UNAUTHENTICATED`                | Policy engine not reached; no device oracle |
-| RC05-NEG-20 | Pin rotated: old pin inside window, then after removal | Accepted, then `UNAUTHENTICATED` | No lingering acceptance after removal       |
-| RC05-NEG-21 | Malformed pin configuration at startup                 | **Startup failure**              | No listener bound                           |
-| RC05-NEG-22 | Two devices sharing one pin at startup                 | **Startup failure**              | No listener bound                           |
-| RC05-NEG-23 | Device enrollment adding a 3rd active pin              | `RESOURCE_EXHAUSTED`             | Max 2 pins enforced; existing pins retained |
-| RC05-NEG-24 | Enrolling device beyond 256 global device limit        | `RESOURCE_EXHAUSTED`             | Trust store unchanged; capacity bounded     |
-| RC05-NEG-25 | Enrollment request with display label > 64 bytes       | `INVALID_REQUEST_SCHEMA`         | Trust store unchanged                       |
+| RC05-NEG-16 | Valid chain, but SPKI not pinned to any device         | `UNAUTHENTICATED`                | Policy engine not reached; no device oracle |
+| RC05-NEG-17 | Pin rotated: old pin inside window, then after removal | Accepted, then `UNAUTHENTICATED` | No lingering acceptance after removal       |
+| RC05-NEG-18 | Malformed pin configuration at startup                 | **Startup failure**              | No listener bound                           |
+| RC05-NEG-19 | Two devices sharing one pin at startup                 | **Startup failure**              | No listener bound                           |
+| RC05-NEG-20 | Device enrollment adding a 3rd active pin              | `RESOURCE_EXHAUSTED`             | Max 2 pins enforced; existing pins retained |
+| RC05-NEG-21 | Enrolling device beyond 256 global device limit        | `RESOURCE_EXHAUSTED`             | Trust store unchanged; capacity bounded     |
+| RC05-NEG-22 | Enrollment request with display label > 64 bytes       | `INVALID_REQUEST_SCHEMA`         | Trust store unchanged                       |
 
-### Trust Store Cryptographic Integrity & File Defense (RC05-NEG-26 … 34)
+### Trust Store & CA File Integrity (RC05-NEG-23 … 28)
 
-| ID          | Attack / input                                         | Expected result                 | Critical no-side-effect                     |
-| :---------- | :----------------------------------------------------- | :------------------------------ | :------------------------------------------ |
-| RC05-NEG-26 | Same-UID attacker adds unsigned record to trust store  | **Startup failure**             | Missing operator signature fails startup    |
-| RC05-NEG-27 | Tampered `clientId`, `clientType`, or pin in store     | **Startup failure**             | Ed25519 signature mismatch fails startup    |
-| RC05-NEG-28 | Same-UID attacker modifies revocation state in store   | **Startup failure**             | Unsigned revocation state fails startup     |
-| RC05-NEG-29 | Trust store path swapped via symlink during safe-open  | **Startup failure**             | `O_NOFOLLOW`/`fstat` rejects symlink        |
-| RC05-NEG-30 | Trust store is group/world writable (`mode & 0077`)    | **Startup failure**             | Insecure mode rejected; no listener bound   |
-| RC05-NEG-31 | Trust store owned by wrong UID (not process UID)       | **Startup failure**             | Untrusted owner rejected; no listener bound |
-| RC05-NEG-32 | Trust store file corrupted or exceeds 256 KiB          | **Startup failure**             | Fails closed; corrupt state rejected        |
-| RC05-NEG-33 | Durability Phase 1: Pre-rename temp file write failure | Operation fails closed          | Original store unchanged; reports failure   |
-| RC05-NEG-34 | Durability Phase 3: Post-rename parent-fsync failure   | Fatal fail-closed state entered | Operation reports failure; stops mutation   |
+| ID          | Attack / input                                      | Expected result        | Critical no-side-effect                     |
+| :---------- | :-------------------------------------------------- | :--------------------- | :------------------------------------------ |
+| RC05-NEG-23 | Trust-store file is a symlink                       | **Startup failure**    | Symlink rejected; no listener bound         |
+| RC05-NEG-24 | Trust store is group/world writable (`mode & 0077`) | **Startup failure**    | Insecure mode rejected; no listener bound   |
+| RC05-NEG-25 | Trust store owned by wrong UID (not process UID)    | **Startup failure**    | Untrusted owner rejected; no listener bound |
+| RC05-NEG-26 | Trust store file corrupted or exceeds 256 KiB       | **Startup failure**    | Fails closed; corrupt state rejected        |
+| RC05-NEG-27 | Atomic write failure during trust store update      | Operation fails closed | No partial write; trust state preserved     |
+| RC05-NEG-28 | Client CA file is symlink or group/world writable   | **Startup failure**    | Insecure CA rejected; no listener bound     |
 
-### Enrollment Secret & Bootstrap Lifecycle (RC05-NEG-35 … 49)
+### Enrollment Bootstrap & Quotas (RC05-NEG-29 … 38)
 
-| ID          | Attack / input                                          | Expected result                    | Critical no-side-effect                      |
-| :---------- | :------------------------------------------------------ | :--------------------------------- | :------------------------------------------- |
-| RC05-NEG-35 | Remote self-enrollment attempt on `/mcp`                | Rejected (`404`/`UNAUTHENTICATED`) | No device enrolled; policy not reached       |
-| RC05-NEG-36 | `POST /enroll/complete` without client cert mTLS        | Handshake refused                  | Endpoint unreachable without mTLS            |
-| RC05-NEG-37 | `POST /enroll/complete` with no matching pending record | HTTP 400 `Enrollment failed`       | No oracle; no device enrolled                |
-| RC05-NEG-38 | `POST /enroll/complete` with mismatched SPKI pin        | HTTP 400 `Enrollment failed`       | Proof of possession failed; state preserved  |
-| RC05-NEG-39 | `POST /enroll/complete` with incorrect one-time secret  | HTTP 400 `Enrollment failed`       | Secret attempt counted; state preserved      |
-| RC05-NEG-40 | `POST /enroll/complete` secret input > 128 UTF-8 bytes  | HTTP 400 `Enrollment failed`       | Bounded admission fails before hashing       |
-| RC05-NEG-41 | Secret verification timing attack                       | Constant-time comparison           | `timingSafeEqual` over 32-byte digests       |
-| RC05-NEG-42 | Raw enrollment secret inspection in serialized pending  | Absent (SHA-256 digest only)       | Raw secret never persisted or stored         |
-| RC05-NEG-43 | Secret attempts exceed 3 failed tries on a challenge    | Challenge purged immediately       | Challenge eliminated; online guessing halted |
-| RC05-NEG-44 | `POST /enroll/complete` after 300 s monotonic expiry    | HTTP 400 `Enrollment failed`       | Expired challenge purged; clock not extended |
-| RC05-NEG-45 | Single-use enrollment secret replayed                   | HTTP 400 `Enrollment failed`       | Single-use enforced; no duplicate device     |
-| RC05-NEG-46 | Duplicate pending creation for same expected SPKI       | Reuses existing pending record     | No second secret; TTL not reset              |
-| RC05-NEG-47 | Concurrent creation attempts for same expected SPKI     | Exactly one pending record created | Concurrency lock prevents duplicate records  |
-| RC05-NEG-48 | Pending enrollment quota exceeded (16 global/4 operator | Rejected via Admin IPC             | Existing pending/enrolled state unchanged    |
-| RC05-NEG-49 | Gateway with 0 devices: ordinary `/mcp` tool request    | `UNAUTHENTICATED`                  | No session minted; zero-device state safe    |
+| ID          | Attack / input                                                                     | Expected result              | Critical no-side-effect                      |
+| :---------- | :--------------------------------------------------------------------------------- | :--------------------------- | :------------------------------------------- |
+| RC05-NEG-29 | Unauthenticated/tokenless attempt to perform remote self-enrollment through `/mcp` | `UNAUTHENTICATED`            | No device enrolled; policy/tools not reached |
+| RC05-NEG-30 | `POST /enroll/complete` without client cert mTLS                                   | Handshake refused            | Endpoint unreachable without mTLS            |
+| RC05-NEG-31 | `POST /enroll/complete` with no matching pending record                            | HTTP 400                     | No device enrolled; trust store unchanged    |
+| RC05-NEG-32 | `POST /enroll/complete` with mismatched SPKI pin                                   | HTTP 400                     | Proof of possession failed; state preserved  |
+| RC05-NEG-33 | `POST /enroll/complete` with incorrect one-time secret                             | HTTP 400                     | Secret attempt counted; state preserved      |
+| RC05-NEG-34 | Secret attempts exceed 3 failed tries on a challenge                               | Challenge purged immediately | Challenge eliminated; online guessing halted |
+| RC05-NEG-35 | `POST /enroll/complete` after 300 s monotonic expiry                               | HTTP 400                     | Expired challenge purged; clock not extended |
+| RC05-NEG-36 | Single-use enrollment secret replayed                                              | HTTP 400                     | Single-use enforced; no duplicate device     |
+| RC05-NEG-37 | Pending enrollment quota exceeded (16 global/4 operator)                           | Rejected via Admin IPC       | Existing pending/enrolled state unchanged    |
+| RC05-NEG-38 | Gateway with 0 devices: ordinary `/mcp` tool request                               | `UNAUTHENTICATED`            | No session minted; zero-device state safe    |
 
-### Session Core & Wire Bootstrap (RC05-NEG-50 … 58)
+### Session Bootstrap & Wire Protocol (RC05-NEG-39 … 47)
 
 | ID          | Attack / input                                           | Expected result                 | Critical no-side-effect                      |
 | :---------- | :------------------------------------------------------- | :------------------------------ | :------------------------------------------- |
-| RC05-NEG-50 | Tokenless ordinary tool request to `/mcp`                | `UNAUTHENTICATED`               | Policy engine not reached                    |
-| RC05-NEG-51 | Client-supplied `Mcp-Session-Id` on initial initialize   | Ignored / replaced by server ID | Client cannot fixate or force session ID     |
-| RC05-NEG-52 | Tokenless `initialize` from unenrolled/revoked device    | `UNAUTHENTICATED`               | No session minted; no token issued           |
-| RC05-NEG-53 | Request with valid `Mcp-Session-Id` but missing token    | `UNAUTHENTICATED`               | Dual-header enforced; policy not reached     |
-| RC05-NEG-54 | Request with valid token but wrong `Mcp-Session-Id`      | `INVALID_SESSION_TOKEN`         | Cross-session mismatch rejected              |
-| RC05-NEG-55 | Request with valid `Mcp-Session-Id` but wrong token      | `INVALID_SESSION_TOKEN`         | Constant-time check fails; no policy reached |
-| RC05-NEG-56 | Valid session token presented from different device SPKI | `INVALID_SESSION_TOKEN`         | Device binding enforced; non-portable token  |
-| RC05-NEG-57 | Malformed session token (> 128 bytes or non-hex)         | `INVALID_SESSION_TOKEN`         | Pre-parse bound enforced; no policy reached  |
-| RC05-NEG-58 | Tokenless `initialize` flood exceeding active cap (8)    | Refused (`RESOURCE_EXHAUSTED`)  | Existing sessions unaffected                 |
+| RC05-NEG-39 | Tokenless ordinary tool request to `/mcp`                | `UNAUTHENTICATED`               | Policy engine not reached                    |
+| RC05-NEG-40 | Client-supplied `Mcp-Session-Id` on initial initialize   | Ignored / replaced by server ID | Client cannot fixate or force session ID     |
+| RC05-NEG-41 | Tokenless `initialize` from unenrolled/revoked device    | `UNAUTHENTICATED`               | No session minted; no token issued           |
+| RC05-NEG-42 | Request with valid `Mcp-Session-Id` but missing token    | `INVALID_SESSION_TOKEN`         | Dual-header enforced; policy not reached     |
+| RC05-NEG-43 | Request with valid token but wrong `Mcp-Session-Id`      | `INVALID_SESSION_TOKEN`         | Cross-session mismatch rejected              |
+| RC05-NEG-44 | Request with valid `Mcp-Session-Id` but wrong token      | `INVALID_SESSION_TOKEN`         | Constant-time check fails; no policy reached |
+| RC05-NEG-45 | Valid session token presented from different device SPKI | `INVALID_SESSION_TOKEN`         | Device binding enforced; non-portable token  |
+| RC05-NEG-46 | Malformed session token (> 128 bytes or non-hex)         | `INVALID_SESSION_TOKEN`         | Pre-parse bound enforced; no policy reached  |
+| RC05-NEG-47 | Tokenless `initialize` flood exceeding active cap (8)    | Refused (`RESOURCE_EXHAUSTED`)  | Existing sessions unaffected                 |
 
-### Actor Binding & Approvals (RC05-NEG-59 … 63)
+### Actor Binding & Approvals (RC05-NEG-48 … 52)
 
-| ID          | Attack / input                                          | Expected result          | Critical no-side-effect                       |
-| :---------- | :------------------------------------------------------ | :----------------------- | :-------------------------------------------- |
-| RC05-NEG-59 | Request supplies `clientId` / `clientType` / `deviceId` | `INVALID_REQUEST_SCHEMA` | Policy engine not reached; trusted preserved  |
-| RC05-NEG-60 | Request supplies `sessionId` in JSON-RPC parameters     | `INVALID_REQUEST_SCHEMA` | Trusted session context not overridden        |
-| RC05-NEG-61 | `_arcApproval` object carries actor fields              | `INVALID_REQUEST_SCHEMA` | No approval state mutated                     |
-| RC05-NEG-62 | Actor context reaching `executionPayloadHash`           | Equals derived context   | No caller value influences hash               |
-| RC05-NEG-63 | Remote client attempts redeeming under expired session  | `APPROVAL_REJECTED`      | Approval not extended, not revived, not bound |
+| ID          | Attack / input                                                                                                | Expected result          | Critical no-side-effect                                                                                                                |
+| :---------- | :------------------------------------------------------------------------------------------------------------ | :----------------------- | :------------------------------------------------------------------------------------------------------------------------------------- |
+| RC05-NEG-48 | Request supplies `clientId` / `clientType` / `deviceId`                                                       | `INVALID_REQUEST_SCHEMA` | Policy engine not reached; trusted preserved                                                                                           |
+| RC05-NEG-49 | Request supplies `sessionId` in JSON-RPC parameters                                                           | `INVALID_REQUEST_SCHEMA` | Trusted session context not overridden                                                                                                 |
+| RC05-NEG-50 | `_arcApproval` object carries actor fields                                                                    | `INVALID_REQUEST_SCHEMA` | No approval state mutated                                                                                                              |
+| RC05-NEG-51 | Actor context reaching `executionPayloadHash`                                                                 | Equals derived context   | No caller value influences hash                                                                                                        |
+| RC05-NEG-52 | Client re-authenticates to new session B and attempts redeeming approval bound to expired session A (§28 X-7) | `APPROVAL_REJECTED`      | Approval not consumed, not extended, not revived; direct request with expired session A token fails earlier as `INVALID_SESSION_TOKEN` |
 
-### Bounded Token-Bucket Rate Limiting & Resource Bounds (RC05-NEG-64 … 76)
+### Rate Limiting, Admission Layers & Memory Bounds (RC05-NEG-53 … 61)
 
-| ID          | Attack / input                                        | Expected result                   | Critical no-side-effect                      |
-| :---------- | :---------------------------------------------------- | :-------------------------------- | :------------------------------------------- |
-| RC05-NEG-64 | Layer A: Connection attempt with empty token bucket   | Connection dropped / TCP reset    | Terminated before TLS; no CPU wasted         |
-| RC05-NEG-65 | Layer A: Connection rate exceeding 1 token/s refill   | Connection dropped                | Exact 1 token/s monotonic refill enforced    |
-| RC05-NEG-66 | Layer A: Token bucket accumulation beyond capacity 20 | Refill clamped at capacity 20     | Tokens never exceed capacity; burst bounded  |
-| RC05-NEG-67 | Layer A: Wall-clock rollback to gain tokens           | Tokens not granted                | Monotonic clock enforced; immune to rollback |
-| RC05-NEG-68 | Layer B: Pre-session HTTP request with empty bucket   | HTTP 429 Too Many Requests        | Refused before session lookup / MCP parse    |
-| RC05-NEG-69 | Layer B: HTTP request rate exceeding 2 token/s refill | HTTP 429 Too Many Requests        | Exact 2 tokens/s monotonic refill enforced   |
-| RC05-NEG-70 | Layer C: Authenticated MCP request with empty bucket  | MCP `RATE_LIMIT_EXCEEDED`         | Refused before policy/subsystem execution    |
-| RC05-NEG-71 | Layer C: MCP request rate exceeding 5 token/s refill  | MCP `RATE_LIMIT_EXCEEDED`         | Exact 5 tokens/s monotonic refill enforced   |
-| RC05-NEG-72 | Source-IP churn attack against rate limiters          | Key cap enforced; LRU fail-closed | Table memory bounded (4096/2048/1024 keys)   |
-| RC05-NEG-73 | IPv4-mapped IPv6 address used to bypass IPv4 limit    | Normalized to canonical IPv4      | Shares bucket with IPv4 peer; no bypass      |
-| RC05-NEG-74 | IPv6 rotation within `/64` subnet to bypass limit     | Grouped under `/64` prefix        | Shares bucket across subnet; no bypass       |
-| RC05-NEG-75 | Request body exceeding 4 MiB during chunked read      | Aborted during read; close socket | Streaming ceiling enforced; no 4 MiB buffer  |
-| RC05-NEG-76 | Slowloris attack (headers/body read exceeding 10 s)   | Connection aborted                | Buffers freed; worker thread not blocked     |
+| ID          | Attack / input                                        | Expected result                   | Critical no-side-effect                     |
+| :---------- | :---------------------------------------------------- | :-------------------------------- | :------------------------------------------ |
+| RC05-NEG-53 | Layer A: Connection flood exceeding 60 conn/min       | Connection dropped / TCP reset    | Terminated before TLS; no CPU wasted        |
+| RC05-NEG-54 | Layer A: Concurrent handshakes exceeding 64 global    | Connection dropped                | Handshake queue bounded                     |
+| RC05-NEG-55 | Layer B: Pre-session HTTP flood exceeding 120 req/min | HTTP 429 Too Many Requests        | Refused before session lookup / MCP parse   |
+| RC05-NEG-56 | Layer C: Authenticated flood exceeding 300 req/min    | MCP `RATE_LIMIT_EXCEEDED`         | Refused before policy/subsystem execution   |
+| RC05-NEG-57 | Source-IP churn attack against rate limiters          | Key cap enforced; LRU fail-closed | Table memory bounded (4096/2048/1024 keys)  |
+| RC05-NEG-58 | IPv4-mapped IPv6 address used to bypass IPv4 limit    | Normalized to canonical IPv4      | Shares bucket with IPv4 peer; no bypass     |
+| RC05-NEG-59 | IPv6 rotation within `/64` subnet to bypass limit     | Grouped under `/64` prefix        | Shares bucket across subnet; no bypass      |
+| RC05-NEG-60 | Request body exceeding 4 MiB during chunked read      | Aborted during read; close socket | Streaming ceiling enforced; no 4 MiB buffer |
+| RC05-NEG-61 | Slowloris attack (headers/body read exceeding 10 s)   | Connection aborted                | Buffers freed; worker thread not blocked    |
 
-### Authentication-Before-Policy & Anti-Oracle (RC05-NEG-77 … 82)
+### Authentication-Before-Policy & Anti-Oracle (RC05-NEG-62 … 67)
 
 | ID          | Attack / input                                         | Expected result         | Critical no-side-effect                      |
 | :---------- | :----------------------------------------------------- | :---------------------- | :------------------------------------------- |
-| RC05-NEG-77 | Unenrolled device authentication failure               | `UNAUTHENTICATED`       | Anti-oracle: `DEVICE_NOT_ENROLLED` not sent  |
-| RC05-NEG-78 | Revoked device authentication failure pre-session      | `UNAUTHENTICATED`       | Anti-oracle: revocation status not disclosed |
-| RC05-NEG-79 | Revoked device presenting existing session token       | `INVALID_SESSION_TOKEN` | Anti-oracle: generic rejection returned      |
-| RC05-NEG-80 | Unauthenticated remote request that would be ALLOWed   | `UNAUTHENTICATED`       | Policy engine not reached (verified by spy)  |
-| RC05-NEG-81 | Unauthenticated remote request targeting mutation tool | `UNAUTHENTICATED`       | Subsystems not called (verified by spy)      |
-| RC05-NEG-82 | Authenticated session hitting a `DENY` policy          | `POLICY_DENIED`         | Auth success does not imply authorization    |
+| RC05-NEG-62 | Unenrolled device authentication failure               | `UNAUTHENTICATED`       | Anti-oracle: `DEVICE_NOT_ENROLLED` not sent  |
+| RC05-NEG-63 | Revoked device authentication failure pre-session      | `UNAUTHENTICATED`       | Anti-oracle: revocation status not disclosed |
+| RC05-NEG-64 | Revoked device presenting existing session token       | `INVALID_SESSION_TOKEN` | Anti-oracle: generic rejection returned      |
+| RC05-NEG-65 | Unauthenticated remote request that would be ALLOWed   | `UNAUTHENTICATED`       | Policy engine not reached (verified by spy)  |
+| RC05-NEG-66 | Unauthenticated remote request targeting mutation tool | `UNAUTHENTICATED`       | Subsystems not called (verified by spy)      |
+| RC05-NEG-67 | Authenticated session hitting a `DENY` policy          | `POLICY_DENIED`         | Auth success does not imply authorization    |
 
-### Approval Separation (RC05-NEG-83 … 84)
+### Approval Separation (RC05-NEG-68 … 69)
 
 | ID          | Attack / input                                   | Expected result         | Critical no-side-effect                     |
 | :---------- | :----------------------------------------------- | :---------------------- | :------------------------------------------ |
-| RC05-NEG-83 | Session token used as an approval token          | `APPROVAL_REJECTED`     | Subsystem not called                        |
-| RC05-NEG-84 | Approval token used as a session token in header | `INVALID_SESSION_TOKEN` | Domain separation enforced; no policy reach |
+| RC05-NEG-68 | Session token used as an approval token          | `APPROVAL_REJECTED`     | Subsystem not called                        |
+| RC05-NEG-69 | Approval token used as a session token in header | `INVALID_SESSION_TOKEN` | Domain separation enforced; no policy reach |
 
-### Restart, Drain, Audit Secrecy, Admin Isolation (RC05-NEG-85 … 96)
+### Restart, Audit Secrecy, Admin Isolation (RC05-NEG-70 … 79)
 
-| ID          | Attack / input                                        | Expected result                   | Critical no-side-effect                   |
-| :---------- | :---------------------------------------------------- | :-------------------------------- | :---------------------------------------- |
-| RC05-NEG-85 | Restart: sessions cleared, approvals invalidated      | Sessions invalid; approvals gone  | Trust survives; approvals stay volatile   |
-| RC05-NEG-86 | Normal shutdown connection drain exceeds 60 seconds   | Connections force-closed at 60 s  | Sessions revoked; audit evidence flushed  |
-| RC05-NEG-87 | Audit log inspection after session bootstrap          | No raw session token in audit     | Central redaction eliminates raw token    |
-| RC05-NEG-88 | Audit log inspection after enrollment completion      | No raw enrollment secret in audit | Central redaction eliminates secret       |
-| RC05-NEG-89 | Audit log inspection for private keys / cert material | No private cryptographic material | Cryptographic secrecy preserved           |
-| RC05-NEG-90 | Remote client attempts `approve` action via MCP       | `POLICY_DENIED`                   | No approval state mutated; admin IPC only |
-| RC05-NEG-91 | Remote client attempts `reject` action via MCP        | `POLICY_DENIED`                   | No approval state mutated; admin IPC only |
-| RC05-NEG-92 | Remote client attempts approval list/inspect via MCP  | `POLICY_DENIED`                   | No review material disclosed              |
-| RC05-NEG-93 | Remote client attempts device enroll/revoke via MCP   | Rejected (`POLICY_DENIED`)        | Trust store unchanged; admin IPC only     |
-| RC05-NEG-94 | Remote client attempts policy modification via MCP    | `POLICY_DENIED`                   | Policy engine unchanged                   |
-| RC05-NEG-95 | Remote client attempts session revocation for another | Rejected                          | Cross-device session mutation barred      |
-| RC05-NEG-96 | Remote client attempts modifying trust store directly | Rejected                          | Admin IPC only; remote tool rejected      |
+| ID          | Attack / input                                        | Expected result                   | Critical no-side-effect                                                            |
+| :---------- | :---------------------------------------------------- | :-------------------------------- | :--------------------------------------------------------------------------------- |
+| RC05-NEG-70 | Restart: sessions cleared, approvals invalidated      | Sessions invalid; approvals gone  | Trust survives; approvals stay volatile                                            |
+| RC05-NEG-71 | Audit log inspection after session bootstrap          | No raw session token in audit     | Central redaction eliminates raw token                                             |
+| RC05-NEG-72 | Audit log inspection after enrollment completion      | No raw enrollment secret in audit | Central redaction eliminates secret                                                |
+| RC05-NEG-73 | Audit log inspection for private keys / cert material | No private cryptographic material | Cryptographic secrecy preserved                                                    |
+| RC05-NEG-74 | Remote client attempts `approve` action via MCP       | Unknown tool rejection (`-32601`) | Tool not exposed via MCP; policy not reached; no approval state mutated            |
+| RC05-NEG-75 | Remote client attempts `reject` action via MCP        | Unknown tool rejection (`-32601`) | Tool not exposed via MCP; policy not reached; no approval state mutated            |
+| RC05-NEG-76 | Remote client attempts approval list/inspect via MCP  | Unknown tool rejection (`-32601`) | Tool not exposed via MCP; policy not reached; no review material disclosed         |
+| RC05-NEG-77 | Remote client attempts device enroll/revoke via MCP   | Unknown tool rejection (`-32601`) | Tool not exposed via MCP; policy not reached; trust store unchanged                |
+| RC05-NEG-78 | Remote client attempts policy modification via MCP    | Unknown tool rejection (`-32601`) | Tool not exposed via MCP; policy not reached; policy engine unchanged              |
+| RC05-NEG-79 | Remote client attempts session revocation for another | Unknown tool rejection (`-32601`) | Tool not exposed via MCP; policy not reached; cross-device session mutation barred |
 
-**Final catalog size: N = 96.** Every threat in §35 maps to one or more of these
+**Final catalog size: N = 79.** Every threat in §35 maps to one or more of these
 contiguous controls.
 
 ---
 
 ## 35. Threat Matrix
 
-| Threat                                    | Trust Boundary      | Preventive Control                               | Detection / Audit                   | Negative control           |
-| :---------------------------------------- | :------------------ | :----------------------------------------------- | :---------------------------------- | :------------------------- |
-| Unauthenticated remote tool invocation    | TB-1 Ingress        | §11–§12 auth sequence; §3 invariant              | `AUTH_FAILED`                       | 50, 80, 81                 |
-| Plaintext or downgraded transport         | TB-1 Ingress        | §6 TLS 1.3 only, no fallback                     | `AUTH_FAILED` / handshake refusal   | 01, 07                     |
-| Untrusted CA client certificate           | TB-1 Ingress        | §6 T-8, §7 P-3 client CA validation              | Handshake refused                   | 09                         |
-| Expired client certificate                | TB-1 Ingress        | §6 T-7 client certificate expiry check           | Handshake refused                   | 10                         |
-| Unenrolled device authentication attempt  | TB-1 → TB-2         | §8 device trust store; anti-oracle rule          | `AUTH_FAILED`                       | 19, 77                     |
-| Pin rotation overlap window abuse         | TB-1 → TB-2         | §7 P-7 explicit window removal                   | `AUTH_FAILED`                       | 20                         |
-| Certificate/key theft (no private key)    | TB-1 Ingress        | §7 mTLS requires private key                     | `AUTH_FAILED`                       | 08, 11                     |
-| Session token theft                       | TB-2 Policy         | §11 binding to device + SPKI                     | `INVALID_SESSION_TOKEN`             | 56                         |
-| Session fixation / client-asserted ID     | TB-2 Policy         | §5.3, §11 server-generated ID & token            | `INVALID_SESSION_TOKEN`             | 51, 60                     |
-| Cross-device token replay                 | TB-2 Policy         | §11 binding                                      | `INVALID_SESSION_TOKEN`             | 56                         |
-| Malformed session token presented         | TB-2 Policy         | §11 128-byte ceiling, strict hex check           | `INVALID_SESSION_TOKEN`             | 57                         |
-| Actor-field spoofing from remote JSON     | TB-2 Policy         | §13 server-derived actor                         | `INVALID_REQUEST_SCHEMA`            | 59, 60, 61, 62             |
-| Auth mistaken for authorization           | TB-2 Policy         | §14 separation; RC-04 policy unchanged           | `POLICY_DENIED`                     | 82                         |
-| Session token used as approval token      | TB-2 Policy         | §28 separation                                   | `APPROVAL_REJECTED`                 | 83                         |
-| Approval token used as session token      | TB-2 Policy         | §28 separation                                   | `INVALID_SESSION_TOKEN`             | 84                         |
-| Approval re-bound across expiring session | TB-2 Policy         | §28 X-7 fails closed                             | `APPROVAL_REJECTED`                 | 63                         |
-| TCP / TLS handshake token-bucket flood    | TB-1 Ingress        | §21 Layer A token bucket (cap 20, refill 1/s)    | TCP drop                            | 64, 65, 66, 67             |
-| HTTP pre-session request flood            | TB-1 Ingress        | §21 Layer B token bucket (cap 30, refill 2/s)    | HTTP 429 Too Many Requests          | 68, 69                     |
-| Authenticated MCP request flood           | TB-2 Policy         | §21 Layer C token bucket (cap 60, refill 5/s)    | MCP `RATE_LIMIT_EXCEEDED`           | 70, 71                     |
-| Limiter-key churn memory exhaustion       | TB-1 Ingress        | §21.2 key caps (4096/2048/1024), LRU fail-closed | Connection drop / HTTP 429          | 72                         |
-| IP normalization bypass                   | TB-1 Ingress        | §21.3 IPv4 unmapping & IPv6 /64 prefix grouping  | `RATE_LIMITED` / HTTP 429           | 73, 74                     |
-| Slowloris / partial body                  | TB-1 Ingress        | §20 read timeouts, header bounds                 | `REMOTE_DISCONNECTED`               | 76                         |
-| Oversized / compressed payload            | TB-1 Ingress        | §20 4 MiB during-read enforcement                | `PAYLOAD_TOO_LARGE`                 | 75                         |
-| Enrollment replay / race                  | TB-1 → TB-2         | §9 single-use secrets, atomic completion         | `DEVICE_ENROLLMENT_REJECTED`        | 45                         |
-| Rogue enrollment authority                | TB-2 Policy         | §9 local-operator-only bootstrap                 | `DEVICE_ENROLLMENT_REJECTED`        | 35, 37                     |
-| First-device bootstrap bypass             | TB-1 Ingress        | §5.2, §9 zero-device startup requires completion | `UNAUTHENTICATED`                   | 49                         |
-| Enrollment-completion endpoint abuse      | TB-1 Ingress        | §9 mTLS, SPKI match, 3-attempt lockout, 300s TTL | HTTP 400 / purge challenge          | 36, 38, 39, 43, 44         |
-| Oversized enrollment secret input         | TB-1 Ingress        | §9.1 128-byte bounded admission                  | HTTP 400 `Enrollment failed`        | 40                         |
-| Enrollment secret timing side-channel     | TB-1 Ingress        | §9.1 constant-time timingSafeEqual comparison    | Constant-time rejection             | 41                         |
-| Raw enrollment secret leakage             | TB-2 Policy         | §9.1 SHA-256 digest-only storage                 | Raw secret absent from persistence  | 42                         |
-| Duplicate pending SPKI exhaustion         | TB-2 Policy         | §9.1 single active pending per SPKI, dedup reuse | Reuses existing pending record      | 46, 47                     |
-| Pending enrollment quota exhaustion       | TB-2 Policy         | §9 E-7 16 global / 4 operator quotas             | Rejected via Admin IPC              | 48                         |
-| Same-UID forged device record in store    | TB-3 Storage        | §16.1 Operator Ed25519 signature required        | Startup failure                     | 26                         |
-| Same-UID tampered record fields           | TB-3 Storage        | §16.1 Canonical JSON signature verification      | Startup failure                     | 27                         |
-| Same-UID unsigned revocation tampering    | TB-3 Storage        | §16.1 Operator capability signature required     | Startup failure                     | 28                         |
-| Trust store symlink swap / TOCTOU         | TB-3 Storage        | §16.2 Safe-open descriptor fstat validation      | Startup failure                     | 29                         |
-| Attacker-writable trust store file/mode   | TB-3 Storage        | §16.2 Regular file, mode 0600, UID check         | Startup failure / write abort       | 30, 31                     |
-| Attacker-writable CA / trust roots        | TB-3 Storage        | §6 T-11 root/launcher ownership, safe-open       | Startup failure                     | 17, 18                     |
-| Malformed / duplicate pin in trust store  | TB-3 Storage        | §7 P-8, §8 malformed/duplicate pin rejection     | Startup failure                     | 21, 22                     |
-| Trust store resource exhaustion           | TB-3 Storage        | §8 256 device cap, 256 KiB size cap              | `RESOURCE_EXHAUSTED` / Startup fail | 23, 24, 32                 |
-| Display label overflow in enrollment      | TB-2 Policy         | §8 64-byte display label bound                   | `INVALID_REQUEST_SCHEMA`            | 25                         |
-| Trust store pre-rename write failure      | TB-3 Storage        | §16.3 Phase 1 fail-closed persistence            | Operation fails closed              | 33                         |
-| Durability uncertainty after rename       | TB-3 Storage        | §16.3 Phase 3 parent fsync failure fatal state   | Fatal fail-closed gateway state     | 34                         |
-| Device revocation not enforced            | TB-2 Policy         | §8, §11 immediate revocation                     | `AUTH_FAILED` / `SESSION_REVOKED`   | 78, 79                     |
-| Session / token bootstrap abuse           | TB-1 → TB-2         | §5.3, §11 tokenless initialize only, quotas      | `UNAUTHENTICATED` / session cap     | 51, 52, 58                 |
-| Mismatched session ID + token             | TB-2 Policy         | §5.3, §11 dual-header requirement                | `INVALID_SESSION_TOKEN`             | 53, 54, 55                 |
-| Server certificate expiring at runtime    | TB-1 Ingress        | §6 T-7 runtime check before new TLS handshakes   | Handshake refused; health degraded  | 15                         |
-| Runtime cert expiry connection drain      | TB-1 Ingress        | §6 T-7 maximum 60 s drain before force-close     | Connections force-closed at 60 s    | 16                         |
-| Normal shutdown drain overflow            | TB-1 Ingress        | §26 C-8 maximum 60 s drain before force-close    | Connections force-closed at 60 s    | 86                         |
-| Server certificate SAN mismatch or expiry | TB-1 Ingress        | §6 T-5, §18 startup hostname & validity checks   | Startup failure                     | 12, 13, 14                 |
-| Remote administrative escalation          | TB-2 Policy         | §15 admin stays local IPC                        | `POLICY_DENIED`                     | 90, 91, 92, 93, 94, 95, 96 |
-| Secret leakage into audit/logs/errors     | TB-3 Host Execution | §17 K-3, §24 central redaction                   | Audit secrecy assertions            | 87, 88, 89                 |
-| Proxy-header identity spoofing            | TB-1 Ingress        | §6.1 in-process TLS; headers never authoritative | `UNAUTHENTICATED`                   | 19                         |
-| DNS rebinding / browser origin            | TB-1 Ingress        | §23 default-deny origin, Host validation         | Rejection before parse              | 02, 05                     |
-| Restart resurrecting authority            | TB-2 Policy         | §29 restart semantics                            | `SESSION_REVOKED`                   | 85                         |
-| Wildcard bind exposure                    | TB-1 Ingress        | §18 explicit opt-in                              | Startup failure                     | 05                         |
+| Threat                                        | Trust Boundary      | Preventive Control                                                  | Detection / Audit                                      | Negative control       |
+| :-------------------------------------------- | :------------------ | :------------------------------------------------------------------ | :----------------------------------------------------- | :--------------------- |
+| Unauthenticated remote tool invocation        | TB-1 Ingress        | §11–§12 auth sequence; §3 invariant                                 | `AUTH_FAILED`                                          | 39, 65, 66             |
+| Plaintext or downgraded transport             | TB-1 Ingress        | §6 TLS 1.3 only, no fallback                                        | `AUTH_FAILED` / handshake refusal                      | 01, 07                 |
+| Unsupported transport / legacy endpoint probe | TB-1 Ingress        | §5.1 Streamable HTTP only, no legacy SSE, strict method routing     | HTTP 404 / HTTP 405                                    | 03, 04                 |
+| Stateless transport misconfiguration          | TB-1 Ingress        | §5.3 stateful mode required, sessionIdGenerator mandatory           | Startup failure                                        | 06                     |
+| Untrusted CA client certificate               | TB-1 Ingress        | §6 T-8, §7 P-3 client CA validation                                 | Handshake refused                                      | 09                     |
+| Expired client certificate                    | TB-1 Ingress        | §6 T-7 client certificate expiry check                              | Handshake refused                                      | 10                     |
+| Unenrolled device authentication attempt      | TB-1 → TB-2         | §8 device trust store; anti-oracle rule                             | `AUTH_FAILED`                                          | 16, 62                 |
+| Pin rotation overlap window abuse             | TB-1 → TB-2         | §7 P-7 explicit window removal                                      | `AUTH_FAILED`                                          | 17                     |
+| Certificate/key theft (no private key)        | TB-1 Ingress        | §7 mTLS requires private key                                        | `AUTH_FAILED`                                          | 08, 11                 |
+| Session token theft                           | TB-2 Policy         | §11 binding to device + SPKI                                        | `INVALID_SESSION_TOKEN`                                | 45                     |
+| Session fixation / client-asserted ID         | TB-2 Policy         | §5.3, §11 server-generated ID & token                               | `INVALID_SESSION_TOKEN`                                | 40, 49                 |
+| Cross-device token replay                     | TB-2 Policy         | §11 binding                                                         | `INVALID_SESSION_TOKEN`                                | 45                     |
+| Malformed session token presented             | TB-2 Policy         | §11 128-byte ceiling, strict hex check                              | `INVALID_SESSION_TOKEN`                                | 46                     |
+| Actor-field spoofing from remote JSON         | TB-2 Policy         | §13 server-derived actor                                            | `INVALID_REQUEST_SCHEMA`                               | 48, 49, 50, 51         |
+| Auth mistaken for authorization               | TB-2 Policy         | §14 separation; RC-04 policy unchanged                              | `POLICY_DENIED`                                        | 67                     |
+| Session token used as approval token          | TB-2 Policy         | §28 separation                                                      | `APPROVAL_REJECTED`                                    | 68                     |
+| Approval token used as session token          | TB-2 Policy         | §28 separation                                                      | `INVALID_SESSION_TOKEN`                                | 69                     |
+| Approval re-bound across expiring session     | TB-2 Policy         | §28 X-7 fails closed; session-bound approval invalid across re-auth | `APPROVAL_REJECTED`                                    | 52                     |
+| TCP / TLS handshake flood                     | TB-1 Ingress        | §21 Layer A connection limits & handshake caps                      | TCP drop                                               | 53, 54                 |
+| HTTP pre-session request flood                | TB-1 Ingress        | §21 Layer B pre-session HTTP limiter                                | HTTP 429 Too Many Requests                             | 55                     |
+| Authenticated MCP request flood               | TB-2 Policy         | §21 Layer C authenticated limiter                                   | MCP `RATE_LIMIT_EXCEEDED`                              | 56                     |
+| Limiter-key churn memory exhaustion           | TB-1 Ingress        | §21.2 key caps (4096/2048/1024), LRU fail-closed                    | Connection drop / HTTP 429                             | 57                     |
+| IP normalization bypass                       | TB-1 Ingress        | §21.3 IPv4 unmapping & IPv6 /64 prefix grouping                     | `RATE_LIMITED` / HTTP 429                              | 58, 59                 |
+| Slowloris / partial body                      | TB-1 Ingress        | §20 read timeouts, header bounds                                    | `REMOTE_DISCONNECTED`                                  | 61                     |
+| Oversized / compressed payload                | TB-1 Ingress        | §20 4 MiB during-read enforcement                                   | `PAYLOAD_TOO_LARGE`                                    | 60                     |
+| Enrollment replay / race                      | TB-1 → TB-2         | §9 single-use secrets, atomic completion                            | `DEVICE_ENROLLMENT_REJECTED`                           | 36                     |
+| Rogue enrollment authority                    | TB-2 Policy         | §9 local-operator-only bootstrap                                    | `UNAUTHENTICATED` / HTTP 400                           | 29, 31                 |
+| First-device bootstrap bypass                 | TB-1 Ingress        | §5.2, §9 zero-device startup requires completion                    | `UNAUTHENTICATED`                                      | 38                     |
+| Enrollment-completion endpoint abuse          | TB-1 Ingress        | §9 mTLS, SPKI match, 3-attempt lockout, 300s TTL                    | HTTP 400 / purge challenge                             | 30, 32, 33, 34, 35     |
+| Pending enrollment quota exhaustion           | TB-2 Policy         | §9 E-7 16 global / 4 operator quotas                                | Rejected via Admin IPC                                 | 37                     |
+| Attacker-writable trust store                 | TB-3 Storage        | §16 regular file, mode 0600, UID check                              | Startup failure / write abort                          | 24, 25                 |
+| Trust-store symlink swap                      | TB-3 Storage        | §16 `O_NOFOLLOW`/`lstat` symlink check                              | Startup failure                                        | 23                     |
+| Attacker-writable CA / trust roots            | TB-3 Storage        | §6 T-11 mode & 0022 check, symlink check                            | Startup failure                                        | 28                     |
+| Malformed / duplicate pin in trust store      | TB-3 Storage        | §7 P-8, §8 malformed/duplicate pin rejection                        | Startup failure                                        | 18, 19                 |
+| Trust store resource exhaustion               | TB-3 Storage        | §8 256 device cap, 256 KiB size cap                                 | `RESOURCE_EXHAUSTED` / Startup fail                    | 20, 21, 26             |
+| Display label overflow in enrollment          | TB-2 Policy         | §8 64-byte display label bound                                      | `INVALID_REQUEST_SCHEMA`                               | 22                     |
+| Trust store atomic persistence failure        | TB-3 Storage        | §16 atomic write + fsync                                            | Operation fails closed                                 | 27                     |
+| Device revocation not enforced                | TB-2 Policy         | §8, §11 immediate revocation                                        | `AUTH_FAILED` / `SESSION_REVOKED`                      | 63, 64                 |
+| Session / token bootstrap abuse               | TB-1 → TB-2         | §5.3, §11 tokenless initialize only, quotas                         | `UNAUTHENTICATED` / session cap                        | 40, 41, 47             |
+| Mismatched session ID + token                 | TB-2 Policy         | §5.3, §11 dual-header requirement                                   | `INVALID_SESSION_TOKEN`                                | 42, 43, 44             |
+| Server certificate expiring at runtime        | TB-1 Ingress        | §6 T-7 runtime check before new TLS handshakes                      | Handshake refused; health degraded                     | 15                     |
+| Server certificate SAN mismatch or expiry     | TB-1 Ingress        | §6 T-5, §18 startup hostname & validity checks                      | Startup failure                                        | 12, 13, 14             |
+| Remote administrative escalation              | TB-2 Policy         | §15 admin stays local IPC; no MCP admin tools                       | Unknown tool rejection (`-32601`) / policy not reached | 74, 75, 76, 77, 78, 79 |
+| Secret leakage into audit/logs/errors         | TB-3 Host Execution | §17 K-3, §24 central redaction                                      | Audit secrecy assertions                               | 71, 72, 73             |
+| Proxy-header identity spoofing                | TB-1 Ingress        | §6.1 in-process TLS; headers never authoritative                    | `UNAUTHENTICATED`                                      | 16                     |
+| DNS rebinding / browser origin                | TB-1 Ingress        | §23 default-deny origin, Host validation                            | Rejection before parse                                 | 02, 05                 |
+| Restart resurrecting authority                | TB-2 Policy         | §29 restart semantics                                               | `SESSION_REVOKED`                                      | 70                     |
+| Wildcard bind exposure                        | TB-1 Ingress        | §18 explicit opt-in                                                 | Startup failure                                        | 05                     |
 
 ---
 
@@ -1472,14 +1292,12 @@ These are the required **success** paths. Task 0 does not implement them.
    `authenticationActive: true`; `/mcp` rejects ordinary sessions; `/enroll/complete`
    is ready for bootstrap.
 3. **Remote gateway startup with enrolled devices** — starts with valid TLS config,
-   client CA roots, and populated trust store; all device records verified against
-   operator Ed25519 public key; listener bound; health reports enrolled device count.
+   client CA roots, and populated trust store; listener bound; health reports
+   enrolled device count.
 4. **First-device local enrollment initiation & remote completion** — operator
-   creates pending enrollment on local admin IPC; `deviceId` generated; operator
-   signs canonical authorization; client connects over TLS 1.3 mTLS to
-   `POST /enroll/complete` with matching SPKI and valid secret; secret digest verified
-   via `timingSafeEqual`; device record atomically written to trust store;
-   `DEVICE_ENROLLED` audited.
+   creates pending enrollment on local admin IPC; client connects over TLS 1.3
+   mTLS to `POST /enroll/complete` with matching SPKI and valid secret; device
+   record atomically written to trust store; `DEVICE_ENROLLED` audited.
 5. **Session bootstrap via tokenless initialize** — enrolled device connects over
    TLS 1.3 mTLS; issues initial tokenless `initialize` on `/mcp`; server mints
    session, generates `Mcp-Session-Id`, and returns raw token in `Arc-Session-Token`
@@ -1498,47 +1316,45 @@ These are the required **success** paths. Task 0 does not implement them.
 10. **Session expiration and re-authentication** — idle/absolute expiry revokes
     the session; a new session is issued after re-authentication; old token no
     longer works.
-11. **Device revocation** — operator revokes with signed capability; live sessions
-    for that device are revoked; subsequent requests fail with generic
-    `UNAUTHENTICATED`; the trust store reflects the signed revocation across restart.
+11. **Device revocation** — operator revokes; live sessions for that device are
+    revoked; subsequent requests fail with generic `UNAUTHENTICATED`; the trust
+    store reflects the revocation across restart.
 
 ---
 
 ## 37. Historical Documentation Reconciliation
 
-| Historical source                            | Historical wording                                                                                                                            | Ambiguity / conflict                                                                    | **Normative RC-05 rule**                                                                                                                 |
-| :------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------- |
-| `README.md`                                  | "Remote MCP over HTTPS/SSE", mutual TLS, device enrollment                                                                                    | "SSE" is a deprecated transport name in SDK 1.30.0                                      | **Streamable HTTP only** (§5). SSE survives as _response framing_, not as a transport.                                                   |
-| `docs/architecture/overview.md`              | "local stdio and remote authenticated HTTPS/SSE"; "device enrollment, token lifecycle management, and session pinning"                        | Suggests both transports can run; does not define session pinning                       | **Mutually exclusive listeners** (§4). "Session pinning" = binding to `(Mcp-Session-Id, deviceId, SPKI, clientId)` (§5.4, §11).          |
-| `docs/architecture/trust-boundaries.md`      | "TLS 1.3 with pinned certificates"; "Hard ceiling on JSON-RPC message size (default: 4 MB)"; "Sliding-window rate limiter per client session" | Pinning undefined; "4 MB" ambiguous; limiter keyed on "session" only is unsafe pre-auth | **SPKI SHA-256 pin in addition to CA chain validation** (§7); **4 MiB on raw body** (§20); **deterministic bounded token bucket** (§21). |
-| `docs/architecture/trust-boundaries.md`      | "HTTPS/WSS SSE" transport termination                                                                                                         | Implies WebSocket support                                                               | **WebSocket not supported** (§5).                                                                                                        |
-| `docs/threat-model/threat-model.md`          | "Mandatory TLS 1.3, cryptographic session tokens, client device enrollment, stdio inheritance checks (RC-05)"                                 | "stdio inheritance checks" undefined for a remote stage                                 | stdio is a **separate mutually exclusive mode** whose actor is never derived from remote credentials (§4, §13).                          |
-| `docs/architecture/package-ownership.md`     | `packages/auth` owns identity/session/device auth; `apps/mcp-server` owns stdio + HTTPS/SSE transports                                        | Confirms ownership; transport name stale                                                | Ownership **preserved**; transport is **Streamable HTTP** (§30).                                                                         |
-| `docs/architecture/rc04-scope-acceptance.md` | Remote HTTPS/SSE/TLS/mTLS deferred to RC-05; OIDC/SAML/OAuth2 + device attestation "RC-05"; remote approval administration absent             | Conflicts with the narrower README roadmap                                              | Transport per §5; **OIDC/OAuth2/SAML/IdP/attestation deferred beyond RC-05** (§10); **admin stays local** (§15).                         |
-| `docs/architecture/trust-boundaries.md`      | "All remote connections require TLS 1.3 with pinned certificates"                                                                             | Does not say whether a proxy may terminate TLS                                          | **In-process TLS only**; proxy termination out of scope (§6).                                                                            |
-| `packages/auth/src/index.ts`                 | `IAuthEngine.verifyToken` / `generateSessionToken` as the RC-05 target                                                                        | Implies a token engine; silent on binding and enrollment                                | Contract kept conceptually; RC-05 adds **enrollment, pinning, and TLS-identity binding** around it (§8, §11).                            |
-| Filesystem permissions as security root      | Mode `0600` protects trust store and CA files from untrusted processes                                                                        | Weakened under same-UID threat model where untrusted processes share process UID        | **Operator Ed25519 cryptographic authorization is authoritative** (§16.1); filesystem checks are defense in depth (§16.2).               |
-| "Sliding-window rate limiter"                | Wording suggested non-deterministic windowing or variable memory                                                                              | Vulnerable to memory exhaustion under key churn                                         | **Bounded token bucket using monotonic time** (§21) provides exact rate control with fixed O(1) memory per key.                          |
+| Historical source                            | Historical wording                                                                                                                            | Ambiguity / conflict                                                                    | **Normative RC-05 rule**                                                                                                        |
+| :------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------ |
+| `README.md`                                  | "Remote MCP over HTTPS/SSE", mutual TLS, device enrollment                                                                                    | "SSE" is a deprecated transport name in SDK 1.30.0                                      | **Streamable HTTP only** (§5). SSE survives as _response framing_, not as a transport.                                          |
+| `docs/architecture/overview.md`              | "local stdio and remote authenticated HTTPS/SSE"; "device enrollment, token lifecycle management, and session pinning"                        | Suggests both transports can run; does not define session pinning                       | **Mutually exclusive listeners** (§4). "Session pinning" = binding to `(Mcp-Session-Id, deviceId, SPKI, clientId)` (§5.4, §11). |
+| `docs/architecture/trust-boundaries.md`      | "TLS 1.3 with pinned certificates"; "Hard ceiling on JSON-RPC message size (default: 4 MB)"; "Sliding-window rate limiter per client session" | Pinning undefined; "4 MB" ambiguous; limiter keyed on "session" only is unsafe pre-auth | **SPKI SHA-256 pin in addition to CA chain validation** (§7); **4 MiB on raw body** (§20); **three-layer rate limiting** (§21). |
+| `docs/architecture/trust-boundaries.md`      | "HTTPS/WSS SSE" transport termination                                                                                                         | Implies WebSocket support                                                               | **WebSocket not supported** (§5).                                                                                               |
+| `docs/threat-model/threat-model.md`          | "Mandatory TLS 1.3, cryptographic session tokens, client device enrollment, stdio inheritance checks (RC-05)"                                 | "stdio inheritance checks" undefined for a remote stage                                 | stdio is a **separate mutually exclusive mode** whose actor is never derived from remote credentials (§4, §13).                 |
+| `docs/architecture/package-ownership.md`     | `packages/auth` owns identity/session/device auth; `apps/mcp-server` owns stdio + HTTPS/SSE transports                                        | Confirms ownership; transport name stale                                                | Ownership **preserved**; transport is **Streamable HTTP** (§30).                                                                |
+| `docs/architecture/rc04-scope-acceptance.md` | Remote HTTPS/SSE/TLS/mTLS deferred to RC-05; OIDC/SAML/OAuth2 + device attestation "RC-05"; remote approval administration absent             | Conflicts with the narrower README roadmap                                              | Transport per §5; **OIDC/OAuth2/SAML/IdP/attestation deferred beyond RC-05** (§10); **admin stays local** (§15).                |
+| `docs/architecture/trust-boundaries.md`      | "All remote connections require TLS 1.3 with pinned certificates"                                                                             | Does not say whether a proxy may terminate TLS                                          | **In-process TLS only**; proxy termination out of scope (§6).                                                                   |
+| `packages/auth/src/index.ts`                 | `IAuthEngine.verifyToken` / `generateSessionToken` as the RC-05 target                                                                        | Implies a token engine; silent on binding and enrollment                                | Contract kept conceptually; RC-05 adds **enrollment, pinning, and TLS-identity binding** around it (§8, §11).                   |
 
 ---
 
 ## 38. Implementation Breakdown
 
-Ten reviewable tasks, derived from independently reviewable security boundaries.
+Ten tasks, derived from independently reviewable security boundaries.
 **Task 0 is not implementation and is not counted.**
 
-| #   | Title                                                              | Scope                                                                                                                                                                                                                                                                                                                                                                        | Expected files                                                                           | Security invariants                             | Controls                          | Depends on | Stop boundary                                      |
-| :-- | :----------------------------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------- | :---------------------------------------------- | :-------------------------------- | :--------- | :------------------------------------------------- |
-| 1   | Device identity, SPKI pinning, and operator-authorized trust store | `deviceId` generation at pending time, SPKI pin derivation, canonical JSON Ed25519 operator signature verification, safe-open descriptor checks (`O_NOFOLLOW`/`fstat`), 256 KiB cap, 3-phase durability failure semantics. **No network I/O.**                                                                                                                               | `packages/auth/src/**`, `packages/protocol/src/**`, tests                                | §7 P-4..P-8, §8 all, §16 all                    | 19–25, 26–34                      | —          | No network I/O, no session logic, no server wiring |
-| 2   | Enrollment lifecycle and operator admin IPC                        | Pending enrollment creation (local admin IPC), `deviceId` pre-assignment, Ed25519 authorization signing, 32-byte secret digest storage, 300 s monotonic TTL, lockout (3 tries), dedup reuse, quotas.                                                                                                                                                                         | `packages/auth/src/**`, `apps/mcp-server/src/admin-ipc.ts`, `apps/cli/src/**`, tests     | §9 E-1..E-3, E-5..E-15                          | 40–48                             | 1          | No network listener; testable over local admin IPC |
-| 3   | TLS 1.3 & mTLS admission layer                                     | TLS 1.3 listener, client-cert requirement, CA chain validation, CA file integrity (root/launcher-owned, safe-open), server cert validity/SAN match, Layer A token-bucket limiter (cap 20, refill 1/s).                                                                                                                                                                       | `apps/mcp-server/src/**`, tests                                                          | §6 all, §7 P-1..P-3, §18, §21 Layer A           | 01, 05, 07–18, 64–67              | 1          | No MCP session yet; transport admits, nothing more |
-| 4   | Enrollment completion bootstrap endpoint                           | `POST /enroll/complete` bootstrap router, mTLS SPKI proof-of-possession verification, timing-safe 32-byte secret digest check (`timingSafeEqual`), bounded input (≤ 128 B), atomic device activation, zero-device bootstrap, uniform HTTP 400 rejection.                                                                                                                     | `apps/mcp-server/src/**`, `packages/auth/src/**`, tests                                  | §5.1, §5.2, §9 E-4, E-13..E-15, §12 Step 4      | 35–39, 49                         | 1, 2, 3    | Bootstrap endpoint only; no MCP session creation   |
-| 5   | Session State Core                                                 | Opaque 256-bit token generation/digest verification, `Mcp-Session-Id` binding data model, monotonic absolute (3600 s) and idle (300 s) TTL, revocation, session quotas (8/64/1024), concurrency-safe session store. **Pure logic; no HTTP response/header logic.**                                                                                                           | `packages/auth/src/**`, tests                                                            | §5.4, §11 all, §26 C-2/C-4                      | 54–58                             | 1          | Pure session state logic; no HTTP wiring           |
-| 6   | Actor context derivation and RC-04 pipeline wiring                 | Map authenticated connection → `(clientId, clientType, deviceId, sessionId)`; block caller-supplied actor fields in JSON-RPC; wire into shared pipeline; anti-oracle generic rejections.                                                                                                                                                                                     | `apps/mcp-server/src/**`, tests                                                          | §3, §13, §14, §25                               | 59–63, 77–82                      | 3, 5       | No new tool logic                                  |
-| 7   | Multi-layer rate limiting and resource bounds                      | Layer B secure HTTP pre-session token bucket (cap 30, refill 2/s), Layer C authenticated token bucket (cap 60, refill 5/s), limiter memory caps (4096/2048/1024), LRU fail-closed, IP normalization and `/64` grouping, body/header bounds.                                                                                                                                  | `packages/auth/src/**` or `apps/mcp-server/src/**`, tests                                | §20, §21 Layer B & C, §21.2, §21.3, §26 C-1/C-3 | 68–76                             | 3, 5       | Bounds only; no policy decisions                   |
-| 8   | Streamable HTTP Gateway Composition + Wire Bootstrap + Health      | `StreamableHTTPServerTransport` integration on `/mcp`, stateful mode, tokenless `initialize` wire routing, `Mcp-Session-Id` generator, `Arc-Session-Token` response header, dual-header validation, call into Task 5 session core, GET/POST/DELETE session routing, stdio/remote mutual exclusion, runtime cert expiry 60 s drain, normal shutdown 60 s drain, health model. | `apps/mcp-server/src/**`, `packages/protocol/src/**`, tests                              | §4, §5.3, §6 T-7, §19, §23, §26 C-8, §27        | 02, 03, 04, 06, 15, 16, 50–53, 86 | 3, 5, 6, 7 | Composition only; no policy/approval change        |
-| 9   | Operator device and session administration                         | CLI + admin IPC methods: list/inspect/revoke devices, list/revoke sessions, pin overlap window management with signed capabilities.                                                                                                                                                                                                                                          | `apps/cli/src/**`, `apps/mcp-server/src/admin-ipc.ts`, tests                             | §15, §26                                        | 90–96                             | 1, 2, 5    | Admin stays local; no remote admin surface         |
-| 10  | Audit events, acceptance test suite + finalization                 | Gateway audit catalog, central secret redaction assertions, acceptance test suite for all 96 negative controls, `scripts/verify-rc05.sh`, `verify:rc05`, final documentation.                                                                                                                                                                                                | `packages/audit/src/**`, `packages/protocol/src/**`, `tests/**`, `scripts/**`, `docs/**` | §24, §28–§29, §34–§35                           | all 96                            | 1–9        | Finalization only                                  |
+| #   | Title                                                    | Scope                                                                                                                                                                                                                          | Expected files                                                                           | Security invariants                             | Controls                  | Depends on | Stop boundary                                      |
+| :-- | :------------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :--------------------------------------------------------------------------------------- | :---------------------------------------------- | :------------------------ | :--------- | :------------------------------------------------- |
+| 1   | Device identity, SPKI pinning, and trust-store integrity | `deviceId` generation, SPKI pin derivation/validation, trust-store read/write/validate, file permissions (0600), ownership, symlink check, size cap (256 KiB), atomic fsync persistence. **No network I/O.**                   | `packages/auth/src/**`, `packages/protocol/src/**`, tests                                | §7 P-4..P-8, §8 all, §16 all                    | 16–27                     | —          | No network I/O, no session logic, no server wiring |
+| 2   | Enrollment lifecycle and operator admin IPC              | Pending enrollment creation (local-channel initiated), one-time secret generation, monotonic TTL (300 s), challenge lockout (3 failed tries), quotas (16 global/4 operator), cancel.                                           | `packages/auth/src/**`, `apps/mcp-server/src/admin-ipc.ts`, `apps/cli/src/**`, tests     | §9 E-1..E-3, E-5..E-12                          | 33–37                     | 1          | No network listener; testable over local admin IPC |
+| 3   | TLS 1.3 & mTLS admission layer                           | TLS 1.3 listener, client-cert requirement, CA chain validation, CA file integrity (mode/symlink), server cert startup/runtime validity and SAN match, Layer A TCP/TLS admission limiter.                                       | `apps/mcp-server/src/**`, tests                                                          | §6 all, §7 P-1..P-3, §18, §21 Layer A           | 01, 05, 07–15, 28, 53, 54 | 1          | No MCP session yet; transport admits, nothing more |
+| 4   | Enrollment completion bootstrap endpoint                 | `POST /enroll/complete` bootstrap router, mTLS SPKI proof-of-possession verification, single-use secret check, atomic device activation, zero-device bootstrap handling.                                                       | `apps/mcp-server/src/**`, `packages/auth/src/**`, tests                                  | §5.1, §5.2, §9 E-4, §12 Step 4                  | 29–32, 38                 | 1, 2, 3    | Bootstrap endpoint only; no MCP session creation   |
+| 5   | Session issuance, wire bootstrap, and token lifecycle    | Tokenless `initialize` handling, `Mcp-Session-Id` generator, `Arc-Session-Token` header issuance, dual-header validation (`Mcp-Session-Id` + `Authorization`), token digests, TTLs, caps, approval-as-session token rejection. | `packages/auth/src/**`, tests                                                            | §5.3, §5.4, §11 all, §26 C-2/C-4                | 39–47, 69                 | 1          | Session logic only; no MCP tool execution          |
+| 6   | Actor context derivation and RC-04 pipeline wiring       | Map authenticated connection → `(clientId, clientType, deviceId, sessionId)`; block caller-supplied actor fields in JSON-RPC; wire into shared pipeline; anti-oracle generic rejections; session-as-approval rejection.        | `apps/mcp-server/src/**`, tests                                                          | §3, §13, §14, §25                               | 48–52, 62–68              | 3, 5       | No new tool logic                                  |
+| 7   | Multi-layer rate limiting and resource bounds            | Layer B secure HTTP pre-session limiter, Layer C authenticated limiter, limiter memory caps (4096/2048/1024), LRU fail-closed, IP normalization and `/64` grouping, body/header bounds.                                        | `packages/auth/src/**` or `apps/mcp-server/src/**`, tests                                | §20, §21 Layer B & C, §21.2, §21.3, §26 C-1/C-3 | 55–61                     | 3, 5       | Bounds only; no policy decisions                   |
+| 8   | Streamable HTTP gateway composition and health           | `StreamableHTTPServerTransport` integration on `/mcp`, stateful mode, runtime cert expiry health degradation, zero-device health status, mutual exclusion with stdio, restart session invalidation.                            | `apps/mcp-server/src/**`, `packages/protocol/src/**`, tests                              | §4, §5, §19, §23, §27, §29                      | 02, 03, 04, 06, 70        | 3–7        | Composition only; no policy/approval change        |
+| 9   | Operator device and session administration               | CLI + admin IPC methods: list/inspect/revoke devices, list/revoke sessions, pin overlap window management.                                                                                                                     | `apps/cli/src/**`, `apps/mcp-server/src/admin-ipc.ts`, tests                             | §15, §26                                        | 74–79                     | 1, 2, 5    | Admin stays local; no remote admin surface         |
+| 10  | Audit events, acceptance test suite + finalization       | Gateway audit catalog, central secret redaction assertions, acceptance test suite for all 79 negative controls, `scripts/verify-rc05.sh`, `verify:rc05`, final documentation.                                                  | `packages/audit/src/**`, `packages/protocol/src/**`, `tests/**`, `scripts/**`, `docs/**` | §24, §28–§29, §34–§35                           | 71–73, all 79 regression  | 1–9        | Finalization only                                  |
 
 ---
 
@@ -1549,59 +1365,48 @@ RC-05 is complete only when **all** of the following hold:
 1. The remote transport contract of §5 is implemented **exactly** — Streamable
    HTTP, stateful, TLS 1.3, no legacy SSE, no plaintext, no WebSocket.
 2. The **enrollment bootstrap endpoint (`POST /enroll/complete`)** is implemented
-   per §5.1 and §9, enabling zero-enrolled-device startup, mTLS proof-of-possession
-   bootstrap, timing-safe 32-byte secret digest verification, and uniform HTTP 400
-   anti-oracle failures.
-3. The **enrollment secret verifier model (§9.1)** is implemented: raw secret
-   returned once, only SHA-256 binary digest retained in pending records, ≤ 128 B
-   input bound, and raw secret absent from persistence, logs, audit, and errors.
-4. The **same-UID cryptographic operator authorization model (§16.1)** is
-   implemented: `deviceId` pre-assigned at pending creation, canonical JSON
-   authorization signed by operator Ed25519 key, and all persisted device records
-   verified against operator public key on startup.
-5. The **filesystem defense-in-depth and 3-phase durability model (§16.2, §16.3)**
-   is implemented: descriptor/`fstat` safe-open checks, and post-rename parent
-   directory fsync failure entering a fatal fail-closed state.
-6. The **session bootstrap wire protocol (§5.3)** is implemented exactly: tokenless
+   per §5.1 and §9, enabling zero-enrolled-device startup and mTLS proof-of-possession
+   bootstrap.
+3. The **session bootstrap wire protocol (§5.3)** is implemented exactly: tokenless
    `initialize`, `Arc-Session-Token` header response, and subsequent dual-header
    verification (`Mcp-Session-Id` + `Authorization: Bearer <token>`).
-7. **Session ID unification (§5.4)** is implemented: `actor.sessionId == Mcp-Session-Id`.
-8. **Authenticated remote MCP only**: no request can reach policy or a subsystem
+4. **Session ID unification (§5.4)** is implemented: `actor.sessionId == Mcp-Session-Id`.
+5. **Authenticated remote MCP only**: no request can reach policy or a subsystem
    without the full §12 sequence.
-9. The **TLS contract (§6)** is satisfied, including mandatory mTLS, in-process
-   termination, same-UID CA protection (root/launcher-owned or inherited FD),
-   server private key inherited FD loading, and runtime cert expiry 60 s drain.
-10. The **deterministic bounded token-bucket rate limiter (§21)** is satisfied
-    across Layers A, B, and C with monotonic time, key ceilings, and IPv6 `/64`
-    prefix normalization.
-11. The **anti-oracle error model (§25)** is preserved: pre-session failures return
-    only generic `UNAUTHENTICATED` (no external `DEVICE_NOT_ENROLLED`), post-session
-    failures return generic `INVALID_SESSION_TOKEN`, and enrollment completion
-    failures return uniform HTTP 400 `{"error":"Enrollment failed"}`.
-12. **Shutdown and cert-expiry 60 s drain windows (§6 T-7, §26 C-8)** are enforced.
-13. **Authentication/authorization separation (§14)** is preserved and
+6. The **TLS contract (§6)** is satisfied, including mandatory mTLS, in-process
+   termination, client CA file integrity, and runtime certificate expiry handling.
+7. The **device identity and trust store integrity model (§8, §16)** is satisfied,
+   including regular file verification, mode 0600 permissions, process UID ownership,
+   256 KiB size ceiling, 256 device cap, and atomic fsync persistence.
+8. The **three-layer rate limiting model (§21)** is satisfied, including Layer A
+   connection caps, Layer B HTTP 429 pre-session limiting, Layer C authenticated
+   limiting, limiter key bounds, and IPv6 `/64` prefix normalization.
+9. The **anti-oracle error model (§25)** is preserved: pre-session failures on `/mcp`
+   return only generic `UNAUTHENTICATED` (no external `DEVICE_NOT_ENROLLED`), bootstrap failures
+   on `POST /enroll/complete` return uniform `HTTP 400 Bad Request`, and post-session
+   failures return generic `INVALID_SESSION_TOKEN`.
+10. **Authentication/authorization separation (§14)** is preserved and
     demonstrated: a valid session hitting `DENY` is denied.
-14. **RC-04 policy and approval invariants are preserved** — `DENY >
+11. **RC-04 policy and approval invariants are preserved** — `DENY >
 REQUIRE_APPROVAL > ALLOW`, mutation floor, approval binding, 300 s monotonic
     TTL, restart invalidation — with regression tests proving it.
-15. **Local stdio regression is green**: existing stdio behaviour and RC-01…RC-04
+12. **Local stdio regression is green**: existing stdio behaviour and RC-01…RC-04
     suites unchanged (822 tests / 82 suites passing).
-16. **All 96 negative controls (§34) are green** in a dedicated acceptance suite,
+13. **All 79 negative controls (§34) are green** in a dedicated acceptance suite,
     with no skips and no todos.
-17. **Remote positive flows (§36)** pass as integration tests.
-18. **Audit redaction/secrecy tests** pass: no token, enrollment secret, private key,
+14. **Remote positive flows (§36)** pass as integration tests.
+15. **Audit redaction/secrecy tests** pass: no token, enrollment secret, private key,
     or `Authorization` value appears in any record.
-19. **No secret or private credential artifacts** exist in the repository.
-20. **`scripts/verify-rc05.sh` and `pnpm run verify:rc05`** exist and pass.
-21. The **RC-05 final integration report** is written and accurate.
-22. **Exact-head push CI, PR CI including Dependency Review, independent review,
+16. **No secret or private credential artifacts** exist in the repository.
+17. **`scripts/verify-rc05.sh` and `pnpm run verify:rc05`** exist and pass.
+18. The **RC-05 final integration report** is written and accurate.
+19. **Exact-head push CI, PR CI including Dependency Review, independent review,
     merge, and post-merge main CI** all complete with attempt 1 green.
 
 ---
 
 ## 40. Open Questions
 
-None. Every ambiguity and threat boundary raised across Task 0.1 and Task 0.2
-is resolved above by an explicit normative rule. Items that could not be resolved
-without a separate security design are marked **out of scope** rather than left
-undefined (§33).
+None. Every ambiguity raised by the Task-0 brief and Task 0.1 review is resolved
+above by an explicit normative rule. Items that could not be resolved without a
+separate security design are marked **out of scope** rather than left undefined (§33).
