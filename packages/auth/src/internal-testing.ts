@@ -7,4 +7,6 @@ export {
   defaultFsAdapter,
   verifyTrustStoreFileIntegrityWithAdapter,
   atomicPersistTrustStoreWithAdapter,
+  loadTrustStoreWithAdapter,
+  saveTrustStoreWithAdapter,
 } from './trust-store.js';

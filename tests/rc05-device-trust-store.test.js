@@ -34,6 +34,8 @@ import {
   defaultFsAdapter,
   verifyTrustStoreFileIntegrityWithAdapter,
   atomicPersistTrustStoreWithAdapter,
+  loadTrustStoreWithAdapter,
+  saveTrustStoreWithAdapter,
 } from '../packages/auth/dist/internal-testing.js';
 import { ArcError } from '../packages/protocol/dist/index.js';
 
@@ -497,7 +499,7 @@ describe('CesSpace ARC — RC-05 Task 1: Device Identity, SPKI Pinning & Trust S
       );
 
       assert.throws(
-        () => DeviceTrustStore.loadFromFileWithAdapter(filePath, mismatchedFileAdapter),
+        () => loadTrustStoreWithAdapter(filePath, mismatchedFileAdapter),
         (err) => err instanceof ArcError && err.code === 'ACCESS_DENIED',
       );
 
@@ -541,7 +543,7 @@ describe('CesSpace ARC — RC-05 Task 1: Device Identity, SPKI Pinning & Trust S
       );
 
       assert.throws(
-        () => store.saveToFileWithAdapter(filePath, mismatchedParentAdapter),
+        () => saveTrustStoreWithAdapter(store, filePath, mismatchedParentAdapter),
         (err) => err instanceof ArcError && err.code === 'ACCESS_DENIED',
       );
 
@@ -631,7 +633,7 @@ describe('CesSpace ARC — RC-05 Task 1: Device Identity, SPKI Pinning & Trust S
           throw new Error('Simulated write I/O failure');
         },
       };
-      assert.throws(() => store.saveToFileWithAdapter(filePath, writeFailAdapter));
+      assert.throws(() => saveTrustStoreWithAdapter(store, filePath, writeFailAdapter));
       assert.equal(fs.readFileSync(filePath, 'utf8'), contentBefore, 'Prior target bytes intact');
       assertNoTempFiles();
 
@@ -641,7 +643,7 @@ describe('CesSpace ARC — RC-05 Task 1: Device Identity, SPKI Pinning & Trust S
         writeSync: () => 0, // zero progress
       };
       assert.throws(
-        () => store.saveToFileWithAdapter(filePath, shortWriteAdapter),
+        () => saveTrustStoreWithAdapter(store, filePath, shortWriteAdapter),
         (err) => err instanceof ArcError && err.code === 'INTERNAL_ERROR',
       );
       assert.equal(fs.readFileSync(filePath, 'utf8'), contentBefore, 'Prior target bytes intact');
@@ -655,7 +657,7 @@ describe('CesSpace ARC — RC-05 Task 1: Device Identity, SPKI Pinning & Trust S
           throw new Error('Simulated file fsync failure');
         },
       };
-      assert.throws(() => store.saveToFileWithAdapter(filePath, fsyncFailAdapter));
+      assert.throws(() => saveTrustStoreWithAdapter(store, filePath, fsyncFailAdapter));
       assert.equal(fs.readFileSync(filePath, 'utf8'), contentBefore, 'Prior target bytes intact');
       assertNoTempFiles();
 
@@ -666,7 +668,7 @@ describe('CesSpace ARC — RC-05 Task 1: Device Identity, SPKI Pinning & Trust S
           throw new Error('Simulated atomic rename failure');
         },
       };
-      assert.throws(() => store.saveToFileWithAdapter(filePath, renameFailAdapter));
+      assert.throws(() => saveTrustStoreWithAdapter(store, filePath, renameFailAdapter));
       assert.equal(fs.readFileSync(filePath, 'utf8'), contentBefore, 'Prior target bytes intact');
       assertNoTempFiles();
     });
@@ -727,7 +729,7 @@ describe('CesSpace ARC — RC-05 Task 1: Device Identity, SPKI Pinning & Trust S
         };
 
         assert.throws(
-          () => store.saveToFileWithAdapter(wrongOwnerTarget, mismatchedTargetAdapter),
+          () => saveTrustStoreWithAdapter(store, wrongOwnerTarget, mismatchedTargetAdapter),
           (err) => err instanceof ArcError && err.code === 'ACCESS_DENIED',
         );
         assert.equal(fs.readFileSync(wrongOwnerTarget, 'utf8'), 'prior-bytes');
@@ -814,28 +816,136 @@ describe('CesSpace ARC — RC-05 Task 1: Device Identity, SPKI Pinning & Trust S
       const store = DeviceTrustStore.createEmpty();
       store.enrollDevice({ clientId: 'c1', clientType: 't1', pin: samplePin(0x11) });
 
-      // 1. Recognized unsupported codes (ENOTSUP, EOPNOTSUPP, EINVAL) are tolerated
-      for (const unsupportedCode of ['ENOTSUP', 'EOPNOTSUPP', 'EINVAL']) {
-        const unsupportedAdapter = {
+      // 1. openSync must NOT tolerate EINVAL: fail closed with INTERNAL_ERROR
+      const openEinvalAdapter = {
+        ...defaultFsAdapter,
+        openSync: (p, flags, mode) => {
+          if (path.resolve(p) === path.resolve(tempDir)) {
+            const err = new Error('Invalid argument on directory open');
+            err.code = 'EINVAL';
+            throw err;
+          }
+          return defaultFsAdapter.openSync(p, flags, mode);
+        },
+      };
+      assert.throws(
+        () => atomicPersistTrustStoreWithAdapter(filePath, store.toData(), openEinvalAdapter),
+        (err) => err instanceof ArcError && err.code === 'INTERNAL_ERROR',
+        'EINVAL on openSync must fail closed',
+      );
+
+      // 2. openSync tolerates ENOTSUP and EOPNOTSUPP (unsupported directory descriptor open)
+      for (const openUnsupportedCode of ['ENOTSUP', 'EOPNOTSUPP']) {
+        const openUnsupportedAdapter = {
           ...defaultFsAdapter,
           openSync: (p, flags, mode) => {
             if (path.resolve(p) === path.resolve(tempDir)) {
-              const err = new Error(`Directory sync not supported: ${unsupportedCode}`);
-              err.code = unsupportedCode;
+              const err = new Error(`Directory open unsupported: ${openUnsupportedCode}`);
+              err.code = openUnsupportedCode;
               throw err;
             }
             return defaultFsAdapter.openSync(p, flags, mode);
           },
         };
-
         assert.doesNotThrow(
-          () => atomicPersistTrustStoreWithAdapter(filePath, store.toData(), unsupportedAdapter),
-          `Code ${unsupportedCode} should be tolerated`,
+          () =>
+            atomicPersistTrustStoreWithAdapter(filePath, store.toData(), openUnsupportedAdapter),
+          `Code ${openUnsupportedCode} on openSync should be tolerated`,
         );
       }
 
-      // 2. EIO must fail closed and report failure
-      const eioAdapter = {
+      // 3. openSync operational errors fail closed (EIO, EBADF, EPERM, EISDIR, unexpected)
+      for (const openErrorCode of ['EIO', 'EBADF', 'EPERM', 'EISDIR']) {
+        const openErrorAdapter = {
+          ...defaultFsAdapter,
+          openSync: (p, flags, mode) => {
+            if (path.resolve(p) === path.resolve(tempDir)) {
+              const err = new Error(`Operational error on directory open: ${openErrorCode}`);
+              err.code = openErrorCode;
+              throw err;
+            }
+            return defaultFsAdapter.openSync(p, flags, mode);
+          },
+        };
+        assert.throws(
+          () => atomicPersistTrustStoreWithAdapter(filePath, store.toData(), openErrorAdapter),
+          (err) => err instanceof ArcError && err.code === 'INTERNAL_ERROR',
+          `${openErrorCode} on openSync must fail closed`,
+        );
+      }
+
+      const openUnexpectedAdapter = {
+        ...defaultFsAdapter,
+        openSync: (p, flags, mode) => {
+          if (path.resolve(p) === path.resolve(tempDir)) {
+            throw new Error('Unexpected catastrophic error on directory open');
+          }
+          return defaultFsAdapter.openSync(p, flags, mode);
+        },
+      };
+      assert.throws(
+        () => atomicPersistTrustStoreWithAdapter(filePath, store.toData(), openUnexpectedAdapter),
+        (err) => err instanceof ArcError && err.code === 'INTERNAL_ERROR',
+      );
+
+      // 4. fsyncSync tolerates ENOTSUP, EOPNOTSUPP, and narrowly EINVAL (OS signal on opened directory)
+      for (const fsyncUnsupportedCode of ['ENOTSUP', 'EOPNOTSUPP', 'EINVAL']) {
+        const fsyncUnsupportedAdapter = {
+          ...defaultFsAdapter,
+          openSync: (p, flags, mode) => {
+            if (path.resolve(p) === path.resolve(tempDir)) return 999;
+            return defaultFsAdapter.openSync(p, flags, mode);
+          },
+          fsyncSync: (fd) => {
+            if (fd === 999) {
+              const err = new Error(`Directory fsync unsupported: ${fsyncUnsupportedCode}`);
+              err.code = fsyncUnsupportedCode;
+              throw err;
+            }
+            return defaultFsAdapter.fsyncSync(fd);
+          },
+          closeSync: (fd) => {
+            if (fd === 999) return;
+            return defaultFsAdapter.closeSync(fd);
+          },
+        };
+
+        assert.doesNotThrow(
+          () =>
+            atomicPersistTrustStoreWithAdapter(filePath, store.toData(), fsyncUnsupportedAdapter),
+          `Code ${fsyncUnsupportedCode} on fsyncSync should be tolerated`,
+        );
+      }
+
+      // 5. fsyncSync operational errors fail closed (EIO, EBADF, EPERM, EISDIR, unexpected)
+      for (const fsyncErrorCode of ['EIO', 'EBADF', 'EPERM', 'EISDIR']) {
+        const fsyncErrorAdapter = {
+          ...defaultFsAdapter,
+          openSync: (p, flags, mode) => {
+            if (path.resolve(p) === path.resolve(tempDir)) return 999;
+            return defaultFsAdapter.openSync(p, flags, mode);
+          },
+          fsyncSync: (fd) => {
+            if (fd === 999) {
+              const err = new Error(`Operational error on directory fsync: ${fsyncErrorCode}`);
+              err.code = fsyncErrorCode;
+              throw err;
+            }
+            return defaultFsAdapter.fsyncSync(fd);
+          },
+          closeSync: (fd) => {
+            if (fd === 999) return;
+            return defaultFsAdapter.closeSync(fd);
+          },
+        };
+        assert.throws(
+          () => atomicPersistTrustStoreWithAdapter(filePath, store.toData(), fsyncErrorAdapter),
+          (err) => err instanceof ArcError && err.code === 'INTERNAL_ERROR',
+          `${fsyncErrorCode} on fsyncSync must fail closed`,
+        );
+      }
+
+      const fsyncUnexpectedAdapter = {
         ...defaultFsAdapter,
         openSync: (p, flags, mode) => {
           if (path.resolve(p) === path.resolve(tempDir)) return 999;
@@ -843,9 +953,7 @@ describe('CesSpace ARC — RC-05 Task 1: Device Identity, SPKI Pinning & Trust S
         },
         fsyncSync: (fd) => {
           if (fd === 999) {
-            const err = new Error('I/O error during directory fsync');
-            err.code = 'EIO';
-            throw err;
+            throw new Error('Unexpected catastrophic error on directory fsync');
           }
           return defaultFsAdapter.fsyncSync(fd);
         },
@@ -855,56 +963,7 @@ describe('CesSpace ARC — RC-05 Task 1: Device Identity, SPKI Pinning & Trust S
         },
       };
       assert.throws(
-        () => atomicPersistTrustStoreWithAdapter(filePath, store.toData(), eioAdapter),
-        (err) => err instanceof ArcError && err.code === 'INTERNAL_ERROR',
-      );
-
-      // 3. EBADF must fail closed and report failure
-      const ebadfAdapter = {
-        ...defaultFsAdapter,
-        openSync: (p, flags, mode) => {
-          if (path.resolve(p) === path.resolve(tempDir)) {
-            const err = new Error('Bad file descriptor');
-            err.code = 'EBADF';
-            throw err;
-          }
-          return defaultFsAdapter.openSync(p, flags, mode);
-        },
-      };
-      assert.throws(
-        () => atomicPersistTrustStoreWithAdapter(filePath, store.toData(), ebadfAdapter),
-        (err) => err instanceof ArcError && err.code === 'INTERNAL_ERROR',
-      );
-
-      // 4. EPERM must fail closed and report failure
-      const epermAdapter = {
-        ...defaultFsAdapter,
-        openSync: (p, flags, mode) => {
-          if (path.resolve(p) === path.resolve(tempDir)) {
-            const err = new Error('Operation not permitted');
-            err.code = 'EPERM';
-            throw err;
-          }
-          return defaultFsAdapter.openSync(p, flags, mode);
-        },
-      };
-      assert.throws(
-        () => atomicPersistTrustStoreWithAdapter(filePath, store.toData(), epermAdapter),
-        (err) => err instanceof ArcError && err.code === 'INTERNAL_ERROR',
-      );
-
-      // 5. Unexpected error without code must fail closed
-      const unexpectedAdapter = {
-        ...defaultFsAdapter,
-        openSync: (p, flags, mode) => {
-          if (path.resolve(p) === path.resolve(tempDir)) {
-            throw new Error('Unexpected catastrophic error');
-          }
-          return defaultFsAdapter.openSync(p, flags, mode);
-        },
-      };
-      assert.throws(
-        () => atomicPersistTrustStoreWithAdapter(filePath, store.toData(), unexpectedAdapter),
+        () => atomicPersistTrustStoreWithAdapter(filePath, store.toData(), fsyncUnexpectedAdapter),
         (err) => err instanceof ArcError && err.code === 'INTERNAL_ERROR',
       );
     });
@@ -942,14 +1001,20 @@ describe('CesSpace ARC — RC-05 Task 1: Device Identity, SPKI Pinning & Trust S
       assert.equal(fs.readdirSync(realDir).length, 0);
     });
 
-    test('Public API does not expose filesystem adapter or bypass seams (§16.1)', () => {
+    test('Public API does not expose filesystem adapter or bypass seams (§16.1)', async () => {
       // 1. Module exports check: @cesspace-arc/auth must not export adapter interfaces/defaults
       assert.equal(PublicAuth.TrustStoreFsAdapter, undefined);
       assert.equal(PublicAuth.defaultFsAdapter, undefined);
       assert.equal(PublicAuth.verifyTrustStoreFileIntegrityWithAdapter, undefined);
       assert.equal(PublicAuth.atomicPersistTrustStoreWithAdapter, undefined);
+      assert.equal(PublicAuth.loadTrustStoreWithAdapter, undefined);
+      assert.equal(PublicAuth.saveTrustStoreWithAdapter, undefined);
 
-      // 2. Parameter arity check: production API signatures take only domain arguments
+      // 2. Class methods check: DeviceTrustStore must not expose adapter methods
+      assert.equal(PublicAuth.DeviceTrustStore.loadFromFileWithAdapter, undefined);
+      assert.equal(PublicAuth.DeviceTrustStore.prototype.saveToFileWithAdapter, undefined);
+
+      // 3. Parameter arity check: production API signatures take only domain arguments
       assert.equal(
         PublicAuth.DeviceTrustStore.loadFromFile.length,
         1,
@@ -969,6 +1034,71 @@ describe('CesSpace ARC — RC-05 Task 1: Device Identity, SPKI Pinning & Trust S
         PublicAuth.atomicPersistTrustStore.length,
         2,
         'atomicPersistTrustStore accepts only filePath and data',
+      );
+
+      // 4. Normal load/save execute real filesystem validation
+      const realFilePath = path.join(tempDir, 'real-public-devices.json');
+      const realStore = DeviceTrustStore.createEmpty();
+      const realPin = samplePin(0x88);
+      realStore.enrollDevice({ clientId: 'client-pub', clientType: 'cli', pin: realPin });
+      realStore.saveToFile(realFilePath);
+
+      // Verify file was written with 0600 mode on POSIX
+      const writtenStat = fs.lstatSync(realFilePath);
+      assert.equal(writtenStat.isFile(), true);
+      if (process.platform !== 'win32') {
+        assert.equal(writtenStat.mode & 0o777, 0o600);
+      }
+
+      // Verify loading the real file succeeds and restores enrolled device
+      const loadedStore = DeviceTrustStore.loadFromFile(realFilePath);
+      assert.equal(loadedStore.getDevices().length, 1);
+      assert.equal(loadedStore.getDevices()[0].clientId, 'client-pub');
+
+      // Verify real validation rejects symlinks
+      const symlinkTarget = path.join(tempDir, 'real-symlink-target.json');
+      fs.symlinkSync(realFilePath, symlinkTarget);
+      assert.throws(
+        () => realStore.saveToFile(symlinkTarget),
+        (err) =>
+          err instanceof ArcError &&
+          (err.code === 'UNSAFE_SYMLINK' || err.code === 'ACCESS_DENIED'),
+      );
+
+      // Verify real validation rejects non-existent load
+      assert.throws(
+        () => DeviceTrustStore.loadFromFile(path.join(tempDir, 'non-existent.json')),
+        (err) => err instanceof ArcError && err.code === 'FILE_NOT_FOUND',
+      );
+
+      // 5. Package exports map protects package boundary against deep subpath imports
+      const authPkgPath = path.resolve('packages/auth/package.json');
+      const authPkgJson = JSON.parse(fs.readFileSync(authPkgPath, 'utf8'));
+      assert.ok(authPkgJson.exports, 'packages/auth must define an exports map');
+      assert.deepEqual(
+        authPkgJson.exports['.'],
+        {
+          types: './dist/index.d.ts',
+          import: './dist/index.js',
+          default: './dist/index.js',
+        },
+        'Root export must map strictly to dist/index.js',
+      );
+      assert.deepEqual(
+        Object.keys(authPkgJson.exports),
+        ['.'],
+        'Package exports must expose only the root "." entry point',
+      );
+
+      assert.equal(
+        authPkgJson.exports['./dist/internal-testing.js'],
+        undefined,
+        'Internal testing module must not be accessible via package exports',
+      );
+      assert.equal(
+        authPkgJson.exports['./internal-testing'],
+        undefined,
+        'Internal testing subpath must not be accessible via package exports',
       );
     });
   });

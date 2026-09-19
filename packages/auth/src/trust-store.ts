@@ -525,24 +525,43 @@ export function atomicPersistTrustStoreWithAdapter(
     // fsync parent directory where supported
     if (process.platform !== 'win32') {
       let dirFd: number | null = null;
+      let dirOpened = false;
       try {
         const dirOpenFlags = (fs.constants.O_RDONLY ?? 0) | (fs.constants.O_DIRECTORY ?? 0);
-        dirFd = fsAdapter.openSync(parentDir, dirOpenFlags);
-        fsAdapter.fsyncSync(dirFd);
-      } catch (err: unknown) {
-        const error = err as NodeJS.ErrnoException;
-        // Specifically recognized unsupported error codes when opening or syncing a directory descriptor:
-        // ENOTSUP / EOPNOTSUPP: Operation not supported on directory synchronization
-        // EINVAL: Invalid argument where OS/filesystem does not support directory synchronization
-        const unsupportedCodes = new Set(['ENOTSUP', 'EOPNOTSUPP', 'EINVAL']);
-        if (error.code && unsupportedCodes.has(error.code)) {
-          // Platform or filesystem genuinely does not support directory fsync; tolerated.
-        } else {
-          // Real I/O error (EIO, ENOSPC), bad descriptor (EBADF), permission (EPERM),
-          // is-a-directory (EISDIR) or other failure: MUST NOT be silently swallowed!
-          throw ArcError.internalError(
-            `Failed to fsync trust store parent directory '${parentDir}': ${error.message || String(err)}`,
-          );
+        try {
+          dirFd = fsAdapter.openSync(parentDir, dirOpenFlags);
+          dirOpened = true;
+        } catch (openErr: unknown) {
+          const errCode = (openErr as NodeJS.ErrnoException).code;
+          // openSync must NOT tolerate EINVAL. Only ENOTSUP and EOPNOTSUPP are tolerated if the
+          // filesystem/OS does not support opening directory descriptors.
+          if (errCode === 'ENOTSUP' || errCode === 'EOPNOTSUPP') {
+            dirOpened = false;
+          } else {
+            throw ArcError.internalError(
+              `Failed to open trust store parent directory for sync '${parentDir}': ${(openErr as Error)?.message || String(openErr)}`,
+            );
+          }
+        }
+
+        if (dirOpened && dirFd !== null) {
+          try {
+            fsAdapter.fsyncSync(dirFd);
+          } catch (fsyncErr: unknown) {
+            const errCode = (fsyncErr as NodeJS.ErrnoException).code;
+            // On certain POSIX/Linux platforms and filesystems (e.g. NFS, FAT, VFAT, or specific
+            // kernel configurations), fsync(2) on an opened directory file descriptor returns
+            // EINVAL (or ENOTSUP/EOPNOTSUPP) to signal that directory synchronization is
+            // unsupported. All operational errors (EIO, EBADF, EPERM, EISDIR, etc.) fail closed.
+            const fsyncUnsupportedCodes = new Set(['ENOTSUP', 'EOPNOTSUPP', 'EINVAL']);
+            if (errCode && fsyncUnsupportedCodes.has(errCode)) {
+              // Tolerated as OS/filesystem signal that directory fsync is unsupported
+            } else {
+              throw ArcError.internalError(
+                `Failed to fsync trust store parent directory '${parentDir}': ${(fsyncErr as Error)?.message || String(fsyncErr)}`,
+              );
+            }
+          }
         }
       } finally {
         if (dirFd !== null) {
@@ -574,6 +593,50 @@ export function atomicPersistTrustStoreWithAdapter(
 }
 
 /**
+ * @internal Standalone internal adapter-aware loader for deterministic tests.
+ * Excluded from the public package index.
+ */
+export function loadTrustStoreWithAdapter(
+  filePath: string,
+  fsAdapter: TrustStoreFsAdapter = defaultFsAdapter,
+): DeviceTrustStore {
+  verifyTrustStoreFileIntegrityWithAdapter(filePath, fsAdapter);
+
+  const resolved = path.resolve(filePath);
+  const content = fsAdapter.readFileSync(resolved, 'utf8');
+
+  if (Buffer.byteLength(content, 'utf8') > MAX_TRUST_STORE_BYTES) {
+    throw ArcError.resourceExhausted(
+      `Trust store file exceeds maximum size ceiling of ${MAX_TRUST_STORE_BYTES} bytes.`,
+    );
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    throw ArcError.invalidRequestSchema(
+      'Failed to parse trust store file: content is not valid JSON.',
+    );
+  }
+
+  const validated = validateTrustStoreData(parsed);
+  return new DeviceTrustStore(validated);
+}
+
+/**
+ * @internal Standalone internal adapter-aware persister for deterministic tests.
+ * Excluded from the public package index.
+ */
+export function saveTrustStoreWithAdapter(
+  store: DeviceTrustStore,
+  filePath: string,
+  fsAdapter: TrustStoreFsAdapter = defaultFsAdapter,
+): void {
+  atomicPersistTrustStoreWithAdapter(filePath, store.toData(), fsAdapter);
+}
+
+/**
  * In-memory manager for enrolled device trust and pinning invariants (§7, §8, §16).
  */
 export class DeviceTrustStore {
@@ -601,7 +664,7 @@ export class DeviceTrustStore {
    * store throws and never silently defaults to empty.
    */
   public static loadFromFile(filePath: string): DeviceTrustStore {
-    return DeviceTrustStore.loadFromFileWithAdapter(filePath, defaultFsAdapter);
+    return loadTrustStoreWithAdapter(filePath, defaultFsAdapter);
   }
 
   /**
@@ -609,48 +672,7 @@ export class DeviceTrustStore {
    * Production entry point using real filesystem.
    */
   public saveToFile(filePath: string): void {
-    this.saveToFileWithAdapter(filePath, defaultFsAdapter);
-  }
-
-  /**
-   * @internal Internal adapter-aware loader for deterministic tests.
-   */
-  public static loadFromFileWithAdapter(
-    filePath: string,
-    fsAdapter: TrustStoreFsAdapter = defaultFsAdapter,
-  ): DeviceTrustStore {
-    verifyTrustStoreFileIntegrityWithAdapter(filePath, fsAdapter);
-
-    const resolved = path.resolve(filePath);
-    const content = fsAdapter.readFileSync(resolved, 'utf8');
-
-    if (Buffer.byteLength(content, 'utf8') > MAX_TRUST_STORE_BYTES) {
-      throw ArcError.resourceExhausted(
-        `Trust store file exceeds maximum size ceiling of ${MAX_TRUST_STORE_BYTES} bytes.`,
-      );
-    }
-
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(content);
-    } catch {
-      throw ArcError.invalidRequestSchema(
-        'Failed to parse trust store file: content is not valid JSON.',
-      );
-    }
-
-    const validated = validateTrustStoreData(parsed);
-    return new DeviceTrustStore(validated);
-  }
-
-  /**
-   * @internal Internal adapter-aware persister for deterministic tests.
-   */
-  public saveToFileWithAdapter(
-    filePath: string,
-    fsAdapter: TrustStoreFsAdapter = defaultFsAdapter,
-  ): void {
-    atomicPersistTrustStoreWithAdapter(filePath, this.toData(), fsAdapter);
+    saveTrustStoreWithAdapter(this, filePath, defaultFsAdapter);
   }
 
   /**
