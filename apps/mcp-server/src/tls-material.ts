@@ -11,6 +11,7 @@
  */
 
 import fs from 'node:fs';
+import net from 'node:net';
 import { createPrivateKey, createPublicKey, X509Certificate } from 'node:crypto';
 import type { KeyObject } from 'node:crypto';
 import { RemoteConfigError, type RemoteFailureReason } from './remote-errors.js';
@@ -198,9 +199,36 @@ export function loadClientCaFile(filePath: string): string {
   } catch {
     throw new RemoteConfigError('Client CA is unreadable.', 'CLIENT_CA_UNREADABLE');
   }
-  if (!/-----BEGIN CERTIFICATE-----/.test(pem)) {
+  // EXACTLY ONE certificate block per configured root.
+  //
+  // A PEM bundle would let one configured path smuggle several trust roots past
+  // the frozen maximum of four, and `new X509Certificate(pem)` would validate
+  // only the first block while the TLS context consumed all of them. The
+  // path-per-root model is therefore enforced literally.
+  const blocks = pem.match(/-----BEGIN CERTIFICATE-----/g) ?? [];
+  if (blocks.length === 0) {
     throw new RemoteConfigError('Client CA is not a PEM certificate.', 'CLIENT_CA_MALFORMED');
   }
+  if (blocks.length > 1) {
+    throw new RemoteConfigError(
+      'Client CA must contain exactly one certificate; one root per configured path.',
+      'CLIENT_CA_MULTIPLE_ROOTS',
+    );
+  }
+
+  // Nothing outside the single PEM block except whitespace is permitted, so no
+  // trailing material can reach the TLS context unvalidated.
+  const withoutBlock = pem.replace(
+    /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/,
+    '',
+  );
+  if (withoutBlock.trim().length !== 0) {
+    throw new RemoteConfigError(
+      'Client CA contains material outside its certificate block.',
+      'CLIENT_CA_MALFORMED',
+    );
+  }
+
   try {
     // Parse before accepting: an unparseable root must fail startup rather than
     // be skipped, or the effective trust set would silently shrink.
@@ -208,10 +236,15 @@ export function loadClientCaFile(filePath: string): string {
   } catch {
     throw new RemoteConfigError('Client CA is malformed.', 'CLIENT_CA_MALFORMED');
   }
-  return pem;
+  return pem.trim();
 }
 
-/** Loads and validates every configured client CA root. */
+/**
+ * Loads and validates every configured client CA root.
+ *
+ * One certificate per path, and at most four paths, so the configured list is
+ * exactly the trust set: no path can contribute more than one root.
+ */
 export function loadClientCaRoots(paths: readonly string[]): string[] {
   return paths.map((caPath) => loadClientCaFile(caPath));
 }
@@ -220,6 +253,14 @@ export function loadClientCaRoots(paths: readonly string[]): string[] {
 export interface ServerCertificateFacts {
   /** Parsed certificate. Public material only. */
   certificate: X509Certificate;
+  /**
+   * The EXACT PEM bytes that were validated above.
+   *
+   * The listener must present these bytes and must never re-read the configured
+   * path, otherwise a file replaced between validation and bind could be served
+   * with a SAN, validity window, or key relation that was never reviewed.
+   */
+  pem: string;
   /** Validity window start, in epoch milliseconds. */
   validFromMs: number;
   /** Validity window end, in epoch milliseconds. */
@@ -289,12 +330,20 @@ export function loadServerCertificate(
   }
 
   // SAN verification through the platform X.509 checker rather than a
-  // hand-written wildcard matcher. `subject: 'never'` restricts the match to
-  // Subject Alternative Name entries, which is exactly the claim §6 T-5 makes;
-  // a CN-only certificate must not be accepted here.
+  // hand-written wildcard matcher.
+  //
+  // DNS names and IP literals have DIFFERENT SAN entry types and different
+  // matching rules, and Node exposes a separate API for each: `checkHost` for
+  // dNSName entries and `checkIP` for iPAddress entries. Calling checkHost with
+  // an IP literal would compare it against dNSName entries and could never
+  // succeed, so the choice is made on the public hostname's own syntax.
+  // `subject: 'never'` keeps the DNS path SAN-only, with no CN fallback.
+  const isIpLiteral = net.isIP(publicHostname) !== 0;
   let matchedSan: string | undefined;
   try {
-    matchedSan = certificate.checkHost(publicHostname, { subject: 'never' });
+    matchedSan = isIpLiteral
+      ? certificate.checkIP(publicHostname)
+      : certificate.checkHost(publicHostname, { subject: 'never' });
   } catch {
     matchedSan = undefined;
   }
@@ -305,7 +354,7 @@ export function loadServerCertificate(
     );
   }
 
-  return { certificate, validFromMs, validToMs };
+  return { certificate, pem, validFromMs, validToMs };
 }
 
 /**

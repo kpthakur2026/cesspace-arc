@@ -37,6 +37,7 @@ export type RemoteFailureReason =
   | 'CLIENT_CA_INSECURE'
   | 'CLIENT_CA_TOO_LARGE'
   | 'CLIENT_CA_MALFORMED'
+  | 'CLIENT_CA_MULTIPLE_ROOTS'
   // Trust store
   | 'TRUST_STORE_PATH_INVALID'
   | 'TRUST_STORE_INVALID'

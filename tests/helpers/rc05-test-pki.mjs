@@ -73,6 +73,10 @@ default_md = default
 policy = policy_any
 x509_extensions = leaf_ext
 copy_extensions = none
+# The suite issues more than one leaf with the same subject (a long-lived and a
+# short-lived localhost server certificate), which the default uniqueness policy
+# would reject.
+unique_subject = no
 [ policy_any ]
 commonName = supplied
 [ leaf_ext ]
@@ -141,6 +145,20 @@ function makeCa(cwd, name) {
     serialFile: `${name}.serial`,
     newCertsDir: `${name}.newcerts`,
   };
+}
+
+/** OpenSSL date string `seconds` from now, in UTC. */
+function opensslDateIn(seconds) {
+  const date = new Date(Date.now() + seconds * 1000);
+  const pad = (n) => String(n).padStart(2, '0');
+  return (
+    `${String(date.getUTCFullYear()).slice(2)}` +
+    `${pad(date.getUTCMonth() + 1)}` +
+    `${pad(date.getUTCDate())}` +
+    `${pad(date.getUTCHours())}` +
+    `${pad(date.getUTCMinutes())}` +
+    `${pad(date.getUTCSeconds())}Z`
+  );
 }
 
 /**
@@ -245,6 +263,33 @@ export function createTestPki(dir) {
 
   return {
     dir: cwd,
+    /**
+     * Issues an additional server leaf valid from now until `validSeconds`
+     * from now, so a test can reach REAL certificate expiry without waiting on
+     * a fixture generated long before the test runs.
+     */
+    issueServerCert({
+      validSeconds,
+      commonName = 'localhost',
+      san = 'DNS:localhost,IP:127.0.0.1',
+    }) {
+      const keyName = `server-ondemand-${Math.random().toString(36).slice(2, 10)}.key`;
+      const certName = `${keyName}.pem`;
+      generateKey(keyName, cwd);
+      const configPath = writeCaConfig(cwd, trustedCa, {
+        serverName: `ondemand-${Math.random().toString(36).slice(2, 10)}`,
+        san,
+      });
+      const certPath = issueLeaf(cwd, {
+        configPath,
+        commonName,
+        keyFile: keyName,
+        certFile: certName,
+        startdate: opensslDate(-1),
+        enddate: opensslDateIn(validSeconds),
+      });
+      return { keyPath: path.join(cwd, keyName), certPath };
+    },
     trustedCaCertPath: trustedCa.certPath,
     untrustedCaCertPath: untrustedCa.certPath,
     serverKeyPath,

@@ -2399,15 +2399,22 @@ export class ArcMcpServer implements IArcMcpServer {
           // configured but invalid policy reports UNHEALTHY with no fallback.
           const policyEngineActive = this.effectivePolicyEngine !== undefined;
           const gatewayStatus = this.remoteGateway?.getStatus();
+          // A bound listener whose certificate has expired cannot serve new
+          // sessions, so it is neither active nor healthy.
+          const gatewayDegradedForHealth = gatewayStatus?.degraded === true;
           const health: HealthResponse = {
-            status: policyEngineActive ? 'HEALTHY' : 'UNHEALTHY',
+            status: !policyEngineActive
+              ? 'UNHEALTHY'
+              : gatewayDegradedForHealth
+                ? 'DEGRADED'
+                : 'HEALTHY',
             version: '0.4.0-rc04',
             stage: 'RC-04',
             policyEngineActive,
             auditActive: true,
             authorizedWorkspacesCount: this.workspaceRegistry.getWorkspaces().length,
             transportMode: this.transportMode,
-            remoteGatewayActive: gatewayStatus?.listenerActive ?? false,
+            remoteGatewayActive: gatewayStatus?.activeAndServing ?? false,
             // Only safe, bounded fields cross this boundary: no certificate or
             // key bytes, no file paths, no pins, no peer addresses.
             ...(gatewayStatus === undefined

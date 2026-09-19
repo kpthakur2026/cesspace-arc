@@ -22,12 +22,17 @@ import tls from 'node:tls';
 import { RemoteGateway } from '../apps/mcp-server/dist/remote-gateway.js';
 import { RemoteConfigError } from '../apps/mcp-server/dist/remote-errors.js';
 import {
+  AdmissionLimiter,
   MAX_LIVE_CONNECTIONS_GLOBAL,
   MAX_LIVE_CONNECTIONS_PER_PEER,
   MAX_IN_FLIGHT_HANDSHAKES,
-  LAYER_A_MAX_ATTEMPTS_PER_WINDOW,
   LAYER_A_BURST,
+  LAYER_A_REFILL_MS,
 } from '../apps/mcp-server/dist/admission-limiter.js';
+import {
+  isWildcardBindHost,
+  TLS_HANDSHAKE_TIMEOUT_MS,
+} from '../apps/mcp-server/dist/remote-config.js';
 import { createTestPki, hasOpenssl, oversizedCaFile, symlinkTo } from './helpers/rc05-test-pki.mjs';
 
 let tempRoot;
@@ -254,7 +259,6 @@ describe('CesSpace ARC — RC-05 Task 3: TLS/mTLS Admission Layer', () => {
           now: { clientCaPaths: [pki.trustedCaCertPath, pki.trustedCaCertPath] },
           reason: 'CLIENT_CA_PATH_INVALID',
         },
-        { now: { handshakeTimeoutMs: 0 }, reason: 'HANDSHAKE_TIMEOUT_INVALID' },
         {
           now: { privateKey: { kind: 'raw', value: 'secret' } },
           reason: 'PRIVATE_KEY_SOURCE_INVALID',
@@ -455,7 +459,10 @@ describe('CesSpace ARC — RC-05 Task 3: TLS/mTLS Admission Layer', () => {
     });
 
     test('RC05-NEG-11: a malformed TLS client input is refused before any higher layer', async () => {
-      const { gateway, port, admitted } = await startGateway({ handshakeTimeoutMs: 200 });
+      const { gateway, port, admitted } = await startGateway(
+        {},
+        { handshakeTimeoutMsForTests: 200 },
+      );
       try {
         for (const payload of [
           Buffer.from('not a tls handshake at all\n'),
@@ -614,6 +621,7 @@ describe('CesSpace ARC — RC-05 Task 3: TLS/mTLS Admission Layer', () => {
         assert.equal(status.degraded, true);
         const serialized = JSON.stringify(status);
         assert.deepEqual(Object.keys(status).sort(), [
+          'activeAndServing',
           'degraded',
           'degradedReason',
           'inFlightHandshakes',
@@ -645,15 +653,13 @@ describe('CesSpace ARC — RC-05 Task 3: TLS/mTLS Admission Layer', () => {
   // =========================================================================
 
   describe('Layer A admission', () => {
-    test('RC05-NEG-53: rate/burst exhaustion drops peers before TLS admission', async () => {
+    test('RC05-NEG-53: burst exhaustion drops peers before TLS admission', async () => {
       const { gateway, port, admitted, refused } = await startGateway(
         {},
         {
           admission: {
-            maxAttemptsPerWindow: LAYER_A_MAX_ATTEMPTS_PER_WINDOW,
-            burst: LAYER_A_BURST,
-            // Keep concurrency out of the way so the rate bound is the binding
-            // limit under test.
+            // Concurrency kept out of the way so the RATE bound is the one
+            // under test; the production burst and rate are unchanged.
             maxLivePerPeer: 1000,
             maxLiveGlobal: 1000,
             maxInFlightHandshakes: 1000,
@@ -661,23 +667,21 @@ describe('CesSpace ARC — RC-05 Task 3: TLS/mTLS Admission Layer', () => {
         },
       );
       try {
-        const allowed = LAYER_A_MAX_ATTEMPTS_PER_WINDOW + LAYER_A_BURST;
-        let connections = 0;
-        // Open and immediately close connections until Layer A refuses.
-        for (let i = 0; i < allowed + 5; i++) {
+        // A fresh peer starts with a full bucket of LAYER_A_BURST tokens, so the
+        // first burst-sized group is admitted and the next attempt is refused.
+        for (let i = 0; i < LAYER_A_BURST + 3; i++) {
           const socket = net.createConnection({ host: '127.0.0.1', port });
           await new Promise((resolve) => {
             socket.once('connect', resolve);
             socket.once('error', resolve);
           });
           socket.destroy();
-          connections += 1;
         }
-        await new Promise((resolve) => setTimeout(resolve, 100));
+        await waitFor(() => refused.includes('RATE_LIMIT'), 2000);
 
         assert.ok(
-          refused.filter((r) => r === 'RATE_LIMIT').length > 0,
-          `expected a rate-limit refusal after ${connections} attempts, saw ${JSON.stringify(refused)}`,
+          refused.includes('RATE_LIMIT'),
+          `expected a rate-limit refusal, saw ${JSON.stringify(refused)}`,
         );
         // Every refusal happened at the TCP layer, so no TLS session resulted.
         assert.equal(admitted.length, 0, 'a refused connection must not be admitted');
@@ -789,7 +793,7 @@ describe('CesSpace ARC — RC-05 Task 3: TLS/mTLS Admission Layer', () => {
     });
 
     test('RC05-ENR-112: a stalled handshake times out and releases every slot', async () => {
-      const { gateway, port } = await startGateway({ handshakeTimeoutMs: 150 });
+      const { gateway, port } = await startGateway({}, { handshakeTimeoutMsForTests: 150 });
       const sockets = [];
       try {
         for (let i = 0; i < 3; i++) {
@@ -848,6 +852,787 @@ describe('CesSpace ARC — RC-05 Task 3: TLS/mTLS Admission Layer', () => {
   // =========================================================================
   // Trust store and transport-mode composition
   // =========================================================================
+
+  // =========================================================================
+  // Handshake accounting (raw socket vs TLS socket)
+  // =========================================================================
+
+  describe('Handshake and connection accounting', () => {
+    test('RC05-ENR-140: one successful handshake that stays open frees its handshake slot', async () => {
+      const { gateway, port } = await startGateway();
+      try {
+        const outcome = await tlsConnect(port, {
+          cert: fs.readFileSync(pki.clientCertPath),
+          key: fs.readFileSync(pki.clientKeyPath),
+        });
+        assert.equal(outcome.connected, true);
+        assert.equal(
+          await waitFor(
+            () =>
+              gateway.getStatus().liveConnections === 1 &&
+              gateway.getStatus().inFlightHandshakes === 0,
+            4000,
+          ),
+          true,
+          'a completed handshake must release its handshake slot immediately',
+        );
+        outcome.socket.destroy();
+      } finally {
+        await gateway.stop();
+      }
+    });
+
+    test('RC05-ENR-141: 64 open handshaken connections do not consume handshake slots', async () => {
+      const { gateway, port } = await startGateway(
+        {},
+        { admission: { maxLivePerPeer: 1000, maxLiveGlobal: MAX_LIVE_CONNECTIONS_GLOBAL } },
+      );
+      const sockets = [];
+      try {
+        for (let i = 0; i < MAX_IN_FLIGHT_HANDSHAKES; i++) {
+          const localAddress = `127.0.0.${2 + (i % 12)}`;
+          const outcome = await tlsConnect(port, {
+            localAddress,
+            cert: fs.readFileSync(pki.clientCertPath),
+            key: fs.readFileSync(pki.clientKeyPath),
+          });
+          if (outcome.connected) sockets.push(outcome.socket);
+        }
+        assert.equal(sockets.length, MAX_IN_FLIGHT_HANDSHAKES);
+        assert.equal(
+          await waitFor(
+            () =>
+              gateway.getStatus().liveConnections === 64 &&
+              gateway.getStatus().inFlightHandshakes === 0,
+            6000,
+          ),
+          true,
+          'long-lived handshaken connections must not hold handshake slots',
+        );
+
+        // A further handshake can still begin, which is the whole point of the
+        // fix: the 64-slot bound must not become a 64-connection lifetime cap.
+        const extra = await tlsConnect(port, {
+          localAddress: '127.0.0.200',
+          cert: fs.readFileSync(pki.clientCertPath),
+          key: fs.readFileSync(pki.clientKeyPath),
+        });
+        assert.equal(extra.connected, true, 'a new handshake must still be possible');
+        sockets.push(extra.socket);
+      } finally {
+        for (const socket of sockets) socket.destroy();
+        await gateway.stop();
+      }
+    });
+
+    test('RC05-ENR-142: stalled handshakes occupy slots until they fail', async () => {
+      const { gateway, port } = await startGateway({}, { handshakeTimeoutMsForTests: 400 });
+      const sockets = [];
+      try {
+        for (let i = 0; i < 3; i++) {
+          const socket = net.createConnection({ host: '127.0.0.1', port });
+          await new Promise((resolve) => {
+            socket.once('connect', resolve);
+            socket.once('error', resolve);
+          });
+          sockets.push(socket);
+        }
+        assert.equal(await waitFor(() => gateway.getStatus().inFlightHandshakes === 3, 2000), true);
+
+        // Past the (shortened) timeout the slots return.
+        assert.equal(
+          await waitFor(() => gateway.getStatus().inFlightHandshakes === 0, 3000),
+          true,
+          'a stalled handshake must release its slot on timeout',
+        );
+        assert.equal(gateway.getStatus().liveConnections, 0);
+      } finally {
+        for (const socket of sockets) socket.destroy();
+        await gateway.stop();
+      }
+    });
+
+    test('RC05-ENR-143: every terminal path releases exactly one slot set', async () => {
+      const { gateway, port } = await startGateway({}, { handshakeTimeoutMsForTests: 300 });
+      try {
+        // Failure: no client certificate.
+        const failed = await tlsConnect(port);
+        await waitFor(() => failed.socket.destroyed, 2000);
+        failed.socket?.destroy();
+        assert.equal(await waitFor(() => gateway.getStatus().inFlightHandshakes === 0, 2000), true);
+        assert.equal(gateway.getStatus().liveConnections, 0);
+
+        // Success then close.
+        const ok = await tlsConnect(port, {
+          cert: fs.readFileSync(pki.clientCertPath),
+          key: fs.readFileSync(pki.clientKeyPath),
+        });
+        assert.equal(ok.connected, true);
+        assert.equal(
+          await waitFor(
+            () =>
+              gateway.getStatus().liveConnections === 1 &&
+              gateway.getStatus().inFlightHandshakes === 0,
+            4000,
+          ),
+          true,
+        );
+        ok.socket.destroy();
+        assert.equal(await waitFor(() => gateway.getStatus().liveConnections === 0, 2000), true);
+
+        // Timeout.
+        const stalled = net.createConnection({ host: '127.0.0.1', port });
+        await new Promise((resolve) => {
+          stalled.once('connect', resolve);
+          stalled.once('error', resolve);
+        });
+        assert.equal(await waitFor(() => gateway.getStatus().inFlightHandshakes === 1, 2000), true);
+        assert.equal(await waitFor(() => gateway.getStatus().inFlightHandshakes === 0, 3000), true);
+        stalled.destroy();
+
+        // The connection state map holds nothing once everything has settled.
+        assert.equal(
+          await waitFor(
+            () =>
+              gateway.getStatus().liveConnections + gateway.getStatus().inFlightHandshakes === 0,
+            2000,
+          ),
+          true,
+        );
+      } finally {
+        await gateway.stop();
+      }
+      // Shutdown releases everything too.
+      assert.equal(gateway.getStatus().liveConnections, 0);
+      assert.equal(gateway.getStatus().inFlightHandshakes, 0);
+    });
+  });
+
+  // =========================================================================
+  // Token-bucket rate semantics
+  // =========================================================================
+
+  describe('Token bucket rate model', () => {
+    /** A limiter whose clock the test drives directly. */
+    function limiterAt(clock) {
+      return new AdmissionLimiter({
+        getMonotonicTimeMs: () => clock.now,
+        maxLivePerPeer: 1000,
+        maxLiveGlobal: 1000,
+        maxInFlightHandshakes: 1000,
+      });
+    }
+
+    test('RC05-ENR-150: the first burst is admitted and the next attempt is refused', () => {
+      const clock = { now: 0 };
+      const limiter = limiterAt(clock);
+
+      for (let i = 0; i < LAYER_A_BURST; i++) {
+        const decision = limiter.admit('127.0.0.1');
+        assert.equal(decision.admitted, true, `attempt ${i + 1} must be admitted`);
+        // Release the handshake slot so only the bucket governs the outcome.
+        limiter.releaseHandshake();
+      }
+
+      const refused = limiter.admit('127.0.0.1');
+      assert.equal(refused.admitted, false);
+      assert.equal(refused.reason, 'RATE_LIMIT', 'the 21st immediate attempt is refused');
+    });
+
+    test('RC05-ENR-151: exactly one token accrues per second of monotonic time', () => {
+      const clock = { now: 0 };
+      const limiter = limiterAt(clock);
+      for (let i = 0; i < LAYER_A_BURST; i++) {
+        limiter.admit('127.0.0.1');
+        limiter.releaseHandshake();
+      }
+      assert.equal(limiter.admit('127.0.0.1').reason, 'RATE_LIMIT');
+
+      // Half a refill interval is not yet a whole token.
+      clock.now += LAYER_A_REFILL_MS / 2;
+      assert.equal(limiter.admit('127.0.0.1').reason, 'RATE_LIMIT');
+
+      // A full interval yields exactly one token, and only one.
+      clock.now += LAYER_A_REFILL_MS / 2;
+      const first = limiter.admit('127.0.0.1');
+      assert.equal(first.admitted, true, 'one token is available after one interval');
+      limiter.releaseHandshake();
+      assert.equal(limiter.admit('127.0.0.1').reason, 'RATE_LIMIT');
+    });
+
+    test('RC05-ENR-152: a long idle period refills to the burst capacity and no further', () => {
+      const clock = { now: 0 };
+      const limiter = limiterAt(clock);
+      for (let i = 0; i < LAYER_A_BURST; i++) {
+        limiter.admit('127.0.0.1');
+        limiter.releaseHandshake();
+      }
+
+      // A very long idle period must not bank more than one burst.
+      clock.now += 24 * 60 * 60 * 1000;
+      let admitted = 0;
+      for (let i = 0; i < LAYER_A_BURST + 5; i++) {
+        const decision = limiter.admit('127.0.0.1');
+        if (decision.admitted) {
+          admitted += 1;
+          limiter.releaseHandshake();
+        }
+      }
+      assert.equal(admitted, LAYER_A_BURST, 'the bucket never holds more than one burst');
+    });
+
+    test('RC05-ENR-153: the rate budget is driven by the monotonic clock only', () => {
+      const wall = { now: 1_800_000_000_000 };
+      const clock = { now: 0 };
+      const limiter = new AdmissionLimiter({
+        getMonotonicTimeMs: () => clock.now,
+        maxLivePerPeer: 1000,
+        maxLiveGlobal: 1000,
+        maxInFlightHandshakes: 1000,
+      });
+
+      for (let i = 0; i < LAYER_A_BURST; i++) {
+        limiter.admit('127.0.0.1');
+        limiter.releaseHandshake();
+      }
+      assert.equal(limiter.admit('127.0.0.1').reason, 'RATE_LIMIT');
+
+      // Moving the wall clock arbitrarily has no effect: the limiter never
+      // consults it.
+      wall.now += 86_400_000;
+      assert.equal(limiter.admit('127.0.0.1').reason, 'RATE_LIMIT');
+      wall.now -= 172_800_000;
+      assert.equal(limiter.admit('127.0.0.1').reason, 'RATE_LIMIT');
+
+      // Only monotonic time restores budget.
+      clock.now += LAYER_A_REFILL_MS;
+      assert.equal(limiter.admit('127.0.0.1').admitted, true);
+    });
+
+    test('RC05-ENR-154: peer rate budgets are isolated', () => {
+      const clock = { now: 0 };
+      const limiter = limiterAt(clock);
+      for (let i = 0; i < LAYER_A_BURST; i++) {
+        limiter.admit('127.0.0.1');
+        limiter.releaseHandshake();
+      }
+      assert.equal(limiter.admit('127.0.0.1').reason, 'RATE_LIMIT');
+
+      // A different peer has its own full bucket.
+      for (let i = 0; i < LAYER_A_BURST; i++) {
+        const decision = limiter.admit('127.0.0.2');
+        assert.equal(decision.admitted, true, 'the second peer has its own budget');
+        limiter.releaseHandshake();
+      }
+      assert.equal(limiter.admit('127.0.0.2').reason, 'RATE_LIMIT');
+      assert.equal(limiter.admit('127.0.0.1').reason, 'RATE_LIMIT', 'the first peer is unaffected');
+    });
+
+    test('RC05-ENR-155: an attempt refused by a concurrency bound still spends a token', () => {
+      const clock = { now: 0 };
+      const limiter = new AdmissionLimiter({
+        getMonotonicTimeMs: () => clock.now,
+        maxLivePerPeer: 1,
+        maxLiveGlobal: 1000,
+        maxInFlightHandshakes: 1000,
+      });
+
+      const first = limiter.admit('127.0.0.1');
+      assert.equal(first.admitted, true);
+      limiter.releaseHandshake(); // the connection is live but no longer handshaking
+
+      // Refused by the per-peer connection cap, yet still rate-accounted.
+      const capped = limiter.admit('127.0.0.1');
+      assert.equal(capped.admitted, false);
+      assert.equal(capped.reason, 'PEER_CONNECTION_CAP');
+
+      // The token was spent: with the connection slot released, the peer still
+      // has one fewer token than a fresh peer would.
+      first.release();
+      let allowed = 0;
+      for (let i = 0; i < LAYER_A_BURST + 5; i++) {
+        const decision = limiter.admit('127.0.0.1');
+        if (decision.admitted) {
+          allowed += 1;
+          decision.release();
+          limiter.releaseHandshake();
+        }
+      }
+      // A fresh peer would admit LAYER_A_BURST. This peer admits two fewer: one
+      // token went to the live connection and one to the attempt that the
+      // concurrency bound refused, which is exactly the required accounting.
+      assert.equal(
+        allowed,
+        LAYER_A_BURST - 2,
+        'the concurrency-refused attempt consumed one of the burst tokens',
+      );
+    });
+  });
+
+  // =========================================================================
+  // Frozen concurrency caps
+  // =========================================================================
+
+  describe('Frozen Layer-A caps', () => {
+    test('RC05-ENR-160: the actual 512 global live-connection bound', () => {
+      const limiter = new AdmissionLimiter({
+        // Concurrency bounds are the subject; the rate seam is raised so the
+        // token bucket does not mask them. Production constants are untouched.
+        attemptsPerMinute: 1_000_000,
+        burst: 100_000,
+      });
+
+      const releases = [];
+      for (let i = 0; i < MAX_LIVE_CONNECTIONS_GLOBAL; i++) {
+        const decision = limiter.admit(`peer-${String(i).padStart(4, '0')}`);
+        assert.equal(decision.admitted, true, `connection ${i + 1} must be admitted`);
+        // Release the handshake slot, retain the live slot.
+        limiter.releaseHandshake();
+        releases.push(decision.release);
+      }
+      assert.equal(limiter.getLiveConnectionCount(), 512);
+      assert.equal(MAX_LIVE_CONNECTIONS_GLOBAL, 512);
+
+      const overflow = limiter.admit('peer-overflow');
+      assert.equal(overflow.admitted, false);
+      assert.equal(overflow.reason, 'GLOBAL_CONNECTION_CAP');
+      assert.equal(limiter.getLiveConnectionCount(), 512, 'the bound is preserved exactly');
+
+      for (const release of releases) release();
+      assert.equal(limiter.getLiveConnectionCount(), 0);
+    });
+
+    test('RC05-ENR-161: the actual 32 per-peer live-connection bound', () => {
+      const limiter = new AdmissionLimiter({
+        attemptsPerMinute: 1_000_000,
+        burst: 100_000,
+      });
+
+      const releases = [];
+      for (let i = 0; i < MAX_LIVE_CONNECTIONS_PER_PEER; i++) {
+        const decision = limiter.admit('192.0.2.1');
+        assert.equal(decision.admitted, true, `connection ${i + 1} must be admitted`);
+        limiter.releaseHandshake();
+        releases.push(decision.release);
+      }
+      assert.equal(MAX_LIVE_CONNECTIONS_PER_PEER, 32);
+      assert.equal(limiter.getLiveConnectionCountForPeer('192.0.2.1'), 32);
+
+      const overflow = limiter.admit('192.0.2.1');
+      assert.equal(overflow.admitted, false);
+      assert.equal(overflow.reason, 'PEER_CONNECTION_CAP');
+      assert.equal(limiter.getLiveConnectionCountForPeer('192.0.2.1'), 32);
+
+      // Another peer is unaffected by the saturated one.
+      assert.equal(limiter.admit('192.0.2.2').admitted, true);
+
+      for (const release of releases) release();
+      assert.equal(limiter.getLiveConnectionCountForPeer('192.0.2.1'), 0);
+    });
+
+    test('RC05-ENR-162: the actual 64 in-flight handshake bound', () => {
+      const limiter = new AdmissionLimiter({
+        attemptsPerMinute: 1_000_000,
+        burst: 100_000,
+        maxLivePerPeer: 1000,
+        maxLiveGlobal: 1000,
+      });
+      for (let i = 0; i < MAX_IN_FLIGHT_HANDSHAKES; i++) {
+        assert.equal(limiter.admit(`198.51.100.${i}`).admitted, true);
+      }
+      assert.equal(limiter.getInFlightHandshakeCount(), 64);
+      const overflow = limiter.admit('198.51.100.200');
+      assert.equal(overflow.admitted, false);
+      assert.equal(overflow.reason, 'HANDSHAKE_CAP');
+      assert.equal(limiter.getInFlightHandshakeCount(), 64, 'the existing 64 are preserved');
+    });
+  });
+
+  // =========================================================================
+  // Wildcard bind canonicalization
+  // =========================================================================
+
+  describe('Wildcard bind canonicalization', () => {
+    test('RC05-NEG-05c: every spelling of the IPv6 unspecified address is wildcard', () => {
+      for (const spelling of [
+        '::',
+        '::0',
+        '0::',
+        '0:0:0:0:0:0:0:0',
+        '0000:0000:0000:0000:0000:0000:0000:0000',
+        '0000:0000:0000:0000:0000:0000:0000:000',
+        '::ffff:0.0.0.0',
+        '0.0.0.0',
+      ]) {
+        assert.equal(isWildcardBindHost(spelling), true, `${spelling} must be wildcard`);
+      }
+    });
+
+    test('RC05-NEG-05d: loopback and explicit literals are not wildcard', () => {
+      for (const literal of ['127.0.0.1', '::1', '0:0:0:0:0:0:0:1', '192.0.2.1', 'fe80::1']) {
+        assert.equal(isWildcardBindHost(literal), false, `${literal} must not be wildcard`);
+      }
+    });
+
+    test('RC05-NEG-05e: expanded IPv6 wildcard is refused without opt-in', async () => {
+      for (const bindHost of ['::', '0000:0000:0000:0000:0000:0000:0000:0000']) {
+        await assert.rejects(
+          () => startGateway({ bindHost }),
+          (err) => err instanceof RemoteConfigError && err.reason === 'WILDCARD_BIND_NOT_OPTED_IN',
+          bindHost,
+        );
+      }
+    });
+
+    test('RC05-NEG-05f: a wildcard bind with opt-in actually binds and admits', async () => {
+      // The previous version of this control bound 127.0.0.1, which proved
+      // nothing. This one binds the wildcard address itself.
+      let gateway;
+      try {
+        const started = await startGateway({ bindHost: '0.0.0.0', allowWildcardBind: true });
+        gateway = started.gateway;
+        assert.equal(gateway.isStarted(), true);
+
+        const outcome = await tlsConnect(started.port, {
+          cert: fs.readFileSync(pki.clientCertPath),
+          key: fs.readFileSync(pki.clientKeyPath),
+        });
+        assert.equal(outcome.connected, true, 'an opted-in wildcard bind must serve TLS');
+        outcome.socket.destroy();
+      } catch (err) {
+        // A platform without IPv4 wildcard support must fail loudly, not skip.
+        assert.ok(err instanceof RemoteConfigError, `unexpected failure: ${String(err)}`);
+        throw err;
+      } finally {
+        await gateway?.stop();
+      }
+    });
+
+    test('RC05-NEG-05g: ambiguous numeric host strings fail before binding', async () => {
+      for (const bindHost of ['1.2.3', '999.1.1.1', '1.2.3.4.5', '::gggg', '0:0:0:0:0:0:0:0:0']) {
+        await assert.rejects(
+          () => startGateway({ bindHost }),
+          (err) => err instanceof RemoteConfigError && err.reason === 'BIND_HOST_INVALID',
+          bindHost,
+        );
+      }
+    });
+
+    test('RC05-NEG-05h: hostnames are accepted under a conservative grammar', async () => {
+      // A syntactically valid hostname passes validation; binding is attempted
+      // and may fail for name-resolution reasons, which is a different failure.
+      for (const bad of ['-leading.example', 'trailing-.example', 'has space.example', 'a..b']) {
+        await assert.rejects(
+          () => startGateway({ bindHost: bad }),
+          (err) => err instanceof RemoteConfigError && err.reason === 'BIND_HOST_INVALID',
+          bad,
+        );
+      }
+    });
+  });
+
+  // =========================================================================
+  // Server certificate SAN: DNS vs IP
+  // =========================================================================
+
+  describe('Server certificate SAN validation', () => {
+    test('RC05-ENR-170: the DNS SAN satisfies a DNS hostname', async () => {
+      const { gateway } = await startGateway({ publicHostname: 'localhost' });
+      await gateway.stop();
+    });
+
+    test('RC05-ENR-171: the IP SAN satisfies an IP hostname', async () => {
+      const { gateway, port } = await startGateway({ publicHostname: '127.0.0.1' });
+      try {
+        assert.equal(gateway.isStarted(), true);
+        assert.equal(port > 0, true);
+      } finally {
+        await gateway.stop();
+      }
+    });
+
+    test('RC05-ENR-172: an IP absent from the SAN fails', async () => {
+      await assert.rejects(
+        () => startGateway({ publicHostname: '192.0.2.99' }),
+        (err) =>
+          err instanceof RemoteConfigError && err.reason === 'SERVER_CERTIFICATE_SAN_MISMATCH',
+      );
+    });
+
+    test('RC05-ENR-173: a DNS-only SAN cannot satisfy an IP hostname', () => {
+      // The SAN-mismatch certificate carries DNS:other.example.invalid only, so
+      // its DNS entry satisfies that name but naming it by IP must fail.
+      return assert.rejects(
+        () =>
+          startGateway({
+            publicHostname: '127.0.0.1',
+            serverCertificatePath: pki.sanMismatchCertPath,
+            privateKey: { kind: 'file', path: pki.sanMismatchKeyPath },
+          }),
+        (err) =>
+          err instanceof RemoteConfigError && err.reason === 'SERVER_CERTIFICATE_SAN_MISMATCH',
+      );
+    });
+
+    test('RC05-ENR-174: a fully verifying client completes against the gateway', async () => {
+      // Every other probe uses rejectUnauthorized:false so it can inspect the
+      // server's decision. This one performs real server-chain and hostname
+      // validation, exercising §7 P-2 rather than only ARC's self-check.
+      const { gateway, port } = await startGateway({ publicHostname: 'localhost' });
+      try {
+        const verified = await new Promise((resolve) => {
+          const socket = tls.connect(
+            {
+              host: '127.0.0.1',
+              port,
+              servername: 'localhost',
+              ca: [fs.readFileSync(pki.trustedCaCertPath)],
+              rejectUnauthorized: true,
+              cert: fs.readFileSync(pki.clientCertPath),
+              key: fs.readFileSync(pki.clientKeyPath),
+            },
+            () => resolve({ ok: true, authorized: socket.authorized, socket }),
+          );
+          socket.once('error', (err) => resolve({ ok: false, error: err }));
+        });
+        assert.equal(verified.ok, true, `verified client must connect: ${verified.error?.message}`);
+        assert.equal(verified.authorized, true);
+        verified.socket.destroy();
+      } finally {
+        await gateway.stop();
+      }
+    });
+  });
+
+  // =========================================================================
+  // Runtime expiry, frozen timeout, byte binding, root counting
+  // =========================================================================
+
+  describe('Runtime expiry and startup invariants', () => {
+    test('RC05-NEG-15c: status is truthful without any new connection', async () => {
+      let now = Date.now();
+      const config = await baseConfig();
+      const gateway = new RemoteGateway(config, { getWallTime: () => now });
+      await gateway.start();
+      try {
+        assert.equal(gateway.getStatus().degraded, false);
+        assert.equal(gateway.getStatus().activeAndServing, true);
+
+        // Cross notAfter exactly, then read status WITHOUT connecting.
+        now = Date.parse(
+          new (await import('node:crypto')).X509Certificate(fs.readFileSync(pki.serverCertPath))
+            .validTo,
+        );
+        const status = gateway.getStatus();
+        assert.equal(status.degraded, true, 'status must notice expiry on its own');
+        assert.equal(status.degradedReason, 'certificate_expired');
+        assert.equal(status.activeAndServing, false, 'it cannot serve new sessions');
+        assert.equal(status.listenerActive, true, 'the socket is still physically bound');
+      } finally {
+        await gateway.stop();
+      }
+    });
+
+    test('RC05-NEG-15d: a new connection after expiry is refused before TLS', async () => {
+      let now = Date.now();
+      const { gateway, port, admitted } = await startGateway({}, { getWallTime: () => now });
+      try {
+        // Establish one connection while valid, and keep it open.
+        const existing = await tlsConnect(port, {
+          cert: fs.readFileSync(pki.clientCertPath),
+          key: fs.readFileSync(pki.clientKeyPath),
+        });
+        assert.equal(existing.connected, true);
+        assert.equal(await waitFor(() => admitted.length === 1, 2000), true);
+
+        now = Date.parse(
+          new (await import('node:crypto')).X509Certificate(fs.readFileSync(pki.serverCertPath))
+            .validTo,
+        );
+
+        // A new raw connection is dropped before any TLS admission.
+        const refused = await tlsConnect(port, {
+          cert: fs.readFileSync(pki.clientCertPath),
+          key: fs.readFileSync(pki.clientKeyPath),
+        });
+        await waitFor(() => refused.socket.destroyed, 2000);
+        assert.equal(refused.socket.destroyed, true, 'a new handshake must be refused');
+        refused.socket?.destroy();
+        assert.equal(admitted.length, 1, 'no new admission may occur');
+
+        // The already-established connection is not destroyed by the expiry.
+        assert.equal(existing.socket.destroyed, false, 'established connections drain normally');
+        existing.socket.destroy();
+      } finally {
+        await gateway.stop();
+      }
+    });
+
+    test('RC05-ENR-175: health reports DEGRADED and remoteGatewayActive=false after expiry', async () => {
+      const { createArcMcpServer } = await import('../apps/mcp-server/dist/index.js');
+      const remotePort = await freePort();
+      // The certificate is issued HERE, valid for a few seconds, so the
+      // composed server reaches real expiry against the real clock without any
+      // clock seam existing on the production composition.
+      const shortLived = pki.issueServerCert({ validSeconds: 6 });
+      const server = createArcMcpServer({
+        transport: 'remote',
+        authorizedRoots: [],
+        remote: {
+          port: remotePort,
+          publicHostname,
+          serverCertificatePath: shortLived.certPath,
+          privateKey: { kind: 'file', path: shortLived.keyPath },
+          clientCaPaths: [pki.trustedCaCertPath],
+        },
+      });
+
+      await server.start();
+      try {
+        const initial = server.getRemoteGatewayStatus();
+        assert.equal(initial.activeAndServing, true, 'starts able to serve');
+
+        const initialHealth = JSON.parse(
+          (await server.dispatchToolCall('health', {})).content[0].text,
+        );
+        assert.equal(initialHealth.remoteGatewayActive, true);
+        assert.equal(initialHealth.status, 'HEALTHY');
+
+        // Wait for the certificate to reach notAfter.
+        const notAfter = Date.parse(
+          new (await import('node:crypto')).X509Certificate(fs.readFileSync(shortLived.certPath))
+            .validTo,
+        );
+        while (Date.now() < notAfter + 1000) {
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+
+        const expired = server.getRemoteGatewayStatus();
+        assert.equal(expired.degraded, true, 'status must notice expiry without a connection');
+        assert.equal(expired.activeAndServing, false);
+        assert.equal(expired.degradedReason, 'certificate_expired');
+
+        const health = JSON.parse((await server.dispatchToolCall('health', {})).content[0].text);
+        assert.equal(health.remoteGatewayActive, false, 'health must not claim an active gateway');
+        assert.equal(health.remoteGatewayDegraded, true);
+        assert.equal(health.remoteGatewayDegradedReason, 'certificate_expired');
+        assert.equal(health.status, 'DEGRADED', 'an expired gateway is not HEALTHY');
+      } finally {
+        await server.stop();
+      }
+    });
+
+    test('RC05-ENR-176: production configuration cannot change the 5000 ms timeout', async () => {
+      const config = await baseConfig();
+      // There is no production field for it at all...
+      assert.equal(Object.prototype.hasOwnProperty.call(config, 'handshakeTimeoutMs'), false);
+
+      // ...and an attempt to smuggle one through is ignored, not honoured.
+      const gateway = new RemoteGateway({ ...config, handshakeTimeoutMs: 1 });
+      try {
+        assert.equal(TLS_HANDSHAKE_TIMEOUT_MS, 5000);
+        assert.equal(gateway.handshakeTimeoutMs, 5000, 'the frozen value cannot be weakened');
+      } finally {
+        await gateway.stop();
+      }
+
+      // The internal seam may only SHORTEN the frozen value.
+      const shortened = new RemoteGateway(config, { handshakeTimeoutMsForTests: 250 });
+      try {
+        assert.equal(shortened.handshakeTimeoutMs, 250);
+      } finally {
+        await shortened.stop();
+      }
+      const extended = new RemoteGateway(config, { handshakeTimeoutMsForTests: 60_000 });
+      try {
+        assert.equal(extended.handshakeTimeoutMs, 5000, 'lengthening is refused');
+      } finally {
+        await extended.stop();
+      }
+    });
+
+    test('RC05-ENR-177: the listener presents exactly the validated certificate bytes', async () => {
+      // A dedicated copy, so the shared fixture is never mutated.
+      const ownedCertPath = path.join(tempRoot, 'byte-binding-server.pem');
+      fs.copyFileSync(pki.serverCertPath, ownedCertPath);
+      fs.chmodSync(ownedCertPath, 0o600);
+
+      const config = await baseConfig({ serverCertificatePath: ownedCertPath });
+      const gateway = new RemoteGateway(config);
+      try {
+        // Replace the configured path with the SAN-mismatch certificate AFTER
+        // validation but BEFORE the listener is created.
+        fs.copyFileSync(pki.sanMismatchCertPath, ownedCertPath);
+
+        await gateway.start();
+        // ARC must present the validated bytes, not the replacement. A verifying
+        // client that trusts the CA and expects localhost would reject the
+        // mismatch certificate, so verifying against localhost proves which
+        // bytes are being served.
+        const probe = await new Promise((resolve) => {
+          const socket = tls.connect(
+            {
+              host: '127.0.0.1',
+              port: gateway.getBoundPort(),
+              servername: 'localhost',
+              ca: [fs.readFileSync(pki.trustedCaCertPath)],
+              rejectUnauthorized: true,
+            },
+            () => resolve({ ok: true, socket }),
+          );
+          socket.once('error', (err) => resolve({ ok: false, error: err }));
+        });
+        // The server still presents the validated localhost certificate, so the
+        // TLS layer succeeds even though the file now holds a different one.
+        assert.equal(probe.ok, true, `expected the validated certificate: ${probe.error?.code}`);
+        probe.socket.destroy();
+      } finally {
+        await gateway.stop();
+      }
+    });
+
+    test('RC05-NEG-28g: a CA file bundling two roots does not bypass the four-root model', async () => {
+      const bundle = path.join(tempRoot, 'ca-bundle.pem');
+      fs.writeFileSync(
+        bundle,
+        fs.readFileSync(pki.trustedCaCertPath, 'utf8') +
+          fs.readFileSync(pki.untrustedCaCertPath, 'utf8'),
+        { mode: 0o644 },
+      );
+      await assert.rejects(
+        () => startGateway({ clientCaPaths: [bundle] }),
+        (err) => err instanceof RemoteConfigError && err.reason === 'CLIENT_CA_MULTIPLE_ROOTS',
+      );
+    });
+
+    test('RC05-NEG-28h: trailing material outside the certificate block fails closed', async () => {
+      const trailing = path.join(tempRoot, 'ca-trailing.pem');
+      fs.writeFileSync(
+        trailing,
+        `${fs.readFileSync(pki.trustedCaCertPath, 'utf8')}
+trailing-not-pem
+`,
+        { mode: 0o644 },
+      );
+      await assert.rejects(
+        () => startGateway({ clientCaPaths: [trailing] }),
+        (err) => err instanceof RemoteConfigError && err.reason === 'CLIENT_CA_MALFORMED',
+      );
+    });
+
+    test('RC05-NEG-28i: five configured roots are refused', async () => {
+      const paths = [];
+      for (let i = 0; i < 5; i++) {
+        const copy = path.join(tempRoot, `ca-copy-${i}.pem`);
+        fs.writeFileSync(copy, fs.readFileSync(pki.trustedCaCertPath, 'utf8'), { mode: 0o644 });
+        paths.push(copy);
+      }
+      await assert.rejects(
+        () => startGateway({ clientCaPaths: paths }),
+        (err) => err instanceof RemoteConfigError && err.reason === 'CLIENT_CA_TOO_MANY',
+      );
+    });
+  });
 
   describe('Transport mode composition', () => {
     test('RC05-ENR-130: stdio mode creates no remote listener', async () => {

@@ -15,13 +15,14 @@
  * property is structural rather than a matter of careful routing.
  */
 
-import fs from 'node:fs';
 import * as tls from 'node:tls';
 import type { Server, TLSSocket } from 'node:tls';
 import { deriveSpkiPin } from '@cesspace-arc/auth';
 import { DeviceTrustStore } from '@cesspace-arc/auth';
 import {
+  isWildcardBindHost,
   resolveRemoteConfig,
+  TLS_HANDSHAKE_TIMEOUT_MS,
   type RemoteConfig,
   type ResolvedRemoteConfig,
 } from './remote-config.js';
@@ -47,7 +48,10 @@ import {
  */
 export interface RemoteGatewayStatus {
   transportMode: 'stdio' | 'remote';
+  /** True while the TCP/TLS listener is physically bound. */
   listenerActive: boolean;
+  /** True only when the bound listener can actually serve a new session. */
+  activeAndServing: boolean;
   /** True when the gateway is running but cannot admit new sessions. */
   degraded: boolean;
   /** Bounded reason for degradation. Absent when healthy. */
@@ -73,10 +77,22 @@ export interface PeerAdmissionContext {
   socket: TLSSocket;
 }
 
-/** Injectable seams for deterministic tests. */
+/**
+ * Internal seams.
+ *
+ * These exist for deterministic tests and are deliberately NOT reachable from
+ * the production ArcServerConfig/RemoteConfig surface: no configuration can
+ * weaken the frozen security values.
+ */
 export interface RemoteGatewayOptions {
   /** Wall clock used for certificate-validity decisions. */
   getWallTime?: () => number;
+  /**
+   * Test-only handshake timeout. Production always uses the frozen
+   * {@link TLS_HANDSHAKE_TIMEOUT_MS}; this seam may only SHORTEN it, and is
+   * ignored when it would lengthen the frozen value.
+   */
+  handshakeTimeoutMsForTests?: number;
   /** Layer A limiter overrides. */
   admission?: AdmissionLimiterOptions;
   /** Invoked once per admitted, chain-validated connection. */
@@ -86,9 +102,23 @@ export interface RemoteGatewayOptions {
 }
 
 interface ConnectionState {
+  /** The exact admission slot held by this connection. */
+  release: () => void;
   handshakeSettled: boolean;
   connectionSettled: boolean;
-  settleHandshake?: () => void;
+}
+
+/**
+ * Stable identity for one open TCP connection, built only from documented
+ * socket properties. Two simultaneously open connections cannot share a tuple.
+ */
+function connectionTuple(socket: {
+  localAddress?: string;
+  localPort?: number;
+  remoteAddress?: string;
+  remotePort?: number;
+}): string {
+  return `${socket.localAddress ?? ''}:${socket.localPort ?? 0}|${socket.remoteAddress ?? ''}:${socket.remotePort ?? 0}`;
 }
 
 /** Maximum time to wait for `close()` to settle during shutdown. */
@@ -97,6 +127,13 @@ const SHUTDOWN_GRACE_MS = 2000;
 export class RemoteGateway {
   private readonly config: ResolvedRemoteConfig;
   private readonly getWallTime: () => number;
+  /**
+   * Resolved TLS handshake timeout in milliseconds.
+   *
+   * Always the frozen {@link TLS_HANDSHAKE_TIMEOUT_MS} in production; only the
+   * internal test seam may resolve it lower.
+   */
+  public readonly handshakeTimeoutMs: number;
   private readonly limiter: AdmissionLimiter;
   private readonly options: RemoteGatewayOptions;
 
@@ -107,12 +144,29 @@ export class RemoteGateway {
   private started = false;
   private degradedReason?: 'certificate_expired';
   private readonly liveSockets = new Set<TLSSocket>();
-  /** Per-socket settle flags, so each counter is released exactly once. */
-  private readonly connectionStates = new WeakMap<TLSSocket, ConnectionState>();
+  /**
+   * Per-connection settle state, keyed by the TCP connection tuple.
+   *
+   * The raw socket seen in `connection` and the TLSSocket seen in
+   * `secureConnection` are DIFFERENT objects, so state cannot be keyed by either
+   * one. The tuple (localAddress:localPort|remoteAddress:remotePort) is made of
+   * public properties, is identical for both objects, and uniquely identifies a
+   * connection while it is open. The map is bounded by the global live
+   * connection cap because an entry exists only for an admitted connection.
+   */
+  private readonly connectionStates = new Map<string, ConnectionState>();
 
   constructor(config: RemoteConfig, options: RemoteGatewayOptions = {}) {
     this.options = options;
     this.getWallTime = options.getWallTime ?? (() => Date.now());
+    const requestedTimeout = options.handshakeTimeoutMsForTests;
+    this.handshakeTimeoutMs =
+      typeof requestedTimeout === 'number' &&
+      Number.isInteger(requestedTimeout) &&
+      requestedTimeout > 0 &&
+      requestedTimeout < TLS_HANDSHAKE_TIMEOUT_MS
+        ? requestedTimeout
+        : TLS_HANDSHAKE_TIMEOUT_MS;
     this.limiter = new AdmissionLimiter(options.admission ?? {});
 
     // Everything below runs BEFORE a listener exists. Any rejection propagates
@@ -157,7 +211,15 @@ export class RemoteGateway {
     }
 
     const caRoots = loadClientCaRoots(this.config.clientCaPaths);
-    const certificatePem = fs.readFileSync(this.config.serverCertificatePath, 'utf8');
+    // The EXACT bytes validated in the constructor, never a re-read of the
+    // configured path: a file replaced after validation must not be served.
+    const certificatePem = this.facts?.pem;
+    if (certificatePem === undefined) {
+      throw new RemoteConfigError(
+        'Server certificate material is unavailable.',
+        'SERVER_CERTIFICATE_UNREADABLE',
+      );
+    }
 
     const keyMaterial = this.privateKeyMaterial;
     if (keyMaterial === undefined) {
@@ -177,8 +239,9 @@ export class RemoteGateway {
           ca: caRoots,
           cert: certificatePem,
           key: keyMaterial.pem,
-          // §20: a stalled handshake must not hold a slot indefinitely.
-          handshakeTimeout: this.config.handshakeTimeoutMs,
+          // §20: a stalled handshake must not hold a slot indefinitely. The
+          // test seam may only SHORTEN the frozen value.
+          handshakeTimeout: this.handshakeTimeoutMs,
         },
         () => {
           // Intentionally empty. Task 3 has no application protocol: an admitted
@@ -213,7 +276,15 @@ export class RemoteGateway {
         };
         server.once('error', onError);
         server.once('listening', onListening);
-        server.listen({ host: this.config.bindHost, port: this.config.port });
+        // Literal bind semantics: an explicitly opted-in IPv6 wildcard must not
+        // silently broaden into an unintended dual-stack IPv4 listener.
+        server.listen({
+          host: this.config.bindHost,
+          port: this.config.port,
+          ...(isWildcardBindHost(this.config.bindHost) && this.config.bindHost.includes(':')
+            ? { ipv6Only: true }
+            : {}),
+        });
       });
     } catch (err: unknown) {
       // Leave nothing half-open.
@@ -252,11 +323,22 @@ export class RemoteGateway {
    * addresses, or the trust-store path.
    */
   public getStatus(): RemoteGatewayStatus {
+    // The degraded state is COMPUTED from the injected clock on every call, so
+    // it becomes truthful the moment the certificate reaches notAfter even if
+    // no further connection is ever attempted.
+    const expired = this.isServerCertificateExpired();
+    if (expired) {
+      this.degradedReason = 'certificate_expired';
+    }
+    const degraded = expired;
     return {
       transportMode: 'remote',
       listenerActive: this.started,
-      degraded: this.degradedReason !== undefined,
-      ...(this.degradedReason === undefined ? {} : { degradedReason: this.degradedReason }),
+      degraded,
+      // A physically bound listener whose certificate has expired is NOT
+      // serving new sessions, so it is reported inactive for health purposes.
+      activeAndServing: this.started && !degraded,
+      ...(degraded ? { degradedReason: 'certificate_expired' as const } : {}),
       liveConnections: this.limiter.getLiveConnectionCount(),
       inFlightHandshakes: this.limiter.getInFlightHandshakeCount(),
     };
@@ -299,6 +381,17 @@ export class RemoteGateway {
    * A refused peer is destroyed immediately: no handshake, no HTTP, no MCP.
    */
   private handleConnection(socket: TLSSocket): void {
+    const tuple = connectionTuple(socket);
+
+    // T-7: the runtime expiry gate runs BEFORE any TLS work on a NEW connection.
+    // Once the server certificate has reached notAfter, no new session may be
+    // established, so the raw socket is destroyed before a handshake can begin.
+    // Connections admitted earlier are untouched and drain normally.
+    if (this.isServerCertificateExpired()) {
+      socket.destroy();
+      return;
+    }
+
     const peerKey = this.peerKeyFor(socket);
     const decision = this.limiter.admit(peerKey);
     if (!decision.admitted) {
@@ -310,38 +403,49 @@ export class RemoteGateway {
     // Two independent slots are held by an admitted connection:
     //  - the in-flight handshake slot, released when the handshake settles;
     //  - the live connection slot, released when the socket closes.
-    // Each settles exactly once regardless of the path taken.
-    const state: ConnectionState = { handshakeSettled: false, connectionSettled: false };
-    this.connectionStates.set(socket, state);
-
-    const settleHandshake = () => {
-      if (state.handshakeSettled) {
-        return;
-      }
-      state.handshakeSettled = true;
-      this.limiter.releaseHandshake();
+    const state: ConnectionState = {
+      release: decision.release,
+      handshakeSettled: false,
+      connectionSettled: false,
     };
-    const settleConnection = () => {
-      if (state.connectionSettled) {
-        return;
-      }
-      state.connectionSettled = true;
-      // A connection that closes without ever completing a handshake (timeout,
-      // socket error, destroy) must still release its handshake slot.
-      settleHandshake();
-      decision.release();
-      this.liveSockets.delete(socket);
-      this.connectionStates.delete(socket);
-    };
-    state.settleHandshake = settleHandshake;
+    this.connectionStates.set(tuple, state);
 
-    socket.once('close', settleConnection);
+    socket.once('close', () => this.settleConnection(tuple));
     socket.once('error', () => {
       socket.destroy();
     });
     socket.once('timeout', () => {
       socket.destroy();
     });
+  }
+
+  /**
+   * Releases the in-flight handshake slot for a connection, exactly once.
+   *
+   * Called from the TLS layer when the handshake settles, looked up by the
+   * connection tuple because the raw and TLS sockets are distinct objects.
+   */
+  private settleHandshakeFor(tuple: string): void {
+    const state = this.connectionStates.get(tuple);
+    if (state === undefined || state.handshakeSettled) {
+      return;
+    }
+    state.handshakeSettled = true;
+    this.limiter.releaseHandshake();
+  }
+
+  /** Releases every slot held by a connection, exactly once. */
+  private settleConnection(tuple: string): void {
+    const state = this.connectionStates.get(tuple);
+    if (state === undefined || state.connectionSettled) {
+      return;
+    }
+    state.connectionSettled = true;
+    // A connection that closes without ever completing a handshake (timeout,
+    // socket error, destroy) must still release its handshake slot.
+    this.settleHandshakeFor(tuple);
+    state.release();
+    this.connectionStates.delete(tuple);
   }
 
   /**
@@ -352,19 +456,19 @@ export class RemoteGateway {
    * true. The identity is derived here and nowhere else.
    */
   private handleSecureConnection(socket: TLSSocket): void {
-    // The handshake has settled, whatever happens next.
-    this.connectionStates.get(socket)?.settleHandshake?.();
+    const tuple = connectionTuple(socket);
 
+    // A handshake that began before expiry but completed after it must still be
+    // refused: the runtime check is repeated at the post-handshake boundary.
     if (this.isServerCertificateExpired()) {
-      // §6 T-7: once the server certificate has expired, no NEW session may be
-      // established. Existing admitted connections are left to drain.
-      this.degradedReason = 'certificate_expired';
+      this.settleConnection(tuple);
       socket.destroy();
       return;
     }
 
     const peerCertificate = socket.getPeerCertificate(true);
-    if (peerCertificate === undefined || !socket.authorized) {
+    if (peerCertificate === undefined || !socket.authorized || peerCertificate.raw === undefined) {
+      this.settleConnection(tuple);
       socket.destroy();
       return;
     }
@@ -373,12 +477,14 @@ export class RemoteGateway {
     try {
       spkiPin = deriveSpkiPin(peerCertificate.raw);
     } catch {
+      this.settleConnection(tuple);
       socket.destroy();
       return;
     }
 
-    // The connection remains counted as live until it closes; the handshake
-    // slot was released above.
+    // The handshake has settled, so its slot is released now; the connection
+    // remains counted as live until it closes.
+    this.settleHandshakeFor(tuple);
     this.liveSockets.add(socket);
 
     // Task 3 boundary: a valid chain and a canonical SPKI pin. No enrollment,
@@ -389,10 +495,17 @@ export class RemoteGateway {
 
   /** Handshake failure: settle the slot and drop the socket. */
   private handleHandshakeFailure(socket: TLSSocket): void {
-    this.connectionStates.get(socket)?.settleHandshake?.();
+    this.settleConnection(connectionTuple(socket));
     socket.destroy();
   }
 
+  /**
+   * True when the server certificate has reached notAfter.
+   *
+   * The boundary is inclusive: at exactly notAfter the certificate is expired.
+   * Evaluated with the injected wall clock, never a cached flag, so status
+   * reflects the current instant.
+   */
   private isServerCertificateExpired(): boolean {
     const facts = this.facts;
     if (facts === undefined) {

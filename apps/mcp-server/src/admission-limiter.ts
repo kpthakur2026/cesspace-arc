@@ -14,16 +14,24 @@
  * are reclaimed by idle eviction; if none is reclaimable the connection is
  * refused outright rather than allocating, so attacker-driven key churn cannot
  * grow memory.
+ *
+ * Rate model: a MONOTONIC TOKEN BUCKET, not a fixed window. The frozen pair
+ * "60 attempts / min (burst 20)" is a refill rate of one token per second with a
+ * bucket that holds at most 20. A fixed window would admit 60 + 20 = 80
+ * immediate attempts, which is not a burst capacity of 20, so it is not used.
  */
 
 /** Frozen Layer A rate window, in milliseconds. */
 export const LAYER_A_WINDOW_MS = 60_000;
 
-/** Frozen Layer A connection attempts per window, per peer. */
-export const LAYER_A_MAX_ATTEMPTS_PER_WINDOW = 60;
+/** Frozen Layer A refill rate, in connection-attempt tokens per minute, per peer. */
+export const LAYER_A_ATTEMPTS_PER_MINUTE = 60;
 
-/** Frozen Layer A burst capacity, per peer. */
+/** Frozen Layer A burst capacity: the maximum tokens the bucket may hold. */
 export const LAYER_A_BURST = 20;
+
+/** Refill interval implied by the frozen rate: one token per second. */
+export const LAYER_A_REFILL_MS = 60_000 / LAYER_A_ATTEMPTS_PER_MINUTE;
 
 /** Frozen maximum concurrent live connections per peer. */
 export const MAX_LIVE_CONNECTIONS_PER_PEER = 32;
@@ -53,10 +61,10 @@ export type AdmissionDecision =
   { admitted: true; release: () => void } | { admitted: false; reason: AdmissionRefusalReason };
 
 interface PeerState {
-  /** Monotonic milliseconds of the start of the current rate window. */
-  windowStartedAtMs: number;
-  /** Attempts counted in the current window. */
-  attempts: number;
+  /** Token-bucket level. Never exceeds the burst capacity. */
+  tokens: number;
+  /** Monotonic millisecond of the last refill, for lazy accrual. */
+  lastRefillMs: number;
   /** Live connections currently held by this peer. */
   live: number;
   /** Last monotonic millisecond this key was touched, for idle eviction. */
@@ -68,7 +76,7 @@ export interface AdmissionLimiterOptions {
   /** Monotonic clock in milliseconds. */
   getMonotonicTimeMs?: () => number;
   /** Overridable bounds; defaults are the frozen values. */
-  maxAttemptsPerWindow?: number;
+  attemptsPerMinute?: number;
   burst?: number;
   maxLivePerPeer?: number;
   maxLiveGlobal?: number;
@@ -85,7 +93,7 @@ export interface AdmissionLimiterOptions {
  */
 export class AdmissionLimiter {
   private readonly getMonotonicTimeMs: () => number;
-  private readonly maxAttemptsPerWindow: number;
+  private readonly refillMs: number;
   private readonly burst: number;
   private readonly maxLivePerPeer: number;
   private readonly maxLiveGlobal: number;
@@ -99,7 +107,8 @@ export class AdmissionLimiter {
 
   constructor(options: AdmissionLimiterOptions = {}) {
     this.getMonotonicTimeMs = options.getMonotonicTimeMs ?? (() => performance.now());
-    this.maxAttemptsPerWindow = options.maxAttemptsPerWindow ?? LAYER_A_MAX_ATTEMPTS_PER_WINDOW;
+    const attemptsPerMinute = options.attemptsPerMinute ?? LAYER_A_ATTEMPTS_PER_MINUTE;
+    this.refillMs = 60_000 / attemptsPerMinute;
     this.burst = options.burst ?? LAYER_A_BURST;
     this.maxLivePerPeer = options.maxLivePerPeer ?? MAX_LIVE_CONNECTIONS_PER_PEER;
     this.maxLiveGlobal = options.maxLiveGlobal ?? MAX_LIVE_CONNECTIONS_GLOBAL;
@@ -149,18 +158,26 @@ export class AdmissionLimiter {
     const peer = existing ?? this.createPeer(peerKey, now);
     peer.lastSeenMs = now;
 
-    // Fixed rate window with a burst allowance: the frozen "60 attempts / min,
-    // burst 20" pair is enforced as 60 + 20 attempts per rolling window, which
-    // is the conservative reading (a token bucket would admit the same burst at
-    // the window start, then refill continuously). The window is reset lazily
-    // on the first attempt after it elapses.
-    if (now - peer.windowStartedAtMs >= LAYER_A_WINDOW_MS) {
-      peer.windowStartedAtMs = now;
-      peer.attempts = 0;
+    // Lazily accrue tokens at the frozen rate, capped at the burst capacity so
+    // a long idle period can never bank more than one burst.
+    const elapsedMs = now - peer.lastRefillMs;
+    if (elapsedMs > 0) {
+      peer.tokens = Math.min(this.burst, peer.tokens + elapsedMs / this.refillMs);
+      peer.lastRefillMs = now;
     }
 
-    // Global caps are checked before per-peer accounting so a refusal never
-    // increments a counter that would then have to be released.
+    // The rate budget governs ATTEMPTS: an attempt is refused here when no
+    // token is available, regardless of what any concurrency bound would say.
+    if (peer.tokens < 1) {
+      return { admitted: false, reason: 'RATE_LIMIT' };
+    }
+
+    // The attempt consumes a token whether or not a concurrency bound then
+    // refuses it, so rate accounting reflects requests actually made.
+    peer.tokens -= 1;
+
+    // Concurrency bounds are evaluated after rate accounting, so their refusal
+    // reasons stay precise and the token cost of the attempt is still recorded.
     if (this.liveGlobal + 1 > this.maxLiveGlobal) {
       return { admitted: false, reason: 'GLOBAL_CONNECTION_CAP' };
     }
@@ -171,12 +188,6 @@ export class AdmissionLimiter {
       return { admitted: false, reason: 'PEER_CONNECTION_CAP' };
     }
 
-    // Rate window: attempts counter is the burst-aware sliding window bound.
-    if (peer.attempts >= this.maxAttemptsPerWindow + this.burst) {
-      return { admitted: false, reason: 'RATE_LIMIT' };
-    }
-
-    peer.attempts += 1;
     peer.live += 1;
     this.liveGlobal += 1;
     this.inFlightHandshakes += 1;
@@ -216,8 +227,9 @@ export class AdmissionLimiter {
 
   private createPeer(peerKey: string, now: number): PeerState {
     const peer: PeerState = {
-      windowStartedAtMs: now,
-      attempts: 0,
+      // A fresh peer starts with a full burst available.
+      tokens: this.burst,
+      lastRefillMs: now,
       live: 0,
       lastSeenMs: now,
     };
