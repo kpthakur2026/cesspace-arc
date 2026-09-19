@@ -1991,5 +1991,33 @@ rules: []
         }
       }
     });
+
+    test('RC04-M-69: advertised MCP server metadata reports the RC-04 version', () => {
+      const { server } = makeServer({ workspaceName: 'server-identity' });
+
+      // The SDK `Server` instance holds the metadata that every connecting MCP
+      // client receives in the `initialize` result. `server.server` is the
+      // constructed SDK object; the field is read directly because exposing a
+      // production getter solely for a test would widen the server's surface.
+      const sdkServer = server.server;
+      assert.ok(sdkServer !== undefined, 'the MCP SDK server instance must exist');
+
+      const serverInfo = sdkServer._serverInfo;
+      assert.ok(
+        serverInfo !== null && typeof serverInfo === 'object',
+        'the SDK server instance must carry its advertised identity metadata',
+      );
+      assert.equal(serverInfo.name, 'cesspace-arc');
+      assert.equal(
+        serverInfo.version,
+        '0.4.0-rc04',
+        'the advertised MCP server metadata must report the RC-04 stage version',
+      );
+      assert.notEqual(
+        serverInfo.version,
+        '0.3.0-rc03',
+        'the advertised MCP server metadata must not still report the RC-03 version',
+      );
+    });
   });
 });
