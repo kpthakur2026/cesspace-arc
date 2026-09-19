@@ -276,6 +276,61 @@ describe('CesSpace ARC — RC-05 Task 2: Enrollment CLI', () => {
       }
     });
 
+    test('RC05-CLI-12: preflight bounds match the authoritative persisted limits', async () => {
+      const build = (overrides) => [
+        'enrollment',
+        'create',
+        '--client-id',
+        overrides.clientId ?? 'agent-alpha',
+        '--client-type',
+        overrides.clientType ?? 'claude-code',
+        '--spki-pin',
+        pin('bounds'),
+        ...ADMIN_ARGS,
+      ];
+
+      // Exactly at the persisted bounds: accepted and sent.
+      const atLimit = await run(build({ clientId: 'i'.repeat(128), clientType: 'c'.repeat(64) }), {
+        createAdminClient: fakeClient(CREATE_OK, []),
+        readPrivateKeyFromFd: () => 'fake-key',
+      });
+      assert.equal(atLimit.exitCode, EXIT_OK, atLimit.err);
+
+      // One character beyond each bound: refused locally, no IPC.
+      const overId = await run(build({ clientId: 'i'.repeat(129) }), {
+        createAdminClient: fakeClient(CREATE_OK, []),
+        readPrivateKeyFromFd: () => 'fake-key',
+      });
+      assert.equal(overId.exitCode, EXIT_USAGE);
+      assert.match(overId.err, /--client-id must not exceed 128 characters/);
+
+      const overType = await run(build({ clientType: 'c'.repeat(65) }), {
+        createAdminClient: fakeClient(CREATE_OK, []),
+        readPrivateKeyFromFd: () => 'fake-key',
+      });
+      assert.equal(overType.exitCode, EXIT_USAGE);
+      assert.match(overType.err, /--client-type must not exceed 64 characters/);
+    });
+
+    test('RC05-CLI-13: a NUL in an identifier is refused before IPC', async () => {
+      const result = await run(
+        [
+          'enrollment',
+          'create',
+          '--client-id',
+          `agent${String.fromCharCode(0)}alpha`,
+          '--client-type',
+          'claude-code',
+          '--spki-pin',
+          pin('nul'),
+          ...ADMIN_ARGS,
+        ],
+        { createAdminClient: fakeClient(CREATE_OK, []), readPrivateKeyFromFd: () => 'fake-key' },
+      );
+      assert.equal(result.exitCode, EXIT_USAGE);
+      assert.match(result.err, /must not contain NUL/);
+    });
+
     test('RC05-CLI-05: an unusable success payload is refused rather than displayed', async () => {
       const result = await run(
         [

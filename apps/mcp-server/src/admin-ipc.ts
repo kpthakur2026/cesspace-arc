@@ -965,10 +965,23 @@ export class AdminIpcServer {
         operatorId: this.operatorId,
       });
 
+      // Constructed field by field against the declared closed protocol shape.
+      // A structural spread would also carry PendingEnrollmentView's internal
+      // fields (notably the failed-attempt counter) into the response.
+      const view = created.enrollment;
       return {
         ok: true,
         result: {
-          enrollment: { ...created.enrollment },
+          enrollment: {
+            enrollmentId: view.enrollmentId,
+            clientId: view.clientId,
+            clientType: view.clientType,
+            spkiPin: view.spkiPin,
+            displayLabel: view.displayLabel,
+            createdAt: view.createdAt,
+            expiresAt: view.expiresAt,
+            remainingSeconds: view.remainingSeconds,
+          },
           secret: created.secret,
         },
       };

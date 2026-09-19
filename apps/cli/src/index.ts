@@ -243,8 +243,14 @@ const ENROLLMENT_SPKI_PIN_REGEX = /^[0-9a-f]{64}$/;
 const ENROLLMENT_ID_REGEX = /^[0-9a-f]{32}$/;
 /** Maximum display label size in UTF-8 bytes. */
 const ENROLLMENT_MAX_LABEL_BYTES = 64;
-/** Maximum clientId / clientType size in UTF-8 bytes. */
-const ENROLLMENT_MAX_IDENTIFIER_BYTES = 128;
+/**
+ * Persisted client identity bounds, matching the authoritative domain rules in
+ * @cesspace-arc/auth: clientId <= 128 characters, clientType <= 64 characters.
+ * Character counts, not bytes, because that is what the trust-store schema
+ * enforces. The server re-validates authoritatively.
+ */
+const ENROLLMENT_MAX_CLIENT_ID_CHARS = 128;
+const ENROLLMENT_MAX_CLIENT_TYPE_CHARS = 64;
 
 interface EnrollmentCreateOptions {
   clientId: string;
@@ -254,17 +260,19 @@ interface EnrollmentCreateOptions {
 }
 
 /** Validates a required bounded identifier supplied on the command line. */
-function validateEnrollmentIdentifier(value: string | undefined, option: string): string {
+function validateEnrollmentIdentifier(
+  value: string | undefined,
+  option: string,
+  maxChars: number,
+): string {
   if (value === undefined || value.trim().length === 0) {
     throw new UsageError(`${option} is required.`);
   }
   if (value.includes('\u0000')) {
     throw new UsageError(`${option} must not contain NUL.`);
   }
-  if (Buffer.byteLength(value, 'utf8') > ENROLLMENT_MAX_IDENTIFIER_BYTES) {
-    throw new UsageError(
-      `${option} must not exceed ${ENROLLMENT_MAX_IDENTIFIER_BYTES} UTF-8 bytes.`,
-    );
+  if (value.length > maxChars) {
+    throw new UsageError(`${option} must not exceed ${maxChars} characters.`);
   }
   return value;
 }
@@ -296,8 +304,16 @@ function parseEnrollmentCreateArgs(args: readonly string[]): EnrollmentCreateOpt
     }
   }
 
-  const validatedClientId = validateEnrollmentIdentifier(clientId, '--client-id');
-  const validatedClientType = validateEnrollmentIdentifier(clientType, '--client-type');
+  const validatedClientId = validateEnrollmentIdentifier(
+    clientId,
+    '--client-id',
+    ENROLLMENT_MAX_CLIENT_ID_CHARS,
+  );
+  const validatedClientType = validateEnrollmentIdentifier(
+    clientType,
+    '--client-type',
+    ENROLLMENT_MAX_CLIENT_TYPE_CHARS,
+  );
 
   if (spkiPin === undefined) {
     throw new UsageError('--spki-pin is required.');

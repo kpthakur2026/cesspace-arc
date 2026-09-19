@@ -17,6 +17,17 @@ export const MAX_DISPLAY_LABEL_BYTES = 64;
 export const MAX_TRUST_STORE_BYTES = 256 * 1024; // 262,144 bytes (256 KiB)
 
 /**
+ * Persisted client identity bounds.
+ *
+ * These are the AUTHORITATIVE rules for both pending-enrollment admission and
+ * the persistent trust-store schema. They are declared once here because a
+ * pending challenge that the trust store would later refuse to serialize is an
+ * unpersistable device: admission and persistence must agree exactly.
+ */
+export const MAX_CLIENT_ID_CHARS = 128;
+export const MAX_CLIENT_TYPE_CHARS = 64;
+
+/**
  * Metadata record for an enrolled device in the ARC trust store.
  * Persists strictly the fields permitted by §8:
  * deviceId, clientId, clientType, pin set, enrollment timestamp, display label, revocation state.
@@ -65,6 +76,48 @@ export function isValidDeviceId(id: unknown): id is string {
  */
 export function isValidSpkiPin(pin: unknown): pin is string {
   return typeof pin === 'string' && SPKI_PIN_REGEX.test(pin);
+}
+
+/**
+ * Validates a client identifier against the authoritative persisted rule.
+ *
+ * Shared by pending-enrollment admission and trust-store persistence so the two
+ * can never diverge. A value that passes here is guaranteed to satisfy the
+ * trust-store schema.
+ */
+export function validateClientId(value: unknown): string {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw ArcError.invalidRequestSchema('clientId must be a non-empty string.');
+  }
+  if (value.includes('\u0000')) {
+    throw ArcError.invalidRequestSchema('clientId must not contain NUL characters.');
+  }
+  if (value.length > MAX_CLIENT_ID_CHARS) {
+    throw ArcError.invalidRequestSchema(
+      `clientId must be a non-empty string up to ${MAX_CLIENT_ID_CHARS} characters.`,
+    );
+  }
+  return value;
+}
+
+/**
+ * Validates a client type against the authoritative persisted rule.
+ *
+ * See {@link validateClientId}: the same rule governs admission and persistence.
+ */
+export function validateClientType(value: unknown): string {
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    throw ArcError.invalidRequestSchema('clientType must be a non-empty string.');
+  }
+  if (value.includes('\u0000')) {
+    throw ArcError.invalidRequestSchema('clientType must not contain NUL characters.');
+  }
+  if (value.length > MAX_CLIENT_TYPE_CHARS) {
+    throw ArcError.invalidRequestSchema(
+      `clientType must be a non-empty string up to ${MAX_CLIENT_TYPE_CHARS} characters.`,
+    );
+  }
+  return value;
 }
 
 /**

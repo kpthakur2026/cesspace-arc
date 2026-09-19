@@ -20,7 +20,12 @@
 
 import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { ArcError } from '@cesspace-arc/protocol';
-import { isValidSpkiPin, validateDisplayLabel } from './device-identity.js';
+import {
+  isValidSpkiPin,
+  validateClientId,
+  validateClientType,
+  validateDisplayLabel,
+} from './device-identity.js';
 
 /** Enrollment challenge TTL in seconds (§9.2). Enforced monotonically. */
 export const ENROLLMENT_TTL_SECONDS = 300;
@@ -44,9 +49,6 @@ export const ENROLLMENT_SECRET_REGEX = /^[0-9a-f]{64}$/;
 
 /** Canonical operator identifier: SHA-256 of the operator SPKI public key. */
 export const OPERATOR_ID_REGEX = /^[0-9a-f]{64}$/;
-
-/** Maximum clientId / clientType size accepted here, in UTF-8 bytes. */
-export const MAX_CLIENT_IDENTIFIER_BYTES = 128;
 
 /** Maximum serialized size of one bounded enrollment view payload. */
 export const MAX_ENROLLMENT_METADATA_BYTES = 512;
@@ -117,8 +119,7 @@ export type ConsumeOutcome =
   | { ok: true; enrollment: PendingEnrollmentView }
   | {
       ok: false;
-      reason:
-        'UNKNOWN_ENROLLMENT' | 'EXPIRED' | 'SECRET_MISMATCH' | 'LOCKED_OUT' | 'ALREADY_CONSUMED';
+      reason: 'UNKNOWN_ENROLLMENT' | 'EXPIRED' | 'SECRET_MISMATCH' | 'LOCKED_OUT';
       /** True when this attempt was counted against the lockout. */
       counted: boolean;
     };
@@ -137,27 +138,18 @@ interface InternalPendingEnrollment {
   failedAttempts: number;
   /** SHA-256 verifier of the one-time secret. The raw secret is not retained. */
   secretDigest: Buffer;
-  consumed: boolean;
 }
+
+/**
+ * Fixed 32-byte dummy used as the comparison operand when a submitted secret is
+ * malformed. It is not derived from any secret and grants nothing; it exists so
+ * the malformed path performs the same constant-time comparison as every other
+ * mismatch rather than a visibly separate branch.
+ */
+const DUMMY_SECRET_DIGEST = Buffer.alloc(32, 0);
 
 function sha256Bytes(value: string): Buffer {
   return createHash('sha256').update(value, 'utf8').digest();
-}
-
-function validateIdentifier(value: unknown, name: string): string {
-  if (typeof value !== 'string' || value.trim().length === 0) {
-    throw ArcError.invalidRequestSchema(`${name} must be a non-empty string.`);
-  }
-  if (value.includes('\u0000')) {
-    throw ArcError.invalidRequestSchema(`${name} must not contain NUL characters.`);
-  }
-  const bytes = Buffer.byteLength(value, 'utf8');
-  if (bytes > MAX_CLIENT_IDENTIFIER_BYTES) {
-    throw ArcError.invalidRequestSchema(
-      `${name} exceeds the maximum allowed ${MAX_CLIENT_IDENTIFIER_BYTES} UTF-8 bytes (got ${bytes} bytes).`,
-    );
-  }
-  return value;
 }
 
 /**
@@ -228,8 +220,10 @@ export class EnrollmentManager {
       throw ArcError.invalidRequestSchema('Enrollment input must be an object.');
     }
 
-    const clientId = validateIdentifier(input.clientId, 'clientId');
-    const clientType = validateIdentifier(input.clientType, 'clientType');
+    // Shared with the persistent trust-store schema, so an accepted challenge
+    // can always be serialized as an enrolled device later.
+    const clientId = validateClientId(input.clientId);
+    const clientType = validateClientType(input.clientType);
     if (!isValidSpkiPin(input.spkiPin)) {
       throw ArcError.invalidRequestSchema(
         'spkiPin must be exactly 64 lowercase hexadecimal characters.',
@@ -245,8 +239,18 @@ export class EnrollmentManager {
       );
     }
 
-    // Expired records must never keep consuming quota (§9.2, E-7).
+    // Expired records must never keep consuming quota (§9.2, E-7) or hold an
+    // SPKI, so expiry is applied before either uniqueness or quota is judged.
     this.purgeExpired();
+
+    // A live canonical SPKI identifies AT MOST ONE pending challenge, because
+    // the frozen completion flow selects the challenge by the presented SPKI
+    // and never transmits an enrollment identifier (§9.1). Two live challenges
+    // for one pin would make that selection ambiguous, so it fails closed here,
+    // before any quota accounting or state mutation.
+    if (this.findLiveBySpki(input.spkiPin) !== undefined) {
+      throw ArcError.invalidRequestSchema('A pending enrollment already exists for this SPKI pin.');
+    }
 
     if (this.pendingById.size + 1 > MAX_PENDING_ENROLLMENTS_GLOBAL) {
       throw ArcError.resourceExhausted(
@@ -278,7 +282,6 @@ export class EnrollmentManager {
       monotonicDeadline: nowMono + BigInt(ENROLLMENT_TTL_SECONDS) * 1_000_000_000n,
       failedAttempts: 0,
       secretDigest: sha256Bytes(secret),
-      consumed: false,
     };
 
     this.pendingById.set(enrollmentId, record);
@@ -317,54 +320,84 @@ export class EnrollmentManager {
   }
 
   /**
-   * Verifies and atomically consumes a one-time secret.
+   * Finds the single live pending challenge bound to a canonical SPKI pin.
    *
-   * Task 4 calls this after mTLS/SPKI proof succeeds. Ordering matters: the
-   * monotonic expiry check runs BEFORE the secret is examined, so an expired
-   * challenge can never be consumed and its secret can never be replayed.
-   *
-   * On a wrong secret the attempt is counted; the third failed attempt purges
-   * the challenge immediately. Returning a reason is safe because this value
-   * never reaches a remote client — Task 4 maps every failure to one uniform
-   * HTTP 400 response.
+   * A linear scan over a table bounded at 16 live records is used deliberately
+   * instead of a secondary index: a derived index could drift out of step with
+   * the records, whereas a scan cannot. Combined with the admission rule in
+   * {@link create}, this yields 0 or 1 match, never more.
    */
-  public verifyAndConsume(enrollmentId: string, secret: unknown): ConsumeOutcome {
-    if (typeof enrollmentId !== 'string' || !ENROLLMENT_ID_REGEX.test(enrollmentId)) {
+  private findLiveBySpki(spkiPin: string): InternalPendingEnrollment | undefined {
+    if (typeof spkiPin !== 'string' || !isValidSpkiPin(spkiPin)) {
+      return undefined;
+    }
+    for (const record of this.pendingById.values()) {
+      if (record.spkiPin === spkiPin) {
+        return record;
+      }
+    }
+    return undefined;
+  }
+
+  /** Bounded view of the live challenge for a pin, or undefined. */
+  public getBySpki(spkiPin: string): PendingEnrollmentView | undefined {
+    this.purgeExpired();
+    const record = this.findLiveBySpki(spkiPin);
+    return record === undefined ? undefined : this.toView(record);
+  }
+
+  /**
+   * Verifies and atomically consumes a one-time secret, selected by the
+   * presented canonical SPKI pin.
+   *
+   * This is the frozen Task-4 entry point: the remote completion request carries
+   * ONLY the secret, and ARC derives the pin from the authenticated mTLS
+   * certificate. The pin is therefore the trusted selector, and the submitted
+   * secret is the only attacker-controlled input.
+   *
+   * Ordering matters: monotonic expiry is evaluated BEFORE the secret is
+   * examined, so an expired challenge can never be consumed and its secret can
+   * never be replayed.
+   *
+   * On return the caller receives the bounded enrollment metadata needed for
+   * atomic activation. This method performs NO trust-store mutation and NO
+   * network I/O; Task 4 owns activation.
+   */
+  public verifyAndConsumeBySpki(spkiPin: string, secret: unknown): ConsumeOutcome {
+    // A malformed or unknown pin is indistinguishable from an unknown challenge.
+    if (typeof spkiPin !== 'string' || !isValidSpkiPin(spkiPin)) {
       return { ok: false, reason: 'UNKNOWN_ENROLLMENT', counted: false };
     }
 
-    const record = this.pendingById.get(enrollmentId);
+    const record = this.findLiveBySpki(spkiPin);
     if (record === undefined) {
       return { ok: false, reason: 'UNKNOWN_ENROLLMENT', counted: false };
     }
-    if (record.consumed) {
-      return { ok: false, reason: 'ALREADY_CONSUMED', counted: false };
-    }
     if (this.getMonotonicTime() >= record.monotonicDeadline) {
       // Expiry wins over every other check, including a correct secret.
-      this.pendingById.delete(enrollmentId);
+      this.pendingById.delete(record.enrollmentId);
       return { ok: false, reason: 'EXPIRED', counted: false };
     }
 
-    // Constant-time comparison over equal-length verifier material. A
-    // malformed submission is treated as a mismatch so it cannot be used to
-    // probe for free.
-    const candidate =
-      typeof secret === 'string' && ENROLLMENT_SECRET_REGEX.test(secret)
-        ? sha256Bytes(secret)
-        : null;
-    // A digest is always 32 bytes, so the length check is defensive only.
-    const secretMatches =
-      candidate !== null &&
-      candidate.length === record.secretDigest.length &&
-      timingSafeEqual(candidate, record.secretDigest);
+    // Constant-time comparison over equal-length digest material on EVERY path.
+    //
+    // A malformed secret is still hashed and still compared against a fixed
+    // dummy digest, so the malformed path costs the same and follows the same
+    // code as a well-formed wrong secret. A malformed submission is counted as
+    // a failed attempt, exactly like any other mismatch.
+    const submitted = typeof secret === 'string' ? secret : '';
+    const candidateDigest = sha256Bytes(submitted);
+    const wellFormed = ENROLLMENT_SECRET_REGEX.test(submitted);
+    const expectedDigest = wellFormed ? record.secretDigest : DUMMY_SECRET_DIGEST;
+    const digestMatches = timingSafeEqual(candidateDigest, expectedDigest);
+    const secretMatches = wellFormed && digestMatches;
 
     if (!secretMatches) {
       record.failedAttempts += 1;
       if (record.failedAttempts >= MAX_FAILED_SECRET_ATTEMPTS) {
-        // Third failure: immediate purge. The challenge cannot be revived and
-        // its secret is permanently unusable.
-        this.pendingById.delete(enrollmentId);
+        // Third failure: immediate purge. The challenge cannot be revived, its
+        // secret is permanently unusable, and its SPKI is released.
+        this.pendingById.delete(record.enrollmentId);
         return { ok: false, reason: 'LOCKED_OUT', counted: true };
       }
       return { ok: false, reason: 'SECRET_MISMATCH', counted: true };
@@ -372,7 +405,7 @@ export class EnrollmentManager {
 
     // Single-use: the record is removed in the same synchronous step that
     // observes the match, so no second caller can observe it as live.
-    this.pendingById.delete(enrollmentId);
+    this.pendingById.delete(record.enrollmentId);
     return { ok: true, enrollment: this.toView(record) };
   }
 

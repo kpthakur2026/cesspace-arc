@@ -8,8 +8,12 @@ import {
   generateDeviceId,
   isValidDeviceId,
   isValidSpkiPin,
+  validateClientId,
+  validateClientType,
   validateDisplayLabel,
   MAX_ACTIVE_PINS_PER_DEVICE,
+  MAX_CLIENT_ID_CHARS,
+  MAX_CLIENT_TYPE_CHARS,
   MAX_ENROLLED_DEVICES,
   MAX_TRUST_STORE_BYTES,
 } from './device-identity.js';
@@ -100,25 +104,22 @@ export function validateTrustStoreData(raw: unknown): DeviceTrustStoreData {
     }
     seenDeviceIds.add(devObj.deviceId);
 
-    // clientId
-    if (
-      typeof devObj.clientId !== 'string' ||
-      devObj.clientId.trim().length === 0 ||
-      devObj.clientId.length > 128
-    ) {
+    // clientId / clientType share the authoritative admission rule, so a value
+    // accepted for a pending enrollment can always be persisted here.
+    let clientId: string;
+    let clientType: string;
+    try {
+      clientId = validateClientId(devObj.clientId);
+    } catch {
       throw ArcError.invalidRequestSchema(
-        `Invalid clientId at index ${i}: must be a non-empty string up to 128 characters.`,
+        `Invalid clientId at index ${i}: must be a non-empty string up to ${MAX_CLIENT_ID_CHARS} characters.`,
       );
     }
-
-    // clientType
-    if (
-      typeof devObj.clientType !== 'string' ||
-      devObj.clientType.trim().length === 0 ||
-      devObj.clientType.length > 64
-    ) {
+    try {
+      clientType = validateClientType(devObj.clientType);
+    } catch {
       throw ArcError.invalidRequestSchema(
-        `Invalid clientType at index ${i}: must be a non-empty string up to 64 characters.`,
+        `Invalid clientType at index ${i}: must be a non-empty string up to ${MAX_CLIENT_TYPE_CHARS} characters.`,
       );
     }
 
@@ -179,8 +180,8 @@ export function validateTrustStoreData(raw: unknown): DeviceTrustStoreData {
 
     validatedDevices.push({
       deviceId: devObj.deviceId,
-      clientId: devObj.clientId,
-      clientType: devObj.clientType,
+      clientId,
+      clientType,
       pins: Object.freeze([...devObj.pins]),
       enrolledAt: devObj.enrolledAt,
       displayLabel,
@@ -743,12 +744,10 @@ export class DeviceTrustStore {
     }
 
     const { clientId, clientType, pin } = input;
-    if (typeof clientId !== 'string' || clientId.trim().length === 0) {
-      throw ArcError.invalidRequestSchema('clientId must be a non-empty string.');
-    }
-    if (typeof clientType !== 'string' || clientType.trim().length === 0) {
-      throw ArcError.invalidRequestSchema('clientType must be a non-empty string.');
-    }
+    // Same authoritative rules as the persisted schema: enrollment must never
+    // produce a device the trust store would refuse to serialize.
+    validateClientId(clientId);
+    validateClientType(clientType);
     if (!isValidSpkiPin(pin)) {
       throw ArcError.invalidRequestSchema(
         'Invalid SPKI pin: must be exactly 64 lowercase hexadecimal characters.',

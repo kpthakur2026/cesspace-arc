@@ -10,7 +10,7 @@
  * authentication mechanism.
  */
 
-import { test, describe, before, after } from 'node:test';
+import { test, describe, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -164,6 +164,14 @@ describe('CesSpace ARC — RC-05 Task 2: Enrollment Admin IPC', () => {
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
+  // The shared fixture uses one volatile enrollment manager across cases, so
+  // pending state is released between them. Without this, accumulated
+  // challenges would eventually trip the 4-per-operator quota and make unrelated
+  // cases depend on execution order.
+  afterEach(() => {
+    enrollmentManager.clear();
+  });
+
   // =========================================================================
   // enrollment.create
   // =========================================================================
@@ -216,6 +224,40 @@ describe('CesSpace ARC — RC-05 Task 2: Enrollment Admin IPC', () => {
       assert.equal(failure.ok, false);
       assert.ok(!JSON.stringify(failure).includes(secret));
       assert.equal(failure.error.code, 'NOT_FOUND_OR_NOT_PENDING');
+    });
+
+    test('RC05-NEG-33s: the create response has exactly the declared closed shape', async () => {
+      const response = await adminRequest(endpoint, operator.privateKey, 'enrollment.create', {
+        clientId: 'shape-client',
+        clientType: 'claude-code',
+        spkiPin: pin('shape'),
+        displayLabel: 'shape-label',
+      });
+
+      assert.equal(response.ok, true);
+      // Exact key sets, asserted against the real wire response rather than a
+      // TypeScript type. Extra internal fields must not leak by spreading.
+      assert.deepEqual(Object.keys(response).sort(), ['ok', 'result']);
+      assert.deepEqual(Object.keys(response.result).sort(), ['enrollment', 'secret']);
+      assert.deepEqual(Object.keys(response.result.enrollment).sort(), [
+        'clientId',
+        'clientType',
+        'createdAt',
+        'displayLabel',
+        'enrollmentId',
+        'expiresAt',
+        'remainingSeconds',
+        'spkiPin',
+      ]);
+
+      // Internal state must be absent from the serialized response.
+      const serialized = JSON.stringify(response);
+      for (const leaked of ['failedAttempts', 'operatorId', 'secretDigest', 'monotonicDeadline']) {
+        assert.ok(!serialized.includes(leaked), `${leaked} must not appear in the response`);
+      }
+      // The secret appears exactly once, as its own top-level field.
+      assert.match(response.result.secret, /^[0-9a-f]{64}$/);
+      assert.equal(JSON.stringify(response).split(response.result.secret).length - 1, 1);
     });
 
     test('RC05-NEG-33f: a display label is bounded and optional', async () => {
@@ -588,7 +630,10 @@ describe('CesSpace ARC — RC-05 Task 2: Enrollment Admin IPC', () => {
 
       assert.equal(enrollmentManager.get(enrollmentId), undefined);
       assert.equal(
-        enrollmentManager.verifyAndConsume(enrollmentId, created.result.secret).ok,
+        enrollmentManager.verifyAndConsumeBySpki(
+          created.result.enrollment.spkiPin,
+          created.result.secret,
+        ).ok,
         false,
       );
     });

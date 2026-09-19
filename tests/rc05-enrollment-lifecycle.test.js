@@ -159,7 +159,7 @@ describe('CesSpace ARC — RC-05 Task 2: Pending Enrollment Lifecycle', () => {
       const id = created.enrollment.enrollmentId;
       const before = manager.get(id);
 
-      const outcome = manager.verifyAndConsume(id, 'f'.repeat(64));
+      const outcome = manager.verifyAndConsumeBySpki(created.enrollment.spkiPin, 'f'.repeat(64));
       assert.equal(outcome.ok, false);
       assert.equal(outcome.reason, 'SECRET_MISMATCH');
       assert.equal(outcome.counted, true);
@@ -178,7 +178,7 @@ describe('CesSpace ARC — RC-05 Task 2: Pending Enrollment Lifecycle', () => {
       const created = create();
       const id = created.enrollment.enrollmentId;
       const outcomes = ['', 'not-hex', 'a'.repeat(63), 'A'.repeat(64), 42, null, undefined].map(
-        (malformed) => manager.verifyAndConsume(id, malformed),
+        (malformed) => manager.verifyAndConsumeBySpki(created.enrollment.spkiPin, malformed),
       );
       for (const outcome of outcomes) {
         assert.equal(outcome.ok, false);
@@ -207,22 +207,22 @@ describe('CesSpace ARC — RC-05 Task 2: Pending Enrollment Lifecycle', () => {
       const id = created.enrollment.enrollmentId;
       const wrong = 'f'.repeat(64);
 
-      const first = manager.verifyAndConsume(id, wrong);
+      const first = manager.verifyAndConsumeBySpki(created.enrollment.spkiPin, wrong);
       assert.equal(first.reason, 'SECRET_MISMATCH');
       assert.ok(manager.get(id), 'still pending after failure 1');
 
-      const second = manager.verifyAndConsume(id, wrong);
+      const second = manager.verifyAndConsumeBySpki(created.enrollment.spkiPin, wrong);
       assert.equal(second.reason, 'SECRET_MISMATCH');
       assert.ok(manager.get(id), 'still pending after failure 2');
 
-      const third = manager.verifyAndConsume(id, wrong);
+      const third = manager.verifyAndConsumeBySpki(created.enrollment.spkiPin, wrong);
       assert.equal(third.reason, 'LOCKED_OUT');
       assert.equal(manager.get(id), undefined, 'purged on failure 3');
       assert.equal(manager.getPendingCount(), 0);
 
       // A subsequent attempt cannot revive it, and the correct secret is now
       // useless too — the challenge is gone, not merely marked.
-      const afterPurge = manager.verifyAndConsume(id, created.secret);
+      const afterPurge = manager.verifyAndConsumeBySpki(created.enrollment.spkiPin, created.secret);
       assert.equal(afterPurge.ok, false);
       assert.equal(afterPurge.reason, 'UNKNOWN_ENROLLMENT');
     });
@@ -234,7 +234,7 @@ describe('CesSpace ARC — RC-05 Task 2: Pending Enrollment Lifecycle', () => {
       // Exactly at the deadline the challenge is already expired.
       mono += BigInt(ENROLLMENT_TTL_SECONDS) * 1_000_000_000n;
 
-      const outcome = manager.verifyAndConsume(id, created.secret);
+      const outcome = manager.verifyAndConsumeBySpki(created.enrollment.spkiPin, created.secret);
       assert.equal(outcome.ok, false);
       assert.equal(outcome.reason, 'EXPIRED', 'expiry wins over a correct secret');
       assert.equal(manager.get(id), undefined);
@@ -250,7 +250,7 @@ describe('CesSpace ARC — RC-05 Task 2: Pending Enrollment Lifecycle', () => {
       mono += 100_000_000_000n; // 100 s
       manager.get(id);
       manager.list();
-      manager.verifyAndConsume(id, 'f'.repeat(64));
+      manager.verifyAndConsumeBySpki(created.enrollment.spkiPin, 'f'.repeat(64));
       mono += 100_000_000_000n; // 200 s
       manager.get(id);
       manager.purgeExpired();
@@ -281,7 +281,7 @@ describe('CesSpace ARC — RC-05 Task 2: Pending Enrollment Lifecycle', () => {
       wall -= 172_800_000;
       assert.ok(clocked.get(created.enrollment.enrollmentId), 'wall rollback must not revive it');
 
-      const outcome = clocked.verifyAndConsume(created.enrollment.enrollmentId, created.secret);
+      const outcome = clocked.verifyAndConsumeBySpki(created.enrollment.spkiPin, created.secret);
       assert.equal(outcome.ok, true, 'consumption is governed by the monotonic clock alone');
     });
 
@@ -293,11 +293,11 @@ describe('CesSpace ARC — RC-05 Task 2: Pending Enrollment Lifecycle', () => {
       const created = create();
       const id = created.enrollment.enrollmentId;
 
-      const consumed = manager.verifyAndConsume(id, created.secret);
+      const consumed = manager.verifyAndConsumeBySpki(created.enrollment.spkiPin, created.secret);
       assert.equal(consumed.ok, true);
       assert.equal(consumed.enrollment.enrollmentId, id);
 
-      const replay = manager.verifyAndConsume(id, created.secret);
+      const replay = manager.verifyAndConsumeBySpki(created.enrollment.spkiPin, created.secret);
       assert.equal(replay.ok, false);
       assert.equal(replay.reason, 'UNKNOWN_ENROLLMENT', 'the record is gone, not merely marked');
       assert.equal(manager.getPendingCount(), 0);
@@ -389,6 +389,288 @@ describe('CesSpace ARC — RC-05 Task 2: Pending Enrollment Lifecycle', () => {
   });
 
   // =========================================================================
+  // SPKI-indexed completion (frozen §9.1 / §12 contract)
+  // =========================================================================
+
+  describe('SPKI-indexed pending and consume semantics', () => {
+    test('RC05-ENR-50: a live SPKI identifies at most one pending challenge', () => {
+      const first = create({ spkiPin: pin('unique') });
+
+      assert.throws(
+        () => create({ spkiPin: pin('unique') }),
+        (err) => err.code === 'INVALID_REQUEST_SCHEMA',
+        'a second live challenge for the same pin must fail closed',
+      );
+
+      // The rejection happens before quota or state mutation: the existing
+      // challenge and its secret are still valid.
+      assert.equal(manager.getPendingCount(), 1);
+      assert.ok(manager.getBySpki(pin('unique')));
+      assert.equal(
+        manager.verifyAndConsumeBySpki(pin('unique'), first.secret).ok,
+        true,
+        'the original secret must remain valid',
+      );
+    });
+
+    test('RC05-ENR-51: duplicate rejection precedes quota accounting', () => {
+      // Fill every other slot so a quota check would also fire if it ran first.
+      const pins = [];
+      for (let i = 0; i < MAX_PENDING_ENROLLMENTS_GLOBAL - 1; i++) {
+        const p = pin(`quota-order-${i}`);
+        pins.push(p);
+        create({
+          spkiPin: p,
+          operatorId: crypto.createHash('sha256').update(`op-${i}`).digest('hex'),
+        });
+      }
+      assert.equal(manager.getPendingCount(), MAX_PENDING_ENROLLMENTS_GLOBAL - 1);
+
+      // This creation is both a duplicate SPKI and the one that would exceed the
+      // global quota. It must be reported as the duplicate.
+      assert.throws(
+        () => create({ spkiPin: pins[0] }),
+        (err) => err.code === 'INVALID_REQUEST_SCHEMA',
+      );
+      assert.equal(manager.getPendingCount(), MAX_PENDING_ENROLLMENTS_GLOBAL - 1);
+    });
+
+    test('RC05-ENR-52: cancellation releases the SPKI for a new challenge', () => {
+      const first = create({ spkiPin: pin('release-cancel') });
+      assert.equal(manager.cancel(first.enrollment.enrollmentId), true);
+
+      const second = create({ spkiPin: pin('release-cancel') });
+      assert.notEqual(second.enrollment.enrollmentId, first.enrollment.enrollmentId);
+      // The cancelled challenge's secret is dead even though the pin is reused.
+      assert.equal(manager.verifyAndConsumeBySpki(pin('release-cancel'), first.secret).ok, false);
+      assert.equal(manager.verifyAndConsumeBySpki(pin('release-cancel'), second.secret).ok, true);
+    });
+
+    test('RC05-ENR-53: expiry releases the SPKI for a new challenge', () => {
+      const first = create({ spkiPin: pin('release-expiry') });
+      mono += BigInt(ENROLLMENT_TTL_SECONDS) * 1_000_000_000n;
+
+      const second = create({ spkiPin: pin('release-expiry') });
+      assert.notEqual(second.enrollment.enrollmentId, first.enrollment.enrollmentId);
+      assert.equal(
+        manager.verifyAndConsumeBySpki(pin('release-expiry'), first.secret).ok,
+        false,
+        'the expired secret must be unusable',
+      );
+      assert.equal(manager.verifyAndConsumeBySpki(pin('release-expiry'), second.secret).ok, true);
+    });
+
+    test('RC05-ENR-54: successful consumption releases the SPKI for a new challenge', () => {
+      const first = create({ spkiPin: pin('release-consume') });
+      assert.equal(manager.verifyAndConsumeBySpki(pin('release-consume'), first.secret).ok, true);
+
+      const second = create({ spkiPin: pin('release-consume') });
+      assert.notEqual(second.enrollment.enrollmentId, first.enrollment.enrollmentId);
+      assert.equal(
+        manager.verifyAndConsumeBySpki(pin('release-consume'), first.secret).ok,
+        false,
+        'a consumed secret must never be replayable',
+      );
+    });
+
+    test('RC05-ENR-55: a presented SPKI can never select another challenge', () => {
+      const a = create({ spkiPin: pin('sel-a') });
+      const b = create({ spkiPin: pin('sel-b') });
+
+      // B's VALID secret presented under A's pin must not consume B.
+      const crossed = manager.verifyAndConsumeBySpki(pin('sel-a'), b.secret);
+      assert.equal(crossed.ok, false);
+      assert.equal(crossed.reason, 'SECRET_MISMATCH');
+      assert.ok(manager.getBySpki(pin('sel-b')), 'B must remain pending and unconsumed');
+      assert.equal(manager.verifyAndConsumeBySpki(pin('sel-b'), a.secret).ok, false);
+      assert.equal(manager.verifyAndConsumeBySpki(pin('sel-b'), b.secret).ok, true);
+    });
+
+    test('RC05-ENR-56: a wrong secret increments only the selected challenge', () => {
+      create({ spkiPin: pin('inc-a') });
+      create({ spkiPin: pin('inc-b') });
+
+      for (let i = 0; i < 3; i++) {
+        assert.equal(manager.verifyAndConsumeBySpki(pin('inc-a'), 'f'.repeat(64)).ok, false);
+      }
+
+      assert.equal(manager.getBySpki(pin('inc-a')), undefined, 'A is locked out');
+      const untouched = manager.getBySpki(pin('inc-b'));
+      assert.ok(untouched, 'B must be unaffected');
+      assert.equal(untouched.failedAttempts, 0, 'B accrued no failures');
+    });
+
+    test('RC05-ENR-57: two valid SPKI+secret calls yield exactly one consumption', () => {
+      const created = create({ spkiPin: pin('once-only') });
+      const first = manager.verifyAndConsumeBySpki(pin('once-only'), created.secret);
+      const second = manager.verifyAndConsumeBySpki(pin('once-only'), created.secret);
+
+      assert.equal(first.ok, true);
+      assert.equal(second.ok, false);
+      assert.equal(second.reason, 'UNKNOWN_ENROLLMENT');
+      assert.equal([first, second].filter((r) => r.ok).length, 1);
+    });
+
+    test('RC05-ENR-58a: a malformed secret still consumes a failed attempt', () => {
+      const created = create({ spkiPin: pin('malformed-secret') });
+      const malformed = ['', 'not-hex', 'a'.repeat(63), 'A'.repeat(64), 42, null, undefined, {}];
+
+      const outcomes = malformed.map((value) =>
+        manager.verifyAndConsumeBySpki(pin('malformed-secret'), value),
+      );
+      for (const outcome of outcomes) {
+        assert.equal(outcome.ok, false);
+      }
+      assert.deepEqual(
+        outcomes.slice(0, 3).map((o) => o.counted),
+        [true, true, true],
+        'malformed submissions must be counted while the challenge is live',
+      );
+      assert.deepEqual(
+        outcomes.slice(0, 3).map((o) => o.reason),
+        ['SECRET_MISMATCH', 'SECRET_MISMATCH', 'LOCKED_OUT'],
+      );
+      assert.equal(manager.getBySpki(pin('malformed-secret')), undefined, 'purged on the third');
+      // The genuine secret is now dead too.
+      assert.equal(
+        manager.verifyAndConsumeBySpki(pin('malformed-secret'), created.secret).ok,
+        false,
+      );
+    });
+
+    test('RC05-ENR-58: malformed pins are indistinguishable from unknown ones', () => {
+      const created = create({ spkiPin: pin('malformed-pin') });
+      for (const bad of ['', 'not-hex', 'A'.repeat(64), 'a'.repeat(63), null, undefined, 42]) {
+        const outcome = manager.verifyAndConsumeBySpki(bad, created.secret);
+        assert.equal(outcome.ok, false);
+        assert.equal(outcome.reason, 'UNKNOWN_ENROLLMENT');
+        assert.equal(outcome.counted, false);
+      }
+      // The real challenge was never touched.
+      assert.equal(manager.getBySpki(pin('malformed-pin')).failedAttempts, 0);
+      assert.equal(manager.verifyAndConsumeBySpki(pin('malformed-pin'), created.secret).ok, true);
+    });
+
+    test('RC05-ENR-59: the success payload carries the metadata Task 4 needs', () => {
+      const created = create({ spkiPin: pin('payload'), displayLabel: 'lab' });
+      const outcome = manager.verifyAndConsumeBySpki(pin('payload'), created.secret);
+
+      assert.equal(outcome.ok, true);
+      assert.deepEqual(Object.keys(outcome.enrollment).sort(), [
+        'clientId',
+        'clientType',
+        'createdAt',
+        'displayLabel',
+        'enrollmentId',
+        'expiresAt',
+        'failedAttempts',
+        'remainingSeconds',
+        'spkiPin',
+      ]);
+      assert.equal(outcome.enrollment.spkiPin, pin('payload'));
+      assert.equal(outcome.enrollment.clientId, CLIENT.clientId);
+      assert.equal(outcome.enrollment.clientType, CLIENT.clientType);
+      assert.equal(outcome.enrollment.displayLabel, 'lab');
+    });
+
+    test('RC05-ENR-60: the primitive performs no trust-store mutation', () => {
+      const trustStore = DeviceTrustStore.createEmpty();
+      const created = create({ spkiPin: pin('no-mutation') });
+      const outcome = manager.verifyAndConsumeBySpki(pin('no-mutation'), created.secret);
+
+      assert.equal(outcome.ok, true);
+      assert.equal(trustStore.getDeviceCount(), 0, 'Task 4 owns activation');
+      assert.equal(trustStore.getDevices().length, 0);
+    });
+  });
+
+  // =========================================================================
+  // Metadata compatibility with the persisted trust-store schema
+  // =========================================================================
+
+  describe('Persisted-schema compatibility', () => {
+    test('RC05-ENR-70: maximum accepted clientType persists without a schema failure', () => {
+      const clientType = 'c'.repeat(64);
+      const created = create({ clientType, spkiPin: pin('max-type') });
+      assert.equal(created.enrollment.clientType, clientType);
+
+      const store = DeviceTrustStore.createEmpty();
+      const enrolled = store.enrollDevice({
+        clientId: created.enrollment.clientId,
+        clientType: created.enrollment.clientType,
+        pin: created.enrollment.spkiPin,
+        displayLabel: created.enrollment.displayLabel,
+      });
+      assert.equal(enrolled.reconnected, false);
+      // The serialized form survives the persisted schema check.
+      assert.equal(store.toData().devices[0].clientType, clientType);
+    });
+
+    test('RC05-ENR-71: the first value beyond the persisted clientType bound is rejected at creation', () => {
+      assert.throws(
+        () => create({ clientType: 'c'.repeat(65), spkiPin: pin('over-type') }),
+        (err) => err.code === 'INVALID_REQUEST_SCHEMA',
+      );
+      assert.equal(manager.getPendingCount(), 0);
+
+      // The trust store rejects exactly the same value, so the two rules agree.
+      const store = DeviceTrustStore.createEmpty();
+      assert.throws(
+        () => store.enrollDevice({ clientId: 'x', clientType: 'c'.repeat(65), pin: pin('over') }),
+        (err) => err.code === 'INVALID_REQUEST_SCHEMA',
+      );
+    });
+
+    test('RC05-ENR-72: the clientId boundary matches the persisted rule', () => {
+      const clientId = 'i'.repeat(128);
+      const created = create({ clientId, spkiPin: pin('max-id') });
+      assert.equal(created.enrollment.clientId, clientId);
+
+      const store = DeviceTrustStore.createEmpty();
+      store.enrollDevice({ clientId, clientType: 'claude-code', pin: created.enrollment.spkiPin });
+      assert.equal(store.toData().devices[0].clientId, clientId);
+
+      assert.throws(
+        () => create({ clientId: 'i'.repeat(129), spkiPin: pin('over-id') }),
+        (err) => err.code === 'INVALID_REQUEST_SCHEMA',
+      );
+      assert.throws(
+        () =>
+          store.enrollDevice({
+            clientId: 'i'.repeat(129),
+            clientType: 'claude-code',
+            pin: pin('over-id'),
+          }),
+        (err) => err.code === 'INVALID_REQUEST_SCHEMA',
+      );
+    });
+
+    test('RC05-ENR-73: an accepted challenge is always persistable end to end', () => {
+      const created = create({
+        clientId: 'i'.repeat(128),
+        clientType: 'c'.repeat(64),
+        spkiPin: pin('persistable'),
+        displayLabel: 'y'.repeat(64),
+      });
+
+      // Validating the trust-store document shape with the accepted metadata
+      // succeeds: admission can never produce an unserializable device.
+      const store = DeviceTrustStore.createEmpty();
+      store.enrollDevice({
+        clientId: created.enrollment.clientId,
+        clientType: created.enrollment.clientType,
+        pin: created.enrollment.spkiPin,
+        displayLabel: created.enrollment.displayLabel,
+      });
+      const data = store.toData();
+      assert.equal(data.devices.length, 1);
+      assert.equal(data.devices[0].clientType.length, 64);
+      assert.equal(data.devices[0].clientId.length, 128);
+      assert.equal(data.devices[0].displayLabel.length, 64);
+    });
+  });
+
+  // =========================================================================
   // Cancellation
   // =========================================================================
 
@@ -401,7 +683,7 @@ describe('CesSpace ARC — RC-05 Task 2: Pending Enrollment Lifecycle', () => {
       assert.equal(manager.get(id), undefined);
       assert.equal(manager.getPendingCount(), 0);
 
-      const outcome = manager.verifyAndConsume(id, created.secret);
+      const outcome = manager.verifyAndConsumeBySpki(created.enrollment.spkiPin, created.secret);
       assert.equal(outcome.ok, false);
       assert.equal(outcome.reason, 'UNKNOWN_ENROLLMENT');
     });
@@ -416,7 +698,10 @@ describe('CesSpace ARC — RC-05 Task 2: Pending Enrollment Lifecycle', () => {
       assert.equal(manager.cancel('A'.repeat(32)), false);
 
       // Consumed.
-      assert.equal(manager.verifyAndConsume(id, created.secret).ok, true);
+      assert.equal(
+        manager.verifyAndConsumeBySpki(created.enrollment.spkiPin, created.secret).ok,
+        true,
+      );
       assert.equal(manager.cancel(id), false, 'no existence oracle for a consumed challenge');
 
       // Expired.
@@ -447,14 +732,13 @@ describe('CesSpace ARC — RC-05 Task 2: Pending Enrollment Lifecycle', () => {
   describe('Race and atomicity semantics', () => {
     test('RC05-ENR-30: two simultaneous valid consumptions — exactly one succeeds', () => {
       const created = create();
-      const id = created.enrollment.enrollmentId;
 
       // Every EnrollmentManager transition is synchronous and contains no await,
       // so no other task in the single-threaded event loop can interleave inside
       // it. Two "simultaneous" callers are therefore observed as an ordered
       // sequence, and the guarantee holds regardless of which runs first.
-      const first = manager.verifyAndConsume(id, created.secret);
-      const second = manager.verifyAndConsume(id, created.secret);
+      const first = manager.verifyAndConsumeBySpki(created.enrollment.spkiPin, created.secret);
+      const second = manager.verifyAndConsumeBySpki(created.enrollment.spkiPin, created.secret);
 
       assert.equal(first.ok, true);
       assert.equal(second.ok, false);
@@ -469,12 +753,12 @@ describe('CesSpace ARC — RC-05 Task 2: Pending Enrollment Lifecycle', () => {
       // Attempts interleave with inspections and cancellations, which must not
       // reset or advance the counter.
       const outcomes = [];
-      outcomes.push(manager.verifyAndConsume(id, 'f'.repeat(64)));
+      outcomes.push(manager.verifyAndConsumeBySpki(created.enrollment.spkiPin, 'f'.repeat(64)));
       manager.get(id);
       manager.list();
-      outcomes.push(manager.verifyAndConsume(id, 'f'.repeat(64)));
+      outcomes.push(manager.verifyAndConsumeBySpki(created.enrollment.spkiPin, 'f'.repeat(64)));
       manager.get(id);
-      outcomes.push(manager.verifyAndConsume(id, 'f'.repeat(64)));
+      outcomes.push(manager.verifyAndConsumeBySpki(created.enrollment.spkiPin, 'f'.repeat(64)));
 
       assert.deepEqual(
         outcomes.map((o) => o.reason),
@@ -482,14 +766,17 @@ describe('CesSpace ARC — RC-05 Task 2: Pending Enrollment Lifecycle', () => {
       );
       assert.equal(manager.get(id), undefined);
       // A fourth attempt is not a fourth attempt against the same challenge.
-      assert.equal(manager.verifyAndConsume(id, created.secret).reason, 'UNKNOWN_ENROLLMENT');
+      assert.equal(
+        manager.verifyAndConsumeBySpki(created.enrollment.spkiPin, created.secret).reason,
+        'UNKNOWN_ENROLLMENT',
+      );
     });
 
     test('RC05-ENR-32: cancel versus consume yields at most one terminal outcome', () => {
       // Consume wins.
       const consumedFirst = create({ spkiPin: pin('race-a') });
       assert.equal(
-        manager.verifyAndConsume(consumedFirst.enrollment.enrollmentId, consumedFirst.secret).ok,
+        manager.verifyAndConsumeBySpki(consumedFirst.enrollment.spkiPin, consumedFirst.secret).ok,
         true,
       );
       assert.equal(manager.cancel(consumedFirst.enrollment.enrollmentId), false);
@@ -498,7 +785,7 @@ describe('CesSpace ARC — RC-05 Task 2: Pending Enrollment Lifecycle', () => {
       const cancelledFirst = create({ spkiPin: pin('race-b') });
       assert.equal(manager.cancel(cancelledFirst.enrollment.enrollmentId), true);
       assert.equal(
-        manager.verifyAndConsume(cancelledFirst.enrollment.enrollmentId, cancelledFirst.secret).ok,
+        manager.verifyAndConsumeBySpki(cancelledFirst.enrollment.spkiPin, cancelledFirst.secret).ok,
         false,
       );
     });
@@ -511,14 +798,14 @@ describe('CesSpace ARC — RC-05 Task 2: Pending Enrollment Lifecycle', () => {
       // One nanosecond before the deadline the correct secret still works.
       mono += BigInt(ENROLLMENT_TTL_SECONDS) * 1_000_000_000n - 1n;
       assert.equal(
-        manager.verifyAndConsume(created.enrollment.enrollmentId, created.secret).ok,
+        manager.verifyAndConsumeBySpki(created.enrollment.spkiPin, created.secret).ok,
         true,
       );
 
       // Exactly at the deadline it does not: expiry is checked first.
       mono += 1n;
       assert.equal(
-        manager.verifyAndConsume(second.enrollment.enrollmentId, second.secret).reason,
+        manager.verifyAndConsumeBySpki(second.enrollment.spkiPin, second.secret).reason,
         'EXPIRED',
       );
     });
