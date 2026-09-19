@@ -1308,6 +1308,77 @@ describe('CesSpace ARC — RC-05 Task 3: TLS/mTLS Admission Layer', () => {
       }
     });
 
+    test('RC05-NEG-05i: an opted-in IPv6 wildcard binds ipv6Only', async () => {
+      // Platform capability is DETECTED, never skipped: the configuration
+      // semantics are asserted unconditionally, and the runtime dual-stack
+      // behaviour is asserted whenever the platform can actually bind IPv6.
+      const ipv6Available = await new Promise((resolve) => {
+        const probe = net.createServer();
+        probe.once('error', () => resolve(false));
+        probe.listen({ host: '::1', port: 0, ipv6Only: true }, () => {
+          probe.close(() => resolve(true));
+        });
+      });
+
+      // Semantic assertion, always executed: the expanded forms are wildcard and
+      // require the opt-in regardless of platform support.
+      for (const spelling of ['::', '0000:0000:0000:0000:0000:0000:0000:0000']) {
+        assert.equal(isWildcardBindHost(spelling), true);
+        await assert.rejects(
+          () => startGateway({ bindHost: spelling }),
+          (err) => err instanceof RemoteConfigError && err.reason === 'WILDCARD_BIND_NOT_OPTED_IN',
+        );
+      }
+
+      if (!ipv6Available) {
+        // The platform genuinely cannot bind IPv6. This is reported as an
+        // explicit capability failure rather than being declared a pass for an
+        // untested dual-stack behaviour.
+        assert.fail(
+          'platform cannot bind ::1, so IPv6 wildcard opt-in cannot be verified at runtime',
+        );
+      }
+
+      const { gateway, port } = await startGateway({ bindHost: '::', allowWildcardBind: true });
+      try {
+        assert.equal(gateway.isStarted(), true, 'the opted-in IPv6 wildcard binds');
+
+        // A TLS client reaches it over IPv6 loopback.
+        const viaV6 = await new Promise((resolve) => {
+          const socket = tls.connect(
+            {
+              host: '::1',
+              port,
+              servername: publicHostname,
+              ca: [fs.readFileSync(pki.trustedCaCertPath)],
+              rejectUnauthorized: false,
+              cert: fs.readFileSync(pki.clientCertPath),
+              key: fs.readFileSync(pki.clientKeyPath),
+            },
+            () => resolve({ ok: true, socket }),
+          );
+          socket.once('error', (err) => resolve({ ok: false, error: err }));
+        });
+        assert.equal(viaV6.ok, true, `IPv6 loopback must reach the listener: ${viaV6.error?.code}`);
+        viaV6.socket.destroy();
+
+        // ipv6Only means the same port is NOT a wildcard IPv4 listener.
+        const viaV4 = await new Promise((resolve) => {
+          const socket = net.createConnection({ host: '127.0.0.1', port });
+          socket.once('connect', () => resolve({ connected: true, socket }));
+          socket.once('error', () => resolve({ connected: false }));
+        });
+        assert.equal(
+          viaV4.connected,
+          false,
+          'an IPv6-only wildcard must not silently accept IPv4 connections',
+        );
+        viaV4.socket?.destroy();
+      } finally {
+        await gateway.stop();
+      }
+    });
+
     test('RC05-NEG-05g: ambiguous numeric host strings fail before binding', async () => {
       for (const bindHost of ['1.2.3', '999.1.1.1', '1.2.3.4.5', '::gggg', '0:0:0:0:0:0:0:0:0']) {
         await assert.rejects(
@@ -1631,6 +1702,283 @@ trailing-not-pem
         () => startGateway({ clientCaPaths: paths }),
         (err) => err instanceof RemoteConfigError && err.reason === 'CLIENT_CA_TOO_MANY',
       );
+    });
+  });
+
+  // =========================================================================
+  // Shutdown lifecycle
+  // =========================================================================
+
+  describe('Shutdown releases every admission slot', () => {
+    test('RC05-ENR-180: a stalled handshake is destroyed by shutdown, not by timeout', async () => {
+      const { gateway, port } = await startGateway({}, { handshakeTimeoutMsForTests: 30_000 });
+      const stalled = net.createConnection({ host: '127.0.0.1', port });
+      await new Promise((resolve) => {
+        stalled.once('connect', resolve);
+        stalled.once('error', resolve);
+      });
+      assert.equal(
+        await waitFor(
+          () =>
+            gateway.getStatus().liveConnections === 1 &&
+            gateway.getStatus().inFlightHandshakes === 1,
+          2000,
+        ),
+        true,
+      );
+
+      // Stop well before the (deliberately long) handshake timeout.
+      await gateway.stop();
+
+      assert.equal(gateway.getStatus().liveConnections, 0, 'live connections reset');
+      assert.equal(gateway.getStatus().inFlightHandshakes, 0, 'handshake slots reset');
+
+      // The client must have been destroyed by shutdown itself.
+      assert.equal(
+        await waitFor(() => stalled.destroyed, 2000),
+        true,
+        'shutdown must destroy an admitted pre-handshake socket',
+      );
+      stalled.destroy();
+
+      // Past where the handshake timeout would have fired, counters stay at
+      // exactly zero: the neutralized release closures must not run again.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      assert.equal(gateway.getStatus().liveConnections, 0);
+      assert.equal(gateway.getStatus().inFlightHandshakes, 0);
+      assert.ok(gateway.getStatus().liveConnections >= 0, 'counters never go negative');
+    });
+
+    test('RC05-ENR-181: shutdown destroys an open handshaken connection', async () => {
+      const { gateway, port } = await startGateway();
+      try {
+        const outcome = await tlsConnect(port, {
+          cert: fs.readFileSync(pki.clientCertPath),
+          key: fs.readFileSync(pki.clientKeyPath),
+        });
+        assert.equal(outcome.connected, true);
+        assert.equal(
+          await waitFor(
+            () =>
+              gateway.getStatus().liveConnections === 1 &&
+              gateway.getStatus().inFlightHandshakes === 0,
+            2000,
+          ),
+          true,
+        );
+
+        // Stop WITHOUT closing the client first.
+        await gateway.stop();
+
+        assert.equal(gateway.getStatus().liveConnections, 0);
+        assert.equal(gateway.getStatus().inFlightHandshakes, 0);
+        assert.equal(
+          await waitFor(() => outcome.socket.destroyed, 2000),
+          true,
+          'shutdown must destroy the TLS socket',
+        );
+
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        assert.equal(gateway.getStatus().liveConnections, 0, 'late close must not decrement');
+        assert.equal(gateway.getStatus().inFlightHandshakes, 0);
+      } finally {
+        await gateway.stop();
+      }
+    });
+
+    test('RC05-ENR-182: mixed handshaken and stalled connections both terminate cleanly', async () => {
+      const { gateway, port } = await startGateway({}, { handshakeTimeoutMsForTests: 30_000 });
+      const stalled = net.createConnection({ host: '127.0.0.1', port });
+      await new Promise((resolve) => {
+        stalled.once('connect', resolve);
+        stalled.once('error', resolve);
+      });
+      const outcome = await tlsConnect(port, {
+        cert: fs.readFileSync(pki.clientCertPath),
+        key: fs.readFileSync(pki.clientKeyPath),
+      });
+      assert.equal(outcome.connected, true);
+      assert.equal(
+        await waitFor(
+          () =>
+            gateway.getStatus().liveConnections === 2 &&
+            gateway.getStatus().inFlightHandshakes === 1,
+          2000,
+        ),
+        true,
+        'one handshaken connection and one stalled handshake',
+      );
+
+      await gateway.stop();
+
+      assert.equal(gateway.getStatus().liveConnections, 0);
+      assert.equal(gateway.getStatus().inFlightHandshakes, 0);
+      assert.equal(await waitFor(() => stalled.destroyed, 2000), true);
+      assert.equal(await waitFor(() => outcome.socket.destroyed, 2000), true);
+
+      // Past every delayed event, the counters are still exactly zero.
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      assert.equal(gateway.getStatus().liveConnections, 0);
+      assert.equal(gateway.getStatus().inFlightHandshakes, 0);
+      stalled.destroy();
+    });
+
+    test('RC05-ENR-183: stop is idempotent', async () => {
+      const { gateway, port } = await startGateway();
+      const outcome = await tlsConnect(port, {
+        cert: fs.readFileSync(pki.clientCertPath),
+        key: fs.readFileSync(pki.clientKeyPath),
+      });
+      assert.equal(outcome.connected, true);
+      assert.equal(await waitFor(() => gateway.getStatus().liveConnections === 1, 2000), true);
+
+      await gateway.stop();
+      const first = gateway.getStatus();
+      assert.equal(first.liveConnections, 0);
+
+      // A second stop must neither throw nor move any counter.
+      await gateway.stop();
+      await gateway.stop();
+      const second = gateway.getStatus();
+      assert.equal(second.liveConnections, first.liveConnections);
+      assert.equal(second.inFlightHandshakes, first.inFlightHandshakes);
+      assert.equal(second.listenerActive, false);
+      outcome.socket.destroy();
+    });
+  });
+
+  // =========================================================================
+  // Terminal certificate expiry
+  // =========================================================================
+
+  describe('Certificate expiry is terminal', () => {
+    test('RC05-NEG-15e: a wall-clock rollback cannot restore admission', async () => {
+      let now = Date.now();
+      const { gateway, port, admitted } = await startGateway({}, { getWallTime: () => now });
+      try {
+        // Establish a connection while healthy.
+        const existing = await tlsConnect(port, {
+          cert: fs.readFileSync(pki.clientCertPath),
+          key: fs.readFileSync(pki.clientKeyPath),
+        });
+        assert.equal(existing.connected, true);
+        assert.equal(await waitFor(() => admitted.length === 1, 2000), true);
+        const beforeExpiry = now;
+
+        // Cross notAfter exactly and observe the latch.
+        now = Date.parse(
+          new (await import('node:crypto')).X509Certificate(fs.readFileSync(pki.serverCertPath))
+            .validTo,
+        );
+        const atBoundary = gateway.getStatus();
+        assert.equal(atBoundary.degraded, true, 'exact notAfter is expired');
+        assert.equal(atBoundary.degradedReason, 'certificate_expired');
+        assert.equal(atBoundary.activeAndServing, false);
+
+        // Roll the wall clock BACK to before notAfter.
+        now = beforeExpiry;
+        const rolled = gateway.getStatus();
+        assert.equal(rolled.degraded, true, 'the latch is terminal');
+        assert.equal(rolled.activeAndServing, false, 'admission cannot be restored');
+        assert.equal(rolled.degradedReason, 'certificate_expired');
+
+        // A new connection is still refused.
+        const refused = await tlsConnect(port, {
+          cert: fs.readFileSync(pki.clientCertPath),
+          key: fs.readFileSync(pki.clientKeyPath),
+        });
+        await waitFor(() => refused.socket.destroyed, 2000);
+        assert.equal(refused.socket.destroyed, true, 'new handshakes stay refused');
+        refused.socket?.destroy();
+        assert.equal(admitted.length, 1, 'no admission after the latch');
+
+        // The connection established before expiry drains normally.
+        assert.equal(existing.socket.destroyed, false, 'existing connections are not evicted');
+        existing.socket.destroy();
+      } finally {
+        await gateway.stop();
+      }
+    });
+  });
+
+  // =========================================================================
+  // Production configuration surface
+  // =========================================================================
+
+  describe('Production remote configuration has no testing seams', () => {
+    test('RC05-ENR-184: RemoteConfig exposes no clock, timeout, or limiter override', async () => {
+      const resolved = await baseConfig();
+      const seamNames = [
+        'getWallTime',
+        'handshakeTimeoutMs',
+        'handshakeTimeoutMsForTests',
+        'admission',
+        'limiter',
+        'maxLivePerPeer',
+        'maxLiveGlobal',
+        'maxInFlightHandshakes',
+        'attemptsPerMinute',
+        'burst',
+        'maxPeerKeys',
+        'idleEvictionMs',
+      ];
+      for (const seam of seamNames) {
+        assert.equal(
+          Object.prototype.hasOwnProperty.call(resolved, seam),
+          false,
+          `${seam} must not exist on production remote configuration`,
+        );
+      }
+
+      // The resolved configuration is exactly the trusted selector set.
+      assert.deepEqual(Object.keys(resolved).sort(), [
+        'bindHost',
+        'clientCaPaths',
+        'port',
+        'privateKey',
+        'publicHostname',
+        'serverCertificatePath',
+      ]);
+
+      // Smuggling a seam through the configuration object is ignored: the
+      // gateway resolves its own clock and timeout, and the resolved config
+      // never carries them forward.
+      const gateway = new RemoteGateway({
+        ...resolved,
+        getWallTime: () => 0,
+        handshakeTimeoutMs: 1,
+      });
+      try {
+        assert.equal(gateway.handshakeTimeoutMs, TLS_HANDSHAKE_TIMEOUT_MS);
+      } finally {
+        await gateway.stop();
+      }
+    });
+
+    test('RC05-ENR-185: the composed server uses the real wall clock', async () => {
+      const { createArcMcpServer } = await import('../apps/mcp-server/dist/index.js');
+      const remotePort = await freePort();
+      const server = createArcMcpServer({
+        transport: 'remote',
+        authorizedRoots: [],
+        remote: {
+          port: remotePort,
+          publicHostname,
+          serverCertificatePath: pki.serverCertPath,
+          privateKey: { kind: 'file', path: pki.serverKeyPath },
+          clientCaPaths: [pki.trustedCaCertPath],
+        },
+      });
+      await server.start();
+      try {
+        // The gateway is healthy against the real clock, which proves the
+        // composed path did not inherit a frozen or zeroed clock.
+        const status = server.getRemoteGatewayStatus();
+        assert.equal(status.degraded, false);
+        assert.equal(status.activeAndServing, true);
+      } finally {
+        await server.stop();
+      }
     });
   });
 

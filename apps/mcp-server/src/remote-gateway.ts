@@ -104,6 +104,10 @@ export interface RemoteGatewayOptions {
 interface ConnectionState {
   /** The exact admission slot held by this connection. */
   release: () => void;
+  /** The raw socket accepted before any TLS work. Always present. */
+  rawSocket: TLSSocket;
+  /** The TLS socket, once the handshake has produced one. */
+  tlsSocket?: TLSSocket;
   handshakeSettled: boolean;
   connectionSettled: boolean;
 }
@@ -143,6 +147,8 @@ export class RemoteGateway {
   private facts?: ServerCertificateFacts;
   private started = false;
   private degradedReason?: 'certificate_expired';
+  /** Terminal latch: once the certificate is seen expired it stays expired. */
+  private expiryLatched = false;
   private readonly liveSockets = new Set<TLSSocket>();
   /**
    * Per-connection settle state, keyed by the TCP connection tuple.
@@ -326,11 +332,7 @@ export class RemoteGateway {
     // The degraded state is COMPUTED from the injected clock on every call, so
     // it becomes truthful the moment the certificate reaches notAfter even if
     // no further connection is ever attempted.
-    const expired = this.isServerCertificateExpired();
-    if (expired) {
-      this.degradedReason = 'certificate_expired';
-    }
-    const degraded = expired;
+    const degraded = this.isServerCertificateExpiredOrLatched();
     return {
       transportMode: 'remote',
       listenerActive: this.started,
@@ -350,13 +352,54 @@ export class RemoteGateway {
     this.server = undefined;
     this.started = false;
 
+    // 1. Stop accepting new connections first, so nothing new can be admitted
+    //    while the existing state is being torn down.
+    if (server !== undefined) {
+      try {
+        server.close();
+      } catch {
+        // Already closed; teardown continues.
+      }
+    }
+
+    // 2. Capture both sockets of every outstanding connection BEFORE settling.
+    //    `liveSockets` only holds post-handshake TLS sockets, so a socket still
+    //    mid-handshake would otherwise survive until its TLS handshake timeout.
+    const outstanding = [...this.connectionStates.entries()].map(([tuple, state]) => ({
+      tuple,
+      sockets: [state.rawSocket, state.tlsSocket].filter(
+        (candidate): candidate is TLSSocket => candidate !== undefined,
+      ),
+    }));
+
+    // 3. Synchronously settle every connection exactly once. This neutralizes
+    //    each captured `release` closure BEFORE any counter is reset, so a late
+    //    close/error/timeout callback cannot decrement a reset counter below
+    //    zero: the state entry is gone and settleConnection() becomes a no-op.
+    for (const { tuple } of outstanding) {
+      this.settleConnection(tuple);
+    }
+    this.connectionStates.clear();
+
+    // 4. Destroy every admitted socket, handshaken or not. Destroy is
+    //    idempotent, so overlapping raw/TLS destruction is harmless.
+    for (const { sockets } of outstanding) {
+      for (const socket of sockets) {
+        socket.destroy();
+      }
+    }
     for (const socket of this.liveSockets) {
       socket.destroy();
     }
     this.liveSockets.clear();
+
+    // 5. Only now may limiter state be reset: every release closure has already
+    //    run, and any that could still fire has nothing to act on.
     this.limiter.reset();
 
     if (server === undefined) {
+      // A second stop finds nothing tracked, nothing to destroy, and counters
+      // that are already zero, so it is a structural no-op.
       return;
     }
     await new Promise<void>((resolve) => {
@@ -387,7 +430,7 @@ export class RemoteGateway {
     // Once the server certificate has reached notAfter, no new session may be
     // established, so the raw socket is destroyed before a handshake can begin.
     // Connections admitted earlier are untouched and drain normally.
-    if (this.isServerCertificateExpired()) {
+    if (this.isServerCertificateExpiredOrLatched()) {
       socket.destroy();
       return;
     }
@@ -405,6 +448,7 @@ export class RemoteGateway {
     //  - the live connection slot, released when the socket closes.
     const state: ConnectionState = {
       release: decision.release,
+      rawSocket: socket,
       handshakeSettled: false,
       connectionSettled: false,
     };
@@ -460,7 +504,7 @@ export class RemoteGateway {
 
     // A handshake that began before expiry but completed after it must still be
     // refused: the runtime check is repeated at the post-handshake boundary.
-    if (this.isServerCertificateExpired()) {
+    if (this.isServerCertificateExpiredOrLatched()) {
       this.settleConnection(tuple);
       socket.destroy();
       return;
@@ -485,6 +529,10 @@ export class RemoteGateway {
     // The handshake has settled, so its slot is released now; the connection
     // remains counted as live until it closes.
     this.settleHandshakeFor(tuple);
+    const state = this.connectionStates.get(tuple);
+    if (state !== undefined) {
+      state.tlsSocket = socket;
+    }
     this.liveSockets.add(socket);
 
     // Task 3 boundary: a valid chain and a canonical SPKI pin. No enrollment,
@@ -500,18 +548,32 @@ export class RemoteGateway {
   }
 
   /**
-   * True when the server certificate has reached notAfter.
+   * True when the server certificate has reached notAfter, or has ever been
+   * observed to have reached it.
    *
    * The boundary is inclusive: at exactly notAfter the certificate is expired.
-   * Evaluated with the injected wall clock, never a cached flag, so status
-   * reflects the current instant.
+   * The result is LATCHED, because frozen T-7 says "once expired, new TLS
+   * handshakes are refused" — a clock that moves backwards must not restore
+   * admission. A wall clock is not monotonic, so an unlatched comparison could
+   * be reversed by a backwards correction and silently reopen the gateway.
    */
-  private isServerCertificateExpired(): boolean {
-    const facts = this.facts;
-    if (facts === undefined) {
+  private isServerCertificateExpiredOrLatched(): boolean {
+    if (this.expiryLatched) {
       return true;
     }
-    return this.getWallTime() >= facts.validToMs;
+    const facts = this.facts;
+    if (facts === undefined) {
+      // Without validated facts the gateway cannot prove it may serve.
+      this.expiryLatched = true;
+      this.degradedReason = 'certificate_expired';
+      return true;
+    }
+    if (this.getWallTime() >= facts.validToMs) {
+      this.expiryLatched = true;
+      this.degradedReason = 'certificate_expired';
+      return true;
+    }
+    return false;
   }
 
   /** Peer key for Layer A accounting: the remote address, else a fixed bucket. */

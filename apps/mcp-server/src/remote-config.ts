@@ -146,7 +146,15 @@ export function isIpv4Unspecified(address: string): boolean {
  */
 export type PrivateKeySource = { kind: 'file'; path: string } | { kind: 'fd'; fd: number };
 
-/** Bounded remote gateway configuration. */
+/**
+ * Bounded remote gateway configuration.
+ *
+ * This is PRODUCTION configuration and carries trusted selectors only: hosts,
+ * ports, and file paths. It deliberately exposes no testing seams — no wall
+ * clock, no handshake-timeout override, and no limiter override. Those live
+ * solely on the internal RemoteGatewayOptions seam, so no configuration file or
+ * environment value can weaken a frozen security value.
+ */
 export interface RemoteConfig {
   /** Bind host. Defaults to loopback. */
   bindHost?: string;
@@ -167,8 +175,6 @@ export interface RemoteConfig {
   allowWildcardBind?: boolean;
   /** Optional device trust-store path, validated through the Task-1 loader. */
   trustStorePath?: string;
-  /** Injectable wall clock for certificate-validity decisions. */
-  getWallTime?: () => number;
 }
 
 /** Fully resolved, validated remote configuration. */
