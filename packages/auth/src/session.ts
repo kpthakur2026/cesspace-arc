@@ -85,6 +85,28 @@ export const MCP_SESSION_ID_HEADER = 'Mcp-Session-Id';
 /** The only recognized Authorization scheme for the session credential. */
 export const SESSION_AUTH_SCHEME = 'Bearer';
 
+/**
+ * Maximum useful length of a session `Authorization` header.
+ *
+ * `Bearer` + one separator + a 128-byte token is the only accepted syntax, so a
+ * longer value cannot be a valid credential. The parser checks this length FIRST
+ * and refuses anything above it before slicing or splitting, so a peer cannot
+ * make ARC allocate proportionally to an arbitrarily large header. The global
+ * 16 KiB HTTP header bound is Task 7's; this is Task 5's own credential bound.
+ */
+export const MAX_SESSION_AUTHORIZATION_HEADER_BYTES =
+  SESSION_AUTH_SCHEME.length + 1 + MAX_SESSION_TOKEN_INPUT_BYTES;
+
+/**
+ * How long an unused session-ID reservation survives before being reclaimed.
+ *
+ * This is INTERNAL housekeeping, not a wire contract: a reservation exists only
+ * for the round trip between ID generation and `initialize` completion, and an
+ * abandoned one must not pin capacity forever. It reuses the idle window because
+ * that is the same order of magnitude as a bootstrap exchange.
+ */
+export const SESSION_ID_RESERVATION_TTL_SECONDS = SESSION_IDLE_TIMEOUT_SECONDS;
+
 // ---------------------------------------------------------------------------
 // Trusted inputs and results
 // ---------------------------------------------------------------------------
@@ -119,8 +141,16 @@ export interface SessionRequestContext {
   presentedSessionId?: string | null;
   /** Presented `Authorization` header value, verbatim, if any. */
   authorizationHeader?: string | null;
-  /** Server-derived identity. Never taken from the request. */
-  identity: TrustedSessionIdentity;
+  /**
+   * Server-derived identity, or `undefined` when the mTLS identity resolves to
+   * no ACTIVE enrolled device.
+   *
+   * Absence is representable on purpose: an unknown SPKI or a revoked device is
+   * a real admission outcome (RC05-NEG-41), not a precondition the caller must
+   * settle before asking. A caller can never substitute a fabricated identity
+   * object, because the value must come from `resolveActiveDeviceIdentity`.
+   */
+  identity?: TrustedSessionIdentity | undefined;
 }
 
 /** Trusted, internal result of a successful session authentication. */
@@ -265,23 +295,55 @@ export function parseBearerCredential(header: unknown): string | null {
   if (typeof header !== 'string') {
     return null;
   }
-  // Case-insensitive scheme, single space separator, exactly two parts. No
-  // trimming beyond the scheme boundary, and no tolerance for a trailing
-  // comment, comma list, or second credential.
-  const parts = header.split(' ');
-  if (parts.length !== 2) {
+
+  // Length FIRST, before any slicing or splitting. `split(' ')` on a
+  // peer-controlled value of unbounded length would allocate proportional to the
+  // input; this single comparison makes every later step operate on at most
+  // MAX_SESSION_AUTHORIZATION_HEADER_BYTES characters.
+  if (header.length > MAX_SESSION_AUTHORIZATION_HEADER_BYTES) {
     return null;
   }
-  if (parts[0].toLowerCase() !== SESSION_AUTH_SCHEME.toLowerCase()) {
+
+  const schemeLength = SESSION_AUTH_SCHEME.length;
+  // Need at least `scheme` + one separator + one token character.
+  if (header.length < schemeLength + 2) {
     return null;
   }
-  if (parts[1].length === 0) {
+  // Exactly one space separator at the scheme boundary: positioned indexing
+  // rather than a split, so the parse is O(1) in the number of separators.
+  if (header.charCodeAt(schemeLength) !== 0x20) {
     return null;
   }
-  if (parts[1].includes(',')) {
+  const scheme = header.slice(0, schemeLength);
+  if (scheme.toLowerCase() !== SESSION_AUTH_SCHEME.toLowerCase()) {
     return null;
   }
-  return parts[1];
+
+  const token = header.slice(schemeLength + 1);
+  if (token.length === 0) {
+    return null;
+  }
+  // No second credential, no trailing field, no comma list.
+  if (token.includes(' ')) {
+    return null;
+  }
+  if (token.includes(',')) {
+    return null;
+  }
+  return token;
+}
+
+/**
+ * True only for the canonical server session-ID shape.
+ *
+ * The length check runs BEFORE the regular expression so an arbitrarily large
+ * presented identifier is rejected by one integer comparison and never becomes
+ * a Map lookup key or a hashing input.
+ */
+export function isWellFormedSessionId(value: unknown): value is string {
+  return (
+    typeof value === 'string' && value.length === SESSION_HEX_LENGTH && SESSION_ID_REGEX.test(value)
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -305,6 +367,20 @@ export class SessionManager {
    * quota accounting cannot drift apart.
    */
   private readonly sessions = new Map<string, SessionRecord>();
+  /**
+   * Server-issued session IDs that have been generated but not yet activated,
+   * mapped to the monotonic time of reservation.
+   *
+   * This is what makes "server-issued" a STRUCTURAL property rather than a
+   * syntactic one: the generator is the only way to obtain a reservable ID, and
+   * `issueSession` accepts only a currently reserved one. A caller that invents a
+   * well-formed 64-hex string cannot activate it, because it was never reserved.
+   *
+   * Bounded two ways, so abandoned reservations can never accumulate: the count
+   * is capped together with active sessions at the frozen global capacity, and
+   * each reservation expires after the reservation window.
+   */
+  private readonly reservedSessionIds = new Map<string, bigint>();
 
   constructor(options: SessionManagerOptions = {}) {
     this.getMonotonicTime = options.getMonotonicTime ?? (() => process.hrtime.bigint());
@@ -316,38 +392,46 @@ export class SessionManager {
    * Builds the cryptographically secure `sessionIdGenerator` Task 8 will hand
    * to the SDK's stateful transport.
    *
-   * The generator is the ONLY issuance authority for a session ID: it draws 256
-   * CSPRNG bits, renders 64 lowercase hex characters, and refuses to return an ID
-   * that is already live. Collisions are retried a bounded number of times and
-   * then fail closed, so a broken randomness source can never overwrite a live
-   * session or spin forever.
+   * Each call GENERATES AND RESERVES a fresh 256-bit identifier synchronously
+   * before returning it. A reserved ID cannot be produced again, cannot collide
+   * with a live session, and is the only kind of value `issueSession` will
+   * activate. Collisions are retried a bounded number of times and then fail
+   * closed, so a broken randomness source can never overwrite a live session,
+   * reuse a reservation, or spin forever.
    */
   public createSessionIdGenerator(): () => string {
-    return () => {
-      for (let attempt = 0; attempt < MAX_SESSION_ID_GENERATION_ATTEMPTS; attempt += 1) {
-        const candidate = this.randomBytes(32).toString('hex');
-        if (!SESSION_ID_REGEX.test(candidate)) {
-          continue;
-        }
-        if (!this.sessions.has(candidate)) {
-          return candidate;
-        }
-      }
-      // Exhaustion fails closed. No session is created, no ID is reused, and no
-      // live session is disturbed.
-      throw ArcError.resourceExhausted(
-        'Could not generate a unique session identifier within the bounded attempt limit.',
-      );
-    };
+    return () => this.reserveSessionId();
   }
 
   /**
-   * Issues a gateway session bound to a SERVER-issued session ID.
+   * Releases an UNUSED session-ID reservation.
    *
-   * The caller (Task 8, after the SDK has completed `initialize`) supplies the
-   * server-generated ID plus the trusted device identity. The raw token is
+   * The primitive Task 8 uses when `initialize` processing aborts before
+   * issuance, so an abandoned reservation does not sit until its window expires.
+   *
+   * - an unknown or malformed ID is a harmless `false`;
+   * - an ACTIVE session ID is never touched, because active sessions are not in
+   *   the reservation table;
+   * - only an unused reservation is removed.
+   */
+  public releaseSessionIdReservation(sessionId: string): boolean {
+    if (!isWellFormedSessionId(sessionId)) {
+      return false;
+    }
+    return this.reservedSessionIds.delete(sessionId);
+  }
+
+  /**
+   * Issues a gateway session bound to a RESERVED server-issued session ID.
+   *
+   * The caller (Task 8, after the SDK has completed `initialize`) supplies the ID
+   * returned by the generator plus the trusted device identity. The raw token is
    * minted here, returned exactly once, and otherwise discarded: only its
    * SHA-256 digest is retained.
+   *
+   * Issuance CONSUMES the reservation exactly once — including when it fails for
+   * a quota reason — so a failed initialize must obtain a new server session ID
+   * rather than retrying with a reservation that has already been spent.
    */
   public issueSession(input: {
     sessionId: string;
@@ -355,7 +439,7 @@ export class SessionManager {
   }): SessionIssuance {
     const { sessionId, identity } = input;
 
-    if (typeof sessionId !== 'string' || !SESSION_ID_REGEX.test(sessionId)) {
+    if (!isWellFormedSessionId(sessionId)) {
       throw ArcError.invalidRequestSchema(
         'Session identifier must be 64 lowercase hexadecimal characters issued by the server.',
       );
@@ -389,6 +473,19 @@ export class SessionManager {
         'Session identifier is already active and can never be reassigned.',
       );
     }
+
+    // Structural server-issuance check: only a currently reserved generator
+    // output is activatable. A syntactically perfect caller-chosen ID fails here.
+    if (!this.reservedSessionIds.has(sessionId)) {
+      throw ArcError.invalidRequestSchema(
+        'Session identifier was not issued and reserved by this server.',
+      );
+    }
+
+    // Consume the reservation BEFORE quota evaluation, so every later failure
+    // leaves no stale reservation behind. One server ID is good for exactly one
+    // issuance attempt.
+    this.reservedSessionIds.delete(sessionId);
 
     this.assertQuotaAvailable(deviceId, clientId);
 
@@ -429,20 +526,36 @@ export class SessionManager {
    */
   public admitRequest(context: SessionRequestContext): SessionAdmissionDecision {
     const presentedId = context.presentedSessionId ?? null;
+    const hasPresentedId = presentedId !== null;
     const rawCredential = parseBearerCredential(context.authorizationHeader ?? null);
 
-    // Only a session ID the server ACTUALLY issued counts as session context. A
-    // client-selected or unknown value is never adopted and never becomes an
-    // issuance authority (RC05-NEG-40, §26 C-4).
+    // Shape check BEFORE any Map lookup or hashing. Only a canonical 64-lowercase-
+    // hex identifier can name a server session, so a huge or malformed value is
+    // rejected by one integer comparison and never becomes a lookup key.
+    const wellFormedId = isWellFormedSessionId(presentedId) ? presentedId : null;
+    // Only a well-formed ID the server ACTUALLY has live counts as RECOGNIZED. A
+    // client-selected, unknown, expired, or malformed value is never adopted and
+    // never becomes an issuance authority (RC05-NEG-40, §26 C-4).
     const recognizedId =
-      presentedId !== null && this.sessions.has(presentedId) ? presentedId : null;
+      wellFormedId !== null && this.sessions.has(wellFormedId) ? wellFormedId : null;
 
-    // Post-session domain (§5.3 H): the transport already recognized a session
-    // context, or the presented ID is a real server session. Both require the
-    // full dual-header invariant — a request cannot escape it by calling itself
-    // `initialize`, and a missing or unknown half is uniformly
-    // INVALID_SESSION_TOKEN.
-    if (context.hasExistingSessionContext || recognizedId !== null) {
+    // Session-context domain (§5.3 H).
+    //
+    // An ORDINARY request that presents ANY `Mcp-Session-Id` — known, unknown,
+    // expired, malformed, or client-chosen — is attempting session-context
+    // authentication, so it owes the full dual-header invariant and every failure
+    // is uniformly INVALID_SESSION_TOKEN. Presence of the header is classified by
+    // the header itself, never by the transport's own context flag.
+    //
+    // `initialize` is the deliberate exception only in the TOKENLESS, no-context
+    // case below: a real server session ID, or a recognized context, still forces
+    // the dual-header path, so calling a request `initialize` grants nothing.
+    const requiresSessionContext =
+      context.hasExistingSessionContext ||
+      recognizedId !== null ||
+      (context.kind === 'ordinary' && hasPresentedId);
+
+    if (requiresSessionContext) {
       if (recognizedId === null || rawCredential === null) {
         return { outcome: 'INVALID_SESSION_TOKEN' };
       }
@@ -464,8 +577,14 @@ export class SessionManager {
     }
 
     if (context.kind === 'initialize') {
+      // RC05-NEG-41: bootstrap requires an ACTIVE resolved device identity. An
+      // identity that resolved to nothing — unknown SPKI, or a revoked device —
+      // can never bootstrap, and no reservation, session, or token is minted.
+      if (context.identity === undefined || context.identity === null) {
+        return { outcome: 'UNAUTHENTICATED' };
+      }
       // Eligible for bootstrap. A client-supplied ID, if any, is simply NOT USED:
-      // the transport replaces it with a freshly generated server ID and the
+      // the transport replaces it with a freshly reserved server ID and the
       // session is minted only after `initialize` is actually processed.
       return { outcome: 'BOOTSTRAP_TOKENLESS', identity: context.identity };
     }
@@ -483,11 +602,19 @@ export class SessionManager {
   public authenticate(input: {
     sessionId: string;
     token: unknown;
-    identity: TrustedSessionIdentity;
+    identity: TrustedSessionIdentity | undefined;
   }): TrustedSessionResult | undefined {
     const { sessionId, identity } = input;
 
-    if (typeof sessionId !== 'string' || !SESSION_ID_REGEX.test(sessionId)) {
+    // No active resolved identity means there is nothing the session could be
+    // bound to, so no presented credential can authenticate. This is the
+    // RC05-NEG-41 post-session outcome and it is deliberately indistinguishable
+    // from a wrong token.
+    if (identity === undefined || identity === null) {
+      return undefined;
+    }
+
+    if (!isWellFormedSessionId(sessionId)) {
       // An unknown or malformed ID is generic: the caller learns nothing about
       // whether the session ever existed.
       return undefined;
@@ -605,9 +732,21 @@ export class SessionManager {
     return this.revokeSession(sessionId);
   }
 
-  /** Removes every session. Used by shutdown composition and tests. */
+  /**
+   * Removes every session AND every unused reservation.
+   *
+   * Both collections are volatile state, so a shutdown-style clear must leave
+   * the manager indistinguishable from a fresh one.
+   */
   public clear(): void {
     this.sessions.clear();
+    this.reservedSessionIds.clear();
+  }
+
+  /** Outstanding unused session-ID reservations. */
+  public getReservedSessionIdCount(): number {
+    this.pruneReservations();
+    return this.reservedSessionIds.size;
   }
 
   public getActiveSessionCount(): number {
@@ -701,6 +840,52 @@ export class SessionManager {
     for (const [sessionId, record] of this.sessions) {
       if (this.isExpired(record, now)) {
         this.sessions.delete(sessionId);
+      }
+    }
+  }
+
+  /**
+   * Generates AND synchronously reserves a fresh server session ID.
+   *
+   * Capacity is charged against active sessions PLUS outstanding reservations,
+   * so a caller cannot convert ID generation into an unbounded reservation
+   * table: the frozen global session capacity bounds both collections together.
+   */
+  private reserveSessionId(): string {
+    this.pruneReservations();
+    if (this.sessions.size + this.reservedSessionIds.size >= MAX_ACTIVE_SESSIONS_GLOBAL) {
+      throw ArcError.resourceExhausted(
+        `Cannot reserve a session identifier: at most ${MAX_ACTIVE_SESSIONS_GLOBAL} sessions and reservations may be outstanding at once.`,
+      );
+    }
+    for (let attempt = 0; attempt < MAX_SESSION_ID_GENERATION_ATTEMPTS; attempt += 1) {
+      const candidate = this.randomBytes(32).toString('hex');
+      if (!isWellFormedSessionId(candidate)) {
+        continue;
+      }
+      // Never reuse a live session ID and never hand out a still-reserved one.
+      if (this.sessions.has(candidate) || this.reservedSessionIds.has(candidate)) {
+        continue;
+      }
+      this.reservedSessionIds.set(candidate, this.getMonotonicTime());
+      return candidate;
+    }
+    // Exhaustion fails closed. No session is created, no reservation is made,
+    // no ID is reused, and no live session is disturbed.
+    throw ArcError.resourceExhausted(
+      'Could not generate a unique session identifier within the bounded attempt limit.',
+    );
+  }
+
+  /** Drops reservations that were never consumed within their window. */
+  private pruneReservations(now = this.getMonotonicTime()): void {
+    if (this.reservedSessionIds.size === 0) {
+      return;
+    }
+    const deadline = now - BigInt(SESSION_ID_RESERVATION_TTL_SECONDS) * 1_000_000_000n;
+    for (const [sessionId, reservedAt] of this.reservedSessionIds) {
+      if (reservedAt <= deadline) {
+        this.reservedSessionIds.delete(sessionId);
       }
     }
   }

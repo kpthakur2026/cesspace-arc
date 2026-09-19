@@ -26,12 +26,14 @@ import {
   SessionManager,
   resolveActiveDeviceIdentity,
   parseBearerCredential,
+  isWellFormedSessionId,
   DeviceTrustStore,
   SESSION_ID_REGEX,
   SESSION_TOKEN_REGEX,
   MAX_SESSION_TOKEN_INPUT_BYTES,
   SESSION_ABSOLUTE_TTL_SECONDS,
   SESSION_IDLE_TIMEOUT_SECONDS,
+  SESSION_ID_RESERVATION_TTL_SECONDS,
   MAX_ACTIVE_SESSIONS_PER_DEVICE,
   MAX_ACTIVE_SESSIONS_PER_CLIENT,
   MAX_ACTIVE_SESSIONS_GLOBAL,
@@ -263,9 +265,13 @@ describe('CesSpace ARC — RC-05 Task 5: Secure Session Lifecycle', () => {
           );
         },
       });
-      // Seed the live session into the colliding manager so the generator sees it.
-      colliding.issueSession({ sessionId, identity: identity('collision') });
-      // Token minting also drew randomness; count only the generator's draws.
+      // Seed a live session through the real issuance path, so the generator
+      // sees the ID as active.
+      const seedId = colliding.createSessionIdGenerator()();
+      assert.equal(seedId, sessionId, 'the deterministic source produced the seeded ID');
+      colliding.issueSession({ sessionId: seedId, identity: identity('collision') });
+      // Reservation and token minting also drew randomness; count only the
+      // generator draws under test.
       draws = 0;
 
       const generate = colliding.createSessionIdGenerator();
@@ -279,8 +285,10 @@ describe('CesSpace ARC — RC-05 Task 5: Secure Session Lifecycle', () => {
         MAX_SESSION_ID_GENERATION_ATTEMPTS,
         'collision retries are bounded at the frozen attempt limit',
       );
-      // The live session was never overwritten.
+      // The live session was never overwritten, and no reservation was left.
       assert.equal(colliding.hasSession(sessionId), true);
+      assert.equal(colliding.getReservedSessionIdCount(), 0);
+      assert.equal(colliding.getActiveSessionCount(), 1);
     });
 
     test('RC05-SES-08: a bounded collision sequence eventually yields a free identifier', () => {
@@ -298,13 +306,291 @@ describe('CesSpace ARC — RC-05 Task 5: Secure Session Lifecycle', () => {
           return crypto.randomBytes(size);
         },
       });
-      flaky.issueSession({ sessionId, identity: identity('collision-then-free') });
+      const seedId = flaky.createSessionIdGenerator()();
+      flaky.issueSession({ sessionId: seedId, identity: identity('collision-then-free') });
+      draws = 0;
 
       const generated = flaky.createSessionIdGenerator()();
       assert.match(generated, SESSION_ID_REGEX);
       assert.notEqual(generated, sessionId);
       assert.equal(draws, 3, 'two collisions then a fresh identifier');
       assert.equal(flaky.hasSession(sessionId), true, 'the live session is untouched');
+      // The successful draw is itself reserved, so the caller can activate it.
+      assert.equal(flaky.getReservedSessionIdCount(), 1);
+    });
+  });
+
+  // =========================================================================
+  // Server-issued session IDs are STRUCTURAL
+  // =========================================================================
+
+  describe('Server-issued session IDs are a structural property', () => {
+    test('RC05-SES-43: a syntactically perfect caller-chosen ID cannot be issued', () => {
+      const id = identity('caller-chosen');
+      const attackerChosen = 'a'.repeat(64);
+      assert.match(attackerChosen, SESSION_ID_REGEX, 'the value is shape-valid on purpose');
+
+      assert.throws(
+        () => manager.issueSession({ sessionId: attackerChosen, identity: id }),
+        (err) => err.code === 'INVALID_REQUEST_SCHEMA',
+        'an unreserved ID is refused even though its shape is canonical',
+      );
+
+      assert.equal(manager.hasSession(attackerChosen), false);
+      assert.equal(manager.getActiveSessionCount(), 0);
+      assert.equal(manager.getReservedSessionIdCount(), 0);
+
+      // A whole sweep of shape-valid caller-chosen values is equally refused.
+      for (const seed of ['b', 'c', 'f', '0']) {
+        assert.throws(
+          () => manager.issueSession({ sessionId: seed.repeat(64), identity: id }),
+          (err) => err.code === 'INVALID_REQUEST_SCHEMA',
+        );
+      }
+      assert.equal(manager.getActiveSessionCount(), 0);
+
+      // Only a generator output activates.
+      const reserved = manager.createSessionIdGenerator()();
+      assert.throws(() => manager.issueSession({ sessionId: attackerChosen, identity: id }), {
+        code: 'INVALID_REQUEST_SCHEMA',
+      });
+      const issuance = manager.issueSession({ sessionId: reserved, identity: id });
+      assert.equal(issuance.sessionId, reserved);
+      assert.equal(manager.getActiveSessionCount(), 1);
+    });
+
+    test('RC05-SES-44: generation reserves, so an identical draw cannot be handed out twice', () => {
+      const bytes = crypto.randomBytes(32);
+      const frozen = new SessionManager({
+        getMonotonicTime: () => mono,
+        // Always the SAME 32 bytes, so every draw would otherwise be identical.
+        randomBytes: (size) =>
+          Buffer.concat([bytes, Buffer.alloc(Math.max(0, size - 32))]).subarray(0, size),
+      });
+      const generate = frozen.createSessionIdGenerator();
+
+      const first = generate();
+      assert.match(first, SESSION_ID_REGEX);
+      assert.equal(frozen.getReservedSessionIdCount(), 1);
+
+      // The still-reserved ID is never returned again: the bounded retries are
+      // spent and the call fails closed rather than reissuing it.
+      assert.throws(
+        () => generate(),
+        (err) => err.code === 'RESOURCE_EXHAUSTED',
+        'a reserved ID is never reissued',
+      );
+      assert.equal(frozen.getReservedSessionIdCount(), 1, 'the original reservation survives');
+    });
+
+    test('RC05-SES-45: pre-issuance collision with a live session is bounded and non-destructive', () => {
+      const live = issue('reserve-collision-live');
+      const bytes = Buffer.from(live.sessionId, 'hex');
+      let draws = 0;
+      const colliding = new SessionManager({
+        getMonotonicTime: () => mono,
+        randomBytes: (size) => {
+          draws += 1;
+          return Buffer.concat([bytes, Buffer.alloc(Math.max(0, size - 32))]).subarray(0, size);
+        },
+      });
+
+      // Seed the live session through the real path, then reset the draw count.
+      const seedId = colliding.createSessionIdGenerator()();
+      colliding.issueSession({ sessionId: seedId, identity: identity('reserve-collision-live') });
+      draws = 0;
+
+      assert.throws(
+        () => colliding.createSessionIdGenerator()(),
+        (err) => err.code === 'RESOURCE_EXHAUSTED',
+      );
+      assert.equal(draws, MAX_SESSION_ID_GENERATION_ATTEMPTS, 'retries are bounded');
+      assert.equal(colliding.hasSession(live.sessionId), true, 'the live session is untouched');
+      assert.equal(colliding.getReservedSessionIdCount(), 0, 'no reservation was left behind');
+      assert.equal(colliding.getActiveSessionCount(), 1);
+    });
+
+    test('RC05-SES-46: issuance consumes the reservation exactly once', () => {
+      const id = identity('consume');
+      const reserved = manager.createSessionIdGenerator()();
+      assert.equal(manager.getReservedSessionIdCount(), 1);
+
+      const issuance = manager.issueSession({ sessionId: reserved, identity: id });
+      assert.equal(manager.getReservedSessionIdCount(), 0, 'the reservation is gone');
+      assert.equal(manager.hasSession(reserved), true, 'the active record exists');
+      assert.equal(manager.getActiveSessionCount(), 1);
+
+      // A second issuance on the spent reservation is refused — with the
+      // duplicate-active answer, because the ID is now live.
+      assert.throws(
+        () => manager.issueSession({ sessionId: reserved, identity: id }),
+        (err) => err.code === 'CONFLICT_PRECONDITION_FAILED',
+      );
+
+      // And a released-then-attempted ID is refused once the session is revoked.
+      manager.revokeSession(reserved);
+      assert.throws(
+        () => manager.issueSession({ sessionId: reserved, identity: id }),
+        (err) => err.code === 'INVALID_REQUEST_SCHEMA',
+        'a consumed reservation cannot be replayed',
+      );
+      assert.ok(
+        manager.authenticate({ sessionId: reserved, token: issuance.token, identity: id }) ===
+          undefined,
+      );
+    });
+
+    test('RC05-SES-47: an aborted initialize releases its reservation', () => {
+      const id = identity('aborted');
+
+      for (let i = 0; i < 5; i += 1) {
+        const reserved = manager.createSessionIdGenerator()();
+        assert.equal(manager.getReservedSessionIdCount(), 1, 'exactly one outstanding reservation');
+
+        // initialize processing aborts before issuance.
+        assert.equal(manager.releaseSessionIdReservation(reserved), true);
+        assert.equal(manager.getReservedSessionIdCount(), 0, 'the reservation is gone');
+        assert.equal(manager.hasSession(reserved), false);
+      }
+
+      assert.equal(manager.getReservedSessionIdCount(), 0, 'bounded: no reservation accumulates');
+      assert.equal(manager.getActiveSessionCount(), 0);
+      assert.deepEqual(manager.listSessions(), []);
+
+      // Releasing is a no-op for unknown, malformed, and active IDs.
+      assert.equal(manager.releaseSessionIdReservation('not-an-id'), false);
+      assert.equal(manager.releaseSessionIdReservation('a'.repeat(63)), false);
+      assert.equal(
+        manager.releaseSessionIdReservation(crypto.randomBytes(32).toString('hex')),
+        false,
+      );
+      assert.equal(manager.releaseSessionIdReservation(undefined), false);
+      assert.equal(manager.releaseSessionIdReservation(null), false);
+
+      const live = manager.issueSession({
+        sessionId: manager.createSessionIdGenerator()(),
+        identity: id,
+      });
+      assert.equal(
+        manager.releaseSessionIdReservation(live.sessionId),
+        false,
+        'an ACTIVE session ID is not a reservation and is never removed',
+      );
+      assert.equal(manager.hasSession(live.sessionId), true);
+      assert.ok(
+        manager.authenticate({
+          sessionId: live.sessionId,
+          token: live.token,
+          identity: id,
+        }),
+      );
+    });
+
+    test('RC05-SES-48: a quota failure consumes the reservation rather than leaving it stale', () => {
+      const id = identity('quota-after-reserve');
+
+      // Fill the device to its exact cap.
+      const live = [];
+      for (let i = 0; i < MAX_ACTIVE_SESSIONS_PER_DEVICE; i += 1) {
+        live.push(
+          manager.issueSession({ sessionId: manager.createSessionIdGenerator()(), identity: id }),
+        );
+      }
+      assert.equal(manager.getActiveSessionCountForDevice(id.deviceId), 8);
+
+      // Reserve a fresh server ID, then attempt issuance: the cap refuses it.
+      const doomed = manager.createSessionIdGenerator()();
+      assert.equal(manager.getReservedSessionIdCount(), 1);
+
+      assert.throws(
+        () => manager.issueSession({ sessionId: doomed, identity: id }),
+        (err) => err.code === 'RESOURCE_EXHAUSTED',
+      );
+
+      // One-shot consumption: the reservation is spent whether or not issuance
+      // succeeded, so nothing stale accumulates and the ID cannot be retried.
+      assert.equal(manager.getReservedSessionIdCount(), 0, 'no stale reservation remains');
+      assert.equal(manager.hasSession(doomed), false);
+      assert.throws(
+        () => manager.issueSession({ sessionId: doomed, identity: id }),
+        (err) => err.code === 'INVALID_REQUEST_SCHEMA',
+        'a failed initialize must obtain a NEW server session ID',
+      );
+      assert.equal(manager.getActiveSessionCountForDevice(id.deviceId), 8);
+
+      // The existing sessions are unaffected.
+      for (const session of live) {
+        assert.ok(
+          manager.authenticate({
+            sessionId: session.sessionId,
+            token: session.token,
+            identity: id,
+          }),
+        );
+      }
+
+      // Releasing one session lets a fresh reservation through.
+      manager.revokeSession(live[0].sessionId);
+      const replacement = manager.issueSession({
+        sessionId: manager.createSessionIdGenerator()(),
+        identity: id,
+      });
+      assert.equal(manager.getActiveSessionCountForDevice(id.deviceId), 8);
+      assert.equal(manager.hasSession(replacement.sessionId), true);
+    });
+
+    test('RC05-SES-49: reservations are bounded by the global capacity and by their window', () => {
+      // Reservations plus active sessions cannot exceed the global capacity.
+      const reserved = [];
+      for (let i = 0; i < MAX_ACTIVE_SESSIONS_GLOBAL; i += 1) {
+        reserved.push(manager.createSessionIdGenerator()());
+      }
+      assert.equal(manager.getReservedSessionIdCount(), MAX_ACTIVE_SESSIONS_GLOBAL);
+      assert.throws(
+        () => manager.createSessionIdGenerator()(),
+        (err) => err.code === 'RESOURCE_EXHAUSTED',
+        'abandoned reservations cannot grow without bound',
+      );
+
+      // The window reclaims them, so capacity returns without manual release.
+      mono += BigInt(SESSION_ID_RESERVATION_TTL_SECONDS + 1) * SECOND;
+      assert.equal(manager.getReservedSessionIdCount(), 0);
+      const fresh = manager.createSessionIdGenerator()();
+      assert.match(fresh, SESSION_ID_REGEX);
+      assert.equal(manager.getReservedSessionIdCount(), 1);
+
+      // A reclaimed reservation is no longer activatable.
+      assert.throws(
+        () => manager.issueSession({ sessionId: reserved[0], identity: identity('reclaimed') }),
+        (err) => err.code === 'INVALID_REQUEST_SCHEMA',
+      );
+    });
+
+    test('RC05-SES-50: clear() drops sessions and reservations together', () => {
+      const id = identity('clear-both');
+      const active = manager.issueSession({
+        sessionId: manager.createSessionIdGenerator()(),
+        identity: id,
+      });
+      const staleReservation = manager.createSessionIdGenerator()();
+      manager.createSessionIdGenerator()();
+      assert.equal(manager.getActiveSessionCount(), 1);
+      assert.equal(manager.getReservedSessionIdCount(), 2);
+
+      manager.clear();
+      assert.equal(manager.getActiveSessionCount(), 0);
+      assert.equal(manager.getReservedSessionIdCount(), 0);
+      assert.deepEqual(manager.listSessions(), []);
+      assert.equal(manager.hasSession(active.sessionId), false);
+
+      // Neither the retired session nor the abandoned reservation is activatable.
+      for (const sessionId of [active.sessionId, staleReservation]) {
+        assert.throws(
+          () => manager.issueSession({ sessionId, identity: id }),
+          (err) => err.code === 'INVALID_REQUEST_SCHEMA',
+          'pre-clear state is not activatable after clear()',
+        );
+      }
     });
   });
 
@@ -485,21 +771,133 @@ describe('CesSpace ARC — RC-05 Task 5: Secure Session Lifecycle', () => {
 
     test('RC05-SES-13: an unknown or malformed session ID is INVALID_SESSION_TOKEN', () => {
       const target = issue('unknown-id');
+      const before = JSON.stringify(manager.listSessions());
 
-      for (const presentedSessionId of [
+      const presentable = [
         crypto.randomBytes(32).toString('hex'),
         'not-an-id',
         'a'.repeat(63),
         'A'.repeat(64),
         '',
-      ]) {
-        const decision = manager.admitRequest(ordinaryContext(target, { presentedSessionId }));
+        'a'.repeat(65),
+        '  ',
+      ];
+
+      // BOTH transport-context flags: the presence of an `Mcp-Session-Id` header
+      // is what puts an ordinary request in the session-context domain, so a
+      // transport that reports no recognized context must reach the same answer.
+      for (const hasExistingSessionContext of [true, false]) {
+        for (const presentedSessionId of presentable) {
+          const decision = manager.admitRequest(
+            ordinaryContext(target, { presentedSessionId, hasExistingSessionContext }),
+          );
+          assert.deepEqual(
+            decision,
+            { outcome: 'INVALID_SESSION_TOKEN' },
+            `presented ID ${JSON.stringify(presentedSessionId)} with hasExistingSessionContext=${hasExistingSessionContext} must be refused`,
+          );
+        }
+      }
+
+      assert.equal(JSON.stringify(manager.listSessions()), before, 'no session mutated');
+      assert.deepEqual(manager.admitRequest(ordinaryContext(target)).outcome, 'AUTHENTICATED');
+    });
+
+    test('RC05-SES-41: an ordinary request with a presented ID never falls back to UNAUTHENTICATED', () => {
+      const target = issue('ordinary-id-domain');
+      const wrong = crypto.randomBytes(32).toString('hex');
+
+      // Every combination of (ID knowledge, credential) on an ordinary request
+      // is a session-context attempt, so the outcome is INVALID_SESSION_TOKEN —
+      // never UNAUTHENTICATED, which would falsely advertise a pre-session state.
+      const cases = [
+        { id: crypto.randomBytes(32).toString('hex'), auth: null },
+        { id: 'malformed', auth: null },
+        { id: crypto.randomBytes(32).toString('hex'), auth: `Bearer ${wrong}` },
+        { id: 'malformed', auth: `Bearer ${wrong}` },
+        { id: target.sessionId, auth: null },
+        { id: target.sessionId, auth: `Bearer ${wrong}` },
+      ];
+      for (const { id, auth } of cases) {
+        for (const hasExistingSessionContext of [false, true]) {
+          const decision = manager.admitRequest({
+            kind: 'ordinary',
+            hasExistingSessionContext,
+            presentedSessionId: id,
+            authorizationHeader: auth,
+            identity: target.id,
+          });
+          assert.deepEqual(
+            decision,
+            { outcome: 'INVALID_SESSION_TOKEN' },
+            `id=${JSON.stringify(id)} auth=${String(auth)} ctx=${hasExistingSessionContext}`,
+          );
+        }
+      }
+
+      // The genuinely tokenless ordinary request is still UNAUTHENTICATED.
+      assert.deepEqual(
+        manager.admitRequest({
+          kind: 'ordinary',
+          hasExistingSessionContext: false,
+          presentedSessionId: null,
+          authorizationHeader: null,
+          identity: target.id,
+        }),
+        { outcome: 'UNAUTHENTICATED' },
+      );
+
+      // And the target session is untouched throughout.
+      assert.deepEqual(manager.admitRequest(ordinaryContext(target)).outcome, 'AUTHENTICATED');
+    });
+
+    test('RC05-SES-42: initialize ignores an unknown ID only when it is truly tokenless', () => {
+      const id = identity('initialize-id-domain');
+      const clientChosen = crypto.randomBytes(32).toString('hex');
+
+      for (const presentedSessionId of [clientChosen, 'malformed', '', 'a'.repeat(63)]) {
+        // Tokenless initial initialize: the client ID is ignored and bootstrap
+        // proceeds with a server ID.
         assert.deepEqual(
-          decision,
+          manager.admitRequest({
+            kind: 'initialize',
+            hasExistingSessionContext: false,
+            presentedSessionId,
+            authorizationHeader: null,
+            identity: id,
+          }).outcome,
+          'BOOTSTRAP_TOKENLESS',
+          `tokenless initialize with ${JSON.stringify(presentedSessionId)} bootstraps`,
+        );
+
+        // Carrying a credential makes it a session-context attempt again.
+        assert.deepEqual(
+          manager.admitRequest({
+            kind: 'initialize',
+            hasExistingSessionContext: false,
+            presentedSessionId,
+            authorizationHeader: `Bearer ${crypto.randomBytes(32).toString('hex')}`,
+            identity: id,
+          }),
           { outcome: 'INVALID_SESSION_TOKEN' },
-          `presented ID ${JSON.stringify(presentedSessionId)} must be refused`,
+          'a credential with an unrecognized ID has nothing to bind to',
+        );
+
+        // A recognized transport context does too.
+        assert.deepEqual(
+          manager.admitRequest({
+            kind: 'initialize',
+            hasExistingSessionContext: true,
+            presentedSessionId,
+            authorizationHeader: null,
+            identity: id,
+          }),
+          { outcome: 'INVALID_SESSION_TOKEN' },
         );
       }
+
+      assert.equal(manager.getActiveSessionCount(), 0);
+      assert.equal(manager.getReservedSessionIdCount(), 0);
     });
 
     test('RC05-SES-14: a credential with no server session to bind to is refused', () => {
@@ -596,6 +994,79 @@ describe('CesSpace ARC — RC-05 Task 5: Secure Session Lifecycle', () => {
         });
       }
       assert.deepEqual(manager.admitRequest(ordinaryContext(target)).outcome, 'AUTHENTICATED');
+    });
+
+    test('RC05-SES-51: an oversized Authorization value is refused before any parsing', () => {
+      const target = issue('bounded-auth');
+      const before = JSON.stringify(manager.listSessions());
+
+      // Far beyond any plausible header, and far beyond the useful maximum. A
+      // split-based parser would allocate a copy of this on every request.
+      const giant = `Bearer ${'a'.repeat(4 * 1024 * 1024)}`;
+      assert.ok(giant.length > MAX_SESSION_TOKEN_INPUT_BYTES * 1000);
+
+      assert.equal(parseBearerCredential(giant), null, 'the parser refuses it outright');
+      assert.equal(
+        parseBearerCredential('a'.repeat(1024 * 1024)),
+        null,
+        'a scheme-less megabyte value is refused too',
+      );
+
+      assert.deepEqual(
+        manager.admitRequest(ordinaryContext(target, { authorizationHeader: giant })),
+        { outcome: 'INVALID_SESSION_TOKEN' },
+      );
+
+      // Everything below the boundary still parses, and the session is untouched.
+      const boundaryExact = `Bearer ${'a'.repeat(MAX_SESSION_TOKEN_INPUT_BYTES)}`;
+      assert.equal(
+        parseBearerCredential(boundaryExact),
+        'a'.repeat(MAX_SESSION_TOKEN_INPUT_BYTES),
+        'a header at the useful maximum still parses',
+      );
+      // One byte past the useful maximum is refused.
+      assert.equal(
+        parseBearerCredential(`Bearer ${'a'.repeat(MAX_SESSION_TOKEN_INPUT_BYTES + 1)}`),
+        null,
+      );
+
+      assert.equal(JSON.stringify(manager.listSessions()), before, 'no session mutated');
+      assert.deepEqual(manager.admitRequest(ordinaryContext(target)).outcome, 'AUTHENTICATED');
+    });
+
+    test('RC05-SES-52: an oversized presented session ID never enters a Map lookup', () => {
+      const target = issue('bounded-id');
+      const before = JSON.stringify(manager.listSessions());
+
+      const giantId = 'a'.repeat(2 * 1024 * 1024);
+      assert.equal(isWellFormedSessionId(giantId), false);
+      assert.equal(isWellFormedSessionId('a'.repeat(63)), false);
+      assert.equal(isWellFormedSessionId('A'.repeat(64)), false);
+      assert.equal(isWellFormedSessionId(target.sessionId), true);
+
+      for (const hasExistingSessionContext of [true, false]) {
+        assert.deepEqual(
+          manager.admitRequest(
+            ordinaryContext(target, { presentedSessionId: giantId, hasExistingSessionContext }),
+          ),
+          { outcome: 'INVALID_SESSION_TOKEN' },
+        );
+      }
+
+      // On an initial tokenless initialize the same value is simply ignored.
+      assert.deepEqual(
+        manager.admitRequest({
+          kind: 'initialize',
+          hasExistingSessionContext: false,
+          presentedSessionId: giantId,
+          authorizationHeader: null,
+          identity: target.id,
+        }).outcome,
+        'BOOTSTRAP_TOKENLESS',
+      );
+
+      assert.equal(JSON.stringify(manager.listSessions()), before, 'no session mutated');
+      assert.equal(manager.getReservedSessionIdCount(), 0);
     });
 
     test('RC05-SES-16: the failed-verification path never mutates any session', () => {
@@ -783,10 +1254,20 @@ describe('CesSpace ARC — RC-05 Task 5: Secure Session Lifecycle', () => {
       assert.equal(manager.getActiveSessionCountForDevice(target.id.deviceId), 0);
       void beforeCount;
 
-      // Re-issuance on the SAME ID is now possible because the ID is free, and
-      // the old token cannot be used against the new session.
+      // The retired ID is NOT re-issuable: it is neither live nor reserved, and a
+      // client-chosen value can never be activated.
+      assert.throws(
+        () => manager.issueSession({ sessionId: target.sessionId, identity: target.id }),
+        (err) => err.code === 'INVALID_REQUEST_SCHEMA',
+        'an expired session ID is not a server reservation',
+      );
+
+      // A NEW server-generated session can be issued, and the old token cannot
+      // authenticate it.
+      const replacementId = manager.createSessionIdGenerator()();
+      assert.notEqual(replacementId, target.sessionId);
       const replacement = manager.issueSession({
-        sessionId: target.sessionId,
+        sessionId: replacementId,
         identity: target.id,
       });
       assert.deepEqual(
@@ -1224,7 +1705,7 @@ describe('CesSpace ARC — RC-05 Task 5: Secure Session Lifecycle', () => {
       );
     });
 
-    test('RC05-NEG-41: tokenless initialize from an unenrolled device mints nothing', () => {
+    test('RC05-NEG-41: tokenless initialize from an unenrolled device is UNAUTHENTICATED', () => {
       const store = DeviceTrustStore.createEmpty();
       store.enrollDevice({
         clientId: 'agent-alpha',
@@ -1232,31 +1713,107 @@ describe('CesSpace ARC — RC-05 Task 5: Secure Session Lifecycle', () => {
         pin: pin('neg41-enrolled'),
       });
 
-      // The mTLS identity presented is an SPKI the trust store does not know.
+      // The mTLS identity presented is an SPKI the trust store does not know, so
+      // the authoritative resolver returns nothing for it.
       const untrusted = resolveActiveDeviceIdentity(store, pin('neg41-stranger'));
       assert.equal(untrusted, undefined, 'an unenrolled identity resolves to nothing');
 
-      // The transport must therefore refuse before it can even ask for a
-      // bootstrap decision: no trusted identity means no admission.
+      // That unresolved result goes straight through the REAL admission API.
+      const decision = manager.admitRequest({
+        kind: 'initialize',
+        hasExistingSessionContext: false,
+        presentedSessionId: null,
+        authorizationHeader: null,
+        identity: untrusted,
+      });
+      assert.deepEqual(decision, { outcome: 'UNAUTHENTICATED' });
+
+      // Zero reservations, zero sessions, zero tokens.
+      assert.equal(manager.getReservedSessionIdCount(), 0);
       assert.equal(manager.getActiveSessionCount(), 0);
       assert.deepEqual(manager.listSessions(), []);
+
+      // `resolveActiveDeviceIdentity` is the ONLY source of the trusted identity
+      // admission consumes, so "no active device" is represented by the absence
+      // of that resolution rather than by a caller-supplied object.
     });
 
-    test('RC05-NEG-41b: tokenless initialize from a REVOKED device mints nothing', () => {
+    test('RC05-NEG-41b: tokenless initialize from a REVOKED device is UNAUTHENTICATED', () => {
       const store = DeviceTrustStore.createEmpty();
       const { device } = store.enrollDevice({
         clientId: 'agent-revoked',
         clientType: 'claude-code',
         pin: pin('neg41b'),
       });
-      store.revokeDevice(device.deviceId);
 
-      assert.equal(
-        resolveActiveDeviceIdentity(store, pin('neg41b')),
-        undefined,
-        'a revoked device resolves to nothing',
+      // A revoked device still resolves while it is active, so this pins the
+      // revocation boundary rather than merely an unknown pin.
+      const active = resolveActiveDeviceIdentity(store, pin('neg41b'));
+      assert.ok(active, 'before revocation the identity resolves');
+      assert.deepEqual(
+        manager.admitRequest({
+          kind: 'initialize',
+          hasExistingSessionContext: false,
+          presentedSessionId: null,
+          authorizationHeader: null,
+          identity: active,
+        }).outcome,
+        'BOOTSTRAP_TOKENLESS',
       );
+
+      store.revokeDevice(device.deviceId);
+      const revoked = resolveActiveDeviceIdentity(store, pin('neg41b'));
+      assert.equal(revoked, undefined, 'a revoked device resolves to nothing');
+
+      assert.deepEqual(
+        manager.admitRequest({
+          kind: 'initialize',
+          hasExistingSessionContext: false,
+          presentedSessionId: null,
+          authorizationHeader: null,
+          identity: revoked,
+        }),
+        { outcome: 'UNAUTHENTICATED' },
+      );
+
+      // The earlier eligibility minted nothing by itself, and the revoked device
+      // still has zero sessions, zero reservations, and zero tokens.
+      assert.equal(manager.getReservedSessionIdCount(), 0);
       assert.equal(manager.getActiveSessionCount(), 0);
+      assert.deepEqual(manager.listSessions(), []);
+    });
+
+    test('RC05-NEG-41c: an unresolved identity cannot authenticate a post-session request', () => {
+      const target = issue('neg41c');
+      const store = DeviceTrustStore.createEmpty();
+
+      // The session exists, but the presented mTLS identity resolves to nothing
+      // (unknown pin here; a revoked device behaves identically).
+      const unresolved = resolveActiveDeviceIdentity(store, target.id.spkiPin);
+      assert.equal(unresolved, undefined);
+
+      assert.deepEqual(
+        manager.admitRequest({
+          kind: 'ordinary',
+          hasExistingSessionContext: true,
+          presentedSessionId: target.sessionId,
+          authorizationHeader: `Bearer ${target.issuance.token}`,
+          identity: unresolved,
+        }),
+        { outcome: 'INVALID_SESSION_TOKEN' },
+        'post-session failures stay INVALID_SESSION_TOKEN even with the right credential',
+      );
+      assert.equal(
+        manager.authenticate({
+          sessionId: target.sessionId,
+          token: target.issuance.token,
+          identity: undefined,
+        }),
+        undefined,
+      );
+
+      // The session is not mutated, and the real identity still authenticates.
+      assert.deepEqual(manager.admitRequest(ordinaryContext(target)).outcome, 'AUTHENTICATED');
     });
 
     test('RC05-SES-31: the bootstrap ordering is expressible exactly as Task 8 needs it', () => {
@@ -1322,9 +1879,18 @@ describe('CesSpace ARC — RC-05 Task 5: Secure Session Lifecycle', () => {
       );
       assert.equal(manager.hasSession(target.sessionId), false);
 
-      // Irreversible: re-issuing the same ID yields a session the old token
-      // cannot authenticate.
-      const reissued = manager.issueSession({ sessionId: target.sessionId, identity: target.id });
+      // Irreversible: the retired ID is not re-issuable at all, and a new
+      // server-generated session is what the device must use instead.
+      assert.throws(
+        () => manager.issueSession({ sessionId: target.sessionId, identity: target.id }),
+        (err) => err.code === 'INVALID_REQUEST_SCHEMA',
+        'a revoked session ID cannot be reactivated by re-issuing it',
+      );
+      const reissued = manager.issueSession({
+        sessionId: manager.createSessionIdGenerator()(),
+        identity: target.id,
+      });
+      assert.notEqual(reissued.sessionId, target.sessionId);
       assert.deepEqual(manager.admitRequest(ordinaryContext(target)), {
         outcome: 'INVALID_SESSION_TOKEN',
       });
@@ -1663,6 +2229,52 @@ describe('CesSpace ARC — RC-05 Task 5: Secure Session Lifecycle', () => {
           `the session module must not reference ${banned}`,
         );
       }
+    });
+
+    test('RC05-SES-53: the credential parser cannot allocate proportionally to its input', () => {
+      const source = fs.readFileSync(
+        new URL('../packages/auth/src/session.ts', import.meta.url),
+        'utf8',
+      );
+
+      // The parser body must not call `split(` on the Authorization value: that
+      // would allocate a piece per separator for an arbitrarily large header.
+      // Comments are stripped first, so the assertion is about executed code
+      // rather than prose that happens to name the rejected approach.
+      const parserStart = source.indexOf('export function parseBearerCredential');
+      assert.ok(parserStart > 0, 'the parser must exist');
+      const parserBody = source
+        .slice(parserStart, source.indexOf('\n}', parserStart))
+        .replace(/\/\/[^\n]*/g, '')
+        .replace(/\/\*[\s\S]*?\*\//g, '');
+      assert.equal(
+        parserBody.includes('split('),
+        false,
+        'the Authorization parser must not split an unbounded value',
+      );
+      // It also must not reach for a regular expression that would scan the
+      // whole value; the length comparison is the only pre-filter it needs.
+      assert.equal(/\bRegExp\b|\.match\(|\.exec\(/.test(parserBody), false);
+      // It must apply the length bound before taking any slice.
+      const boundIndex = parserBody.indexOf('MAX_SESSION_AUTHORIZATION_HEADER_BYTES');
+      const sliceIndex = parserBody.indexOf('slice(');
+      assert.ok(boundIndex > 0, 'the useful-length bound must be present');
+      assert.ok(
+        boundIndex < sliceIndex,
+        'the length check must precede the first slice, so nothing large is copied',
+      );
+
+      // Session-ID lookup must be guarded by the cheap shape check.
+      const managerSource = source.slice(source.indexOf('public admitRequest'));
+      const shapeIndex = managerSource.indexOf('isWellFormedSessionId(');
+      const lookupIndex = managerSource.indexOf('this.sessions.has(');
+      assert.ok(shapeIndex > 0, 'the shape check must be present in admission');
+      assert.ok(shapeIndex < lookupIndex, 'the session-ID shape check must precede the Map lookup');
+      assert.equal(
+        /sessions\.has\(\s*presentedId/.test(source),
+        false,
+        'the raw presented value must never be a lookup key',
+      );
     });
 
     test('RC05-SES-40: Task 5 added no network composition to the remote gateway', () => {
