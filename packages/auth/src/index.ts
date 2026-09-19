@@ -16,4 +16,16 @@ export interface IAuthEngine {
 }
 
 export * from './device-identity.js';
-export * from './trust-store.js';
+
+export {
+  type DeviceTrustStoreData,
+  validateTrustStoreData,
+  assertValidTrustStorePath,
+  type MinimalTrustStoreFileStat,
+  type MinimalTrustStoreDirStat,
+  validateTrustStoreFileStat,
+  validateTrustStoreParentDirectoryStat,
+  verifyTrustStoreFileIntegrity,
+  atomicPersistTrustStore,
+  DeviceTrustStore,
+} from './trust-store.js';

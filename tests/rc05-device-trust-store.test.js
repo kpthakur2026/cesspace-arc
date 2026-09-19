@@ -15,6 +15,7 @@ import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 
+import * as PublicAuth from '../packages/auth/dist/index.js';
 import {
   generateDeviceId,
   isValidDeviceId,
@@ -27,10 +28,13 @@ import {
   validateTrustStoreFileStat,
   validateTrustStoreParentDirectoryStat,
   verifyTrustStoreFileIntegrity,
-  atomicPersistTrustStore,
-  defaultFsAdapter,
   MAX_TRUST_STORE_BYTES,
 } from '../packages/auth/dist/index.js';
+import {
+  defaultFsAdapter,
+  verifyTrustStoreFileIntegrityWithAdapter,
+  atomicPersistTrustStoreWithAdapter,
+} from '../packages/auth/dist/internal-testing.js';
 import { ArcError } from '../packages/protocol/dist/index.js';
 
 describe('CesSpace ARC — RC-05 Task 1: Device Identity, SPKI Pinning & Trust Store', () => {
@@ -488,12 +492,12 @@ describe('CesSpace ARC — RC-05 Task 1: Device Identity, SPKI Pinning & Trust S
       };
 
       assert.throws(
-        () => verifyTrustStoreFileIntegrity(filePath, mismatchedFileAdapter),
+        () => verifyTrustStoreFileIntegrityWithAdapter(filePath, mismatchedFileAdapter),
         (err) => err instanceof ArcError && err.code === 'ACCESS_DENIED',
       );
 
       assert.throws(
-        () => DeviceTrustStore.loadFromFile(filePath, mismatchedFileAdapter),
+        () => DeviceTrustStore.loadFromFileWithAdapter(filePath, mismatchedFileAdapter),
         (err) => err instanceof ArcError && err.code === 'ACCESS_DENIED',
       );
 
@@ -532,12 +536,12 @@ describe('CesSpace ARC — RC-05 Task 1: Device Identity, SPKI Pinning & Trust S
 
       // Both read and write verification fail closed on parent ownership mismatch
       assert.throws(
-        () => verifyTrustStoreFileIntegrity(filePath, mismatchedParentAdapter),
+        () => verifyTrustStoreFileIntegrityWithAdapter(filePath, mismatchedParentAdapter),
         (err) => err instanceof ArcError && err.code === 'ACCESS_DENIED',
       );
 
       assert.throws(
-        () => store.saveToFile(filePath, mismatchedParentAdapter),
+        () => store.saveToFileWithAdapter(filePath, mismatchedParentAdapter),
         (err) => err instanceof ArcError && err.code === 'ACCESS_DENIED',
       );
 
@@ -627,7 +631,7 @@ describe('CesSpace ARC — RC-05 Task 1: Device Identity, SPKI Pinning & Trust S
           throw new Error('Simulated write I/O failure');
         },
       };
-      assert.throws(() => store.saveToFile(filePath, writeFailAdapter));
+      assert.throws(() => store.saveToFileWithAdapter(filePath, writeFailAdapter));
       assert.equal(fs.readFileSync(filePath, 'utf8'), contentBefore, 'Prior target bytes intact');
       assertNoTempFiles();
 
@@ -637,7 +641,7 @@ describe('CesSpace ARC — RC-05 Task 1: Device Identity, SPKI Pinning & Trust S
         writeSync: () => 0, // zero progress
       };
       assert.throws(
-        () => store.saveToFile(filePath, shortWriteAdapter),
+        () => store.saveToFileWithAdapter(filePath, shortWriteAdapter),
         (err) => err instanceof ArcError && err.code === 'INTERNAL_ERROR',
       );
       assert.equal(fs.readFileSync(filePath, 'utf8'), contentBefore, 'Prior target bytes intact');
@@ -651,7 +655,7 @@ describe('CesSpace ARC — RC-05 Task 1: Device Identity, SPKI Pinning & Trust S
           throw new Error('Simulated file fsync failure');
         },
       };
-      assert.throws(() => store.saveToFile(filePath, fsyncFailAdapter));
+      assert.throws(() => store.saveToFileWithAdapter(filePath, fsyncFailAdapter));
       assert.equal(fs.readFileSync(filePath, 'utf8'), contentBefore, 'Prior target bytes intact');
       assertNoTempFiles();
 
@@ -662,9 +666,104 @@ describe('CesSpace ARC — RC-05 Task 1: Device Identity, SPKI Pinning & Trust S
           throw new Error('Simulated atomic rename failure');
         },
       };
-      assert.throws(() => store.saveToFile(filePath, renameFailAdapter));
+      assert.throws(() => store.saveToFileWithAdapter(filePath, renameFailAdapter));
       assert.equal(fs.readFileSync(filePath, 'utf8'), contentBefore, 'Prior target bytes intact');
       assertNoTempFiles();
+    });
+
+    test('Existing target trust-store integrity verified before overwrite (§16.1)', () => {
+      const store = DeviceTrustStore.createEmpty();
+      store.enrollDevice({ clientId: 'c1', clientType: 't1', pin: samplePin(0x11) });
+
+      // Helper to assert 0 temp files
+      const assertNoTempFiles = (dir) => {
+        const tempFiles = fs.readdirSync(dir).filter((f) => f.startsWith('.devices.json.tmp.'));
+        assert.equal(tempFiles.length, 0, `Expected 0 temp files, found: ${tempFiles.join(', ')}`);
+      };
+
+      // 1. Clean initial creation when target is absent
+      const freshTarget = path.join(tempDir, 'fresh-devices.json');
+      assert.equal(fs.existsSync(freshTarget), false);
+      assert.doesNotThrow(() => store.saveToFile(freshTarget));
+      assert.equal(fs.existsSync(freshTarget), true);
+      assertNoTempFiles(tempDir);
+
+      // 2. Existing symlink target MUST be rejected, not silently overwritten
+      const realTarget = path.join(tempDir, 'real-target.json');
+      fs.writeFileSync(realTarget, 'original-content', { mode: 0o600 });
+      const symlinkTarget = path.join(tempDir, 'symlink-target.json');
+      fs.symlinkSync(realTarget, symlinkTarget);
+
+      assert.throws(
+        () => store.saveToFile(symlinkTarget),
+        (err) => err instanceof ArcError && err.code === 'UNSAFE_SYMLINK',
+      );
+      // Verify symlink target and original file are untouched
+      assert.equal(fs.lstatSync(symlinkTarget).isSymbolicLink(), true);
+      assert.equal(fs.readFileSync(realTarget, 'utf8'), 'original-content');
+      assertNoTempFiles(tempDir);
+
+      // 3. Existing wrong-owner target MUST be rejected
+      if (process.platform !== 'win32' && typeof process.getuid === 'function') {
+        const currentUid = process.getuid();
+        const wrongOwnerTarget = path.join(tempDir, 'wrong-owner-target.json');
+        fs.writeFileSync(wrongOwnerTarget, 'prior-bytes', { mode: 0o600 });
+
+        const mismatchedTargetAdapter = {
+          ...defaultFsAdapter,
+          lstatSync: (p) => {
+            const s = fs.lstatSync(p);
+            if (path.resolve(p) === path.resolve(wrongOwnerTarget)) {
+              return {
+                isSymbolicLink: () => false,
+                isFile: () => true,
+                size: s.size,
+                mode: 0o100600,
+                uid: currentUid + 9999,
+              };
+            }
+            return s;
+          },
+        };
+
+        assert.throws(
+          () => store.saveToFileWithAdapter(wrongOwnerTarget, mismatchedTargetAdapter),
+          (err) => err instanceof ArcError && err.code === 'ACCESS_DENIED',
+        );
+        assert.equal(fs.readFileSync(wrongOwnerTarget, 'utf8'), 'prior-bytes');
+        assertNoTempFiles(tempDir);
+      }
+
+      // 4. Existing insecure-mode target MUST be rejected (0644 and 0666)
+      if (process.platform !== 'win32') {
+        const insecureTarget = path.join(tempDir, 'insecure-mode-target.json');
+        fs.writeFileSync(insecureTarget, 'prior-mode-bytes', { mode: 0o644 });
+
+        assert.throws(
+          () => store.saveToFile(insecureTarget),
+          (err) => err instanceof ArcError && err.code === 'ACCESS_DENIED',
+        );
+        assert.equal(fs.readFileSync(insecureTarget, 'utf8'), 'prior-mode-bytes');
+        assertNoTempFiles(tempDir);
+
+        fs.chmodSync(insecureTarget, 0o666);
+        assert.throws(
+          () => store.saveToFile(insecureTarget),
+          (err) => err instanceof ArcError && err.code === 'ACCESS_DENIED',
+        );
+        assert.equal(fs.readFileSync(insecureTarget, 'utf8'), 'prior-mode-bytes');
+        assertNoTempFiles(tempDir);
+      }
+
+      // 5. Existing non-regular target (directory) MUST be rejected
+      const dirAsTarget = path.join(tempDir, 'dir-as-target.json');
+      fs.mkdirSync(dirAsTarget, { mode: 0o700 });
+      assert.throws(
+        () => store.saveToFile(dirAsTarget),
+        (err) => err instanceof ArcError && err.code === 'NOT_A_FILE',
+      );
+      assert.equal(fs.statSync(dirAsTarget).isDirectory(), true);
+      assertNoTempFiles(tempDir);
     });
 
     test('Path traversal sequences (..) and invalid paths fail closed (§16.1)', () => {
@@ -708,22 +807,38 @@ describe('CesSpace ARC — RC-05 Task 1: Device Identity, SPKI Pinning & Trust S
       );
     });
 
-    test('Directory fsync error handling: real I/O failure fails closed vs recognized unsupported', () => {
+    test('Directory fsync error handling: recognized unsupported vs fail-closed operational errors', () => {
       if (process.platform === 'win32') return;
 
       const filePath = path.join(tempDir, 'devices.json');
       const store = DeviceTrustStore.createEmpty();
       store.enrollDevice({ clientId: 'c1', clientType: 't1', pin: samplePin(0x11) });
 
-      // 1. Real I/O failure during parent directory fsync MUST NOT be silently swallowed
-      let dirOpened = false;
-      const ioErrorAdapter = {
+      // 1. Recognized unsupported codes (ENOTSUP, EOPNOTSUPP, EINVAL) are tolerated
+      for (const unsupportedCode of ['ENOTSUP', 'EOPNOTSUPP', 'EINVAL']) {
+        const unsupportedAdapter = {
+          ...defaultFsAdapter,
+          openSync: (p, flags, mode) => {
+            if (path.resolve(p) === path.resolve(tempDir)) {
+              const err = new Error(`Directory sync not supported: ${unsupportedCode}`);
+              err.code = unsupportedCode;
+              throw err;
+            }
+            return defaultFsAdapter.openSync(p, flags, mode);
+          },
+        };
+
+        assert.doesNotThrow(
+          () => atomicPersistTrustStoreWithAdapter(filePath, store.toData(), unsupportedAdapter),
+          `Code ${unsupportedCode} should be tolerated`,
+        );
+      }
+
+      // 2. EIO must fail closed and report failure
+      const eioAdapter = {
         ...defaultFsAdapter,
         openSync: (p, flags, mode) => {
-          if (path.resolve(p) === path.resolve(tempDir)) {
-            dirOpened = true;
-            return 999;
-          }
+          if (path.resolve(p) === path.resolve(tempDir)) return 999;
           return defaultFsAdapter.openSync(p, flags, mode);
         },
         fsyncSync: (fd) => {
@@ -739,27 +854,59 @@ describe('CesSpace ARC — RC-05 Task 1: Device Identity, SPKI Pinning & Trust S
           return defaultFsAdapter.closeSync(fd);
         },
       };
-
       assert.throws(
-        () => atomicPersistTrustStore(filePath, store.toData(), ioErrorAdapter),
+        () => atomicPersistTrustStoreWithAdapter(filePath, store.toData(), eioAdapter),
         (err) => err instanceof ArcError && err.code === 'INTERNAL_ERROR',
       );
-      assert.equal(dirOpened, true);
 
-      // 2. Recognized unsupported error code (e.g. ENOTSUP on unsupported filesystem) is tolerated
-      const enotsupAdapter = {
+      // 3. EBADF must fail closed and report failure
+      const ebadfAdapter = {
         ...defaultFsAdapter,
         openSync: (p, flags, mode) => {
           if (path.resolve(p) === path.resolve(tempDir)) {
-            const err = new Error('Directory sync not supported');
-            err.code = 'ENOTSUP';
+            const err = new Error('Bad file descriptor');
+            err.code = 'EBADF';
             throw err;
           }
           return defaultFsAdapter.openSync(p, flags, mode);
         },
       };
+      assert.throws(
+        () => atomicPersistTrustStoreWithAdapter(filePath, store.toData(), ebadfAdapter),
+        (err) => err instanceof ArcError && err.code === 'INTERNAL_ERROR',
+      );
 
-      assert.doesNotThrow(() => atomicPersistTrustStore(filePath, store.toData(), enotsupAdapter));
+      // 4. EPERM must fail closed and report failure
+      const epermAdapter = {
+        ...defaultFsAdapter,
+        openSync: (p, flags, mode) => {
+          if (path.resolve(p) === path.resolve(tempDir)) {
+            const err = new Error('Operation not permitted');
+            err.code = 'EPERM';
+            throw err;
+          }
+          return defaultFsAdapter.openSync(p, flags, mode);
+        },
+      };
+      assert.throws(
+        () => atomicPersistTrustStoreWithAdapter(filePath, store.toData(), epermAdapter),
+        (err) => err instanceof ArcError && err.code === 'INTERNAL_ERROR',
+      );
+
+      // 5. Unexpected error without code must fail closed
+      const unexpectedAdapter = {
+        ...defaultFsAdapter,
+        openSync: (p, flags, mode) => {
+          if (path.resolve(p) === path.resolve(tempDir)) {
+            throw new Error('Unexpected catastrophic error');
+          }
+          return defaultFsAdapter.openSync(p, flags, mode);
+        },
+      };
+      assert.throws(
+        () => atomicPersistTrustStoreWithAdapter(filePath, store.toData(), unexpectedAdapter),
+        (err) => err instanceof ArcError && err.code === 'INTERNAL_ERROR',
+      );
     });
 
     test('Parent directory write integrity enforcement fails before writing temporary state', () => {
@@ -793,6 +940,36 @@ describe('CesSpace ARC — RC-05 Task 1: Device Identity, SPKI Pinning & Trust S
         (err) => err instanceof ArcError && err.code === 'UNSAFE_SYMLINK',
       );
       assert.equal(fs.readdirSync(realDir).length, 0);
+    });
+
+    test('Public API does not expose filesystem adapter or bypass seams (§16.1)', () => {
+      // 1. Module exports check: @cesspace-arc/auth must not export adapter interfaces/defaults
+      assert.equal(PublicAuth.TrustStoreFsAdapter, undefined);
+      assert.equal(PublicAuth.defaultFsAdapter, undefined);
+      assert.equal(PublicAuth.verifyTrustStoreFileIntegrityWithAdapter, undefined);
+      assert.equal(PublicAuth.atomicPersistTrustStoreWithAdapter, undefined);
+
+      // 2. Parameter arity check: production API signatures take only domain arguments
+      assert.equal(
+        PublicAuth.DeviceTrustStore.loadFromFile.length,
+        1,
+        'loadFromFile accepts only filePath',
+      );
+      assert.equal(
+        PublicAuth.DeviceTrustStore.prototype.saveToFile.length,
+        1,
+        'saveToFile accepts only filePath',
+      );
+      assert.equal(
+        PublicAuth.verifyTrustStoreFileIntegrity.length,
+        1,
+        'verifyTrustStoreFileIntegrity accepts only filePath',
+      );
+      assert.equal(
+        PublicAuth.atomicPersistTrustStore.length,
+        2,
+        'atomicPersistTrustStore accepts only filePath and data',
+      );
     });
   });
 

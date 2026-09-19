@@ -368,7 +368,14 @@ export function validateTrustStoreParentDirectoryStat(
  * 5. Parent directory must be owned by process UID or root, and not group/world writable.
  * 6. Size must not exceed 256 KiB.
  */
-export function verifyTrustStoreFileIntegrity(
+export function verifyTrustStoreFileIntegrity(filePath: string): void {
+  verifyTrustStoreFileIntegrityWithAdapter(filePath, defaultFsAdapter);
+}
+
+/**
+ * @internal Internal implementation of verifyTrustStoreFileIntegrity with filesystem adapter.
+ */
+export function verifyTrustStoreFileIntegrityWithAdapter(
   filePath: string,
   fsAdapter: TrustStoreFsAdapter = defaultFsAdapter,
 ): void {
@@ -412,13 +419,21 @@ export function verifyTrustStoreFileIntegrity(
  * 1. Reject traversal sequences or malformed paths.
  * 2. Validate data against schema and size ceiling.
  * 3. Enforce parent directory ownership (process UID or root) and non-writable permissions BEFORE writing.
- * 4. Write to a temporary file in the same directory mode 0600, guaranteeing complete bytes written.
- * 5. fsync temporary file.
- * 6. Rename over destination path.
- * 7. fsync parent directory where supported, propagating actual I/O errors fail-closed.
- * 8. Clean up temporary files on pre-commit failures and preserve prior valid state.
+ * 4. Validate existing destination target file integrity if present BEFORE creating temporary file (§16.1).
+ * 5. Write to a temporary file in the same directory mode 0600, guaranteeing complete bytes written.
+ * 6. fsync temporary file.
+ * 7. Rename over destination path.
+ * 8. fsync parent directory where supported, propagating actual I/O or operational errors fail-closed.
+ * 9. Clean up temporary files on pre-commit failures and preserve prior valid state.
  */
-export function atomicPersistTrustStore(
+export function atomicPersistTrustStore(filePath: string, data: DeviceTrustStoreData): void {
+  atomicPersistTrustStoreWithAdapter(filePath, data, defaultFsAdapter);
+}
+
+/**
+ * @internal Internal implementation of atomicPersistTrustStore with filesystem adapter.
+ */
+export function atomicPersistTrustStoreWithAdapter(
   filePath: string,
   data: DeviceTrustStoreData,
   fsAdapter: TrustStoreFsAdapter = defaultFsAdapter,
@@ -444,7 +459,7 @@ export function atomicPersistTrustStore(
       ? process.getuid()
       : 0;
 
-  // Validate parent directory integrity before writing any temporary trust state (§16.1)
+  // 1. Validate parent directory integrity before writing any temporary trust state (§16.1)
   let parentStat: fs.Stats | MinimalTrustStoreDirStat;
   try {
     parentStat = fsAdapter.lstatSync(parentDir) as MinimalTrustStoreDirStat;
@@ -452,6 +467,20 @@ export function atomicPersistTrustStore(
     throw ArcError.parentNotFound(`Cannot persist: parent directory not found: ${parentDir}`);
   }
   validateTrustStoreParentDirectoryStat(parentStat, currentUid, parentDir);
+
+  // 2. Validate existing destination target file if present BEFORE creating temporary file (§16.1)
+  try {
+    const targetStat = fsAdapter.lstatSync(resolved) as MinimalTrustStoreFileStat;
+    validateTrustStoreFileStat(targetStat, currentUid, resolved);
+  } catch (err: unknown) {
+    if (err instanceof ArcError) {
+      throw err;
+    }
+    const error = err as NodeJS.ErrnoException;
+    if (error.code !== 'ENOENT') {
+      throw ArcError.internalError(`Failed to stat destination trust store file: ${error.message}`);
+    }
+  }
 
   const tmpFilename = `.devices.json.tmp.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}`;
   const tmpPath = path.join(parentDir, tmpFilename);
@@ -502,18 +531,15 @@ export function atomicPersistTrustStore(
         fsAdapter.fsyncSync(dirFd);
       } catch (err: unknown) {
         const error = err as NodeJS.ErrnoException;
-        const unsupportedCodes = new Set([
-          'ENOTSUP',
-          'EOPNOTSUPP',
-          'EINVAL',
-          'EBADF',
-          'EISDIR',
-          'EPERM',
-        ]);
+        // Specifically recognized unsupported error codes when opening or syncing a directory descriptor:
+        // ENOTSUP / EOPNOTSUPP: Operation not supported on directory synchronization
+        // EINVAL: Invalid argument where OS/filesystem does not support directory synchronization
+        const unsupportedCodes = new Set(['ENOTSUP', 'EOPNOTSUPP', 'EINVAL']);
         if (error.code && unsupportedCodes.has(error.code)) {
           // Platform or filesystem genuinely does not support directory fsync; tolerated.
         } else {
-          // Real I/O error or unexpected failure: MUST NOT be swallowed!
+          // Real I/O error (EIO, ENOSPC), bad descriptor (EBADF), permission (EPERM),
+          // is-a-directory (EISDIR) or other failure: MUST NOT be silently swallowed!
           throw ArcError.internalError(
             `Failed to fsync trust store parent directory '${parentDir}': ${error.message || String(err)}`,
           );
@@ -571,13 +597,29 @@ export class DeviceTrustStore {
 
   /**
    * Load trust store from a file on disk after verifying filesystem integrity and schema.
-   * Corrupt, missing, unreadable, or invalid store throws and never silently defaults to empty.
+   * Production entry point using real filesystem. Corrupt, missing, unreadable, or invalid
+   * store throws and never silently defaults to empty.
    */
-  public static loadFromFile(
+  public static loadFromFile(filePath: string): DeviceTrustStore {
+    return DeviceTrustStore.loadFromFileWithAdapter(filePath, defaultFsAdapter);
+  }
+
+  /**
+   * Persist current in-memory store atomically to disk.
+   * Production entry point using real filesystem.
+   */
+  public saveToFile(filePath: string): void {
+    this.saveToFileWithAdapter(filePath, defaultFsAdapter);
+  }
+
+  /**
+   * @internal Internal adapter-aware loader for deterministic tests.
+   */
+  public static loadFromFileWithAdapter(
     filePath: string,
     fsAdapter: TrustStoreFsAdapter = defaultFsAdapter,
   ): DeviceTrustStore {
-    verifyTrustStoreFileIntegrity(filePath, fsAdapter);
+    verifyTrustStoreFileIntegrityWithAdapter(filePath, fsAdapter);
 
     const resolved = path.resolve(filePath);
     const content = fsAdapter.readFileSync(resolved, 'utf8');
@@ -602,10 +644,13 @@ export class DeviceTrustStore {
   }
 
   /**
-   * Persist current in-memory store atomically to disk.
+   * @internal Internal adapter-aware persister for deterministic tests.
    */
-  public saveToFile(filePath: string, fsAdapter: TrustStoreFsAdapter = defaultFsAdapter): void {
-    atomicPersistTrustStore(filePath, this.toData(), fsAdapter);
+  public saveToFileWithAdapter(
+    filePath: string,
+    fsAdapter: TrustStoreFsAdapter = defaultFsAdapter,
+  ): void {
+    atomicPersistTrustStoreWithAdapter(filePath, this.toData(), fsAdapter);
   }
 
   /**
