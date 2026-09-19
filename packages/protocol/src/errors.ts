@@ -498,4 +498,43 @@ export class ArcError extends Error implements ArcErrorPayload {
         'apply_patch only supports modifying existing regular text files. File creation, deletion, renaming, binary patches, and mode changes are forbidden.',
     });
   }
+
+  public static unauthenticated(
+    message = 'Authentication failed.',
+    details?: Record<string, string | number | boolean>,
+  ): ArcError {
+    return new ArcError({
+      code: 'UNAUTHENTICATED',
+      category: 'AUTHENTICATION',
+      message,
+      details,
+      retryable: false,
+    });
+  }
+
+  public static invalidSessionToken(
+    message = 'Invalid or expired session token.',
+    details?: Record<string, string | number | boolean>,
+  ): ArcError {
+    return new ArcError({
+      code: 'INVALID_SESSION_TOKEN',
+      category: 'AUTHENTICATION',
+      message,
+      details,
+      retryable: false,
+    });
+  }
+
+  public static deviceNotEnrolled(
+    message = 'Device not enrolled in trust store.',
+    details?: Record<string, string | number | boolean>,
+  ): ArcError {
+    return new ArcError({
+      code: 'DEVICE_NOT_ENROLLED',
+      category: 'AUTHENTICATION',
+      message,
+      details,
+      retryable: false,
+    });
+  }
 }

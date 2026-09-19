@@ -14,3 +14,6 @@ export interface IAuthEngine {
   verifyToken(token: string): Promise<AuthTokenClaims>;
   generateSessionToken(claims: Omit<AuthTokenClaims, 'issuedAt' | 'expiresAt'>): Promise<string>;
 }
+
+export * from './device-identity.js';
+export * from './trust-store.js';

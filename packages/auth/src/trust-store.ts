@@ -1,0 +1,678 @@
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { ArcError } from '@cesspace-arc/protocol';
+import {
+  EnrolledDeviceRecord,
+  EnrollDeviceInput,
+  generateDeviceId,
+  isValidDeviceId,
+  isValidSpkiPin,
+  validateDisplayLabel,
+  MAX_ACTIVE_PINS_PER_DEVICE,
+  MAX_ENROLLED_DEVICES,
+  MAX_TRUST_STORE_BYTES,
+} from './device-identity.js';
+
+/**
+ * Top-level structure for devices.json trust store.
+ * Strict closed schema: version must be 1, devices must be an array of EnrolledDeviceRecord.
+ */
+export interface DeviceTrustStoreData {
+  readonly version: 1;
+  readonly devices: readonly EnrolledDeviceRecord[];
+}
+
+/**
+ * Validate trust store data against strict closed-schema rules.
+ * Unknown fields, malformed records, duplicate IDs, duplicate pins, or invalid bounds fail closed.
+ */
+export function validateTrustStoreData(raw: unknown): DeviceTrustStoreData {
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+    throw ArcError.invalidRequestSchema('Trust store data must be a JSON object.');
+  }
+
+  const record = raw as Record<string, unknown>;
+  const allowedTopKeys = new Set(['version', 'devices']);
+  for (const key of Object.keys(record)) {
+    if (!allowedTopKeys.has(key)) {
+      throw ArcError.invalidRequestSchema(
+        `Unknown field '${key}' in trust store root. Strict closed schema enforced.`,
+      );
+    }
+  }
+
+  if (record.version !== 1) {
+    throw ArcError.invalidRequestSchema(
+      `Unsupported trust store version '${String(record.version)}'. Expected version 1.`,
+    );
+  }
+
+  if (!Array.isArray(record.devices)) {
+    throw ArcError.invalidRequestSchema('Trust store devices field must be an array.');
+  }
+
+  if (record.devices.length > MAX_ENROLLED_DEVICES) {
+    throw ArcError.resourceExhausted(
+      `Trust store exceeds maximum enrolled devices limit of ${MAX_ENROLLED_DEVICES} (got ${record.devices.length}).`,
+    );
+  }
+
+  const seenDeviceIds = new Set<string>();
+  const seenPins = new Set<string>();
+  const validatedDevices: EnrolledDeviceRecord[] = [];
+
+  const allowedDeviceKeys = new Set([
+    'deviceId',
+    'clientId',
+    'clientType',
+    'pins',
+    'enrolledAt',
+    'displayLabel',
+    'revoked',
+  ]);
+
+  for (let i = 0; i < record.devices.length; i++) {
+    const dev = record.devices[i];
+    if (typeof dev !== 'object' || dev === null || Array.isArray(dev)) {
+      throw ArcError.invalidRequestSchema(`Device record at index ${i} must be an object.`);
+    }
+
+    const devObj = dev as Record<string, unknown>;
+    for (const key of Object.keys(devObj)) {
+      if (!allowedDeviceKeys.has(key)) {
+        throw ArcError.invalidRequestSchema(
+          `Unknown field '${key}' in device record at index ${i}. Strict closed schema enforced.`,
+        );
+      }
+    }
+
+    // deviceId
+    if (!isValidDeviceId(devObj.deviceId)) {
+      throw ArcError.invalidRequestSchema(
+        `Invalid deviceId at index ${i}: must be exactly 32 lowercase hexadecimal characters.`,
+      );
+    }
+    if (seenDeviceIds.has(devObj.deviceId)) {
+      throw ArcError.invalidRequestSchema(
+        `Duplicate deviceId '${devObj.deviceId}' in trust store at index ${i}.`,
+      );
+    }
+    seenDeviceIds.add(devObj.deviceId);
+
+    // clientId
+    if (
+      typeof devObj.clientId !== 'string' ||
+      devObj.clientId.trim().length === 0 ||
+      devObj.clientId.length > 128
+    ) {
+      throw ArcError.invalidRequestSchema(
+        `Invalid clientId at index ${i}: must be a non-empty string up to 128 characters.`,
+      );
+    }
+
+    // clientType
+    if (
+      typeof devObj.clientType !== 'string' ||
+      devObj.clientType.trim().length === 0 ||
+      devObj.clientType.length > 64
+    ) {
+      throw ArcError.invalidRequestSchema(
+        `Invalid clientType at index ${i}: must be a non-empty string up to 64 characters.`,
+      );
+    }
+
+    // pins
+    if (!Array.isArray(devObj.pins)) {
+      throw ArcError.invalidRequestSchema(`pins at index ${i} must be an array.`);
+    }
+    if (devObj.pins.length === 0) {
+      throw ArcError.invalidRequestSchema(
+        `Empty pin set for device '${devObj.deviceId}' at index ${i}. Device must have at least 1 pin.`,
+      );
+    }
+    if (devObj.pins.length > MAX_ACTIVE_PINS_PER_DEVICE) {
+      throw ArcError.resourceExhausted(
+        `Device '${devObj.deviceId}' exceeds maximum active pins of ${MAX_ACTIVE_PINS_PER_DEVICE} (got ${devObj.pins.length}).`,
+      );
+    }
+
+    const devicePins = new Set<string>();
+    for (let pIdx = 0; pIdx < devObj.pins.length; pIdx++) {
+      const pin = devObj.pins[pIdx];
+      if (!isValidSpkiPin(pin)) {
+        throw ArcError.invalidRequestSchema(
+          `Invalid SPKI pin at index ${i}, pin index ${pIdx}: must be 64 lowercase hexadecimal characters.`,
+        );
+      }
+      if (devicePins.has(pin)) {
+        throw ArcError.invalidRequestSchema(
+          `Duplicate pin '${pin}' within device '${devObj.deviceId}'.`,
+        );
+      }
+      devicePins.add(pin);
+
+      if (seenPins.has(pin)) {
+        throw ArcError.invalidRequestSchema(
+          `Pin collision: SPKI pin '${pin}' belongs to more than one enrolled device.`,
+        );
+      }
+      seenPins.add(pin);
+    }
+
+    // enrolledAt
+    if (typeof devObj.enrolledAt !== 'string' || devObj.enrolledAt.trim().length === 0) {
+      throw ArcError.invalidRequestSchema(
+        `Invalid enrolledAt at index ${i}: must be a non-empty ISO 8601 string.`,
+      );
+    }
+
+    // displayLabel
+    const displayLabel = validateDisplayLabel(devObj.displayLabel ?? '');
+
+    // revoked
+    if (typeof devObj.revoked !== 'boolean') {
+      throw ArcError.invalidRequestSchema(
+        `Invalid revoked state at index ${i}: must be a boolean.`,
+      );
+    }
+
+    validatedDevices.push({
+      deviceId: devObj.deviceId,
+      clientId: devObj.clientId,
+      clientType: devObj.clientType,
+      pins: Object.freeze([...devObj.pins]),
+      enrolledAt: devObj.enrolledAt,
+      displayLabel,
+      revoked: devObj.revoked,
+    });
+  }
+
+  return {
+    version: 1,
+    devices: Object.freeze(validatedDevices),
+  };
+}
+
+/**
+ * Perform filesystem integrity checks on the trust store path (§16.1):
+ * 1. Regular file only (reject symlinks via lstat/O_NOFOLLOW).
+ * 2. Ownership must match current process UID.
+ * 3. File mode must be strictly 0600 (mode & 0077 === 0).
+ * 4. Parent directory must be owned by process UID or root, and not group/world writable.
+ * 5. Size must not exceed 256 KiB.
+ */
+export function verifyTrustStoreFileIntegrity(filePath: string): void {
+  if (typeof filePath !== 'string' || filePath.trim().length === 0) {
+    throw ArcError.invalidRequestSchema('Trust store filePath must be a non-empty string.');
+  }
+
+  const resolved = path.resolve(filePath);
+
+  // Check file stats using lstat to catch symlinks
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(resolved);
+  } catch (err: unknown) {
+    const error = err as NodeJS.ErrnoException;
+    if (error.code === 'ENOENT') {
+      throw ArcError.fileNotFound(`Trust store file not found: ${resolved}`);
+    }
+    throw ArcError.internalError(`Failed to stat trust store file: ${error.message}`);
+  }
+
+  // Symlink check
+  if (stat.isSymbolicLink()) {
+    throw ArcError.unsafeSymlink(
+      `Trust store file is a symbolic link: ${resolved}. Symlinks are strictly forbidden.`,
+    );
+  }
+
+  // Regular file check
+  if (!stat.isFile()) {
+    throw ArcError.notAFile(`Trust store path is not a regular file: ${resolved}`);
+  }
+
+  // Size ceiling
+  if (stat.size > MAX_TRUST_STORE_BYTES) {
+    throw ArcError.resourceExhausted(
+      `Trust store file exceeds maximum size ceiling of ${MAX_TRUST_STORE_BYTES} bytes (got ${stat.size} bytes).`,
+    );
+  }
+
+  // POSIX permissions and ownership checks
+  if (process.platform !== 'win32') {
+    // Mode must be strictly 0600: any group/world bit (0077) is forbidden
+    if ((stat.mode & 0o077) !== 0) {
+      throw ArcError.accessDenied(
+        `Trust store permissions 0${(stat.mode & 0o777).toString(8)} are insecure. Must be mode 0600 (group/world access forbidden).`,
+      );
+    }
+
+    // Ownership must equal current process UID
+    if (typeof process.getuid === 'function') {
+      const currentUid = process.getuid();
+      if (stat.uid !== currentUid) {
+        throw ArcError.accessDenied(
+          `Trust store file owner UID (${stat.uid}) does not match process UID (${currentUid}).`,
+        );
+      }
+    }
+
+    // Parent directory checks
+    const parentDir = path.dirname(resolved);
+    let parentStat: fs.Stats;
+    try {
+      parentStat = fs.lstatSync(parentDir);
+    } catch {
+      throw ArcError.parentNotFound(`Trust store parent directory not found: ${parentDir}`);
+    }
+
+    if (parentStat.isSymbolicLink()) {
+      throw ArcError.unsafeSymlink(
+        `Trust store parent directory is a symbolic link: ${parentDir}.`,
+      );
+    }
+
+    if (!parentStat.isDirectory()) {
+      throw ArcError.notADirectory(`Trust store parent path is not a directory: ${parentDir}.`);
+    }
+
+    // Parent directory must not be group or world writable (mode & 0022 === 0)
+    if ((parentStat.mode & 0o022) !== 0) {
+      throw ArcError.accessDenied(
+        `Trust store parent directory permissions 0${(parentStat.mode & 0o777).toString(8)} are group or world writable.`,
+      );
+    }
+
+    // Parent directory must be owned by process UID or root (UID 0)
+    if (typeof process.getuid === 'function') {
+      const currentUid = process.getuid();
+      if (parentStat.uid !== currentUid && parentStat.uid !== 0) {
+        throw ArcError.accessDenied(
+          `Trust store parent directory owner UID (${parentStat.uid}) is neither process UID (${currentUid}) nor root (0).`,
+        );
+      }
+    }
+  }
+}
+
+/**
+ * Atomically persist trust store data to disk following the §16.1 protocol:
+ * 1. Validate data against schema and size ceiling.
+ * 2. Write to a temporary file in the same directory mode 0600.
+ * 3. fsync temporary file.
+ * 4. Rename over destination path.
+ * 5. fsync parent directory where supported.
+ * 6. Fail closed on any error without corrupting or modifying prior state.
+ */
+export function atomicPersistTrustStore(filePath: string, data: DeviceTrustStoreData): void {
+  const validated = validateTrustStoreData(data);
+  const serialized = JSON.stringify(validated, null, 2);
+  const serializedBytes = Buffer.byteLength(serialized, 'utf8');
+
+  if (serializedBytes > MAX_TRUST_STORE_BYTES) {
+    throw ArcError.resourceExhausted(
+      `Serialized trust store exceeds ${MAX_TRUST_STORE_BYTES} byte ceiling (${serializedBytes} bytes).`,
+    );
+  }
+
+  const resolved = path.resolve(filePath);
+  const parentDir = path.dirname(resolved);
+
+  // Validate parent directory integrity
+  if (process.platform !== 'win32') {
+    const parentStat = fs.lstatSync(parentDir);
+    if (parentStat.isSymbolicLink()) {
+      throw ArcError.unsafeSymlink('Cannot persist: parent directory is a symlink.');
+    }
+    if (!parentStat.isDirectory()) {
+      throw ArcError.notADirectory('Cannot persist: parent path is not a directory.');
+    }
+    if ((parentStat.mode & 0o022) !== 0) {
+      throw ArcError.accessDenied('Cannot persist: parent directory is group or world writable.');
+    }
+  }
+
+  const tmpFilename = `.devices.json.tmp.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}`;
+  const tmpPath = path.join(parentDir, tmpFilename);
+
+  let fd: number | null = null;
+  try {
+    // Open temporary file with exclusive creation and mode 0600
+    fd = fs.openSync(
+      tmpPath,
+      fs.constants.O_CREAT | fs.constants.O_WRONLY | fs.constants.O_EXCL,
+      0o600,
+    );
+
+    // Write full buffer
+    fs.writeSync(fd, Buffer.from(serialized, 'utf8'));
+
+    // fsync to flush data to disk
+    fs.fsyncSync(fd);
+
+    fs.closeSync(fd);
+    fd = null;
+
+    // Atomically rename over destination path
+    fs.renameSync(tmpPath, resolved);
+
+    // fsync parent directory where supported
+    if (process.platform !== 'win32') {
+      try {
+        const dirFd = fs.openSync(parentDir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+        try {
+          fs.fsyncSync(dirFd);
+        } finally {
+          fs.closeSync(dirFd);
+        }
+      } catch {
+        // Some filesystems don't permit fsync on directory descriptors; ignore
+      }
+    }
+  } catch (err: unknown) {
+    // Clean up temporary file if it still exists
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // ignore close error during cleanup
+      }
+    }
+    try {
+      if (fs.existsSync(tmpPath)) {
+        fs.unlinkSync(tmpPath);
+      }
+    } catch {
+      // ignore cleanup failure
+    }
+    throw err;
+  }
+}
+
+/**
+ * In-memory manager for enrolled device trust and pinning invariants (§7, §8, §16).
+ */
+export class DeviceTrustStore {
+  private readonly devices: Map<string, EnrolledDeviceRecord> = new Map();
+
+  constructor(initialData?: DeviceTrustStoreData) {
+    if (initialData) {
+      const validated = validateTrustStoreData(initialData);
+      for (const dev of validated.devices) {
+        this.devices.set(dev.deviceId, dev);
+      }
+    }
+  }
+
+  /**
+   * Create an empty in-memory trust store.
+   */
+  public static createEmpty(): DeviceTrustStore {
+    return new DeviceTrustStore({ version: 1, devices: [] });
+  }
+
+  /**
+   * Load trust store from a file on disk after verifying filesystem integrity and schema.
+   * Corrupt, missing, unreadable, or invalid store throws and never silently defaults to empty.
+   */
+  public static loadFromFile(filePath: string): DeviceTrustStore {
+    verifyTrustStoreFileIntegrity(filePath);
+
+    const resolved = path.resolve(filePath);
+    const content = fs.readFileSync(resolved, 'utf8');
+
+    if (Buffer.byteLength(content, 'utf8') > MAX_TRUST_STORE_BYTES) {
+      throw ArcError.resourceExhausted(
+        `Trust store file exceeds maximum size ceiling of ${MAX_TRUST_STORE_BYTES} bytes.`,
+      );
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(content);
+    } catch {
+      throw ArcError.invalidRequestSchema(
+        'Failed to parse trust store file: content is not valid JSON.',
+      );
+    }
+
+    const validated = validateTrustStoreData(parsed);
+    return new DeviceTrustStore(validated);
+  }
+
+  /**
+   * Persist current in-memory store atomically to disk.
+   */
+  public saveToFile(filePath: string): void {
+    atomicPersistTrustStore(filePath, this.toData());
+  }
+
+  /**
+   * Export the current store state as a immutable DeviceTrustStoreData object.
+   */
+  public toData(): DeviceTrustStoreData {
+    return {
+      version: 1,
+      devices: Object.freeze(this.getDevices()),
+    };
+  }
+
+  /**
+   * Return a snapshot list of all enrolled device records.
+   */
+  public getDevices(): readonly EnrolledDeviceRecord[] {
+    return Object.freeze(Array.from(this.devices.values()));
+  }
+
+  /**
+   * Return the count of enrolled devices.
+   */
+  public getDeviceCount(): number {
+    return this.devices.size;
+  }
+
+  /**
+   * Find a device by its ARC-assigned deviceId.
+   */
+  public findDeviceById(deviceId: string): EnrolledDeviceRecord | undefined {
+    return this.devices.get(deviceId);
+  }
+
+  /**
+   * Find an enrolled device by an active SPKI pin.
+   * A pin maps to at most one enrolled device globally.
+   */
+  public findDeviceByPin(pin: string): EnrolledDeviceRecord | undefined {
+    for (const dev of this.devices.values()) {
+      if (dev.pins.includes(pin)) {
+        return dev;
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Query if a device is marked revoked.
+   */
+  public isDeviceRevoked(deviceId: string): boolean {
+    const dev = this.devices.get(deviceId);
+    return dev !== undefined && dev.revoked;
+  }
+
+  /**
+   * Enroll a device in the trust store (§8):
+   * - If the pin already exists with the same clientId: reuses existing deviceId.
+   * - If the pin already exists with a different clientId: rejected.
+   * - If the pin is new: assigns a fresh ARC deviceId, checking 256-device limit.
+   * - Display label validated <= 64 UTF-8 bytes.
+   */
+  public enrollDevice(input: EnrollDeviceInput): {
+    device: EnrolledDeviceRecord;
+    reconnected: boolean;
+  } {
+    if (typeof input !== 'object' || input === null) {
+      throw ArcError.invalidRequestSchema('EnrollDeviceInput must be an object.');
+    }
+
+    const { clientId, clientType, pin } = input;
+    if (typeof clientId !== 'string' || clientId.trim().length === 0) {
+      throw ArcError.invalidRequestSchema('clientId must be a non-empty string.');
+    }
+    if (typeof clientType !== 'string' || clientType.trim().length === 0) {
+      throw ArcError.invalidRequestSchema('clientType must be a non-empty string.');
+    }
+    if (!isValidSpkiPin(pin)) {
+      throw ArcError.invalidRequestSchema(
+        'Invalid SPKI pin: must be exactly 64 lowercase hexadecimal characters.',
+      );
+    }
+
+    const displayLabel = validateDisplayLabel(input.displayLabel ?? '');
+
+    // Check duplicate enrollment
+    const existing = this.findDeviceByPin(pin);
+    if (existing) {
+      if (existing.clientId === clientId) {
+        // Same pin, same clientId: reuse existing device record (§8)
+        return { device: existing, reconnected: true };
+      }
+      // Same pin, different clientId: reject
+      throw ArcError.invalidRequestSchema(
+        `SPKI pin '${pin}' is already enrolled under a different clientId ('${existing.clientId}').`,
+      );
+    }
+
+    // New device: check capacity ceiling
+    if (this.devices.size >= MAX_ENROLLED_DEVICES) {
+      throw ArcError.resourceExhausted(
+        `Cannot enroll device: trust store has reached the maximum of ${MAX_ENROLLED_DEVICES} devices.`,
+      );
+    }
+
+    // Preflight serialized size
+    const newRecord: EnrolledDeviceRecord = {
+      deviceId: generateDeviceId(),
+      clientId,
+      clientType,
+      pins: Object.freeze([pin]),
+      enrolledAt: new Date().toISOString(),
+      displayLabel,
+      revoked: false,
+    };
+
+    // Verify addition does not exceed 256 KiB
+    const candidateData: DeviceTrustStoreData = {
+      version: 1,
+      devices: [...this.devices.values(), newRecord],
+    };
+    const testJson = JSON.stringify(candidateData);
+    if (Buffer.byteLength(testJson, 'utf8') > MAX_TRUST_STORE_BYTES) {
+      throw ArcError.resourceExhausted(
+        `Cannot enroll device: resulting trust store exceeds ${MAX_TRUST_STORE_BYTES} byte ceiling.`,
+      );
+    }
+
+    this.devices.set(newRecord.deviceId, newRecord);
+    return { device: newRecord, reconnected: false };
+  }
+
+  /**
+   * Add a pin to an existing device (rotation overlap window, §7 P-7).
+   * Device can have at most 2 active pins. Adding a 3rd active pin fails closed.
+   */
+  public addPinToDevice(deviceId: string, newPin: string): void {
+    const dev = this.devices.get(deviceId);
+    if (!dev) {
+      throw ArcError.deviceNotEnrolled(`Device '${deviceId}' is not enrolled in trust store.`);
+    }
+
+    if (!isValidSpkiPin(newPin)) {
+      throw ArcError.invalidRequestSchema(
+        'Invalid SPKI pin: must be exactly 64 lowercase hexadecimal characters.',
+      );
+    }
+
+    // If device already has this pin, no-op
+    if (dev.pins.includes(newPin)) {
+      return;
+    }
+
+    // Pin must not belong to another device
+    const otherDev = this.findDeviceByPin(newPin);
+    if (otherDev && otherDev.deviceId !== deviceId) {
+      throw ArcError.invalidRequestSchema(
+        `Pin collision: SPKI pin '${newPin}' is already assigned to device '${otherDev.deviceId}'.`,
+      );
+    }
+
+    // Cannot exceed 2 active pins
+    if (dev.pins.length >= MAX_ACTIVE_PINS_PER_DEVICE) {
+      throw ArcError.resourceExhausted(
+        `Device '${deviceId}' already has maximum active pins of ${MAX_ACTIVE_PINS_PER_DEVICE}. Existing pins retained.`,
+      );
+    }
+
+    const updatedPins = Object.freeze([...dev.pins, newPin]);
+    const updated: EnrolledDeviceRecord = {
+      ...dev,
+      pins: updatedPins,
+    };
+
+    this.devices.set(deviceId, updated);
+  }
+
+  /**
+   * Remove a pin from an existing device (closing rotation overlap window, §7 P-7).
+   * A device cannot have an empty pin set; removing the sole active pin is rejected.
+   */
+  public removePinFromDevice(deviceId: string, pinToRemove: string): void {
+    const dev = this.devices.get(deviceId);
+    if (!dev) {
+      throw ArcError.deviceNotEnrolled(`Device '${deviceId}' is not enrolled in trust store.`);
+    }
+
+    if (!isValidSpkiPin(pinToRemove)) {
+      throw ArcError.invalidRequestSchema('Invalid SPKI pin format.');
+    }
+
+    if (!dev.pins.includes(pinToRemove)) {
+      throw ArcError.invalidRequestSchema(
+        `Pin '${pinToRemove}' is not assigned to device '${deviceId}'.`,
+      );
+    }
+
+    if (dev.pins.length <= 1) {
+      throw ArcError.invalidRequestSchema(
+        `Cannot remove pin '${pinToRemove}': device '${deviceId}' must retain at least 1 active pin.`,
+      );
+    }
+
+    const updatedPins = Object.freeze(dev.pins.filter((p) => p !== pinToRemove));
+    const updated: EnrolledDeviceRecord = {
+      ...dev,
+      pins: updatedPins,
+    };
+
+    this.devices.set(deviceId, updated);
+  }
+
+  /**
+   * Revoke an enrolled device.
+   * Marks the device record as revoked; revocation is immediate and survives restart when persisted.
+   */
+  public revokeDevice(deviceId: string): void {
+    const dev = this.devices.get(deviceId);
+    if (!dev) {
+      throw ArcError.deviceNotEnrolled(`Device '${deviceId}' is not enrolled in trust store.`);
+    }
+
+    const updated: EnrolledDeviceRecord = {
+      ...dev,
+      revoked: true,
+    };
+
+    this.devices.set(deviceId, updated);
+  }
+}
