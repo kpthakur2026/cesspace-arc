@@ -29,8 +29,9 @@ import {
   type WorkspaceRecord,
   RC03_MUTATION_TOOLS,
 } from '@cesspace-arc/policy';
-import { EnrollmentManager } from '@cesspace-arc/auth';
+import { EnrollmentManager, SessionManager } from '@cesspace-arc/auth';
 import { AdminIpcError, AdminIpcServer } from './admin-ipc.js';
+import { RemoteExecutionBridge, type CompleteActor } from './remote-execution.js';
 import { ApprovalAuditSink, getApprovalAuditSink } from './approval-audit.js';
 import { RemoteGateway, type RemoteGatewayStatus } from './remote-gateway.js';
 import type { RemoteConfig } from './remote-config.js';
@@ -1307,6 +1308,18 @@ export class ArcMcpServer implements IArcMcpServer {
    * object the operator channel creates challenges in.
    */
   public readonly enrollmentManager: EnrollmentManager;
+  /**
+   * The ONE process-local session authority (RC-05 Task 6).
+   *
+   * Volatile, process-local, and never configured: the frozen TTLs, quotas, and
+   * header contract are not overridable through ArcServerConfig, the
+   * environment, the CLI, or any network input. Task 8 consumes THIS object for
+   * session issuance and request authentication, so there is no second manager
+   * hidden in a transport adapter.
+   */
+  public readonly sessionManager: SessionManager;
+  /** Remote execution bridge. Present only once a remote gateway is bound. */
+  private remoteExecutionBridge?: RemoteExecutionBridge;
 
   constructor(
     public readonly workspaceRegistry: WorkspaceRegistry,
@@ -1341,6 +1354,13 @@ export class ArcMcpServer implements IArcMcpServer {
      * cannot reach a running state.
      */
     enrollmentManager?: EnrollmentManager,
+    /**
+     * Optional session authority injection for deterministic and integration
+     * tests. NOT reachable from ArcServerConfig, the environment, the CLI, or
+     * any network input: the factory always supplies exactly one instance, and a
+     * server constructed without one creates it here.
+     */
+    sessionManager?: SessionManager,
   ) {
     // Transport mode is resolved once, at construction, and is immutable. A
     // remote configuration supplied alongside stdio is NOT activated.
@@ -1378,6 +1398,11 @@ export class ArcMcpServer implements IArcMcpServer {
     } else {
       this.enrollmentManager = enrollmentManager ?? new EnrollmentManager();
     }
+
+    // RC-05 Task 6: exactly ONE process-local session authority. Volatile, with
+    // frozen TTLs and caps that are not configurable, and shared by every remote
+    // consumer through `getRemoteExecutionBridge()`.
+    this.sessionManager = sessionManager ?? new SessionManager();
 
     this.defaultWorkspaceId = config?.defaultWorkspaceId;
     this.processRegistry =
@@ -1479,30 +1504,61 @@ export class ArcMcpServer implements IArcMcpServer {
   }
 
   /**
-   * The single, authoritative execution pipeline:
-   * MCP request -> schema validation -> caller context -> workspace binding
-   *   -> policy admission -> filesystem/git safety checks -> tool execution
-   *   -> structured audit event -> sanitized MCP response.
+   * The stdio/local entry point into the ONE shared execution pipeline.
+   *
+   * The `actorOverride` seam exists for stdio callers and backward-compatible
+   * tests ONLY. It is deliberately NOT the remote boundary: the remote path
+   * (Task 6) passes a COMPLETE, internally derived actor to
+   * {@link executeAuthenticatedToolCall} and can never express a partial or
+   * caller-selectable actor.
    */
   public async dispatchToolCall(
     toolName: string,
     parameters: Record<string, unknown>,
     actorOverride?: Partial<PolicyEvaluationContext['actor']>,
   ): Promise<{ isError?: boolean; content: Array<{ type: 'text'; text: string }> }> {
-    const startTime = new Date().toISOString();
-    const startMs = Date.now();
-
-    // 1. Authenticated / Local Caller Context
-    const auditActor = {
+    const actor: CompleteActor = {
       clientId: actorOverride?.clientId ?? 'local-stdio-caller',
       clientType: actorOverride?.clientType ?? 'mcp-client',
       sessionId: actorOverride?.sessionId ?? 'stdio-session-01',
       deviceId: actorOverride?.deviceId ?? 'local-machine',
-    };
-
-    const actor: PolicyEvaluationContext['actor'] = {
-      ...auditActor,
       authenticated: actorOverride?.authenticated ?? true,
+    };
+    return this.executeAuthenticatedToolCall(actor, toolName, parameters);
+  }
+
+  /**
+   * The single, authoritative execution pipeline:
+   * authenticated request -> caller context -> schema validation -> workspace
+   *   binding -> policy admission -> filesystem/git safety checks -> tool
+   *   execution -> structured audit event -> sanitized MCP response.
+   *
+   * Both transports converge HERE. stdio supplies its local actor, and the
+   * RC-05 remote bridge supplies the exact actor derived from an authenticated
+   * Task-5 session; neither forks the dispatch switch, duplicates the approval
+   * gate, or reaches a subsystem directly.
+   *
+   * The actor parameter is COMPLETE by construction: there is no default, no
+   * merge, and no partial override, so a caller cannot select or fill in any
+   * authorization-relevant field.
+   *
+   * @internal Reachable from the remote bridge and from stdio; not a transport.
+   */
+  public async executeAuthenticatedToolCall(
+    actor: CompleteActor,
+    toolName: string,
+    parameters: Record<string, unknown>,
+  ): Promise<{ isError?: boolean; content: Array<{ type: 'text'; text: string }> }> {
+    const startTime = new Date().toISOString();
+    const startMs = Date.now();
+
+    // 1. Authenticated Caller Context. `auditActor` is exactly the four bound
+    //    fields, in the same order the audit chain has always recorded them.
+    const auditActor = {
+      clientId: actor.clientId,
+      clientType: actor.clientType,
+      sessionId: actor.sessionId,
+      deviceId: actor.deviceId,
     };
 
     /** Audits a denial and returns the sanitized MCP error response. */
@@ -2863,6 +2919,15 @@ export class ArcMcpServer implements IArcMcpServer {
       }
       this.remoteGateway = gateway;
 
+      // The remote execution bridge is composed over the gateway's CURRENT
+      // authoritative trust store. The resolver is called per request and is
+      // never cached, so device revocation takes effect on the next call.
+      this.remoteExecutionBridge = new RemoteExecutionBridge({
+        sessionManager: this.sessionManager,
+        resolveActiveDeviceIdentity: (spkiPin) => gateway.resolveActiveDeviceIdentity(spkiPin),
+        sink: this,
+      });
+
       // The admin channel is a LOCAL IPC channel, so starting it in remote mode
       // adds no network surface: it remains local-only and Ed25519-authenticated,
       // and it is the operator's device/enrollment administration path. It is
@@ -2912,6 +2977,18 @@ export class ArcMcpServer implements IArcMcpServer {
     return this.remoteGateway?.getStatus();
   }
 
+  /**
+   * The application-level remote execution entry point (RC-05 Task 6).
+   *
+   * Undefined until a remote gateway is bound, and undefined in stdio mode,
+   * which has no device trust store and no sessions. Task 8 will call this from
+   * the Streamable HTTP transport; Task 6 exposes it as an application API only
+   * — no network path reaches it, and the Task-4 `/mcp` route remains deny-only.
+   */
+  public getRemoteExecutionBridge(): RemoteExecutionBridge | undefined {
+    return this.remoteExecutionBridge;
+  }
+
   public async flushAudit(): Promise<void> {
     await this.approvalAuditSink.flush();
     if (this.processRegistry) {
@@ -2924,6 +3001,9 @@ export class ArcMcpServer implements IArcMcpServer {
       await this.remoteGateway.stop();
       this.remoteGateway = undefined;
     }
+    // Sessions are volatile and die with the gateway that authenticated them.
+    this.remoteExecutionBridge = undefined;
+    this.sessionManager.clear();
     if (this.adminIpcServer) {
       await this.adminIpcServer.stop();
     }
@@ -2976,6 +3056,11 @@ export function createArcMcpServer(config?: Partial<ArcServerConfig>): ArcMcpSer
   // both halves of an enrollment observe the same in-memory challenge table.
   const enrollmentManager = new EnrollmentManager();
 
+  // RC-05 Task 6: exactly ONE session authority for the process. It is handed to
+  // the server, which composes the remote execution bridge over it, so session
+  // issuance and request authentication can never diverge.
+  const sessionManager = new SessionManager();
+
   // The admin channel is opt-in through trusted launch configuration only.
   // Supplying exactly one half of the pair fails closed rather than starting
   // partially configured admin access.
@@ -3015,6 +3100,7 @@ export function createArcMcpServer(config?: Partial<ArcServerConfig>): ArcMcpSer
     approvalStateManager,
     adminIpcServer,
     enrollmentManager,
+    sessionManager,
   );
 }
 

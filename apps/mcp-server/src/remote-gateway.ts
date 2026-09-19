@@ -28,6 +28,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Server, TLSSocket } from 'node:tls';
 import { deriveSpkiPin, EnrollmentManager } from '@cesspace-arc/auth';
 import { DeviceTrustStore } from '@cesspace-arc/auth';
+import type { TrustedSessionIdentity } from '@cesspace-arc/auth';
 import {
   isWildcardBindHost,
   resolveRemoteConfig,
@@ -662,6 +663,19 @@ export class RemoteGateway {
    */
   public isEnrollmentStorageFailed(): boolean {
     return this.bootstrap.isStorageFailureLatched();
+  }
+
+  /**
+   * Resolves the CURRENT active enrolled device for a trusted SPKI pin.
+   *
+   * The gateway's authoritative trust store is the one Task 4 loaded and keeps
+   * authoritative, so this is the read path every remote request must use. It
+   * resolves afresh on every call and never caches the result: a resolver-minted
+   * identity remains a valid Task-5 capability object after revocation, so
+   * retaining one would let a revoked device keep authenticating.
+   */
+  public resolveActiveDeviceIdentity(spkiPin: string): TrustedSessionIdentity | undefined {
+    return this.bootstrap.resolveActiveDeviceIdentity(spkiPin);
   }
 
   /**

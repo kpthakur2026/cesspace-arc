@@ -511,4 +511,39 @@ export class ArcError extends Error implements ArcErrorPayload {
       retryable: false,
     });
   }
+
+  /**
+   * Generic pre-session authentication failure (rc05 §25.1).
+   *
+   * The SINGLE client-facing answer for every pre-session device/session
+   * admission failure: no enrolled device, a revoked device, a zero-device
+   * gateway, or a tokenless request with no session context. It deliberately
+   * carries no details, because the reason is an internal diagnostic
+   * (`DEVICE_NOT_ENROLLED` is never remote-facing).
+   */
+  public static unauthenticated(message = 'Authentication failed'): ArcError {
+    return new ArcError({
+      code: 'UNAUTHENTICATED',
+      category: 'AUTHENTICATION',
+      message,
+      retryable: false,
+    });
+  }
+
+  /**
+   * Generic post-session failure (rc05 §25.1).
+   *
+   * The SINGLE client-facing answer once a server-issued session is involved:
+   * missing credential, malformed credential, wrong digest, expiry, revocation,
+   * identity/binding mismatch, or a device that has since been revoked. It never
+   * confirms whether the session existed, expired, or was revoked.
+   */
+  public static invalidSessionToken(message = 'Invalid or expired session token'): ArcError {
+    return new ArcError({
+      code: 'INVALID_SESSION_TOKEN',
+      category: 'AUTHENTICATION',
+      message,
+      retryable: false,
+    });
+  }
 }

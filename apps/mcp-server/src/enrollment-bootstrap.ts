@@ -26,9 +26,11 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
   DeviceTrustStore,
+  resolveActiveDeviceIdentity,
   type DeviceTrustStoreData,
   type EnrollmentManager,
   type PendingEnrollmentView,
+  type TrustedSessionIdentity,
 } from '@cesspace-arc/auth';
 
 /** The only path that can attempt enrollment completion. */
@@ -160,6 +162,21 @@ export class EnrollmentBootstrap {
   /** Enrolled device count, for bounded reporting. Never a device list. */
   public getEnrolledDeviceCount(): number {
     return this.authoritativeTrustStore.getDeviceCount();
+  }
+
+  /**
+   * Resolves the CURRENT active device for a trusted SPKI pin (RC-05 Task 6).
+   *
+   * The single authoritative read path for remote request admission. It runs
+   * against the CURRENT `authoritativeTrustStore` on every call, so a device
+   * revoked between two requests stops resolving immediately — including while
+   * later enrollment activation has already swapped in a newer store.
+   *
+   * The store object itself is deliberately NOT exposed: callers receive either
+   * a resolver-minted identity or `undefined`, and nothing else.
+   */
+  public resolveActiveDeviceIdentity(spkiPin: string): TrustedSessionIdentity | undefined {
+    return resolveActiveDeviceIdentity(this.authoritativeTrustStore, spkiPin);
   }
 
   /**
