@@ -42,10 +42,12 @@ import {
   type AdminChallenge,
   type AdminErrorCode,
   type AdminMethod,
+  type AdminRequestParams,
   type AdminRequestPayload,
   type AdminResponse,
 } from '@cesspace-arc/protocol';
 import type { ApprovalStateManager } from '@cesspace-arc/policy';
+import { EnrollmentManager, deriveOperatorId, ENROLLMENT_ID_REGEX } from '@cesspace-arc/auth';
 import { toAdminSummary } from './approval-gate.js';
 import { ApprovalAuditSink, getApprovalAuditSink } from './approval-audit.js';
 import type { AuditLogger } from '@cesspace-arc/audit';
@@ -81,6 +83,12 @@ export interface AdminIpcServerOptions {
    * instead. No raw token ever enters the sink.
    */
   auditLogger: AuditLogger;
+  /**
+   * RC-05 Task 2 pending-enrollment manager. Optional composition seam: a fresh
+   * volatile manager is created when absent, exactly as the approval state
+   * manager behaves. It is never persisted and never written to the trust store.
+   */
+  enrollmentManager?: EnrollmentManager;
 }
 
 /** Machine-readable startup/socket failures. */
@@ -175,6 +183,10 @@ export class AdminIpcServer {
   private readonly getMonotonicTimeMs: () => number;
 
   private readonly approvalAuditSink: ApprovalAuditSink;
+  /** RC-05 Task 2 volatile pending-enrollment manager. */
+  private readonly enrollmentManager: EnrollmentManager;
+  /** Server-derived per-operator quota key (SHA-256 of the operator SPKI key). */
+  private readonly operatorId: string;
   private server?: net.Server;
   private socketIdentity?: SocketIdentity;
   private started = false;
@@ -243,6 +255,15 @@ export class AdminIpcServer {
     // transition would be written to the chain twice.
     this.approvalAuditSink = getApprovalAuditSink(auditLogger);
     this.approvalStateManager.registerLifecycleSink(this.approvalAuditSink);
+
+    // RC-05 Task 2: volatile pending-enrollment lifecycle. Pure domain state,
+    // never persisted, never written to the trust store.
+    this.enrollmentManager = options.enrollmentManager ?? new EnrollmentManager();
+
+    // The per-operator quota key is derived from the VERIFIED operator public
+    // key, never from request parameters. Only the digest is retained, so the
+    // raw operator key never appears in enrollment state, responses, or errors.
+    this.operatorId = deriveOperatorId(publicKey);
   }
 
   /** Starts listening. Rejects if the endpoint already exists for any reason. */
@@ -613,19 +634,26 @@ export class AdminIpcServer {
     if (rawParams === null || typeof rawParams !== 'object' || Array.isArray(rawParams)) {
       return null;
     }
-    const params: { requestId?: string; reason?: string } = {};
+    // The parameter shape is closed: any key outside this set is rejected, so a
+    // caller cannot smuggle an enrollmentId, deviceId, operator identity, TTL,
+    // attempt counter, or one-time secret into a signed request.
+    const params: AdminRequestParams = {};
     for (const key of Object.keys(rawParams as Record<string, unknown>)) {
       const value = (rawParams as Record<string, unknown>)[key];
-      if (key === 'requestId') {
-        if (typeof value !== 'string') return null;
-        params.requestId = value;
-      } else if (key === 'reason') {
-        if (typeof value !== 'string') return null;
-        params.reason = value;
-      } else {
+      if (
+        key !== 'requestId' &&
+        key !== 'reason' &&
+        key !== 'clientId' &&
+        key !== 'clientType' &&
+        key !== 'spkiPin' &&
+        key !== 'displayLabel' &&
+        key !== 'enrollmentId'
+      ) {
         // Unexpected params are rejected.
         return null;
       }
+      if (typeof value !== 'string') return null;
+      params[key] = value;
     }
 
     const payload: AdminRequestPayload = {
@@ -652,14 +680,74 @@ export class AdminIpcServer {
     const { method, params } = payload;
 
     if (method === 'approvals.list') {
-      if (params.requestId !== undefined || params.reason !== undefined) {
+      if (
+        params.requestId !== undefined ||
+        params.reason !== undefined ||
+        params.clientId !== undefined ||
+        params.clientType !== undefined ||
+        params.spkiPin !== undefined ||
+        params.displayLabel !== undefined ||
+        params.enrollmentId !== undefined
+      ) {
         return errorResponse('INVALID_ADMIN_REQUEST');
       }
       return await this.handleList();
     }
 
+    if (method === 'enrollment.create') {
+      if (
+        params.requestId !== undefined ||
+        params.reason !== undefined ||
+        params.enrollmentId !== undefined
+      ) {
+        return errorResponse('INVALID_ADMIN_REQUEST');
+      }
+      if (
+        params.clientId === undefined ||
+        params.clientType === undefined ||
+        params.spkiPin === undefined
+      ) {
+        return errorResponse('INVALID_ADMIN_REQUEST');
+      }
+      return await this.handleEnrollmentCreate({
+        clientId: params.clientId,
+        clientType: params.clientType,
+        spkiPin: params.spkiPin,
+        ...(params.displayLabel === undefined ? {} : { displayLabel: params.displayLabel }),
+      });
+    }
+
+    if (method === 'enrollment.cancel') {
+      if (
+        params.requestId !== undefined ||
+        params.reason !== undefined ||
+        params.clientId !== undefined ||
+        params.clientType !== undefined ||
+        params.spkiPin !== undefined ||
+        params.displayLabel !== undefined
+      ) {
+        return errorResponse('INVALID_ADMIN_REQUEST');
+      }
+      if (params.enrollmentId === undefined) {
+        return errorResponse('INVALID_ADMIN_REQUEST');
+      }
+      if (!ENROLLMENT_ID_REGEX.test(params.enrollmentId)) {
+        return errorResponse('INVALID_ADMIN_REQUEST');
+      }
+      return await this.handleEnrollmentCancel(params.enrollmentId);
+    }
+
     if (method === 'approvals.inspect') {
-      if (params.requestId === undefined || params.reason !== undefined) {
+      if (
+        params.requestId === undefined ||
+        params.reason !== undefined ||
+        params.clientId !== undefined ||
+        params.clientType !== undefined ||
+        params.spkiPin !== undefined ||
+        params.displayLabel !== undefined ||
+        params.enrollmentId !== undefined ||
+        false
+      ) {
         return errorResponse('INVALID_ADMIN_REQUEST');
       }
       if (!ADMIN_REQUEST_ID_REGEX.test(params.requestId)) {
@@ -669,7 +757,16 @@ export class AdminIpcServer {
     }
 
     if (method === 'approval.approve') {
-      if (params.requestId === undefined || params.reason !== undefined) {
+      if (
+        params.requestId === undefined ||
+        params.reason !== undefined ||
+        params.clientId !== undefined ||
+        params.clientType !== undefined ||
+        params.spkiPin !== undefined ||
+        params.displayLabel !== undefined ||
+        params.enrollmentId !== undefined ||
+        false
+      ) {
         return errorResponse('INVALID_ADMIN_REQUEST');
       }
       if (!ADMIN_REQUEST_ID_REGEX.test(params.requestId)) {
@@ -679,7 +776,15 @@ export class AdminIpcServer {
     }
 
     if (method === 'approval.reject') {
-      if (params.requestId === undefined) {
+      if (
+        params.requestId === undefined ||
+        params.clientId !== undefined ||
+        params.clientType !== undefined ||
+        params.spkiPin !== undefined ||
+        params.displayLabel !== undefined ||
+        params.enrollmentId !== undefined ||
+        false
+      ) {
         return errorResponse('INVALID_ADMIN_REQUEST');
       }
       if (!ADMIN_REQUEST_ID_REGEX.test(params.requestId)) {
@@ -834,6 +939,70 @@ export class AdminIpcServer {
       }
       return errorResponse(this.mapApprovalError(err));
     }
+  }
+
+  /**
+   * Creates a pending enrollment challenge.
+   *
+   * The one-time secret is generated server-side and returned exactly once in
+   * this successful authenticated response. It is never audited, logged,
+   * persisted, or echoed on any failure path.
+   */
+  private async handleEnrollmentCreate(input: {
+    clientId: string;
+    clientType: string;
+    spkiPin: string;
+    displayLabel?: string;
+  }): Promise<AdminResponse> {
+    try {
+      const created = this.enrollmentManager.create({
+        clientId: input.clientId,
+        clientType: input.clientType,
+        spkiPin: input.spkiPin,
+        ...(input.displayLabel === undefined ? {} : { displayLabel: input.displayLabel }),
+        // Server-derived from the VERIFIED operator public key. A caller cannot
+        // supply or influence the per-operator quota key.
+        operatorId: this.operatorId,
+      });
+
+      return {
+        ok: true,
+        result: {
+          enrollment: { ...created.enrollment },
+          secret: created.secret,
+        },
+      };
+    } catch (err: unknown) {
+      return errorResponse(this.mapEnrollmentError(err));
+    }
+  }
+
+  /**
+   * Cancels a pending enrollment.
+   *
+   * An unknown, expired, already-consumed, or already-cancelled identifier
+   * produces the same bounded NOT_FOUND_OR_NOT_PENDING result as an approval
+   * that is not pending, so cancellation is not an existence oracle.
+   */
+  private async handleEnrollmentCancel(enrollmentId: string): Promise<AdminResponse> {
+    try {
+      const cancelled = this.enrollmentManager.cancel(enrollmentId);
+      if (!cancelled) {
+        return errorResponse('NOT_FOUND_OR_NOT_PENDING');
+      }
+      return { ok: true, result: { enrollmentId, state: 'CANCELLED' } };
+    } catch {
+      return errorResponse('INTERNAL_ERROR');
+    }
+  }
+
+  /** Maps an enrollment failure to a bounded admin code. Never leaks detail. */
+  private mapEnrollmentError(err: unknown): AdminErrorCode {
+    if (err instanceof ArcError) {
+      if (err.code === 'RESOURCE_EXHAUSTED') return 'RESOURCE_EXHAUSTED';
+      if (err.code === 'INVALID_REQUEST_SCHEMA') return 'INVALID_ADMIN_REQUEST';
+    }
+    return 'INTERNAL_ERROR';
   }
 
   /** Maps an approval failure to a bounded admin code. Never leaks detail. */

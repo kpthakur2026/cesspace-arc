@@ -13,6 +13,7 @@
   },
   "dependencies": {
     "@cesspace-arc/audit": "workspace:*",
+    "@cesspace-arc/auth": "workspace:*",
     "@cesspace-arc/filesystem": "workspace:*",
     "@cesspace-arc/git": "workspace:*",
     "@cesspace-arc/policy": "workspace:*",

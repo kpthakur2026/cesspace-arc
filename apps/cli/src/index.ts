@@ -80,11 +80,13 @@ Usage:
   ${CLI_NAME} approvals inspect <requestId>
   ${CLI_NAME} approve <requestId>
   ${CLI_NAME} reject <requestId> [--reason <text>]
+  ${CLI_NAME} enrollment create --client-id <id> --client-type <type> --spki-pin <64hex> [--label <text>]
+  ${CLI_NAME} enrollment cancel <enrollmentId>
   ${CLI_NAME} policy test <file> [options]
   ${CLI_NAME} --help
   ${CLI_NAME} --version
 
-Admin channel options (approvals, approve, reject):
+Admin channel options (approvals, approve, reject, enrollment):
   --admin-socket <path>   Local admin IPC endpoint
                           (env: CESSPACE_ARC_ADMIN_SOCKET)
   --admin-key-fd <n>      Inherited file descriptor holding the operator
@@ -195,24 +197,180 @@ async function callAdmin(
 }
 
 /** Renders a bounded admin failure on stderr. Never includes key material. */
-function reportAdminFailure(io: CliIo, response: AdminResponse): number {
+function reportAdminFailure(
+  io: CliIo,
+  response: AdminResponse,
+  context: 'approval' | 'enrollment' = 'approval',
+): number {
   const code = response.error?.code ?? 'INTERNAL_ERROR';
   if (code === 'AUTHENTICATION_FAILED') {
     io.stderr('Admin authentication failed. The operator key was not accepted.\n');
   } else if (code === 'INVALID_ADMIN_REQUEST') {
     io.stderr('Admin request was rejected as invalid.\n');
   } else if (code === 'NOT_FOUND_OR_NOT_PENDING') {
-    io.stderr('No pending approval matches that request ID.\n');
+    io.stderr(
+      context === 'enrollment'
+        ? 'No pending enrollment matches that enrollment ID.\n'
+        : 'No pending approval matches that request ID.\n',
+    );
   } else if (code === 'APPROVAL_EXPIRED') {
     io.stderr('The approval request has expired.\n');
   } else if (code === 'APPROVAL_REJECTED') {
     io.stderr('The approval request could not be acted on.\n');
   } else if (code === 'RESOURCE_EXHAUSTED') {
-    io.stderr('Approval resource limits were reached.\n');
+    io.stderr(
+      context === 'enrollment'
+        ? 'Pending enrollment limits were reached.\n'
+        : 'Approval resource limits were reached.\n',
+    );
   } else {
     io.stderr('Admin operation failed.\n');
   }
   return EXIT_FAILURE;
+}
+
+// ---------------------------------------------------------------------------
+// RC-05 Task 2: enrollment administration
+//
+// Wire-format bounds mirrored locally so the CLI can fail before opening a
+// connection. The server re-validates authoritatively; these are convenience
+// checks only. Authoritative definitions live in the frozen RC-05 contract.
+// ---------------------------------------------------------------------------
+
+/** Canonical SPKI pin: SHA-256 of DER SPKI, 64 lowercase hex characters. */
+const ENROLLMENT_SPKI_PIN_REGEX = /^[0-9a-f]{64}$/;
+/** Server-generated enrollment identifier: 32 lowercase hex characters. */
+const ENROLLMENT_ID_REGEX = /^[0-9a-f]{32}$/;
+/** Maximum display label size in UTF-8 bytes. */
+const ENROLLMENT_MAX_LABEL_BYTES = 64;
+/** Maximum clientId / clientType size in UTF-8 bytes. */
+const ENROLLMENT_MAX_IDENTIFIER_BYTES = 128;
+
+interface EnrollmentCreateOptions {
+  clientId: string;
+  clientType: string;
+  spkiPin: string;
+  displayLabel?: string;
+}
+
+/** Validates a required bounded identifier supplied on the command line. */
+function validateEnrollmentIdentifier(value: string | undefined, option: string): string {
+  if (value === undefined || value.trim().length === 0) {
+    throw new UsageError(`${option} is required.`);
+  }
+  if (value.includes('\u0000')) {
+    throw new UsageError(`${option} must not contain NUL.`);
+  }
+  if (Buffer.byteLength(value, 'utf8') > ENROLLMENT_MAX_IDENTIFIER_BYTES) {
+    throw new UsageError(
+      `${option} must not exceed ${ENROLLMENT_MAX_IDENTIFIER_BYTES} UTF-8 bytes.`,
+    );
+  }
+  return value;
+}
+
+/** Parses `enrollment create` arguments. Rejects unknown options. */
+function parseEnrollmentCreateArgs(args: readonly string[]): EnrollmentCreateOptions {
+  let clientId: string | undefined;
+  let clientType: string | undefined;
+  let spkiPin: string | undefined;
+  let displayLabel: string | undefined;
+
+  const argv = [...args];
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--client-id') {
+      clientId = takeValue(argv, i, arg);
+      i++;
+    } else if (arg === '--client-type') {
+      clientType = takeValue(argv, i, arg);
+      i++;
+    } else if (arg === '--spki-pin') {
+      spkiPin = takeValue(argv, i, arg);
+      i++;
+    } else if (arg === '--label') {
+      displayLabel = takeValue(argv, i, arg);
+      i++;
+    } else {
+      throw new UsageError(`Unknown option for enrollment create: ${arg}`);
+    }
+  }
+
+  const validatedClientId = validateEnrollmentIdentifier(clientId, '--client-id');
+  const validatedClientType = validateEnrollmentIdentifier(clientType, '--client-type');
+
+  if (spkiPin === undefined) {
+    throw new UsageError('--spki-pin is required.');
+  }
+  if (!ENROLLMENT_SPKI_PIN_REGEX.test(spkiPin)) {
+    throw new UsageError('--spki-pin must be exactly 64 lowercase hexadecimal characters.');
+  }
+
+  if (displayLabel !== undefined) {
+    if (displayLabel.includes('\u0000')) {
+      throw new UsageError('--label must not contain NUL.');
+    }
+    if (Buffer.byteLength(displayLabel, 'utf8') > ENROLLMENT_MAX_LABEL_BYTES) {
+      throw new UsageError(`--label must not exceed ${ENROLLMENT_MAX_LABEL_BYTES} UTF-8 bytes.`);
+    }
+  }
+
+  return {
+    clientId: validatedClientId,
+    clientType: validatedClientType,
+    spkiPin,
+    ...(displayLabel === undefined ? {} : { displayLabel }),
+  };
+}
+
+/**
+ * Renders a successful enrollment creation.
+ *
+ * The one-time enrollment secret is displayed exactly once, on stdout, to the
+ * authenticated operator. It is never written to any file, never included in a
+ * log line, and never repeated by any later command.
+ */
+function renderEnrollmentCreate(io: CliIo, result: unknown): number {
+  if (result === null || typeof result !== 'object') {
+    io.stderr('Enrollment creation returned no result.\n');
+    return EXIT_FAILURE;
+  }
+  const enrollment = (result as { enrollment?: unknown }).enrollment;
+  const secret = (result as { secret?: unknown }).secret;
+  if (
+    enrollment === null ||
+    typeof enrollment !== 'object' ||
+    typeof secret !== 'string' ||
+    !/^[0-9a-f]{64}$/.test(secret)
+  ) {
+    io.stderr('Enrollment creation returned an unusable result.\n');
+    return EXIT_FAILURE;
+  }
+
+  const view = enrollment as Record<string, unknown>;
+  io.stdout(`Enrollment ID : ${String(view.enrollmentId)}\n`);
+  io.stdout(`Client        : ${String(view.clientId)} (${String(view.clientType)})\n`);
+  io.stdout(`SPKI pin      : ${String(view.spkiPin)}\n`);
+  if (typeof view.displayLabel === 'string' && view.displayLabel.length > 0) {
+    io.stdout(`Label         : ${view.displayLabel}\n`);
+  }
+  io.stdout(`Expires in    : ${formatSeconds(view.remainingSeconds)}s\n`);
+  io.stdout(`\n`);
+  io.stdout(`One-time enrollment secret (shown once, store it securely):\n`);
+  io.stdout(`${secret}\n`);
+  return EXIT_OK;
+}
+
+/** Renders a successful enrollment cancellation. */
+function renderEnrollmentCancel(io: CliIo, result: unknown): number {
+  if (result === null || typeof result !== 'object') {
+    io.stderr('Enrollment cancellation returned no result.\n');
+    return EXIT_FAILURE;
+  }
+  const view = result as Record<string, unknown>;
+  io.stdout(`Enrollment ID : ${String(view.enrollmentId)}\n`);
+  io.stdout(`State         : ${String(view.state)}\n`);
+  return EXIT_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -538,10 +696,46 @@ export async function runCli(
   try {
     const command = args[0];
 
-    if (command === 'approvals' || command === 'approve' || command === 'reject') {
+    if (
+      command === 'approvals' ||
+      command === 'approve' ||
+      command === 'reject' ||
+      command === 'enrollment'
+    ) {
       const config = resolveAdminConfig(args, io.env);
       const rest = stripAdminOptions(args);
       const head = rest[0];
+
+      if (head === 'enrollment') {
+        const sub = rest[1];
+        if (sub === 'create') {
+          const options = parseEnrollmentCreateArgs(rest.slice(2));
+          const params: Record<string, string> = {
+            clientId: options.clientId,
+            clientType: options.clientType,
+            spkiPin: options.spkiPin,
+          };
+          if (options.displayLabel !== undefined) params.displayLabel = options.displayLabel;
+          const response = await callAdmin(io, config, 'enrollment.create', params);
+          if (!response.ok) return reportAdminFailure(io, response, 'enrollment');
+          return renderEnrollmentCreate(io, response.result);
+        }
+        if (sub === 'cancel') {
+          if (rest.length !== 3) {
+            throw new UsageError('enrollment cancel requires exactly one <enrollmentId>.');
+          }
+          const enrollmentId = rest[2];
+          if (!ENROLLMENT_ID_REGEX.test(enrollmentId)) {
+            throw new UsageError(
+              'enrollmentId must be exactly 32 lowercase hexadecimal characters.',
+            );
+          }
+          const response = await callAdmin(io, config, 'enrollment.cancel', { enrollmentId });
+          if (!response.ok) return reportAdminFailure(io, response, 'enrollment');
+          return renderEnrollmentCancel(io, response.result);
+        }
+        throw new UsageError(`Unknown enrollment subcommand: ${String(sub)}`);
+      }
 
       if (head === 'approvals') {
         const sub = rest[1];

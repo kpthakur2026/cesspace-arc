@@ -26,13 +26,20 @@ export const ADMIN_PROTOCOL_VERSION = 'cesspace-arc-admin-v1';
 
 /** Maximum admin methods are closed; arbitrary method strings are rejected. */
 export type AdminMethod =
-  'approvals.list' | 'approvals.inspect' | 'approval.approve' | 'approval.reject';
+  | 'approvals.list'
+  | 'approvals.inspect'
+  | 'approval.approve'
+  | 'approval.reject'
+  | 'enrollment.create'
+  | 'enrollment.cancel';
 
 export const ADMIN_METHODS: readonly AdminMethod[] = [
   'approvals.list',
   'approvals.inspect',
   'approval.approve',
   'approval.reject',
+  'enrollment.create',
+  'enrollment.cancel',
 ] as const;
 
 /** Challenge lifetime in milliseconds, enforced on a monotonic clock. */
@@ -79,10 +86,26 @@ export interface AdminChallenge {
 /**
  * Parameters for an admin request. The shape is closed per method and is
  * validated again after signature verification.
+ *
+ * RC-05 Task 2 adds the enrollment administration inputs. Everything that
+ * identifies ARC-side state or authority — enrollmentId on creation, deviceId,
+ * operator identity, TTL/deadline, attempt counters, and the one-time secret —
+ * is deliberately absent: those are server-derived and a request carrying them
+ * is rejected as an unknown parameter.
  */
 export interface AdminRequestParams {
   requestId?: string;
   reason?: string;
+  /** `enrollment.create`: operator-supplied logical client identity. */
+  clientId?: string;
+  /** `enrollment.create`: operator-supplied client type. */
+  clientType?: string;
+  /** `enrollment.create`: canonical 64-lowercase-hex SPKI pin to enroll. */
+  spkiPin?: string;
+  /** `enrollment.create`: optional non-security display label. */
+  displayLabel?: string;
+  /** `enrollment.cancel`: server-generated enrollment identifier. */
+  enrollmentId?: string;
 }
 
 /** Canonical signed admin payload. */
@@ -177,11 +200,49 @@ export interface AdminApprovalRejectResult {
   state: string;
 }
 
+/**
+ * Bounded operator-safe view of a pending enrollment.
+ *
+ * Never contains the one-time secret, its digest, the operator public key, or
+ * the internal monotonic deadline.
+ */
+export interface AdminEnrollmentSummary {
+  enrollmentId: string;
+  clientId: string;
+  clientType: string;
+  spkiPin: string;
+  displayLabel: string;
+  createdAt: string;
+  expiresAt: string;
+  remainingSeconds: number;
+}
+
+/**
+ * Successful pending-enrollment creation.
+ *
+ * The one-time enrollment secret appears here and ONLY here: on the
+ * authenticated local admin channel, exactly once, to the authenticated
+ * operator. It is never audited, logged, persisted, echoed in an error, or
+ * retained by the IPC server.
+ */
+export interface AdminEnrollmentCreateResult {
+  enrollment: AdminEnrollmentSummary;
+  /** 64 lowercase hexadecimal characters. Disclosed exactly once. */
+  secret: string;
+}
+
+export interface AdminEnrollmentCancelResult {
+  enrollmentId: string;
+  state: string;
+}
+
 export type AdminResult =
   | AdminApprovalsListResult
   | AdminApprovalsInspectResult
   | AdminApprovalApproveResult
-  | AdminApprovalRejectResult;
+  | AdminApprovalRejectResult
+  | AdminEnrollmentCreateResult
+  | AdminEnrollmentCancelResult;
 
 /** Bounded admin response frame. */
 export interface AdminResponse {
@@ -206,18 +267,27 @@ export interface AdminResponse {
 // canonicalJson() for the same value, which keeps the two conventions aligned.
 // ---------------------------------------------------------------------------
 
+/**
+ * Closed parameter key set, in ascending code-unit order.
+ *
+ * The order is what makes the canonical encoding deterministic; adding a key
+ * here in the wrong position would produce a non-canonical byte form for every
+ * request that uses it.
+ */
+const ADMIN_PARAM_KEYS: readonly (keyof AdminRequestParams)[] = [
+  'clientId',
+  'clientType',
+  'displayLabel',
+  'enrollmentId',
+  'reason',
+  'requestId',
+  'spkiPin',
+];
+
 /** Canonically encodes an admin payload to its exact signed byte form. */
 export function encodeAdminPayload(payload: AdminRequestPayload): string {
-  const paramKeys: string[] = [];
-  // Ascending code-unit order: "reason" < "requestId".
-  if (payload.params.reason !== undefined) paramKeys.push('reason');
-  if (payload.params.requestId !== undefined) paramKeys.push('requestId');
-
-  const paramsJson = `{${paramKeys
-    .map(
-      (key) =>
-        `${JSON.stringify(key)}:${JSON.stringify(payload.params[key as keyof AdminRequestParams])}`,
-    )
+  const paramsJson = `{${ADMIN_PARAM_KEYS.filter((key) => payload.params[key] !== undefined)
+    .map((key) => `${JSON.stringify(key)}:${JSON.stringify(payload.params[key])}`)
     .join(',')}}`;
 
   // Ascending code-unit order: challengeId < method < params < protocol.

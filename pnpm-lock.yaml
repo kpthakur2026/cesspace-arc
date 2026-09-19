@@ -202,6 +202,9 @@ importers:
       '@cesspace-arc/audit':
         specifier: workspace:*
         version: link:../../packages/audit
+      '@cesspace-arc/auth':
+        specifier: workspace:*
+        version: link:../../packages/auth
       '@cesspace-arc/filesystem':
         specifier: workspace:*
         version: link:../../packages/filesystem
