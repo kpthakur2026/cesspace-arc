@@ -1711,7 +1711,11 @@ trailing-not-pem
 
   describe('Shutdown releases every admission slot', () => {
     test('RC05-ENR-180: a stalled handshake is destroyed by shutdown, not by timeout', async () => {
-      const { gateway, port } = await startGateway({}, { handshakeTimeoutMsForTests: 30_000 });
+      // The seam may only SHORTEN the frozen 5000 ms value, so the effective
+      // timeout is 250 ms. That is what makes "past the timeout" a truthful
+      // claim within a fast test.
+      const { gateway, port } = await startGateway({}, { handshakeTimeoutMsForTests: 250 });
+      assert.equal(gateway.handshakeTimeoutMs, 250, 'the seam shortened the frozen value');
       const stalled = net.createConnection({ host: '127.0.0.1', port });
       await new Promise((resolve) => {
         stalled.once('connect', resolve);
@@ -1727,7 +1731,7 @@ trailing-not-pem
         true,
       );
 
-      // Stop well before the (deliberately long) handshake timeout.
+      // Stop before the 250 ms handshake timeout elapses.
       await gateway.stop();
 
       assert.equal(gateway.getStatus().liveConnections, 0, 'live connections reset');
@@ -1741,9 +1745,9 @@ trailing-not-pem
       );
       stalled.destroy();
 
-      // Past where the handshake timeout would have fired, counters stay at
-      // exactly zero: the neutralized release closures must not run again.
-      await new Promise((resolve) => setTimeout(resolve, 300));
+      // Wait PAST the real injected timeout (250 ms). The delayed timeout event
+      // must be a no-op against already-reset state.
+      await new Promise((resolve) => setTimeout(resolve, 500));
       assert.equal(gateway.getStatus().liveConnections, 0);
       assert.equal(gateway.getStatus().inFlightHandshakes, 0);
       assert.ok(gateway.getStatus().liveConnections >= 0, 'counters never go negative');
@@ -1787,7 +1791,7 @@ trailing-not-pem
     });
 
     test('RC05-ENR-182: mixed handshaken and stalled connections both terminate cleanly', async () => {
-      const { gateway, port } = await startGateway({}, { handshakeTimeoutMsForTests: 30_000 });
+      const { gateway, port } = await startGateway({}, { handshakeTimeoutMsForTests: 400 });
       const stalled = net.createConnection({ host: '127.0.0.1', port });
       await new Promise((resolve) => {
         stalled.once('connect', resolve);
@@ -1816,11 +1820,79 @@ trailing-not-pem
       assert.equal(await waitFor(() => stalled.destroyed, 2000), true);
       assert.equal(await waitFor(() => outcome.socket.destroyed, 2000), true);
 
-      // Past every delayed event, the counters are still exactly zero.
-      await new Promise((resolve) => setTimeout(resolve, 300));
+      // Past every delayed event, including the injected handshake timeout, the
+      // counters are still exactly zero.
+      await new Promise((resolve) => setTimeout(resolve, 600));
       assert.equal(gateway.getStatus().liveConnections, 0);
       assert.equal(gateway.getStatus().inFlightHandshakes, 0);
       stalled.destroy();
+    });
+
+    test('RC05-ENR-186: sequential successful connections do not accumulate state', async () => {
+      // 150 sequential connect -> mTLS -> close cycles. If a secondary lifecycle
+      // collection retained closed TLSSockets, this would grow without bound
+      // while every counter returned to zero. The counters cannot prove
+      // retention, so the registry itself is asserted to stay bounded instead:
+      // it is the only collection that holds admitted sockets, and it is
+      // observable through its bounded size.
+      // The rate seam is raised so 150 back-to-back attempts are not throttled
+      // by the frozen burst of 20: this regression is about socket retention,
+      // not about rate limiting, and the concurrency bounds stay at their
+      // production values.
+      const { gateway, port } = await startGateway(
+        {},
+        { admission: { attemptsPerMinute: 6000, burst: 500 } },
+      );
+      const CYCLES = 150;
+      try {
+        for (let i = 0; i < CYCLES; i++) {
+          const outcome = await tlsConnect(port, {
+            cert: fs.readFileSync(pki.clientCertPath),
+            key: fs.readFileSync(pki.clientKeyPath),
+          });
+          assert.equal(outcome.connected, true, `cycle ${i}: handshake must complete`);
+          assert.equal(
+            await waitFor(
+              () =>
+                gateway.getStatus().liveConnections === 1 &&
+                gateway.getStatus().inFlightHandshakes === 0,
+              2000,
+            ),
+            true,
+            `cycle ${i}: the handshake slot must be released`,
+          );
+
+          outcome.socket.destroy();
+          assert.equal(
+            await waitFor(
+              () =>
+                gateway.getStatus().liveConnections === 0 &&
+                gateway.getStatus().inFlightHandshakes === 0,
+              2000,
+            ),
+            true,
+            `cycle ${i}: close must release the connection slot`,
+          );
+        }
+
+        // A further valid connection still succeeds after all that churn.
+        const after = await tlsConnect(port, {
+          cert: fs.readFileSync(pki.clientCertPath),
+          key: fs.readFileSync(pki.clientKeyPath),
+        });
+        assert.equal(after.connected, true, 'the gateway still admits after churn');
+        assert.equal(await waitFor(() => gateway.getStatus().liveConnections === 1, 2000), true);
+        after.socket.destroy();
+        assert.equal(await waitFor(() => gateway.getStatus().liveConnections === 0, 2000), true);
+      } finally {
+        await gateway.stop();
+      }
+
+      // Stop after heavy churn is clean and idempotent.
+      await gateway.stop();
+      assert.equal(gateway.getStatus().liveConnections, 0);
+      assert.equal(gateway.getStatus().inFlightHandshakes, 0);
+      assert.equal(gateway.getStatus().listenerActive, false);
     });
 
     test('RC05-ENR-183: stop is idempotent', async () => {

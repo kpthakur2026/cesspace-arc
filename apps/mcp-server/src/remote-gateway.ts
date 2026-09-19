@@ -149,16 +149,20 @@ export class RemoteGateway {
   private degradedReason?: 'certificate_expired';
   /** Terminal latch: once the certificate is seen expired it stays expired. */
   private expiryLatched = false;
-  private readonly liveSockets = new Set<TLSSocket>();
   /**
-   * Per-connection settle state, keyed by the TCP connection tuple.
+   * THE authoritative registry of active admitted connections, keyed by the TCP
+   * connection tuple.
    *
    * The raw socket seen in `connection` and the TLSSocket seen in
    * `secureConnection` are DIFFERENT objects, so state cannot be keyed by either
    * one. The tuple (localAddress:localPort|remoteAddress:remotePort) is made of
    * public properties, is identical for both objects, and uniquely identifies a
-   * connection while it is open. The map is bounded by the global live
-   * connection cap because an entry exists only for an admitted connection.
+   * connection while it is open.
+   *
+   * This is the ONLY collection that holds admitted sockets. An entry is created
+   * on raw admission and deleted on settlement, so the map is bounded by the
+   * global live-connection cap: there is no second collection that could retain
+   * a closed socket after its counters were released.
    */
   private readonly connectionStates = new Map<string, ConnectionState>();
 
@@ -363,8 +367,8 @@ export class RemoteGateway {
     }
 
     // 2. Capture both sockets of every outstanding connection BEFORE settling.
-    //    `liveSockets` only holds post-handshake TLS sockets, so a socket still
-    //    mid-handshake would otherwise survive until its TLS handshake timeout.
+    //    The registry holds every admitted socket, handshaken or not, so a
+    //    socket still mid-handshake cannot survive until its TLS timeout.
     const outstanding = [...this.connectionStates.entries()].map(([tuple, state]) => ({
       tuple,
       sockets: [state.rawSocket, state.tlsSocket].filter(
@@ -388,11 +392,6 @@ export class RemoteGateway {
         socket.destroy();
       }
     }
-    for (const socket of this.liveSockets) {
-      socket.destroy();
-    }
-    this.liveSockets.clear();
-
     // 5. Only now may limiter state be reset: every release closure has already
     //    run, and any that could still fire has nothing to act on.
     this.limiter.reset();
@@ -529,11 +528,13 @@ export class RemoteGateway {
     // The handshake has settled, so its slot is released now; the connection
     // remains counted as live until it closes.
     this.settleHandshakeFor(tuple);
+    // Attach the TLS socket to the SAME registry entry that already owns the
+    // admission slot. There is no separate collection to keep in step, so a
+    // closed socket cannot be retained after its entry is deleted.
     const state = this.connectionStates.get(tuple);
     if (state !== undefined) {
       state.tlsSocket = socket;
     }
-    this.liveSockets.add(socket);
 
     // Task 3 boundary: a valid chain and a canonical SPKI pin. No enrollment,
     // revocation, or session decision is made here, so an unknown pin is NOT
