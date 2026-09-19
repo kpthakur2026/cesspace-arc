@@ -234,6 +234,32 @@ interface SessionRecord {
 /** Fixed 32-byte all-zero digest used on the malformed-token path. */
 const DUMMY_TOKEN_DIGEST = Buffer.alloc(32, 0);
 
+/**
+ * Provenance registry for trusted session identities.
+ *
+ * `TrustedSessionIdentity` is a runtime CAPABILITY, not a shape. Only
+ * {@link resolveActiveDeviceIdentity} can mint one, and it registers the exact
+ * object here. Every consumer that treats an identity as authoritative asks this
+ * registry first, so a caller that hand-builds a structurally perfect object —
+ * with a valid device ID, client ID, client type, and SPKI pin — cannot obtain
+ * bootstrap eligibility, cannot issue a session, and cannot authenticate.
+ *
+ * A `WeakSet` is used deliberately: it holds no strong reference, needs no
+ * cleanup, is not enumerable, and is not reachable from outside this module.
+ * Provenance therefore cannot be claimed by shape, by a cast, or by copying
+ * fields from a real identity into a new object.
+ */
+const RESOLVED_IDENTITIES = new WeakSet<object>();
+
+/**
+ * True only for an object produced by {@link resolveActiveDeviceIdentity}.
+ *
+ * @internal Module-private by construction: it is not exported from the package.
+ */
+function hasResolverProvenance(identity: unknown): identity is TrustedSessionIdentity {
+  return typeof identity === 'object' && identity !== null && RESOLVED_IDENTITIES.has(identity);
+}
+
 function sha256Bytes(value: string): Buffer {
   return crypto.createHash('sha256').update(value, 'utf8').digest();
 }
@@ -274,12 +300,17 @@ export function resolveActiveDeviceIdentity(
   if (device === undefined || device.revoked) {
     return undefined;
   }
-  return {
+  // The object is constructed here, frozen, and registered as resolver-minted
+  // before it is ever handed out. Freezing also stops a consumer from mutating
+  // an identity it legitimately obtained and thereby rebinding a live session.
+  const identity: TrustedSessionIdentity = Object.freeze({
     deviceId: device.deviceId,
     clientId: device.clientId,
     clientType: device.clientType,
     spkiPin,
-  };
+  });
+  RESOLVED_IDENTITIES.add(identity);
+  return identity;
 }
 
 /**
@@ -296,11 +327,18 @@ export function parseBearerCredential(header: unknown): string | null {
     return null;
   }
 
-  // Length FIRST, before any slicing or splitting. `split(' ')` on a
+  // Character length FIRST, before any slicing or splitting. `split(' ')` on a
   // peer-controlled value of unbounded length would allocate proportional to the
   // input; this single comparison makes every later step operate on at most
-  // MAX_SESSION_AUTHORIZATION_HEADER_BYTES characters.
+  // MAX_SESSION_AUTHORIZATION_HEADER_BYTES code units.
   if (header.length > MAX_SESSION_AUTHORIZATION_HEADER_BYTES) {
+    return null;
+  }
+  // The advertised bound is a BYTE bound, so it is enforced as one. UTF-8 never
+  // encodes in fewer bytes than code units, so the check above already bounds
+  // this measurement; a multibyte value whose character count is inside the
+  // limit but whose encoded size is not is refused here, before any slice.
+  if (Buffer.byteLength(header, 'utf8') > MAX_SESSION_AUTHORIZATION_HEADER_BYTES) {
     return null;
   }
 
@@ -444,9 +482,11 @@ export class SessionManager {
         'Session identifier must be 64 lowercase hexadecimal characters issued by the server.',
       );
     }
-    if (typeof identity !== 'object' || identity === null) {
+    // Provenance first: a structurally perfect but caller-built identity cannot
+    // create a session, whatever its fields say.
+    if (!hasResolverProvenance(identity)) {
       throw ArcError.invalidRequestSchema(
-        'Session identity must be a trusted server-derived object.',
+        'Session identity must be produced by the active-device resolver.',
       );
     }
 
@@ -473,6 +513,11 @@ export class SessionManager {
         'Session identifier is already active and can never be reassigned.',
       );
     }
+
+    // Reservation expiry is enforced HERE, at the issuance decision itself,
+    // rather than relying on some other API having pruned first. A reservation
+    // that outlived its window is not activatable no matter what ran before.
+    this.pruneReservations();
 
     // Structural server-issuance check: only a currently reserved generator
     // output is activatable. A syntactically perfect caller-chosen ID fails here.
@@ -580,7 +625,11 @@ export class SessionManager {
       // RC05-NEG-41: bootstrap requires an ACTIVE resolved device identity. An
       // identity that resolved to nothing — unknown SPKI, or a revoked device —
       // can never bootstrap, and no reservation, session, or token is minted.
-      if (context.identity === undefined || context.identity === null) {
+      //
+      // Provenance, not shape: a caller-fabricated object with perfectly valid
+      // fields is refused exactly like an absent one, because only the
+      // DeviceTrustStore resolver can mint a trusted identity.
+      if (!hasResolverProvenance(context.identity)) {
         return { outcome: 'UNAUTHENTICATED' };
       }
       // Eligible for bootstrap. A client-supplied ID, if any, is simply NOT USED:
@@ -606,11 +655,12 @@ export class SessionManager {
   }): TrustedSessionResult | undefined {
     const { sessionId, identity } = input;
 
-    // No active resolved identity means there is nothing the session could be
-    // bound to, so no presented credential can authenticate. This is the
-    // RC05-NEG-41 post-session outcome and it is deliberately indistinguishable
-    // from a wrong token.
-    if (identity === undefined || identity === null) {
+    // No resolver-minted identity means there is nothing the session could be
+    // bound to, so no presented credential can authenticate. A fabricated object
+    // with valid-looking fields is treated exactly like an absent one. This is
+    // the RC05-NEG-41 post-session outcome and it is deliberately
+    // indistinguishable from a wrong token.
+    if (!hasResolverProvenance(identity)) {
       return undefined;
     }
 
@@ -852,6 +902,13 @@ export class SessionManager {
    * table: the frozen global session capacity bounds both collections together.
    */
   private reserveSessionId(): string {
+    // Capacity accounting is INTRINSIC to generation, not dependent on which API
+    // a caller happened to touch first: expired sessions are purged and expired
+    // reservations pruned before the combined bound is evaluated. Without the
+    // session purge, a manager whose sessions have all expired by the clock would
+    // still refuse to generate on the strength of records that no longer consume
+    // active quota.
+    this.purgeExpired();
     this.pruneReservations();
     if (this.sessions.size + this.reservedSessionIds.size >= MAX_ACTIVE_SESSIONS_GLOBAL) {
       throw ArcError.resourceExhausted(

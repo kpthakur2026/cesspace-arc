@@ -31,6 +31,7 @@ import {
   SESSION_ID_REGEX,
   SESSION_TOKEN_REGEX,
   MAX_SESSION_TOKEN_INPUT_BYTES,
+  MAX_SESSION_AUTHORIZATION_HEADER_BYTES,
   SESSION_ABSOLUTE_TTL_SECONDS,
   SESSION_IDLE_TIMEOUT_SECONDS,
   SESSION_ID_RESERVATION_TTL_SECONDS,
@@ -48,27 +49,58 @@ function pin(seed) {
   return crypto.createHash('sha256').update(`session-pin-${seed}`, 'utf8').digest('hex');
 }
 
-/** A trusted identity as ARC would derive it from mTLS + the trust store. */
-function identity(seed, overrides = {}) {
-  return {
-    deviceId: crypto.createHash('sha256').update(`device-${seed}`).digest('hex').slice(0, 32),
-    clientId: `client-${seed}`,
-    clientType: 'claude-code',
-    spkiPin: pin(seed),
-    ...overrides,
-  };
-}
-
 const SECOND = 1_000_000_000n;
 
 describe('CesSpace ARC — RC-05 Task 5: Secure Session Lifecycle', () => {
   let mono;
   let manager;
+  /**
+   * The real enrolled-device authority backing every fixture identity.
+   *
+   * Trusted identities are a runtime capability minted only by
+   * `resolveActiveDeviceIdentity`, so the suite obtains them the same way the
+   * transport will: enroll a device, then resolve it. Hand-building a
+   * structurally perfect identity object is deliberately NOT available as a
+   * test shortcut, because it is not available in production either.
+   */
+  let trustStore;
 
   beforeEach(() => {
     mono = 1_000_000_000_000n;
     manager = new SessionManager({ getMonotonicTime: () => mono });
+    trustStore = DeviceTrustStore.createEmpty();
   });
+
+  /**
+   * Enrolls (once per seed/pin) and returns the RESOLVER-minted trusted identity.
+   *
+   * Overrides shape the enrollment — the client identifier and type a device is
+   * enrolled under — never the resolved result: the trust store remains the
+   * authority for every field.
+   */
+  function identity(seed, overrides = {}) {
+    const spkiPin = overrides.spkiPin ?? pin(seed);
+    const clientId = overrides.clientId ?? `client-${seed}`;
+    const clientType = overrides.clientType ?? 'claude-code';
+
+    if (trustStore.findDeviceByPin(spkiPin) === undefined) {
+      trustStore.enrollDevice({ clientId, clientType, pin: spkiPin });
+    }
+    const resolved = resolveActiveDeviceIdentity(trustStore, spkiPin);
+    assert.ok(resolved, `the fixture must resolve a real identity for '${seed}'`);
+    return resolved;
+  }
+
+  /** A structurally perfect identity object that carries NO resolver provenance. */
+  function fabricatedIdentity(seed, overrides = {}) {
+    return {
+      deviceId: crypto.createHash('sha256').update(`device-${seed}`).digest('hex').slice(0, 32),
+      clientId: `client-${seed}`,
+      clientType: 'claude-code',
+      spkiPin: pin(seed),
+      ...overrides,
+    };
+  }
 
   /** Issues a session with a generator-produced server ID and a trusted identity. */
   function issue(seed, overrides = {}) {
@@ -566,6 +598,93 @@ describe('CesSpace ARC — RC-05 Task 5: Secure Session Lifecycle', () => {
       );
     });
 
+    test('RC05-SES-59: reservation expiry is enforced at issuance itself', () => {
+      const id = identity('reservation-expiry');
+
+      // At exactly the reservation deadline the reservation is expired. Nothing
+      // pruning-related is called between advancing the clock and the issuance
+      // attempt, so the refusal has to come from issuance's own check.
+      const stale = manager.createSessionIdGenerator()();
+      assert.equal(manager.getReservedSessionIdCount(), 1);
+      mono += BigInt(SESSION_ID_RESERVATION_TTL_SECONDS) * SECOND;
+
+      assert.throws(
+        () => manager.issueSession({ sessionId: stale, identity: id }),
+        (err) => err.code === 'INVALID_REQUEST_SCHEMA',
+        'a reservation past its window cannot activate',
+      );
+      assert.equal(manager.hasSession(stale), false, 'no token was generated');
+      assert.equal(manager.getActiveSessionCount(), 0, 'no session was created');
+      assert.equal(manager.getReservedSessionIdCount(), 0, 'the expired reservation is gone');
+
+      // One nanosecond before the deadline the reservation is still activatable.
+      const boundary = manager.createSessionIdGenerator()();
+      mono += BigInt(SESSION_ID_RESERVATION_TTL_SECONDS) * SECOND - 1n;
+      const issuance = manager.issueSession({ sessionId: boundary, identity: id });
+      assert.equal(issuance.sessionId, boundary, 'deadline - 1 ns is inside the window');
+      assert.equal(manager.getReservedSessionIdCount(), 0);
+
+      // And the boundary is inclusive: exactly at the deadline the next
+      // reservation is expired too.
+      const beyond = manager.createSessionIdGenerator()();
+      mono += BigInt(SESSION_ID_RESERVATION_TTL_SECONDS) * SECOND;
+      assert.throws(
+        () => manager.issueSession({ sessionId: beyond, identity: id }),
+        (err) => err.code === 'INVALID_REQUEST_SCHEMA',
+        'the deadline itself is outside the window',
+      );
+      assert.equal(manager.getReservedSessionIdCount(), 0);
+      assert.equal(manager.hasSession(beyond), false);
+    });
+
+    test('RC05-SES-60: expired sessions release capacity inside generation itself', () => {
+      // Build the ACTUAL global maximum, respecting the per-device and per-client
+      // caps: 1024 sessions spread over 128 devices with 8 each.
+      const perDevice = MAX_ACTIVE_SESSIONS_PER_DEVICE;
+      for (let i = 0; i < MAX_ACTIVE_SESSIONS_GLOBAL; i += 1) {
+        const holder = identity(`capacity-${Math.floor(i / perDevice)}`);
+        manager.issueSession({ sessionId: manager.createSessionIdGenerator()(), identity: holder });
+      }
+      assert.equal(manager.sessions.size, MAX_ACTIVE_SESSIONS_GLOBAL);
+
+      // Expire them all by the monotonic clock without touching ANY
+      // purge-triggering API (no getActiveSessionCount, no listSessions, no
+      // getActiveSessionCountForDevice, no hasSession).
+      mono += BigInt(SESSION_ABSOLUTE_TTL_SECONDS) * SECOND;
+      assert.equal(
+        manager.sessions.size,
+        MAX_ACTIVE_SESSIONS_GLOBAL,
+        'the expired records are still resident: nothing has purged them',
+      );
+      assert.equal(manager.reservedSessionIds.size, 0);
+
+      // Generation alone must reclaim them and succeed.
+      const generated = manager.createSessionIdGenerator()();
+      assert.match(generated, SESSION_ID_REGEX, 'generation succeeds past the capacity bound');
+      assert.equal(manager.sessions.size, 0, 'the purge happened inside generation');
+
+      // The whole flow works end to end afterwards.
+      const issuance = manager.issueSession({
+        sessionId: generated,
+        identity: identity('capacity-after-reclaim'),
+      });
+      assert.equal(manager.hasSession(issuance.sessionId), true);
+
+      // Capacity is genuinely free again, up to the bound. The SAME devices are
+      // reused, which also shows the released quota is per-session and not
+      // per-device.
+      for (let i = 0; i < MAX_ACTIVE_SESSIONS_GLOBAL - 1; i += 1) {
+        const holder = identity(`capacity-${Math.floor(i / perDevice)}`);
+        manager.issueSession({ sessionId: manager.createSessionIdGenerator()(), identity: holder });
+      }
+      assert.equal(manager.sessions.size, MAX_ACTIVE_SESSIONS_GLOBAL);
+      assert.throws(
+        () => manager.createSessionIdGenerator()(),
+        (err) => err.code === 'RESOURCE_EXHAUSTED',
+        'the bound still holds once the capacity is genuinely consumed',
+      );
+    });
+
     test('RC05-SES-50: clear() drops sessions and reservations together', () => {
       const id = identity('clear-both');
       const active = manager.issueSession({
@@ -636,28 +755,40 @@ describe('CesSpace ARC — RC-05 Task 5: Secure Session Lifecycle', () => {
       );
     });
 
-    test('RC05-SES-11: issuance accepts only server-derived, well-formed identity input', () => {
-      const sessionId = manager.createSessionIdGenerator()();
-      const cases = [
-        { deviceId: 'not-hex' },
-        { deviceId: 'a'.repeat(31) },
-        { spkiPin: 'A'.repeat(64) },
-        { spkiPin: 'a'.repeat(63) },
-        { clientId: '' },
-        { clientType: '' },
+    test('RC05-SES-11: issuance accepts a resolver-minted identity and nothing else', () => {
+      // Anything that is not a resolver output is refused, whatever its shape.
+      const presentable = [
+        null,
+        undefined,
+        {},
+        'string',
+        42,
+        fabricatedIdentity('bad-shape'),
+        fabricatedIdentity('bad-device', { deviceId: 'not-hex' }),
+        fabricatedIdentity('bad-pin', { spkiPin: 'A'.repeat(64) }),
+        fabricatedIdentity('bad-client', { clientId: '' }),
+        fabricatedIdentity('bad-type', { clientType: '' }),
+        { ...identity('bad-spread') },
       ];
-      for (const override of cases) {
+      for (const [index, identityInput] of presentable.entries()) {
+        const reserved = manager.createSessionIdGenerator()();
         assert.throws(
-          () => manager.issueSession({ sessionId, identity: identity('bad', override) }),
+          () =>
+            manager.issueSession({
+              sessionId: reserved,
+              identity: identityInput,
+            }),
           (err) => err.code === 'INVALID_REQUEST_SCHEMA',
-          JSON.stringify(Object.keys(override)),
+          `identity candidate #${index} must be refused`,
         );
       }
-      assert.throws(
-        () => manager.issueSession({ sessionId, identity: null }),
-        (err) => err.code === 'INVALID_REQUEST_SCHEMA',
-      );
       assert.equal(manager.getActiveSessionCount(), 0);
+
+      // The genuine resolver output activates normally.
+      const real = identity('bad-genuine');
+      const reserved = manager.createSessionIdGenerator()();
+      const issuance = manager.issueSession({ sessionId: reserved, identity: real });
+      assert.equal(manager.hasSession(issuance.sessionId), true);
     });
   });
 
@@ -724,9 +855,14 @@ describe('CesSpace ARC — RC-05 Task 5: Secure Session Lifecycle', () => {
       const target = issue('portability');
 
       const otherIdentity = identity('portability-other');
-      const otherDeviceIdentity = identity('portability', { deviceId: identity('x').deviceId });
-      const otherClientIdentity = identity('portability', { clientId: 'someone-else' });
-      const otherTypeIdentity = identity('portability', { clientType: 'other-client' });
+      // Each control is a REAL resolver-minted identity for a genuinely
+      // different enrolled device, so the rejection provably comes from the
+      // binding check rather than from a provenance failure.
+      const otherDeviceIdentity = identity('portability-other-device');
+      const otherClientIdentity = identity('portability-other', { clientId: 'someone-else' });
+      const otherTypeIdentity = identity('portability-other-type', {
+        clientType: 'other-client',
+      });
 
       for (const identityOverride of [
         otherIdentity,
@@ -1034,6 +1170,44 @@ describe('CesSpace ARC — RC-05 Task 5: Secure Session Lifecycle', () => {
       assert.deepEqual(manager.admitRequest(ordinaryContext(target)).outcome, 'AUTHENTICATED');
     });
 
+    test('RC05-SES-61: the Authorization bound is enforced in UTF-8 BYTES', () => {
+      const target = issue('utf8-bound');
+      const before = JSON.stringify(manager.listSessions());
+
+      // At the boundary: `Bearer ` (7 bytes) plus 128 single-byte characters is
+      // exactly the advertised byte bound, and it parses.
+      const atBound = `Bearer ${'a'.repeat(MAX_SESSION_TOKEN_INPUT_BYTES)}`;
+      assert.equal(Buffer.byteLength(atBound, 'utf8'), MAX_SESSION_AUTHORIZATION_HEADER_BYTES);
+      assert.equal(parseBearerCredential(atBound), 'a'.repeat(MAX_SESSION_TOKEN_INPUT_BYTES));
+
+      // Inside the CHARACTER bound but outside the BYTE bound: 74 code units,
+      // 141 UTF-8 bytes. The character pre-filter cannot reject this one, so the
+      // byte check is what has to.
+      const multibyte = `Bearer ${'é'.repeat(67)}`;
+      assert.equal(multibyte.length, 74);
+      assert.ok(
+        multibyte.length <= MAX_SESSION_AUTHORIZATION_HEADER_BYTES,
+        'the value is inside the character bound',
+      );
+      assert.equal(Buffer.byteLength(multibyte, 'utf8'), 7 + 67 * 2);
+      assert.ok(
+        Buffer.byteLength(multibyte, 'utf8') > MAX_SESSION_AUTHORIZATION_HEADER_BYTES,
+        'the value is outside the byte bound',
+      );
+
+      for (const header of [multibyte, `Bearer ${'😀'.repeat(33)}`, `Bearer ${'é'.repeat(128)}`]) {
+        assert.equal(parseBearerCredential(header), null, 'refused before credential use');
+        assert.deepEqual(
+          manager.admitRequest(ordinaryContext(target, { authorizationHeader: header })),
+          { outcome: 'INVALID_SESSION_TOKEN' },
+        );
+      }
+
+      // No session mutation, and the genuine credential is unaffected.
+      assert.equal(JSON.stringify(manager.listSessions()), before);
+      assert.deepEqual(manager.admitRequest(ordinaryContext(target)).outcome, 'AUTHENTICATED');
+    });
+
     test('RC05-SES-52: an oversized presented session ID never enters a Map lookup', () => {
       const target = issue('bounded-id');
       const before = JSON.stringify(manager.listSessions());
@@ -1083,11 +1257,21 @@ describe('CesSpace ARC — RC-05 Task 5: Secure Session Lifecycle', () => {
         ordinaryContext(b, { authorizationHeader: null }),
         ordinaryContext(a, { authorizationHeader: `Bearer ${b.issuance.token}` }),
         ordinaryContext(a, { authorizationHeader: 'Bearer ' + 'A'.repeat(64) }),
+        // Genuinely different enrolled devices (resolver-minted, so a binding
+        // rejection is not confounded with a provenance rejection). A real
+        // device carries its own deviceId, clientId, clientType, and SPKI, so
+        // these move together exactly as they do in the trust store.
         ordinaryContext(a, { identity: identity('no-mutation-other') }),
-        ordinaryContext(a, { identity: { ...a.id, spkiPin: pin('no-mutation-other') } }),
-        ordinaryContext(a, { identity: { ...a.id, deviceId: identity('x').deviceId } }),
-        ordinaryContext(a, { identity: { ...a.id, clientId: 'someone-else' } }),
-        ordinaryContext(a, { identity: { ...a.id, clientType: 'other-client' } }),
+        ordinaryContext(a, { identity: identity('no-mutation-other-pin') }),
+        ordinaryContext(a, {
+          identity: identity('no-mutation-other-client', { clientId: 'someone-else' }),
+        }),
+        ordinaryContext(a, {
+          identity: identity('no-mutation-other-type', { clientType: 'other-client' }),
+        }),
+        // And a fabricated object is refused too — by provenance here, which the
+        // dedicated SES-54..56 cases pin down.
+        ordinaryContext(a, { identity: fabricatedIdentity('no-mutation-fabricated') }),
       ];
       for (const context of failures) {
         assert.deepEqual(manager.admitRequest(context), { outcome: 'INVALID_SESSION_TOKEN' });
@@ -2227,6 +2411,211 @@ describe('CesSpace ARC — RC-05 Task 5: Secure Session Lifecycle', () => {
           compiled.includes(banned),
           false,
           `the session module must not reference ${banned}`,
+        );
+      }
+    });
+
+    test('RC05-SES-54: a fabricated identity can never bootstrap a session', () => {
+      // Structurally perfect: every field is a canonical, well-formed value. It
+      // is still not a resolver output, so it is not a trusted identity.
+      const fabricated = fabricatedIdentity('fabricated-bootstrap');
+      assert.match(fabricated.deviceId, /^[0-9a-f]{32}$/);
+      assert.match(fabricated.spkiPin, /^[0-9a-f]{64}$/);
+      assert.equal(fabricated.clientId.length > 0, true);
+      assert.equal(fabricated.clientType.length > 0, true);
+
+      const decision = manager.admitRequest({
+        kind: 'initialize',
+        hasExistingSessionContext: false,
+        presentedSessionId: null,
+        authorizationHeader: null,
+        identity: fabricated,
+      });
+      assert.deepEqual(decision, { outcome: 'UNAUTHENTICATED' });
+
+      // Zero reservations, zero sessions, zero tokens.
+      assert.equal(manager.getReservedSessionIdCount(), 0);
+      assert.equal(manager.getActiveSessionCount(), 0);
+      assert.deepEqual(manager.listSessions(), []);
+
+      // Neither can an object built by copying a REAL identity's fields, nor a
+      // structurally valid identity for a device that was never enrolled.
+      const copied = { ...identity('fabricated-copy-source') };
+      assert.deepEqual(
+        manager.admitRequest({
+          kind: 'initialize',
+          hasExistingSessionContext: false,
+          presentedSessionId: null,
+          authorizationHeader: null,
+          identity: copied,
+        }),
+        { outcome: 'UNAUTHENTICATED' },
+      );
+      assert.equal(manager.getReservedSessionIdCount(), 0);
+      assert.equal(manager.getActiveSessionCount(), 0);
+    });
+
+    test('RC05-SES-55: a fabricated identity is refused before any session is created', () => {
+      const fabricated = fabricatedIdentity('fabricated-issue');
+      const reserved = manager.createSessionIdGenerator()();
+      const beforeViews = JSON.stringify(manager.listSessions());
+
+      assert.throws(
+        () => manager.issueSession({ sessionId: reserved, identity: fabricated }),
+        (err) => err.code === 'INVALID_REQUEST_SCHEMA',
+      );
+
+      // The refusal happens before token minting: no session, and the reserved
+      // server ID is still unused and still activatable by a real identity.
+      assert.equal(manager.hasSession(reserved), false);
+      assert.equal(manager.getActiveSessionCount(), 0);
+      assert.equal(JSON.stringify(manager.listSessions()), beforeViews);
+
+      const genuine = identity('fabricated-issue-genuine');
+      const issuance = manager.issueSession({ sessionId: reserved, identity: genuine });
+      assert.equal(manager.hasSession(issuance.sessionId), true);
+    });
+
+    test('RC05-SES-56: a fabricated identity cannot authenticate a live session', () => {
+      const target = issue('fabricated-auth');
+      const before = JSON.stringify(manager.listSessions());
+
+      // The fabricator knows every field of the real identity and reproduces it
+      // exactly — including the SPKI pin of the device that owns the session.
+      const clone = fabricatedIdentity('fabricated-auth', { spkiPin: target.id.spkiPin });
+
+      assert.deepEqual(manager.admitRequest(ordinaryContext(target, { identity: clone })), {
+        outcome: 'INVALID_SESSION_TOKEN',
+      });
+      assert.equal(
+        manager.authenticate({
+          sessionId: target.sessionId,
+          token: target.issuance.token,
+          identity: clone,
+        }),
+        undefined,
+      );
+
+      // The session is unchanged, and the real identity still authenticates.
+      assert.equal(JSON.stringify(manager.listSessions()), before);
+      assert.deepEqual(
+        manager.admitRequest(ordinaryContext(target)).outcome,
+        'AUTHENTICATED',
+        'the genuine credential still works, so provenance did not break the real path',
+      );
+      // Nor does a mutation of the real identity help: it is frozen.
+      assert.equal(Object.isFrozen(target.id), true);
+      assert.throws(() => {
+        'use strict';
+        target.id.deviceId = 'f'.repeat(32);
+      }, TypeError);
+      assert.deepEqual(manager.admitRequest(ordinaryContext(target)).outcome, 'AUTHENTICATED');
+    });
+
+    test('RC05-SES-57: the real resolver is the only source of a trusted identity', () => {
+      // A device that is enrolled resolves and is accepted end to end.
+      const store = DeviceTrustStore.createEmpty();
+      const { device } = store.enrollDevice({
+        clientId: 'agent-provenance',
+        clientType: 'claude-code',
+        pin: pin('provenance'),
+      });
+      const resolved = resolveActiveDeviceIdentity(store, pin('provenance'));
+      assert.ok(resolved);
+      assert.equal(resolved.deviceId, device.deviceId);
+
+      assert.deepEqual(
+        manager.admitRequest({
+          kind: 'initialize',
+          hasExistingSessionContext: false,
+          presentedSessionId: null,
+          authorizationHeader: null,
+          identity: resolved,
+        }).outcome,
+        'BOOTSTRAP_TOKENLESS',
+      );
+
+      const sessionId = manager.createSessionIdGenerator()();
+      const issuance = manager.issueSession({ sessionId, identity: resolved });
+      assert.deepEqual(
+        manager.admitRequest({
+          kind: 'ordinary',
+          hasExistingSessionContext: true,
+          presentedSessionId: sessionId,
+          authorizationHeader: `Bearer ${issuance.token}`,
+          identity: resolved,
+        }).outcome,
+        'AUTHENTICATED',
+      );
+
+      // Revoking the device makes the resolver stop producing an identity, so
+      // the same call site simply has nothing trusted to present.
+      store.revokeDevice(device.deviceId);
+      const afterRevocation = resolveActiveDeviceIdentity(store, pin('provenance'));
+      assert.equal(afterRevocation, undefined);
+      assert.deepEqual(
+        manager.admitRequest({
+          kind: 'initialize',
+          hasExistingSessionContext: false,
+          presentedSessionId: null,
+          authorizationHeader: null,
+          identity: afterRevocation,
+        }),
+        { outcome: 'UNAUTHENTICATED' },
+      );
+    });
+
+    test('RC05-SES-58: identity provenance is runtime state, not a TypeScript shape', () => {
+      const source = fs.readFileSync(
+        new URL('../packages/auth/src/session.ts', import.meta.url),
+        'utf8',
+      );
+
+      // A module-private WeakSet carries the provenance, and the resolver is the
+      // only writer.
+      assert.equal(source.includes('new WeakSet<object>()'), true, 'a provenance registry exists');
+      assert.equal(
+        (source.match(/RESOLVED_IDENTITIES\.add\(/g) ?? []).length,
+        1,
+        'exactly one site registers an identity',
+      );
+      assert.equal(
+        source.indexOf('RESOLVED_IDENTITIES.add(') >
+          source.indexOf('export function resolveActiveDeviceIdentity'),
+        true,
+        'the single registration site is inside the resolver',
+      );
+      assert.equal(source.includes('Object.freeze('), true, 'resolved identities are frozen');
+
+      // Every consumer that treats an identity as authoritative gates on it.
+      for (const consumer of [
+        'public admitRequest',
+        'public authenticate',
+        'public issueSession',
+      ]) {
+        const start = source.indexOf(consumer);
+        assert.ok(start > 0, `${consumer} must exist`);
+        const body = source.slice(
+          start,
+          source.indexOf('\n  public ', start + 1) === -1
+            ? source.length
+            : source.indexOf('\n  public ', start + 1),
+        );
+        assert.equal(
+          body.includes('hasResolverProvenance('),
+          true,
+          `${consumer} must gate on resolver provenance`,
+        );
+      }
+
+      // The registry is never exported, so no caller can mint provenance.
+      const indexUrl = new URL('../packages/auth/src/index.ts', import.meta.url);
+      const indexSource = fs.readFileSync(indexUrl, 'utf8');
+      for (const forbidden of ['RESOLVED_IDENTITIES', 'hasResolverProvenance', 'WeakSet']) {
+        assert.equal(
+          indexSource.includes(forbidden),
+          false,
+          `${forbidden} must not be exported from the package`,
         );
       }
     });
