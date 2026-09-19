@@ -119,7 +119,13 @@ export type ConsumeOutcome =
   | { ok: true; enrollment: PendingEnrollmentView }
   | {
       ok: false;
-      reason: 'UNKNOWN_ENROLLMENT' | 'EXPIRED' | 'SECRET_MISMATCH' | 'LOCKED_OUT';
+      reason:
+        | 'UNKNOWN_ENROLLMENT'
+        | 'EXPIRED'
+        | 'SECRET_MISMATCH'
+        | 'LOCKED_OUT'
+        /** Proof was correct but durable activation failed; nothing was consumed. */
+        | 'ACTIVATION_FAILED';
       /** True when this attempt was counted against the lockout. */
       counted: boolean;
     };
@@ -138,6 +144,16 @@ interface InternalPendingEnrollment {
   failedAttempts: number;
   /** SHA-256 verifier of the one-time secret. The raw secret is not retained. */
   secretDigest: Buffer;
+  /**
+   * True while a verified proof is inside its activation commit.
+   *
+   * A record in this state is no longer SELECTABLE: the challenge has been
+   * proven once and is being activated, so a nested lookup (which only a
+   * re-entrant commit callback could produce) must not find it. Without this a
+   * synchronous re-entry could observe the same challenge as live and produce a
+   * second success for one single-use secret.
+   */
+  committing: boolean;
 }
 
 /**
@@ -282,6 +298,7 @@ export class EnrollmentManager {
       monotonicDeadline: nowMono + BigInt(ENROLLMENT_TTL_SECONDS) * 1_000_000_000n,
       failedAttempts: 0,
       secretDigest: sha256Bytes(secret),
+      committing: false,
     };
 
     this.pendingById.set(enrollmentId, record);
@@ -332,7 +349,10 @@ export class EnrollmentManager {
       return undefined;
     }
     for (const record of this.pendingById.values()) {
-      if (record.spkiPin === spkiPin) {
+      // A record already inside its activation commit is not selectable: its
+      // single-use secret has been spent, and only the outer transaction may
+      // still observe it.
+      if (record.spkiPin === spkiPin && !record.committing) {
         return record;
       }
     }
@@ -363,7 +383,11 @@ export class EnrollmentManager {
    * atomic activation. This method performs NO trust-store mutation and NO
    * network I/O; Task 4 owns activation.
    */
-  public verifyAndConsumeBySpki(spkiPin: string, secret: unknown): ConsumeOutcome {
+  public completeBySpki(
+    spkiPin: string,
+    secret: unknown,
+    commit: (challenge: PendingEnrollmentView) => void,
+  ): ConsumeOutcome {
     // A malformed or unknown pin is indistinguishable from an unknown challenge.
     if (typeof spkiPin !== 'string' || !isValidSpkiPin(spkiPin)) {
       return { ok: false, reason: 'UNKNOWN_ENROLLMENT', counted: false };
@@ -403,10 +427,33 @@ export class EnrollmentManager {
       return { ok: false, reason: 'SECRET_MISMATCH', counted: true };
     }
 
-    // Single-use: the record is removed in the same synchronous step that
-    // observes the match, so no second caller can observe it as live.
+    // The proof is correct, but NOTHING is consumed yet.
+    //
+    // `commit` performs durable activation and MUST run to completion first. If
+    // it throws, the challenge stays live with its failed-attempt count
+    // untouched, so the device can simply retry once the persistence problem is
+    // resolved. Consumption and activation are therefore one synchronous step
+    // from the caller's perspective, and this API cannot express
+    // "consume now, persist later".
+    const view = this.toView(record);
+    // Withdraw the challenge from selection for the duration of the commit, so
+    // even a synchronous re-entry from inside the callback cannot observe the
+    // same single-use secret as still available.
+    record.committing = true;
+    try {
+      commit(view);
+    } catch {
+      // Activation failed: the challenge becomes selectable again, with its
+      // failed-attempt count and deadline untouched, so the device can retry
+      // once the persistence problem is resolved.
+      record.committing = false;
+      return { ok: false, reason: 'ACTIVATION_FAILED', counted: false };
+    }
+
+    // Single-use: removal happens in the same synchronous step that observed the
+    // successful commit, so no second caller can observe it as live.
     this.pendingById.delete(record.enrollmentId);
-    return { ok: true, enrollment: this.toView(record) };
+    return { ok: true, enrollment: view };
   }
 
   /** Removes every pending enrollment. Used only by restart/tests. */

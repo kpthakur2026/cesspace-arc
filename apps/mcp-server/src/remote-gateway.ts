@@ -1,23 +1,32 @@
 /**
  * CesSpace ARC — RC-05 Task 3 TLS 1.3 / mTLS Admission Gateway
  *
- * A pure TLS admission listener. It terminates TLS 1.3 in-process, requires a
- * client certificate chained to a configured trust root, derives the canonical
- * peer SPKI pin, and admits the connection. It does NOT parse HTTP, does NOT
- * speak MCP, does NOT issue sessions, and does NOT decide device authorization.
- * Those belong to Tasks 4 and beyond.
+ * Terminates TLS 1.3 in-process, requires a client certificate chained to a
+ * configured trust root, derives the canonical peer SPKI pin, and admits the
+ * connection. It does NOT speak MCP, does NOT issue sessions, and does NOT
+ * decide device authorization: those belong to Tasks 5 and beyond.
  *
  * Authoritative contract: §5, §6 (T-1..T-11), §7 P-1..P-3, §18, §19, §20, §21.1.
  *
- * Why `tls.createServer` and not an HTTP server: §20/T-8 require a malformed or
- * unauthenticated connection to be rejected before any HTTP or MCP byte is
- * parsed. A raw TLS server has no HTTP parser in the path at all, so that
- * property is structural rather than a matter of careful routing.
+ * Since Task 4 the listener is a Node HTTPS server rather than a raw TLS
+ * server, because `POST /enroll/complete` is the first HTTP surface. That
+ * change is deliberately invisible to the Task-3 properties it must preserve:
+ *
+ * - `https.createServer` IS a `tls.Server`; the same TLS options, the same
+ *   `connection` / `secureConnection` / `tlsClientError` lifecycle, and the
+ *   same raw-socket-before-TLS ordering are used here unchanged.
+ * - `rejectUnauthorized: true` means a connection without a CA-valid client
+ *   certificate fails the handshake itself, so the HTTP parser is never handed
+ *   the socket and no request listener can run (§20/T-8, RC05-NEG-30).
+ * - The request listener therefore runs only AFTER an authenticated mTLS
+ *   handshake, and it resolves the peer identity from the admission registry
+ *   rather than re-deriving it.
  */
 
-import * as tls from 'node:tls';
+import * as https from 'node:https';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Server, TLSSocket } from 'node:tls';
-import { deriveSpkiPin } from '@cesspace-arc/auth';
+import { deriveSpkiPin, EnrollmentManager } from '@cesspace-arc/auth';
 import { DeviceTrustStore } from '@cesspace-arc/auth';
 import {
   isWildcardBindHost,
@@ -34,6 +43,7 @@ import {
   type ServerCertificateFacts,
 } from './tls-material.js';
 import { RemoteConfigError } from './remote-errors.js';
+import { EnrollmentBootstrap, type EnrollmentBootstrapOptions } from './enrollment-bootstrap.js';
 import {
   AdmissionLimiter,
   type AdmissionLimiterOptions,
@@ -95,6 +105,25 @@ export interface RemoteGatewayOptions {
   handshakeTimeoutMsForTests?: number;
   /** Layer A limiter overrides. */
   admission?: AdmissionLimiterOptions;
+  /**
+   * The pending-enrollment authority used by `POST /enroll/complete`.
+   *
+   * Production composition (`createArcMcpServer`) supplies the EXACT SAME
+   * instance that the authenticated local admin IPC channel writes to, so a
+   * challenge an operator creates locally is immediately visible to a remote
+   * completion. Pending challenges stay volatile and are never persisted, and
+   * this option is not reachable from RemoteConfig, the environment, or the
+   * network.
+   *
+   * When omitted the gateway creates its own instance, which is correct only
+   * for admission-only tests that never complete an enrollment.
+   */
+  enrollmentManager?: EnrollmentManager;
+  /**
+   * @internal Test-only bootstrap seams (durable-write injection). Never
+   * populated from ArcServerConfig, RemoteConfig, the environment, or a request.
+   */
+  bootstrap?: EnrollmentBootstrapOptions;
   /** Invoked once per admitted, chain-validated connection. */
   onAdmitted?: (context: PeerAdmissionContext) => void;
   /** Invoked when Layer A refuses a connection. */
@@ -108,6 +137,14 @@ interface ConnectionState {
   rawSocket: TLSSocket;
   /** The TLS socket, once the handshake has produced one. */
   tlsSocket?: TLSSocket;
+  /**
+   * Canonical SPKI pin, set exactly once at post-handshake admission.
+   *
+   * Routing reads the identity from HERE rather than re-deriving it per
+   * request: the pin the endpoint verifies is the pin the TLS handshake
+   * proved, and there is no second derivation that could disagree.
+   */
+  spkiPin?: string;
   handshakeSettled: boolean;
   connectionSettled: boolean;
 }
@@ -140,6 +177,15 @@ export class RemoteGateway {
   public readonly handshakeTimeoutMs: number;
   private readonly limiter: AdmissionLimiter;
   private readonly options: RemoteGatewayOptions;
+  /**
+   * The gateway's enrollment bootstrap surface.
+   *
+   * Created once, in the constructor, over the trust store loaded from the
+   * REQUIRED `trustStorePath`. It owns the authoritative in-memory trust store
+   * for the process lifetime, so a completed enrollment is visible to every
+   * later request without re-reading the file.
+   */
+  private readonly bootstrap: EnrollmentBootstrap;
 
   /** Server key material, held only until the listener consumes it. */
   private privateKeyMaterial?: ReturnType<typeof loadServerPrivateKey>;
@@ -183,20 +229,30 @@ export class RemoteGateway {
     // out of the constructor, so a failed startup cannot leave a bound socket.
     this.config = resolveRemoteConfig(config);
 
-    if (this.config.trustStorePath !== undefined) {
-      // Reuse the Task-1 loader verbatim. No second trust-store parser exists,
-      // and zero enrolled devices is explicitly valid here (§18, §16).
-      try {
-        DeviceTrustStore.loadFromFile(this.config.trustStorePath);
-      } catch (err: unknown) {
-        throw new RemoteConfigError(
-          'Configured device trust store failed validation.',
-          'TRUST_STORE_INVALID',
-          // Preserve the underlying reason for the operator without exposing it.
-          { cause: err },
-        );
-      }
+    // The device trust store is a REQUIRED remote authentication root, resolved
+    // by `resolveRemoteConfig` already. Reuse the Task-1 loader verbatim: no
+    // second trust-store parser exists. A corrupt, missing, symlinked, or
+    // insecurely-permissioned store fails startup, while a store that is valid
+    // but holds zero devices is explicitly allowed — that is the first
+    // enrollment case (§5.2, §16.1, §18).
+    let trustStore: DeviceTrustStore;
+    try {
+      trustStore = DeviceTrustStore.loadFromFile(this.config.trustStorePath);
+    } catch (err: unknown) {
+      throw new RemoteConfigError(
+        'Configured device trust store failed validation.',
+        'TRUST_STORE_INVALID',
+        // Preserve the underlying reason for the operator without exposing it.
+        { cause: err },
+      );
     }
+
+    this.bootstrap = new EnrollmentBootstrap(
+      options.enrollmentManager ?? new EnrollmentManager(),
+      trustStore,
+      this.config.trustStorePath,
+      options.bootstrap ?? {},
+    );
 
     const keyMaterial = loadServerPrivateKey(this.config.privateKey);
     try {
@@ -238,7 +294,7 @@ export class RemoteGateway {
 
     let server: Server;
     try {
-      server = tls.createServer(
+      server = https.createServer(
         {
           // §6 T-1: exactly TLS 1.3. No compatibility version, no fallback.
           minVersion: 'TLSv1.3',
@@ -253,9 +309,12 @@ export class RemoteGateway {
           // test seam may only SHORTEN the frozen value.
           handshakeTimeout: this.handshakeTimeoutMs,
         },
-        () => {
-          // Intentionally empty. Task 3 has no application protocol: an admitted
-          // connection is held open and counted, and nothing is parsed from it.
+        (req: IncomingMessage, res: ServerResponse) => {
+          // Reached ONLY after a completed, CA-validated mTLS handshake: with
+          // `rejectUnauthorized: true` an unauthenticated peer never produces a
+          // TLSSocket for the HTTP parser to attach to. Routing is therefore
+          // structurally unreachable without mTLS.
+          this.handleRequest(req, res);
         },
       );
     } finally {
@@ -528,12 +587,14 @@ export class RemoteGateway {
     // The handshake has settled, so its slot is released now; the connection
     // remains counted as live until it closes.
     this.settleHandshakeFor(tuple);
-    // Attach the TLS socket to the SAME registry entry that already owns the
-    // admission slot. There is no separate collection to keep in step, so a
-    // closed socket cannot be retained after its entry is deleted.
+    // Attach the TLS socket and the derived identity to the SAME registry entry
+    // that already owns the admission slot. There is no separate collection to
+    // keep in step, so a closed socket cannot be retained after its entry is
+    // deleted, and the router has exactly one source for the peer identity.
     const state = this.connectionStates.get(tuple);
     if (state !== undefined) {
       state.tlsSocket = socket;
+      state.spkiPin = spkiPin;
     }
 
     // Task 3 boundary: a valid chain and a canonical SPKI pin. No enrollment,
@@ -546,6 +607,45 @@ export class RemoteGateway {
   private handleHandshakeFailure(socket: TLSSocket): void {
     this.settleConnection(connectionTuple(socket));
     socket.destroy();
+  }
+
+  // -------------------------------------------------------------------------
+  // Minimal HTTP router (Task 4)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Routes one HTTP request on an already-authenticated mTLS connection.
+   *
+   * The peer identity is read from the admission registry, keyed by the SAME
+   * connection tuple the raw and TLS sockets share. It is never recomputed from
+   * the request and never accepted from the request (§5 of Task 4).
+   */
+  private handleRequest(req: IncomingMessage, res: ServerResponse): void {
+    const state = this.connectionStates.get(connectionTuple(req.socket as TLSSocket));
+    const spkiPin = state?.spkiPin;
+
+    if (spkiPin === undefined) {
+      // Structurally unreachable for an admitted connection: a request cannot
+      // be parsed before the post-handshake handler recorded the identity. If
+      // it ever happens the request is dropped without a body, because there is
+      // no authenticated identity to act on.
+      req.socket.destroy();
+      return;
+    }
+
+    this.bootstrap.handle(req, res, spkiPin).catch(() => {
+      // The controller answers every path it accepts. A rejected promise here
+      // means the response could not be written, so the connection is dropped
+      // rather than left half-answered.
+      if (!res.headersSent && !res.writableEnded) {
+        res.destroy();
+      }
+    });
+  }
+
+  /** Enrolled device count held by this gateway's trust store. */
+  public getEnrolledDeviceCount(): number {
+    return this.bootstrap.getEnrolledDeviceCount();
   }
 
   /**

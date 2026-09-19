@@ -660,6 +660,22 @@ export class DeviceTrustStore {
   }
 
   /**
+   * Build an isolated in-memory store from an existing snapshot.
+   *
+   * The snapshot is revalidated through the SAME closed-schema validator used
+   * for on-disk data and rebuilt into fresh record objects, so the returned
+   * store shares no mutable state with the store the snapshot came from.
+   *
+   * This is what makes a candidate/commit transaction possible: a caller can
+   * stage an enrollment against a candidate built from `toData()`, persist it,
+   * and only then replace the authoritative reference. Mutating the candidate
+   * can never be observed through the original.
+   */
+  public static fromData(data: DeviceTrustStoreData): DeviceTrustStore {
+    return new DeviceTrustStore(data);
+  }
+
+  /**
    * Load trust store from a file on disk after verifying filesystem integrity and schema.
    * Production entry point using real filesystem. Corrupt, missing, unreadable, or invalid
    * store throws and never silently defaults to empty.

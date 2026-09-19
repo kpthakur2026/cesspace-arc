@@ -29,6 +29,7 @@ import {
   type WorkspaceRecord,
   RC03_MUTATION_TOOLS,
 } from '@cesspace-arc/policy';
+import { EnrollmentManager } from '@cesspace-arc/auth';
 import { AdminIpcError, AdminIpcServer } from './admin-ipc.js';
 import { ApprovalAuditSink, getApprovalAuditSink } from './approval-audit.js';
 import { RemoteGateway, type RemoteGatewayStatus } from './remote-gateway.js';
@@ -1317,6 +1318,16 @@ export class ArcMcpServer implements IArcMcpServer {
      * launch configuration supplies both an endpoint and an operator key.
      */
     public readonly adminIpcServer?: AdminIpcServer,
+    /**
+     * The ONE pending-enrollment authority for this process (RC-05 Task 4).
+     *
+     * The authenticated local admin IPC channel creates and cancels pending
+     * challenges through it, and the remote bootstrap endpoint completes them
+     * through the SAME object. There is exactly one instance per process: no
+     * copy, no synchronization, no second remote manager, and no persistence of
+     * pending challenges, which stay volatile and die with the process.
+     */
+    public readonly enrollmentManager?: EnrollmentManager,
   ) {
     // Transport mode is resolved once, at construction, and is immutable. A
     // remote configuration supplied alongside stdio is NOT activated.
@@ -2801,7 +2812,13 @@ export class ArcMcpServer implements IArcMcpServer {
       if (remoteConfig === undefined) {
         throw new Error('Remote transport requires remote gateway configuration.');
       }
-      const gateway = new RemoteGateway(remoteConfig);
+      // The SAME pending-enrollment authority the admin IPC channel uses. A
+      // challenge created locally through the authenticated operator channel is
+      // therefore immediately completable remotely, with no copying and no
+      // cross-process or cross-instance synchronization.
+      const gateway = new RemoteGateway(remoteConfig, {
+        enrollmentManager: this.enrollmentManager,
+      });
       try {
         await gateway.start();
       } catch (err: unknown) {
@@ -2919,6 +2936,12 @@ export function createArcMcpServer(config?: Partial<ArcServerConfig>): ArcMcpSer
 
   const approvalStateManager = new ApprovalStateManager();
 
+  // RC-05 Task 4: exactly ONE pending-enrollment authority per process. It is
+  // passed to the local admin IPC channel (which creates and cancels pending
+  // challenges) and to the remote gateway (which completes them over mTLS), so
+  // both halves of an enrollment observe the same in-memory challenge table.
+  const enrollmentManager = new EnrollmentManager();
+
   // The admin channel is opt-in through trusted launch configuration only.
   // Supplying exactly one half of the pair fails closed rather than starting
   // partially configured admin access.
@@ -2940,6 +2963,8 @@ export function createArcMcpServer(config?: Partial<ArcServerConfig>): ArcMcpSer
         operatorPublicKeyB64: operatorPublicKeyB64 as string,
         approvalStateManager,
         auditLogger,
+        // The SAME instance the remote bootstrap endpoint completes against.
+        enrollmentManager,
       });
     }
   }
@@ -2955,6 +2980,7 @@ export function createArcMcpServer(config?: Partial<ArcServerConfig>): ArcMcpSer
     processRegistry,
     approvalStateManager,
     adminIpcServer,
+    enrollmentManager,
   );
 }
 

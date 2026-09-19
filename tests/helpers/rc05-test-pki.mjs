@@ -290,6 +290,33 @@ export function createTestPki(dir) {
       });
       return { keyPath: path.join(cwd, keyName), certPath };
     },
+    /**
+     * Issues an additional CLIENT leaf from the TRUSTED CA.
+     *
+     * Used by the RC-05 Task-4 bootstrap suite for the "chains correctly but
+     * presents a different SPKI" control: the certificate is genuine and
+     * chain-valid, and only its identity is wrong. The leaf extension set
+     * already carries clientAuth, so it is a valid mTLS client certificate.
+     */
+    issueTrustedClientCert({ commonName = 'client-other', san = 'DNS:client-other.invalid' } = {}) {
+      const suffix = Math.random().toString(36).slice(2, 10);
+      const keyName = `client-other-${suffix}.key`;
+      const certName = `client-other-${suffix}.pem`;
+      generateKey(keyName, cwd);
+      const configPath = writeCaConfig(cwd, trustedCa, {
+        serverName: `client-other-${suffix}`,
+        san,
+      });
+      const certPath = issueLeaf(cwd, {
+        configPath,
+        commonName,
+        keyFile: keyName,
+        certFile: certName,
+        startdate: opensslDate(-1),
+        enddate: opensslDate(30),
+      });
+      return { keyPath: path.join(cwd, keyName), certPath };
+    },
     trustedCaCertPath: trustedCa.certPath,
     untrustedCaCertPath: untrustedCa.certPath,
     serverKeyPath,
@@ -308,6 +335,26 @@ export function createTestPki(dir) {
     malformedCaPath,
     notACertificatePath,
   };
+}
+
+/**
+ * Writes a valid, EMPTY device trust store and returns its path.
+ *
+ * RC-05 Task 4 made `trustStorePath` a required remote authentication root, so
+ * every remote gateway needs a real, valid, securely-permissioned store on disk
+ * even when no device is enrolled yet. Zero enrolled devices is a supported
+ * state (§5.2), not a startup failure.
+ *
+ * The store is written with mode 0600 because the Task-1 loader rejects any
+ * group/world-accessible trust store.
+ */
+export function createEmptyTrustStore(dir, name = 'devices.json') {
+  const filePath = path.join(dir, name);
+  fs.writeFileSync(filePath, JSON.stringify({ version: 1, devices: [] }, null, 2), {
+    mode: 0o600,
+  });
+  fs.chmodSync(filePath, 0o600);
+  return filePath;
 }
 
 /** Creates a symlink to a CA file, for the symlink-rejection control. */

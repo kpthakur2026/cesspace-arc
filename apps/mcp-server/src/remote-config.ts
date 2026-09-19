@@ -173,8 +173,15 @@ export interface RemoteConfig {
   clientCaPaths: readonly string[];
   /** Explicit opt-in required before a wildcard bind is permitted (§18). */
   allowWildcardBind?: boolean;
-  /** Optional device trust-store path, validated through the Task-1 loader. */
-  trustStorePath?: string;
+  /**
+   * Device trust-store path. REQUIRED in remote mode.
+   *
+   * Remote mode performs durable device activation, so it needs an explicit
+   * persistent authentication root: there is no implicit path, no in-memory
+   * fallback, and no silently created empty store. A store that exists and is
+   * valid but holds zero devices is allowed — that is the first-enrollment case.
+   */
+  trustStorePath: string;
 }
 
 /** Fully resolved, validated remote configuration. */
@@ -185,7 +192,7 @@ export interface ResolvedRemoteConfig {
   readonly serverCertificatePath: string;
   readonly privateKey: PrivateKeySource;
   readonly clientCaPaths: readonly string[];
-  readonly trustStorePath?: string;
+  readonly trustStorePath: string;
 }
 
 /**
@@ -386,10 +393,13 @@ export function resolveRemoteConfig(config: RemoteConfig): ResolvedRemoteConfig 
     seenCaPaths.add(resolved);
   }
 
-  const trustStorePath =
-    config.trustStorePath === undefined
-      ? undefined
-      : validatePath(config.trustStorePath, 'Trust-store path', 'TRUST_STORE_PATH_INVALID');
+  // Required, not optional: remote mode has a durable authentication root or it
+  // does not start.
+  const trustStorePath = validatePath(
+    config.trustStorePath,
+    'Trust-store path',
+    'TRUST_STORE_PATH_INVALID',
+  );
 
   return {
     bindHost,
@@ -398,6 +408,6 @@ export function resolveRemoteConfig(config: RemoteConfig): ResolvedRemoteConfig 
     serverCertificatePath,
     privateKey,
     clientCaPaths: [...clientCaPaths],
-    ...(trustStorePath === undefined ? {} : { trustStorePath }),
+    trustStorePath,
   };
 }

@@ -33,11 +33,29 @@ import {
   isWildcardBindHost,
   TLS_HANDSHAKE_TIMEOUT_MS,
 } from '../apps/mcp-server/dist/remote-config.js';
-import { createTestPki, hasOpenssl, oversizedCaFile, symlinkTo } from './helpers/rc05-test-pki.mjs';
+import {
+  createEmptyTrustStore,
+  createTestPki,
+  hasOpenssl,
+  oversizedCaFile,
+  symlinkTo,
+} from './helpers/rc05-test-pki.mjs';
 
 let tempRoot;
 let pki;
 let publicHostname;
+/**
+ * A fresh, valid, EMPTY device trust store for one remote composition.
+ *
+ * Task 4 made the trust store a REQUIRED remote authentication root, so even a
+ * composition that never completes an enrollment must name a real, securely
+ * permissioned store on disk. Zero enrolled devices is a supported state.
+ */
+let trustStoreCounter = 0;
+function freshTrustStore(tag) {
+  trustStoreCounter += 1;
+  return createEmptyTrustStore(tempRoot, `devices-${tag}-${trustStoreCounter}.json`);
+}
 
 before(() => {
   // The suite generates its own X.509 material rather than shipping fixtures,
@@ -96,6 +114,9 @@ async function baseConfig(overrides = {}) {
     serverCertificatePath: pki.serverCertPath,
     privateKey: { kind: 'file', path: pki.serverKeyPath },
     clientCaPaths: [pki.trustedCaCertPath],
+    // Task 4 made the device trust store a REQUIRED remote authentication root.
+    // A valid store holding zero devices is the normal first-enrollment state.
+    trustStorePath: freshTrustStore('base'),
     ...overrides,
   };
 }
@@ -1555,6 +1576,7 @@ describe('CesSpace ARC — RC-05 Task 3: TLS/mTLS Admission Layer', () => {
           serverCertificatePath: shortLived.certPath,
           privateKey: { kind: 'file', path: shortLived.keyPath },
           clientCaPaths: [pki.trustedCaCertPath],
+          trustStorePath: freshTrustStore('enr-175'),
         },
       });
 
@@ -2010,6 +2032,9 @@ trailing-not-pem
         'privateKey',
         'publicHostname',
         'serverCertificatePath',
+        // Task 4 added the device trust store as a REQUIRED remote
+        // authentication root; it is trusted launch configuration, not a seam.
+        'trustStorePath',
       ]);
 
       // Smuggling a seam through the configuration object is ignored: the
@@ -2039,6 +2064,7 @@ trailing-not-pem
           serverCertificatePath: pki.serverCertPath,
           privateKey: { kind: 'file', path: pki.serverKeyPath },
           clientCaPaths: [pki.trustedCaCertPath],
+          trustStorePath: freshTrustStore('enr-185'),
         },
       });
       await server.start();
@@ -2082,6 +2108,7 @@ trailing-not-pem
             serverCertificatePath: pki.serverCertPath,
             privateKey: { kind: 'file', path: pki.serverKeyPath },
             clientCaPaths: [pki.trustedCaCertPath],
+            trustStorePath: freshTrustStore('enr-130b'),
           },
         },
         undefined,
@@ -2115,6 +2142,7 @@ trailing-not-pem
           serverCertificatePath: pki.serverCertPath,
           privateKey: { kind: 'file', path: pki.serverKeyPath },
           clientCaPaths: [pki.trustedCaCertPath],
+          trustStorePath: freshTrustStore('enr-131'),
         },
       });
 
@@ -2153,6 +2181,7 @@ trailing-not-pem
           serverCertificatePath: pki.serverCertPath,
           privateKey: { kind: 'file', path: pki.wrongServerKeyPath },
           clientCaPaths: [pki.trustedCaCertPath],
+          trustStorePath: freshTrustStore('enr-132'),
         },
       });
 

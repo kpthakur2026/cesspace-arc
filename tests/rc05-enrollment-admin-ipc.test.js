@@ -133,6 +133,16 @@ async function adminRawEnvelope(endpoint, envelope) {
   return JSON.parse(frame.toString('utf8'));
 }
 
+/**
+ * RC-05 Task 4 replaced the consume-first primitive with a transactionally
+ * coupled one: `completeBySpki(pin, secret, commit)` consumes the challenge
+ * only after `commit` returns normally. These cases exercise the pure
+ * enrollment domain, so activation is a no-op commit that always succeeds.
+ */
+function consume(target, spkiPin, secret) {
+  return target.completeBySpki(spkiPin, secret, () => {});
+}
+
 describe('CesSpace ARC — RC-05 Task 2: Enrollment Admin IPC', () => {
   let dir;
   let endpoint;
@@ -630,10 +640,7 @@ describe('CesSpace ARC — RC-05 Task 2: Enrollment Admin IPC', () => {
 
       assert.equal(enrollmentManager.get(enrollmentId), undefined);
       assert.equal(
-        enrollmentManager.verifyAndConsumeBySpki(
-          created.result.enrollment.spkiPin,
-          created.result.secret,
-        ).ok,
+        consume(enrollmentManager, created.result.enrollment.spkiPin, created.result.secret).ok,
         false,
       );
     });
