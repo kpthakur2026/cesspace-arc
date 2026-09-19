@@ -134,8 +134,9 @@ export function deriveSpkiPin(
         const pubKey = crypto.createPublicKey({ key: input, format: 'der', type: 'spki' });
         derSpki = pubKey.export({ type: 'spki', format: 'der' });
       } catch {
-        // If already raw DER SubjectPublicKeyInfo buffer
-        derSpki = input;
+        throw ArcError.invalidRequestSchema(
+          'Failed to derive SPKI pin: Buffer is neither a valid X.509 certificate nor valid DER SubjectPublicKeyInfo.',
+        );
       }
     }
   } else {

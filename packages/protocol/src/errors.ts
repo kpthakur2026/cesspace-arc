@@ -499,32 +499,6 @@ export class ArcError extends Error implements ArcErrorPayload {
     });
   }
 
-  public static unauthenticated(
-    message = 'Authentication failed.',
-    details?: Record<string, string | number | boolean>,
-  ): ArcError {
-    return new ArcError({
-      code: 'UNAUTHENTICATED',
-      category: 'AUTHENTICATION',
-      message,
-      details,
-      retryable: false,
-    });
-  }
-
-  public static invalidSessionToken(
-    message = 'Invalid or expired session token.',
-    details?: Record<string, string | number | boolean>,
-  ): ArcError {
-    return new ArcError({
-      code: 'INVALID_SESSION_TOKEN',
-      category: 'AUTHENTICATION',
-      message,
-      details,
-      retryable: false,
-    });
-  }
-
   public static deviceNotEnrolled(
     message = 'Device not enrolled in trust store.',
     details?: Record<string, string | number | boolean>,

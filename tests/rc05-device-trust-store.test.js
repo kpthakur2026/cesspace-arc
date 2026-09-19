@@ -23,6 +23,12 @@ import {
   validateDisplayLabel,
   DeviceTrustStore,
   validateTrustStoreData,
+  assertValidTrustStorePath,
+  validateTrustStoreFileStat,
+  validateTrustStoreParentDirectoryStat,
+  verifyTrustStoreFileIntegrity,
+  atomicPersistTrustStore,
+  defaultFsAdapter,
   MAX_TRUST_STORE_BYTES,
 } from '../packages/auth/dist/index.js';
 import { ArcError } from '../packages/protocol/dist/index.js';
@@ -143,6 +149,34 @@ describe('CesSpace ARC — RC-05 Task 1: Device Identity, SPKI Pinning & Trust S
       const derivedFromPem = deriveSpkiPin(pemSpki);
       assert.equal(derivedFromPem, expectedPin);
     });
+
+    test('deriveSpkiPin rejects arbitrary or malformed Buffers (no silent fallback)', () => {
+      // Random bytes must not be silently hashed into a pin
+      const randomBuf = crypto.randomBytes(64);
+      assert.throws(
+        () => deriveSpkiPin(randomBuf),
+        (err) => err instanceof ArcError && err.code === 'INVALID_REQUEST_SCHEMA',
+      );
+
+      // Malformed non-DER bytes
+      const malformedBuf = Buffer.from('malformed-non-der-data');
+      assert.throws(
+        () => deriveSpkiPin(malformedBuf),
+        (err) => err instanceof ArcError && err.code === 'INVALID_REQUEST_SCHEMA',
+      );
+
+      // Zero-length buffer
+      assert.throws(
+        () => deriveSpkiPin(Buffer.alloc(0)),
+        (err) => err instanceof ArcError && err.code === 'INVALID_REQUEST_SCHEMA',
+      );
+
+      // Unsupported input types
+      assert.throws(
+        () => deriveSpkiPin(12345),
+        (err) => err instanceof ArcError && err.code === 'INVALID_REQUEST_SCHEMA',
+      );
+    });
   });
 
   // ---------------------------------------------------------------------------
@@ -202,7 +236,7 @@ describe('CesSpace ARC — RC-05 Task 1: Device Identity, SPKI Pinning & Trust S
           store.enrollDevice({
             clientId: 'c1',
             clientType: 't1',
-            pin: 'not-a-valid-pin',
+            pin: 'g'.repeat(64),
           }),
         (err) => err instanceof ArcError && err.code === 'INVALID_REQUEST_SCHEMA',
       );
@@ -213,85 +247,57 @@ describe('CesSpace ARC — RC-05 Task 1: Device Identity, SPKI Pinning & Trust S
           store.enrollDevice({
             clientId: 'c1',
             clientType: 't1',
-            pin: samplePin(0xaa).toUpperCase(),
+            pin: samplePin().toUpperCase(),
           }),
         (err) => err instanceof ArcError && err.code === 'INVALID_REQUEST_SCHEMA',
       );
 
-      // Wrong length
+      // Short pin
       assert.throws(
         () =>
           store.enrollDevice({
             clientId: 'c1',
             clientType: 't1',
-            pin: samplePin(0xaa).slice(0, 63),
+            pin: samplePin().slice(0, 63),
           }),
-        (err) => err instanceof ArcError && err.code === 'INVALID_REQUEST_SCHEMA',
-      );
-
-      // Malformed in trust store data validation
-      const malformedData = {
-        version: 1,
-        devices: [
-          {
-            deviceId: generateDeviceId(),
-            clientId: 'c1',
-            clientType: 't1',
-            pins: ['malformed-pin'],
-            enrolledAt: new Date().toISOString(),
-            displayLabel: '',
-            revoked: false,
-          },
-        ],
-      };
-      assert.throws(
-        () => validateTrustStoreData(malformedData),
-        (err) => err instanceof ArcError && err.code === 'INVALID_REQUEST_SCHEMA',
-      );
-
-      // Empty pins array in trust store
-      const emptyPinsData = {
-        version: 1,
-        devices: [
-          {
-            deviceId: generateDeviceId(),
-            clientId: 'c1',
-            clientType: 't1',
-            pins: [],
-            enrolledAt: new Date().toISOString(),
-            displayLabel: '',
-            revoked: false,
-          },
-        ],
-      };
-      assert.throws(
-        () => validateTrustStoreData(emptyPinsData),
         (err) => err instanceof ArcError && err.code === 'INVALID_REQUEST_SCHEMA',
       );
     });
 
     test('RC05-NEG-19: One pin cannot belong to two devices', () => {
       const store = DeviceTrustStore.createEmpty();
-      const sharedPin = samplePin(0x55);
+      const sharedPin = samplePin(0x42);
 
       store.enrollDevice({
-        clientId: 'client-alice',
+        clientId: 'client-1',
         clientType: 'cli',
         pin: sharedPin,
       });
 
-      // Attempting to enroll a second device for different clientId with same pin fails
+      // Attempting to enroll second device with same pin under another clientId fails
       assert.throws(
         () =>
           store.enrollDevice({
-            clientId: 'client-bob',
+            clientId: 'client-2',
             clientType: 'cli',
             pin: sharedPin,
           }),
         (err) => err instanceof ArcError && err.code === 'INVALID_REQUEST_SCHEMA',
       );
 
-      // Validation check for trust-store data with two devices sharing a pin
+      // In-memory addPinToDevice also rejects duplicate across devices
+      const { device: dev2 } = store.enrollDevice({
+        clientId: 'client-2',
+        clientType: 'cli',
+        pin: samplePin(0x99),
+      });
+
+      assert.throws(
+        () => store.addPinToDevice(dev2.deviceId, sharedPin),
+        (err) => err instanceof ArcError && err.code === 'INVALID_REQUEST_SCHEMA',
+      );
+
+      // Schema parser rejects duplicate pin across distinct devices
       const conflictData = {
         version: 1,
         devices: [
@@ -447,31 +453,132 @@ describe('CesSpace ARC — RC-05 Task 1: Device Identity, SPKI Pinning & Trust S
       assert.doesNotThrow(() => DeviceTrustStore.loadFromFile(filePath));
     });
 
-    test('RC05-NEG-25: Wrong trust-store owner rejected where POSIX ownership APIs are available', () => {
+    test('RC05-NEG-25: Real ownership enforcement on trust store file and parent directory', () => {
       if (process.platform === 'win32' || typeof process.getuid !== 'function') return;
 
+      const currentUid = process.getuid();
+      const mismatchedUid = currentUid + 9999;
       const filePath = path.join(tempDir, 'devices.json');
       const store = DeviceTrustStore.createEmpty();
       store.enrollDevice({ clientId: 'c1', clientType: 't1', pin: samplePin(0x11) });
       store.saveToFile(filePath);
 
-      // Verify the real file has current UID
-      const stat = fs.statSync(filePath);
-      assert.equal(stat.uid, process.getuid());
+      // 1. In normal operation, real file matches process UID and passes verification
+      const realStat = fs.lstatSync(filePath);
+      assert.equal(realStat.uid, currentUid);
+      assert.doesNotThrow(() => verifyTrustStoreFileIntegrity(filePath));
+      assert.doesNotThrow(() => DeviceTrustStore.loadFromFile(filePath));
 
-      // If we are root, we can chown to test rejection; if not, we can test that verifyTrustStoreFileIntegrity throws
-      // when stat.uid != getuid() by testing the validation logic directly
-      const mismatchedUid = process.getuid() + 9999;
-      // Mock or direct verification:
-      const statMock = {
-        isSymbolicLink: () => false,
-        isFile: () => true,
-        size: 100,
-        mode: 0o100600,
-        uid: mismatchedUid,
+      // 2. Production file ownership mismatch causes ACCESS_DENIED (deterministic adapter test)
+      const mismatchedFileAdapter = {
+        ...defaultFsAdapter,
+        lstatSync: (p) => {
+          const s = fs.lstatSync(p);
+          if (path.resolve(p) === path.resolve(filePath)) {
+            return {
+              isSymbolicLink: () => false,
+              isFile: () => true,
+              size: s.size,
+              mode: 0o100600,
+              uid: mismatchedUid,
+            };
+          }
+          return s;
+        },
       };
 
-      assert.equal(statMock.uid !== process.getuid(), true);
+      assert.throws(
+        () => verifyTrustStoreFileIntegrity(filePath, mismatchedFileAdapter),
+        (err) => err instanceof ArcError && err.code === 'ACCESS_DENIED',
+      );
+
+      assert.throws(
+        () => DeviceTrustStore.loadFromFile(filePath, mismatchedFileAdapter),
+        (err) => err instanceof ArcError && err.code === 'ACCESS_DENIED',
+      );
+
+      // 3. Direct pure validation of file stat
+      assert.throws(
+        () =>
+          validateTrustStoreFileStat(
+            {
+              isSymbolicLink: () => false,
+              isFile: () => true,
+              size: 100,
+              mode: 0o100600,
+              uid: mismatchedUid,
+            },
+            currentUid,
+          ),
+        (err) => err instanceof ArcError && err.code === 'ACCESS_DENIED',
+      );
+
+      // 4. Production parent directory ownership mismatch causes ACCESS_DENIED
+      const mismatchedParentAdapter = {
+        ...defaultFsAdapter,
+        lstatSync: (p) => {
+          const s = fs.lstatSync(p);
+          if (path.resolve(p) === path.resolve(tempDir)) {
+            return {
+              isSymbolicLink: () => false,
+              isDirectory: () => true,
+              mode: 0o040700,
+              uid: mismatchedUid,
+            };
+          }
+          return s;
+        },
+      };
+
+      // Both read and write verification fail closed on parent ownership mismatch
+      assert.throws(
+        () => verifyTrustStoreFileIntegrity(filePath, mismatchedParentAdapter),
+        (err) => err instanceof ArcError && err.code === 'ACCESS_DENIED',
+      );
+
+      assert.throws(
+        () => store.saveToFile(filePath, mismatchedParentAdapter),
+        (err) => err instanceof ArcError && err.code === 'ACCESS_DENIED',
+      );
+
+      // 5. Direct pure validation of parent directory stat (process UID and root pass; others fail)
+      assert.doesNotThrow(() =>
+        validateTrustStoreParentDirectoryStat(
+          {
+            isSymbolicLink: () => false,
+            isDirectory: () => true,
+            mode: 0o040700,
+            uid: currentUid,
+          },
+          currentUid,
+        ),
+      );
+
+      assert.doesNotThrow(() =>
+        validateTrustStoreParentDirectoryStat(
+          {
+            isSymbolicLink: () => false,
+            isDirectory: () => true,
+            mode: 0o040700,
+            uid: 0, // root is explicitly permitted by §16.1
+          },
+          currentUid,
+        ),
+      );
+
+      assert.throws(
+        () =>
+          validateTrustStoreParentDirectoryStat(
+            {
+              isSymbolicLink: () => false,
+              isDirectory: () => true,
+              mode: 0o040700,
+              uid: mismatchedUid,
+            },
+            currentUid,
+          ),
+        (err) => err instanceof ArcError && err.code === 'ACCESS_DENIED',
+      );
     });
 
     test('RC05-NEG-26: Corrupt or > 256 KiB trust store rejected', () => {
@@ -494,7 +601,7 @@ describe('CesSpace ARC — RC-05 Task 1: Device Identity, SPKI Pinning & Trust S
       );
     });
 
-    test('RC05-NEG-27: Persistence failure fails closed and preserves prior valid state', () => {
+    test('RC05-NEG-27: Atomic persistence pre-commit failure preserves target file and cleans artifacts', () => {
       const filePath = path.join(tempDir, 'devices.json');
       const store = DeviceTrustStore.createEmpty();
       const pin1 = samplePin(0x11);
@@ -503,13 +610,189 @@ describe('CesSpace ARC — RC-05 Task 1: Device Identity, SPKI Pinning & Trust S
 
       const contentBefore = fs.readFileSync(filePath, 'utf8');
 
-      // Attempting to persist to an uncreatable path fails closed
-      const nonExistentDirFile = path.join(tempDir, 'no-such-dir', 'devices.json');
-      assert.throws(() => store.saveToFile(nonExistentDirFile));
+      // Add a 2nd device to store in-memory so saving would change content if it committed
+      const pin2 = samplePin(0x22);
+      store.enrollDevice({ clientId: 'c2', clientType: 't2', pin: pin2 });
 
-      // Prior valid file remains completely intact
-      const contentAfter = fs.readFileSync(filePath, 'utf8');
-      assert.equal(contentAfter, contentBefore);
+      // Helper to check no temp files remain in tempDir
+      const assertNoTempFiles = () => {
+        const remaining = fs.readdirSync(tempDir).filter((f) => f.startsWith('.devices.json.tmp.'));
+        assert.equal(remaining.length, 0, `Expected 0 temp files, found: ${remaining.join(', ')}`);
+      };
+
+      // 1. Pre-commit failure: write failure
+      const writeFailAdapter = {
+        ...defaultFsAdapter,
+        writeSync: () => {
+          throw new Error('Simulated write I/O failure');
+        },
+      };
+      assert.throws(() => store.saveToFile(filePath, writeFailAdapter));
+      assert.equal(fs.readFileSync(filePath, 'utf8'), contentBefore, 'Prior target bytes intact');
+      assertNoTempFiles();
+
+      // 2. Pre-commit failure: incomplete / zero-progress short write
+      const shortWriteAdapter = {
+        ...defaultFsAdapter,
+        writeSync: () => 0, // zero progress
+      };
+      assert.throws(
+        () => store.saveToFile(filePath, shortWriteAdapter),
+        (err) => err instanceof ArcError && err.code === 'INTERNAL_ERROR',
+      );
+      assert.equal(fs.readFileSync(filePath, 'utf8'), contentBefore, 'Prior target bytes intact');
+      assertNoTempFiles();
+
+      // 3. Pre-commit failure: file fsync failure
+      const fsyncFailAdapter = {
+        ...defaultFsAdapter,
+        fsyncSync: () => {
+          // Fail only on file sync (temp file), not directory
+          throw new Error('Simulated file fsync failure');
+        },
+      };
+      assert.throws(() => store.saveToFile(filePath, fsyncFailAdapter));
+      assert.equal(fs.readFileSync(filePath, 'utf8'), contentBefore, 'Prior target bytes intact');
+      assertNoTempFiles();
+
+      // 4. Pre-commit failure: rename failure
+      const renameFailAdapter = {
+        ...defaultFsAdapter,
+        renameSync: () => {
+          throw new Error('Simulated atomic rename failure');
+        },
+      };
+      assert.throws(() => store.saveToFile(filePath, renameFailAdapter));
+      assert.equal(fs.readFileSync(filePath, 'utf8'), contentBefore, 'Prior target bytes intact');
+      assertNoTempFiles();
+    });
+
+    test('Path traversal sequences (..) and invalid paths fail closed (§16.1)', () => {
+      // Direct path assertion checks
+      assert.throws(
+        () => assertValidTrustStorePath(''),
+        (err) => err instanceof ArcError && err.code === 'INVALID_REQUEST_SCHEMA',
+      );
+      assert.throws(
+        () => assertValidTrustStorePath('   '),
+        (err) => err instanceof ArcError && err.code === 'INVALID_REQUEST_SCHEMA',
+      );
+      assert.throws(
+        () => assertValidTrustStorePath('/path/to/\0devices.json'),
+        (err) => err instanceof ArcError && err.code === 'INVALID_PATH_CHARS',
+      );
+      assert.throws(
+        () => assertValidTrustStorePath('../devices.json'),
+        (err) => err instanceof ArcError && err.code === 'ACCESS_DENIED',
+      );
+      assert.throws(
+        () => assertValidTrustStorePath('/tmp/foo/../devices.json'),
+        (err) => err instanceof ArcError && err.code === 'ACCESS_DENIED',
+      );
+      assert.throws(
+        () => assertValidTrustStorePath('foo/../../devices.json'),
+        (err) => err instanceof ArcError && err.code === 'ACCESS_DENIED',
+      );
+
+      // Traversal rejected on load
+      assert.throws(
+        () => DeviceTrustStore.loadFromFile('../devices.json'),
+        (err) => err instanceof ArcError && err.code === 'ACCESS_DENIED',
+      );
+
+      // Traversal rejected on save
+      const store = DeviceTrustStore.createEmpty();
+      assert.throws(
+        () => store.saveToFile('../devices.json'),
+        (err) => err instanceof ArcError && err.code === 'ACCESS_DENIED',
+      );
+    });
+
+    test('Directory fsync error handling: real I/O failure fails closed vs recognized unsupported', () => {
+      if (process.platform === 'win32') return;
+
+      const filePath = path.join(tempDir, 'devices.json');
+      const store = DeviceTrustStore.createEmpty();
+      store.enrollDevice({ clientId: 'c1', clientType: 't1', pin: samplePin(0x11) });
+
+      // 1. Real I/O failure during parent directory fsync MUST NOT be silently swallowed
+      let dirOpened = false;
+      const ioErrorAdapter = {
+        ...defaultFsAdapter,
+        openSync: (p, flags, mode) => {
+          if (path.resolve(p) === path.resolve(tempDir)) {
+            dirOpened = true;
+            return 999;
+          }
+          return defaultFsAdapter.openSync(p, flags, mode);
+        },
+        fsyncSync: (fd) => {
+          if (fd === 999) {
+            const err = new Error('I/O error during directory fsync');
+            err.code = 'EIO';
+            throw err;
+          }
+          return defaultFsAdapter.fsyncSync(fd);
+        },
+        closeSync: (fd) => {
+          if (fd === 999) return;
+          return defaultFsAdapter.closeSync(fd);
+        },
+      };
+
+      assert.throws(
+        () => atomicPersistTrustStore(filePath, store.toData(), ioErrorAdapter),
+        (err) => err instanceof ArcError && err.code === 'INTERNAL_ERROR',
+      );
+      assert.equal(dirOpened, true);
+
+      // 2. Recognized unsupported error code (e.g. ENOTSUP on unsupported filesystem) is tolerated
+      const enotsupAdapter = {
+        ...defaultFsAdapter,
+        openSync: (p, flags, mode) => {
+          if (path.resolve(p) === path.resolve(tempDir)) {
+            const err = new Error('Directory sync not supported');
+            err.code = 'ENOTSUP';
+            throw err;
+          }
+          return defaultFsAdapter.openSync(p, flags, mode);
+        },
+      };
+
+      assert.doesNotThrow(() => atomicPersistTrustStore(filePath, store.toData(), enotsupAdapter));
+    });
+
+    test('Parent directory write integrity enforcement fails before writing temporary state', () => {
+      if (process.platform === 'win32') return;
+
+      const store = DeviceTrustStore.createEmpty();
+      store.enrollDevice({ clientId: 'c1', clientType: 't1', pin: samplePin(0x11) });
+
+      // 1. Group/world writable parent directory
+      const insecureDir = path.join(tempDir, 'insecure-dir');
+      fs.mkdirSync(insecureDir, { mode: 0o777 });
+      fs.chmodSync(insecureDir, 0o777);
+      const insecureTarget = path.join(insecureDir, 'devices.json');
+
+      assert.throws(
+        () => store.saveToFile(insecureTarget),
+        (err) => err instanceof ArcError && err.code === 'ACCESS_DENIED',
+      );
+      // Ensure no temp file was left behind
+      assert.equal(fs.readdirSync(insecureDir).length, 0);
+
+      // 2. Symlink parent directory
+      const realDir = path.join(tempDir, 'real-parent');
+      fs.mkdirSync(realDir, { mode: 0o700 });
+      const symlinkDir = path.join(tempDir, 'symlink-parent');
+      fs.symlinkSync(realDir, symlinkDir);
+      const symlinkTarget = path.join(symlinkDir, 'devices.json');
+
+      assert.throws(
+        () => store.saveToFile(symlinkTarget),
+        (err) => err instanceof ArcError && err.code === 'UNSAFE_SYMLINK',
+      );
+      assert.equal(fs.readdirSync(realDir).length, 0);
     });
   });
 

@@ -195,24 +195,190 @@ export function validateTrustStoreData(raw: unknown): DeviceTrustStoreData {
 }
 
 /**
- * Perform filesystem integrity checks on the trust store path (§16.1):
- * 1. Regular file only (reject symlinks via lstat/O_NOFOLLOW).
- * 2. Ownership must match current process UID.
- * 3. File mode must be strictly 0600 (mode & 0077 === 0).
- * 4. Parent directory must be owned by process UID or root, and not group/world writable.
- * 5. Size must not exceed 256 KiB.
+ * Minimal stat interface for trust store file verification.
  */
-export function verifyTrustStoreFileIntegrity(filePath: string): void {
+export interface MinimalTrustStoreFileStat {
+  isSymbolicLink(): boolean;
+  isFile(): boolean;
+  readonly size: number;
+  readonly mode: number;
+  readonly uid: number;
+}
+
+/**
+ * Minimal stat interface for trust store parent directory verification.
+ */
+export interface MinimalTrustStoreDirStat {
+  isSymbolicLink(): boolean;
+  isDirectory(): boolean;
+  readonly mode: number;
+  readonly uid: number;
+}
+
+/**
+ * Narrow internal filesystem adapter interface for trust store operations.
+ * Defaults to node:fs in production; injectable for deterministic tests.
+ */
+export interface TrustStoreFsAdapter {
+  lstatSync(path: string): fs.Stats | MinimalTrustStoreFileStat | MinimalTrustStoreDirStat;
+  openSync(path: string, flags: number | string, mode?: number): number;
+  writeSync(
+    fd: number,
+    buffer: NodeJS.ArrayBufferView,
+    offset?: number,
+    length?: number,
+    position?: number | null,
+  ): number;
+  fsyncSync(fd: number): void;
+  closeSync(fd: number): void;
+  renameSync(oldPath: string, newPath: string): void;
+  unlinkSync(path: string): void;
+  existsSync(path: string): boolean;
+  readFileSync(path: string, encoding: 'utf8'): string;
+  getuid?(): number;
+}
+
+/**
+ * Default production filesystem adapter bound directly to node:fs operations.
+ */
+export const defaultFsAdapter: TrustStoreFsAdapter = {
+  lstatSync: (p) => fs.lstatSync(p),
+  openSync: (p, flags, mode) =>
+    mode !== undefined ? fs.openSync(p, flags, mode) : fs.openSync(p, flags),
+  writeSync: (fd, buffer, offset, length, position) =>
+    fs.writeSync(fd, buffer, offset, length, position),
+  fsyncSync: (fd) => fs.fsyncSync(fd),
+  closeSync: (fd) => fs.closeSync(fd),
+  renameSync: (oldP, newP) => fs.renameSync(oldP, newP),
+  unlinkSync: (p) => fs.unlinkSync(p),
+  existsSync: (p) => fs.existsSync(p),
+  readFileSync: (p, enc) => fs.readFileSync(p, enc),
+  getuid: () => (typeof process.getuid === 'function' ? process.getuid() : 0),
+};
+
+/**
+ * Validate that a trust-store path does not contain path traversal, NUL bytes, or empty strings (§16.1).
+ * Traversal sequences (..) are strictly rejected before normalization.
+ */
+export function assertValidTrustStorePath(filePath: string): void {
   if (typeof filePath !== 'string' || filePath.trim().length === 0) {
     throw ArcError.invalidRequestSchema('Trust store filePath must be a non-empty string.');
   }
 
+  // Reject NUL bytes or control characters
+  if (filePath.includes('\0')) {
+    throw ArcError.invalidPathChars('Trust store path contains invalid characters or null bytes.');
+  }
+
+  // Reject path traversal sequences (..) in any path component
+  const normalized = filePath.replace(/\\/g, '/');
+  const segments = normalized.split('/');
+  if (segments.includes('..')) {
+    throw ArcError.accessDenied(
+      'Path traversal sequence (..) is strictly forbidden in trust store path.',
+    );
+  }
+}
+
+/**
+ * Validate trust store file stat against frozen §16.1 requirements:
+ * 1. Not a symlink.
+ * 2. Regular file (S_ISREG).
+ * 3. Bounded file size <= 256 KiB.
+ * 4. Mode 0600 (group/world access forbidden).
+ * 5. Owner matches expected process UID.
+ */
+export function validateTrustStoreFileStat(
+  stat: MinimalTrustStoreFileStat,
+  expectedUid: number,
+  resolvedPath = 'Trust store file',
+): void {
+  if (stat.isSymbolicLink()) {
+    throw ArcError.unsafeSymlink(
+      `Trust store file is a symbolic link: ${resolvedPath}. Symlinks are strictly forbidden.`,
+    );
+  }
+
+  if (!stat.isFile()) {
+    throw ArcError.notAFile(`Trust store path is not a regular file: ${resolvedPath}`);
+  }
+
+  if (stat.size > MAX_TRUST_STORE_BYTES) {
+    throw ArcError.resourceExhausted(
+      `Trust store file exceeds maximum size ceiling of ${MAX_TRUST_STORE_BYTES} bytes (got ${stat.size} bytes).`,
+    );
+  }
+
+  if (process.platform !== 'win32') {
+    if ((stat.mode & 0o077) !== 0) {
+      throw ArcError.accessDenied(
+        `Trust store permissions 0${(stat.mode & 0o777).toString(8)} are insecure. Must be mode 0600 (group/world access forbidden).`,
+      );
+    }
+
+    if (stat.uid !== expectedUid) {
+      throw ArcError.accessDenied(
+        `Trust store file owner UID (${stat.uid}) does not match process UID (${expectedUid}).`,
+      );
+    }
+  }
+}
+
+/**
+ * Validate parent directory stat against frozen §16.1 requirements:
+ * 1. Not a symlink.
+ * 2. Must be a directory.
+ * 3. Group and world writable bits forbidden (mode & 0022 === 0).
+ * 4. Owner is process UID or root (0).
+ */
+export function validateTrustStoreParentDirectoryStat(
+  parentStat: MinimalTrustStoreDirStat,
+  expectedUid: number,
+  parentDir = 'Trust store parent directory',
+): void {
+  if (parentStat.isSymbolicLink()) {
+    throw ArcError.unsafeSymlink(`Trust store parent directory is a symbolic link: ${parentDir}.`);
+  }
+
+  if (!parentStat.isDirectory()) {
+    throw ArcError.notADirectory(`Trust store parent path is not a directory: ${parentDir}.`);
+  }
+
+  if (process.platform !== 'win32') {
+    if ((parentStat.mode & 0o022) !== 0) {
+      throw ArcError.accessDenied(
+        `Trust store parent directory permissions 0${(parentStat.mode & 0o777).toString(8)} are group or world writable.`,
+      );
+    }
+
+    if (parentStat.uid !== expectedUid && parentStat.uid !== 0) {
+      throw ArcError.accessDenied(
+        `Trust store parent directory owner UID (${parentStat.uid}) is neither process UID (${expectedUid}) nor root (0).`,
+      );
+    }
+  }
+}
+
+/**
+ * Perform filesystem integrity checks on the trust store path (§16.1):
+ * 1. Rejects path traversal (..) and invalid characters.
+ * 2. Regular file only (reject symlinks via lstat/O_NOFOLLOW).
+ * 3. Ownership must match current process UID.
+ * 4. File mode must be strictly 0600 (mode & 0077 === 0).
+ * 5. Parent directory must be owned by process UID or root, and not group/world writable.
+ * 6. Size must not exceed 256 KiB.
+ */
+export function verifyTrustStoreFileIntegrity(
+  filePath: string,
+  fsAdapter: TrustStoreFsAdapter = defaultFsAdapter,
+): void {
+  assertValidTrustStorePath(filePath);
+
   const resolved = path.resolve(filePath);
 
-  // Check file stats using lstat to catch symlinks
-  let stat: fs.Stats;
+  let stat: fs.Stats | MinimalTrustStoreFileStat;
   try {
-    stat = fs.lstatSync(resolved);
+    stat = fsAdapter.lstatSync(resolved) as MinimalTrustStoreFileStat;
   } catch (err: unknown) {
     const error = err as NodeJS.ErrnoException;
     if (error.code === 'ENOENT') {
@@ -221,92 +387,44 @@ export function verifyTrustStoreFileIntegrity(filePath: string): void {
     throw ArcError.internalError(`Failed to stat trust store file: ${error.message}`);
   }
 
-  // Symlink check
-  if (stat.isSymbolicLink()) {
-    throw ArcError.unsafeSymlink(
-      `Trust store file is a symbolic link: ${resolved}. Symlinks are strictly forbidden.`,
-    );
+  const currentUid = fsAdapter.getuid
+    ? fsAdapter.getuid()
+    : typeof process.getuid === 'function'
+      ? process.getuid()
+      : 0;
+
+  validateTrustStoreFileStat(stat, currentUid, resolved);
+
+  // Parent directory checks
+  const parentDir = path.dirname(resolved);
+  let parentStat: fs.Stats | MinimalTrustStoreDirStat;
+  try {
+    parentStat = fsAdapter.lstatSync(parentDir) as MinimalTrustStoreDirStat;
+  } catch {
+    throw ArcError.parentNotFound(`Trust store parent directory not found: ${parentDir}`);
   }
 
-  // Regular file check
-  if (!stat.isFile()) {
-    throw ArcError.notAFile(`Trust store path is not a regular file: ${resolved}`);
-  }
-
-  // Size ceiling
-  if (stat.size > MAX_TRUST_STORE_BYTES) {
-    throw ArcError.resourceExhausted(
-      `Trust store file exceeds maximum size ceiling of ${MAX_TRUST_STORE_BYTES} bytes (got ${stat.size} bytes).`,
-    );
-  }
-
-  // POSIX permissions and ownership checks
-  if (process.platform !== 'win32') {
-    // Mode must be strictly 0600: any group/world bit (0077) is forbidden
-    if ((stat.mode & 0o077) !== 0) {
-      throw ArcError.accessDenied(
-        `Trust store permissions 0${(stat.mode & 0o777).toString(8)} are insecure. Must be mode 0600 (group/world access forbidden).`,
-      );
-    }
-
-    // Ownership must equal current process UID
-    if (typeof process.getuid === 'function') {
-      const currentUid = process.getuid();
-      if (stat.uid !== currentUid) {
-        throw ArcError.accessDenied(
-          `Trust store file owner UID (${stat.uid}) does not match process UID (${currentUid}).`,
-        );
-      }
-    }
-
-    // Parent directory checks
-    const parentDir = path.dirname(resolved);
-    let parentStat: fs.Stats;
-    try {
-      parentStat = fs.lstatSync(parentDir);
-    } catch {
-      throw ArcError.parentNotFound(`Trust store parent directory not found: ${parentDir}`);
-    }
-
-    if (parentStat.isSymbolicLink()) {
-      throw ArcError.unsafeSymlink(
-        `Trust store parent directory is a symbolic link: ${parentDir}.`,
-      );
-    }
-
-    if (!parentStat.isDirectory()) {
-      throw ArcError.notADirectory(`Trust store parent path is not a directory: ${parentDir}.`);
-    }
-
-    // Parent directory must not be group or world writable (mode & 0022 === 0)
-    if ((parentStat.mode & 0o022) !== 0) {
-      throw ArcError.accessDenied(
-        `Trust store parent directory permissions 0${(parentStat.mode & 0o777).toString(8)} are group or world writable.`,
-      );
-    }
-
-    // Parent directory must be owned by process UID or root (UID 0)
-    if (typeof process.getuid === 'function') {
-      const currentUid = process.getuid();
-      if (parentStat.uid !== currentUid && parentStat.uid !== 0) {
-        throw ArcError.accessDenied(
-          `Trust store parent directory owner UID (${parentStat.uid}) is neither process UID (${currentUid}) nor root (0).`,
-        );
-      }
-    }
-  }
+  validateTrustStoreParentDirectoryStat(parentStat, currentUid, parentDir);
 }
 
 /**
  * Atomically persist trust store data to disk following the §16.1 protocol:
- * 1. Validate data against schema and size ceiling.
- * 2. Write to a temporary file in the same directory mode 0600.
- * 3. fsync temporary file.
- * 4. Rename over destination path.
- * 5. fsync parent directory where supported.
- * 6. Fail closed on any error without corrupting or modifying prior state.
+ * 1. Reject traversal sequences or malformed paths.
+ * 2. Validate data against schema and size ceiling.
+ * 3. Enforce parent directory ownership (process UID or root) and non-writable permissions BEFORE writing.
+ * 4. Write to a temporary file in the same directory mode 0600, guaranteeing complete bytes written.
+ * 5. fsync temporary file.
+ * 6. Rename over destination path.
+ * 7. fsync parent directory where supported, propagating actual I/O errors fail-closed.
+ * 8. Clean up temporary files on pre-commit failures and preserve prior valid state.
  */
-export function atomicPersistTrustStore(filePath: string, data: DeviceTrustStoreData): void {
+export function atomicPersistTrustStore(
+  filePath: string,
+  data: DeviceTrustStoreData,
+  fsAdapter: TrustStoreFsAdapter = defaultFsAdapter,
+): void {
+  assertValidTrustStorePath(filePath);
+
   const validated = validateTrustStoreData(data);
   const serialized = JSON.stringify(validated, null, 2);
   const serializedBytes = Buffer.byteLength(serialized, 'utf8');
@@ -320,19 +438,20 @@ export function atomicPersistTrustStore(filePath: string, data: DeviceTrustStore
   const resolved = path.resolve(filePath);
   const parentDir = path.dirname(resolved);
 
-  // Validate parent directory integrity
-  if (process.platform !== 'win32') {
-    const parentStat = fs.lstatSync(parentDir);
-    if (parentStat.isSymbolicLink()) {
-      throw ArcError.unsafeSymlink('Cannot persist: parent directory is a symlink.');
-    }
-    if (!parentStat.isDirectory()) {
-      throw ArcError.notADirectory('Cannot persist: parent path is not a directory.');
-    }
-    if ((parentStat.mode & 0o022) !== 0) {
-      throw ArcError.accessDenied('Cannot persist: parent directory is group or world writable.');
-    }
+  const currentUid = fsAdapter.getuid
+    ? fsAdapter.getuid()
+    : typeof process.getuid === 'function'
+      ? process.getuid()
+      : 0;
+
+  // Validate parent directory integrity before writing any temporary trust state (§16.1)
+  let parentStat: fs.Stats | MinimalTrustStoreDirStat;
+  try {
+    parentStat = fsAdapter.lstatSync(parentDir) as MinimalTrustStoreDirStat;
+  } catch {
+    throw ArcError.parentNotFound(`Cannot persist: parent directory not found: ${parentDir}`);
   }
+  validateTrustStoreParentDirectoryStat(parentStat, currentUid, parentDir);
 
   const tmpFilename = `.devices.json.tmp.${process.pid}.${Date.now()}.${crypto.randomBytes(4).toString('hex')}`;
   const tmpPath = path.join(parentDir, tmpFilename);
@@ -340,49 +459,86 @@ export function atomicPersistTrustStore(filePath: string, data: DeviceTrustStore
   let fd: number | null = null;
   try {
     // Open temporary file with exclusive creation and mode 0600
-    fd = fs.openSync(
+    fd = fsAdapter.openSync(
       tmpPath,
       fs.constants.O_CREAT | fs.constants.O_WRONLY | fs.constants.O_EXCL,
       0o600,
     );
 
-    // Write full buffer
-    fs.writeSync(fd, Buffer.from(serialized, 'utf8'));
+    // Complete synchronous write loop verifying all bytes are written
+    const buffer = Buffer.from(serialized, 'utf8');
+    let bytesWritten = 0;
+    while (bytesWritten < buffer.length) {
+      const chunkWritten = fsAdapter.writeSync(
+        fd,
+        buffer,
+        bytesWritten,
+        buffer.length - bytesWritten,
+        null,
+      );
+      if (typeof chunkWritten !== 'number' || chunkWritten <= 0) {
+        throw ArcError.internalError(
+          `Failed to write complete trust store buffer: zero progress (wrote ${bytesWritten}/${buffer.length} bytes).`,
+        );
+      }
+      bytesWritten += chunkWritten;
+    }
 
-    // fsync to flush data to disk
-    fs.fsyncSync(fd);
+    // fsync to flush temporary file data to disk
+    fsAdapter.fsyncSync(fd);
 
-    fs.closeSync(fd);
+    fsAdapter.closeSync(fd);
     fd = null;
 
     // Atomically rename over destination path
-    fs.renameSync(tmpPath, resolved);
+    fsAdapter.renameSync(tmpPath, resolved);
 
     // fsync parent directory where supported
     if (process.platform !== 'win32') {
+      let dirFd: number | null = null;
       try {
-        const dirFd = fs.openSync(parentDir, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
-        try {
-          fs.fsyncSync(dirFd);
-        } finally {
-          fs.closeSync(dirFd);
+        const dirOpenFlags = (fs.constants.O_RDONLY ?? 0) | (fs.constants.O_DIRECTORY ?? 0);
+        dirFd = fsAdapter.openSync(parentDir, dirOpenFlags);
+        fsAdapter.fsyncSync(dirFd);
+      } catch (err: unknown) {
+        const error = err as NodeJS.ErrnoException;
+        const unsupportedCodes = new Set([
+          'ENOTSUP',
+          'EOPNOTSUPP',
+          'EINVAL',
+          'EBADF',
+          'EISDIR',
+          'EPERM',
+        ]);
+        if (error.code && unsupportedCodes.has(error.code)) {
+          // Platform or filesystem genuinely does not support directory fsync; tolerated.
+        } else {
+          // Real I/O error or unexpected failure: MUST NOT be swallowed!
+          throw ArcError.internalError(
+            `Failed to fsync trust store parent directory '${parentDir}': ${error.message || String(err)}`,
+          );
         }
-      } catch {
-        // Some filesystems don't permit fsync on directory descriptors; ignore
+      } finally {
+        if (dirFd !== null) {
+          try {
+            fsAdapter.closeSync(dirFd);
+          } catch {
+            // ignore close error during cleanup
+          }
+        }
       }
     }
   } catch (err: unknown) {
-    // Clean up temporary file if it still exists
     if (fd !== null) {
       try {
-        fs.closeSync(fd);
+        fsAdapter.closeSync(fd);
       } catch {
         // ignore close error during cleanup
       }
     }
     try {
-      if (fs.existsSync(tmpPath)) {
-        fs.unlinkSync(tmpPath);
+      if (fsAdapter.existsSync(tmpPath)) {
+        fsAdapter.unlinkSync(tmpPath);
       }
     } catch {
       // ignore cleanup failure
@@ -417,11 +573,14 @@ export class DeviceTrustStore {
    * Load trust store from a file on disk after verifying filesystem integrity and schema.
    * Corrupt, missing, unreadable, or invalid store throws and never silently defaults to empty.
    */
-  public static loadFromFile(filePath: string): DeviceTrustStore {
-    verifyTrustStoreFileIntegrity(filePath);
+  public static loadFromFile(
+    filePath: string,
+    fsAdapter: TrustStoreFsAdapter = defaultFsAdapter,
+  ): DeviceTrustStore {
+    verifyTrustStoreFileIntegrity(filePath, fsAdapter);
 
     const resolved = path.resolve(filePath);
-    const content = fs.readFileSync(resolved, 'utf8');
+    const content = fsAdapter.readFileSync(resolved, 'utf8');
 
     if (Buffer.byteLength(content, 'utf8') > MAX_TRUST_STORE_BYTES) {
       throw ArcError.resourceExhausted(
@@ -445,8 +604,8 @@ export class DeviceTrustStore {
   /**
    * Persist current in-memory store atomically to disk.
    */
-  public saveToFile(filePath: string): void {
-    atomicPersistTrustStore(filePath, this.toData());
+  public saveToFile(filePath: string, fsAdapter: TrustStoreFsAdapter = defaultFsAdapter): void {
+    atomicPersistTrustStore(filePath, this.toData(), fsAdapter);
   }
 
   /**
