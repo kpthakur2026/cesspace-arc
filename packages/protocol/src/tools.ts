@@ -15,6 +15,23 @@ export interface HealthResponse {
   policyEngineActive: boolean;
   auditActive: boolean;
   authorizedWorkspacesCount: number;
+  /**
+   * The single active transport mode for this process (§4 L-4). Exactly one
+   * mode runs per process: stdio and remote are mutually exclusive.
+   */
+  transportMode: 'stdio' | 'remote';
+  /** True only while the remote TLS listener is bound and serving. */
+  remoteGatewayActive: boolean;
+  /**
+   * True when the remote gateway is running but cannot admit new sessions.
+   * Absent when the gateway is absent, stdio-only, or healthy.
+   */
+  remoteGatewayDegraded?: boolean;
+  /**
+   * Bounded reason for gateway degradation. Never certificate material, key
+   * material, file paths, pins, or peer addresses (§19).
+   */
+  remoteGatewayDegradedReason?: 'certificate_expired';
 }
 
 export interface ListDirectoryRequest {

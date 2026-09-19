@@ -31,6 +31,8 @@ import {
 } from '@cesspace-arc/policy';
 import { AdminIpcError, AdminIpcServer } from './admin-ipc.js';
 import { ApprovalAuditSink, getApprovalAuditSink } from './approval-audit.js';
+import { RemoteGateway, type RemoteGatewayStatus } from './remote-gateway.js';
+import type { RemoteConfig } from './remote-config.js';
 import {
   ARC_APPROVAL_KEY,
   computeExecutionPayloadHash,
@@ -56,7 +58,19 @@ import { ControlledProcessRunner, type ITerminalSubsystem } from '@cesspace-arc/
 import { z } from 'zod';
 
 export interface ArcServerConfig {
-  transport: 'stdio';
+  /**
+   * The single active transport mode for this process (§4 L-4).
+   *
+   * stdio and remote are MUTUALLY EXCLUSIVE: selecting 'remote' does not add a
+   * listener beside stdio, it replaces it. RC-04 stdio semantics are unchanged
+   * when 'stdio' is selected.
+   */
+  transport: 'stdio' | 'remote';
+  /**
+   * Remote gateway configuration. Required when transport is 'remote' and
+   * ignored (never implicitly activated) when it is 'stdio'.
+   */
+  remote?: RemoteConfig;
   authorizedRoots: Array<{ id: string; path: string }>;
   defaultWorkspaceId?: string;
   stage?: string;
@@ -1264,6 +1278,12 @@ export function sanitizePreValidationParameters(
 export class ArcMcpServer implements IArcMcpServer {
   private server: Server;
   private transport?: StdioServerTransport;
+  /** Remote TLS admission gateway. Present only in remote mode. */
+  private remoteGateway?: RemoteGateway;
+  /** Immutable transport mode for this process. */
+  private readonly transportMode: 'stdio' | 'remote';
+  /** Remote configuration, retained only in remote mode. */
+  private readonly remoteConfig?: RemoteConfig;
   private defaultWorkspaceId?: string;
   public processRegistry?: ProcessRegistry;
   /** Approval state manager. Always present; a fresh one is created if not injected. */
@@ -1298,6 +1318,11 @@ export class ArcMcpServer implements IArcMcpServer {
      */
     public readonly adminIpcServer?: AdminIpcServer,
   ) {
+    // Transport mode is resolved once, at construction, and is immutable. A
+    // remote configuration supplied alongside stdio is NOT activated.
+    this.transportMode = config?.transport ?? 'stdio';
+    this.remoteConfig = this.transportMode === 'remote' ? config?.remote : undefined;
+
     // The approval state manager is mandatory for Task 4 authorization.
     this.approvalStateManager = approvalStateManager ?? new ApprovalStateManager();
 
@@ -2373,6 +2398,7 @@ export class ArcMcpServer implements IArcMcpServer {
           // usable effective Layer-2 engine was initialized. An explicitly
           // configured but invalid policy reports UNHEALTHY with no fallback.
           const policyEngineActive = this.effectivePolicyEngine !== undefined;
+          const gatewayStatus = this.remoteGateway?.getStatus();
           const health: HealthResponse = {
             status: policyEngineActive ? 'HEALTHY' : 'UNHEALTHY',
             version: '0.4.0-rc04',
@@ -2380,6 +2406,18 @@ export class ArcMcpServer implements IArcMcpServer {
             policyEngineActive,
             auditActive: true,
             authorizedWorkspacesCount: this.workspaceRegistry.getWorkspaces().length,
+            transportMode: this.transportMode,
+            remoteGatewayActive: gatewayStatus?.listenerActive ?? false,
+            // Only safe, bounded fields cross this boundary: no certificate or
+            // key bytes, no file paths, no pins, no peer addresses.
+            ...(gatewayStatus === undefined
+              ? {}
+              : {
+                  remoteGatewayDegraded: gatewayStatus.degraded,
+                  ...(gatewayStatus.degradedReason === undefined
+                    ? {}
+                    : { remoteGatewayDegradedReason: gatewayStatus.degradedReason }),
+                }),
           };
           result = health;
           break;
@@ -2748,6 +2786,44 @@ export class ArcMcpServer implements IArcMcpServer {
   }
 
   public async start(): Promise<void> {
+    // Exactly one transport mode runs per process (§4 L-4). In remote mode the
+    // stdio transport is never connected, so there is no second listener and no
+    // way for a remote failure to fall back to stdio.
+    if (this.transportMode === 'remote') {
+      const remoteConfig = this.remoteConfig;
+      if (remoteConfig === undefined) {
+        throw new Error('Remote transport requires remote gateway configuration.');
+      }
+      const gateway = new RemoteGateway(remoteConfig);
+      try {
+        await gateway.start();
+      } catch (err: unknown) {
+        // All-or-nothing: nothing is left bound, and stdio is NOT started as a
+        // fallback.
+        await gateway.stop();
+        throw err;
+      }
+      this.remoteGateway = gateway;
+
+      // The admin channel is a LOCAL IPC channel, so starting it in remote mode
+      // adds no network surface: it remains local-only and Ed25519-authenticated,
+      // and it is the operator's device/enrollment administration path. It is
+      // started only after the gateway is bound, and a failure here tears the
+      // whole process back down rather than leaving a half-active composition.
+      if (this.adminIpcServer) {
+        try {
+          await this.adminIpcServer.start();
+        } catch (err: unknown) {
+          await this.stop();
+          if (err instanceof AdminIpcError) {
+            throw new Error(`Admin IPC channel failed to start: ${err.reason}`, { cause: err });
+          }
+          throw new Error('Admin IPC channel failed to start.', { cause: err });
+        }
+      }
+      return;
+    }
+
     this.transport = new StdioServerTransport();
     await this.server.connect(this.transport);
 
@@ -2768,6 +2844,16 @@ export class ArcMcpServer implements IArcMcpServer {
     }
   }
 
+  /** The single active transport mode for this process. */
+  public getTransportMode(): 'stdio' | 'remote' {
+    return this.transportMode;
+  }
+
+  /** Bounded, non-secret remote gateway status. Undefined in stdio mode. */
+  public getRemoteGatewayStatus(): RemoteGatewayStatus | undefined {
+    return this.remoteGateway?.getStatus();
+  }
+
   public async flushAudit(): Promise<void> {
     await this.approvalAuditSink.flush();
     if (this.processRegistry) {
@@ -2776,6 +2862,10 @@ export class ArcMcpServer implements IArcMcpServer {
   }
 
   public async stop(): Promise<void> {
+    if (this.remoteGateway !== undefined) {
+      await this.remoteGateway.stop();
+      this.remoteGateway = undefined;
+    }
     if (this.adminIpcServer) {
       await this.adminIpcServer.stop();
     }
