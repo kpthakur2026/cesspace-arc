@@ -18,7 +18,7 @@
     "format": "prettier --write .",
     "lint": "eslint .",
     "typecheck": "tsc --build",
-    "test": "node --test tests/protocol-contracts.test.js tests/rc01-negative-controls.test.js tests/rc02-negative-controls.test.js tests/rc03-filesystem-mutations.test.js tests/rc03-patch.test.js tests/rc03-mcp-policy-audit.test.js tests/rc04-approval-state.test.js tests/rc04-policy-engine.test.js tests/rc04-admin-ipc.test.js tests/rc04-cli.test.js tests/rc04-mcp-approval.test.js tests/rc04-security-audit.test.js tests/rc04-negative-controls.test.js tests/rc05-device-trust-store.test.js tests/rc05-enrollment-lifecycle.test.js tests/rc05-enrollment-admin-ipc.test.js tests/rc05-enrollment-cli.test.js tests/rc05-tls-admission.test.js tests/rc05-enrollment-bootstrap.test.js",
+    "test": "node --test tests/protocol-contracts.test.js tests/rc01-negative-controls.test.js tests/rc02-negative-controls.test.js tests/rc03-filesystem-mutations.test.js tests/rc03-patch.test.js tests/rc03-mcp-policy-audit.test.js tests/rc04-approval-state.test.js tests/rc04-policy-engine.test.js tests/rc04-admin-ipc.test.js tests/rc04-cli.test.js tests/rc04-mcp-approval.test.js tests/rc04-security-audit.test.js tests/rc04-negative-controls.test.js tests/rc05-device-trust-store.test.js tests/rc05-enrollment-lifecycle.test.js tests/rc05-enrollment-admin-ipc.test.js tests/rc05-enrollment-cli.test.js tests/rc05-tls-admission.test.js tests/rc05-enrollment-bootstrap.test.js tests/rc05-session-lifecycle.test.js",
     "bench:rc01": "node benchmarks/rc01-benchmark.js",
     "bench:rc02": "node benchmarks/rc02-benchmark.js",
     "bench:rc04-policy": "node benchmarks/rc04-policy-benchmark.js",

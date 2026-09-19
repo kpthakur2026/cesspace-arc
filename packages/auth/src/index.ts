@@ -1,6 +1,11 @@
 /**
- * Interface definition for Authentication Engine.
- * Implementation target: RC-05.
+ * Legacy placeholder interface.
+ *
+ * NOT the RC-05 session model. RC-05 session tokens are opaque and carry zero
+ * structured claims — no clientId, clientType, deviceId, sessionId, or expiry
+ * inside the token — so a claim-bearing token shape cannot express them. The
+ * authoritative RC-05 implementation is the session domain in `session.ts`,
+ * exported below; nothing in RC-05 implements or consumes these declarations.
  */
 export interface AuthTokenClaims {
   clientId: string;
@@ -56,3 +61,39 @@ export {
   MAX_FAILED_SECRET_ATTEMPTS,
   MAX_ENROLLMENT_METADATA_BYTES,
 } from './enrollment.js';
+
+/**
+ * RC-05 Task 5: secure session lifecycle.
+ *
+ * Pure domain logic: no network I/O, no filesystem I/O, no HTTP server, no MCP
+ * SDK transport, no policy evaluation, no approval redemption, and no subsystem
+ * or tool dispatch. The manager owns server session IDs, digest-only session
+ * tokens, binding, monotonic expiry, revocation, active-session quotas, and the
+ * pure wire-admission decisions Task 8 will connect to the remote transport.
+ */
+export {
+  SessionManager,
+  resolveActiveDeviceIdentity,
+  parseBearerCredential,
+  type SessionManagerOptions,
+  type TrustedSessionIdentity,
+  type TrustedSessionResult,
+  type SessionIssuance,
+  type SessionView,
+  type SessionRequestKind,
+  type SessionRequestContext,
+  type SessionAdmissionDecision,
+  SESSION_HEX_LENGTH,
+  SESSION_ID_REGEX,
+  SESSION_TOKEN_REGEX,
+  MAX_SESSION_TOKEN_INPUT_BYTES,
+  SESSION_ABSOLUTE_TTL_SECONDS,
+  SESSION_IDLE_TIMEOUT_SECONDS,
+  MAX_ACTIVE_SESSIONS_PER_DEVICE,
+  MAX_ACTIVE_SESSIONS_PER_CLIENT,
+  MAX_ACTIVE_SESSIONS_GLOBAL,
+  MAX_SESSION_ID_GENERATION_ATTEMPTS,
+  ARC_SESSION_TOKEN_HEADER,
+  MCP_SESSION_ID_HEADER,
+  SESSION_AUTH_SCHEME,
+} from './session.js';
