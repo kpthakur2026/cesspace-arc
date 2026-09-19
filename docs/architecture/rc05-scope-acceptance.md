@@ -226,8 +226,9 @@ client certificate and looks up the enrolled device record. If not found or
 revoked, authentication fails with generic `UNAUTHENTICATED` (§25).
 C. **Tokenless Initialize:** The **ONLY** tokenless MCP request permitted on
 `/mcp` is the initial MCP `initialize` request for a connection that has no
-existing MCP session. Any ordinary tool invocation or request missing a token
-is rejected with generic `UNAUTHENTICATED`.
+existing MCP session. Any tokenless ordinary tool invocation or request with no
+recognized or existing session context is rejected with generic
+`UNAUTHENTICATED` (§25, RC05-NEG-39).
 D. **Session ID Generation:** The SDK generates the `Mcp-Session-Id`. If an
 attacker presents a client-supplied `Mcp-Session-Id` on initial `initialize`,
 it is **never adopted**; the SDK generates a fresh, opaque, server-controlled
@@ -252,10 +253,23 @@ Mcp-Session-Id: <server-issued-id>
 Authorization: Bearer <session-token>
 ```
 
-H. **Mismatched Rejection:** If either header is missing, malformed, or does not
-match the active session record and the presented TLS SPKI identity, the
-request is rejected with generic `INVALID_SESSION_TOKEN` (or `UNAUTHENTICATED`
-if pre-session) strictly before policy evaluation.
+H. **Session Error Semantics:** The gateway strictly distinguishes pre-session
+and post-session failure modes:
+
+- **Pre-Session Context:** A tokenless ordinary tool invocation or request to
+  `/mcp` carrying no recognized or existing session context returns generic
+  `UNAUTHENTICATED` strictly before policy evaluation (RC05-NEG-39,
+  RC05-NEG-41, RC05-NEG-63).
+- **Post-Session Context:** Any request associated with an existing or prior
+  server-issued `Mcp-Session-Id` that has a missing session token (RC05-NEG-42),
+  malformed token (RC05-NEG-46), incorrect token digest (RC05-NEG-44), expired
+  session, revoked session (RC05-NEG-64), or SPKI/device binding mismatch
+  (RC05-NEG-43, RC05-NEG-45) returns generic `INVALID_SESSION_TOKEN` strictly
+  before policy evaluation.
+
+Dual-header enforcement is strictly evaluated before policy or subsystem
+dispatch.
+
 I. **Session Quotas:** Re-running tokenless `initialize` cannot mint unbounded
 sessions; each issuance is accounted against the per-device (8), per-client
 (64), and global (1024) session quotas (§11, §26).
@@ -1316,9 +1330,13 @@ These are the required **success** paths. Task 0 does not implement them.
 10. **Session expiration and re-authentication** — idle/absolute expiry revokes
     the session; a new session is issued after re-authentication; old token no
     longer works.
-11. **Device revocation** — operator revokes; live sessions for that device are
-    revoked; subsequent requests fail with generic `UNAUTHENTICATED`; the trust
-    store reflects the revocation across restart.
+11. **Device revocation** — operator revokes a device via local admin IPC; all
+    live sessions for that device are immediately revoked; any request using an
+    existing/revoked session credential returns generic `INVALID_SESSION_TOKEN`
+    (RC05-NEG-64); any fresh/pre-session authentication attempt by the revoked
+    device returns generic `UNAUTHENTICATED` (RC05-NEG-63); and the revoked
+    device state is durably committed to the trust store and persists across
+    server restart (§8, §11, §16, §25).
 
 ---
 
