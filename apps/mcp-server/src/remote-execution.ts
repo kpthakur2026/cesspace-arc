@@ -44,7 +44,7 @@
  * until admission has succeeded.
  */
 
-import { ArcError } from '@cesspace-arc/protocol';
+import { ArcError, type ArcErrorCode } from '@cesspace-arc/protocol';
 import type {
   SessionManager,
   TrustedSessionIdentity,
@@ -552,17 +552,122 @@ export function remoteRateLimitFailure(): ArcError {
 }
 
 /**
- * The HTTP body for the frozen `RATE_LIMIT_EXCEEDED` refusal (§21.1 Layer C).
- *
- * Derived from {@link remoteRateLimitFailure} so the wire representation and the
- * shared pipeline's error can never disagree. No retry-after hint, remaining
- * budget, limiter key, or session identifier is included: §25.1 requires a
- * sanitized refusal, and a computed retry delay would disclose exactly how full
- * the bucket is.
+ * The JSON-RPC protocol version every MCP message carries (§25).
  */
-export function remoteRateLimitResponseBody(): string {
-  const failure = remoteRateLimitFailure();
-  return JSON.stringify({ code: failure.code, message: failure.message });
+export const MCP_JSONRPC_VERSION = '2.0';
+
+/**
+ * The JSON-RPC error code for an application-level admission refusal.
+ *
+ * `-32000` is the code the installed SDK itself uses for the refusals it frames
+ * on this channel (missing/unknown session, unacceptable `Accept`, unsupported
+ * protocol version), so an ARC admission refusal is shaped exactly like the
+ * transport refusals an MCP client already reads on this same connection.
+ */
+export const MCP_ADMISSION_ERROR_CODE = -32000;
+
+/**
+ * The JSON-RPC error code for a body that is not ONE valid Request object
+ * (§2.0 of the JSON-RPC 2.0 specification).
+ */
+export const MCP_INVALID_REQUEST_ERROR_CODE = -32600;
+
+/**
+ * HTTP status for an MCP JSON-RPC error reply to a POST.
+ *
+ * `200` is the MCP application channel: the JSON-RPC envelope, not the HTTP
+ * status, carries the outcome. This is deliberately NOT a bare refusal status —
+ * §25 assigns bare HTTP status codes to the TRANSPORT layers (Layer B's 429,
+ * the 404/405/413 transport refusals), never to an MCP-framed refusal.
+ */
+export const MCP_POST_REPLY_STATUS = 200;
+
+/**
+ * HTTP status for an MCP JSON-RPC error reply to a GET or DELETE.
+ *
+ * A GET/DELETE request cannot carry a JSON-RPC request, so there is no request
+ * to reply to; the installed SDK's own convention for "this request cannot be
+ * served" on this surface is `400` with a JSON-RPC error envelope, and this
+ * uses the same status so the ARC refusal is shaped like its neighbours. The
+ * envelope — not the status — still carries the ARC semantic code.
+ */
+export const MCP_STREAM_REPLY_STATUS = 400;
+
+/** A JSON-RPC request identifier, or `null` when none could be obtained. */
+export type JsonRpcRequestId = string | number | null;
+
+/**
+ * Reads the JSON-RPC request ID from an ALREADY-PARSED, ALREADY-BOUNDED body.
+ *
+ * This never parses anything itself: Task-7's request limits run first, and an
+ * unparseable or oversized body yields `null` rather than triggering a second
+ * read. A body that is not a single object — an array, a scalar, `null` — has no
+ * request to reply to, so it also yields `null`.
+ */
+export function jsonRpcRequestId(body: unknown): JsonRpcRequestId {
+  if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+    return null;
+  }
+  const id = (body as { id?: unknown }).id;
+  if (typeof id === 'string') {
+    return id;
+  }
+  return typeof id === 'number' && Number.isFinite(id) ? id : null;
+}
+
+/**
+ * One MCP JSON-RPC error envelope (§25).
+ *
+ * THE single framing for every application-level refusal this surface emits —
+ * device/session admission, Layer C, and a refused batch — so a client cannot
+ * tell the refusals apart by their shape. The ARC semantic code travels in
+ * `error.data.code`; the JSON-RPC code is a stable MCP-channel constant, and
+ * `error.message` is the frozen client-facing message.
+ */
+export function mcpErrorBody(
+  jsonRpcCode: number,
+  arcCode: ArcErrorCode,
+  message: string,
+  id: JsonRpcRequestId,
+): string {
+  return JSON.stringify({
+    jsonrpc: MCP_JSONRPC_VERSION,
+    id,
+    error: { code: jsonRpcCode, message, data: { code: arcCode } },
+  });
+}
+
+/**
+ * The MCP JSON-RPC error for one admission refusal, derived from the canonical
+ * anti-oracle `ArcError` so the wire representation and the shared pipeline's
+ * error can never disagree.
+ *
+ * Nothing beyond the frozen code and message is included: no limiter key, no
+ * token count, no retry-after hint, no session identifier, no device identity,
+ * and no reason. §25.1 requires a sanitized refusal, and a retry delay would
+ * disclose exactly how full the bucket is.
+ */
+export function mcpAdmissionErrorBody(failure: ArcError, id: JsonRpcRequestId): string {
+  return mcpErrorBody(MCP_ADMISSION_ERROR_CODE, failure.code, failure.message, id);
+}
+
+/** The single client-facing message for a refused JSON-RPC batch (§25). */
+export const MCP_BATCH_REFUSAL_MESSAGE = 'JSON-RPC batching is not supported.';
+
+/**
+ * The MCP JSON-RPC error for a refused JSON-RPC batch.
+ *
+ * The batch is refused as ONE malformed Request — it is not a Request object —
+ * BEFORE it is handed to the SDK, so no member of it can be dispatched, and no
+ * per-member rate token or concurrency slot is ever created.
+ */
+export function mcpBatchRefusalBody(id: JsonRpcRequestId = null): string {
+  return mcpErrorBody(
+    MCP_INVALID_REQUEST_ERROR_CODE,
+    'INVALID_REQUEST_SCHEMA',
+    MCP_BATCH_REFUSAL_MESSAGE,
+    id,
+  );
 }
 
 /**

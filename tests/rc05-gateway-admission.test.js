@@ -40,7 +40,13 @@ import path from 'node:path';
 import tls from 'node:tls';
 
 import { ArcMcpServer } from '../apps/mcp-server/dist/index.js';
-import { remoteRateLimitResponseBody } from '../apps/mcp-server/dist/remote-execution.js';
+import {
+  MCP_ADMISSION_ERROR_CODE,
+  MCP_INVALID_REQUEST_ERROR_CODE,
+  MCP_POST_REPLY_STATUS,
+  MCP_STREAM_REPLY_STATUS,
+  remoteRateLimitFailure,
+} from '../apps/mcp-server/dist/remote-execution.js';
 import {
   LAYER_C_BURST,
   LAYER_C_REQUESTS_PER_MINUTE,
@@ -124,14 +130,20 @@ async function freePort() {
 /**
  * Writes a trust store holding `pins`, with the LAST `revokedCount` of them
  * marked revoked, and returns its path plus the records.
+ *
+ * `clientEnrolled` places the test client certificate's OWN SPKI pin at index 0.
+ * Setting it false leaves the store non-empty but the connecting peer unknown —
+ * the "recognized store, unrecognized SPKI" shape, which must be refused exactly
+ * like an empty store.
  */
-function trustStore(tag, pinCount, revokedCount = 0) {
+function trustStore(tag, pinCount, revokedCount = 0, clientEnrolled = true) {
   counter += 1;
   const storePath = path.join(tempRoot, `devices-${tag}-${counter}.json`);
   const store = DeviceTrustStore.createEmpty();
   const records = [];
   for (let index = 0; index < pinCount; index += 1) {
-    const pin = index === 0 ? clientPin() : `${String(index).repeat(64)}`.slice(0, 64);
+    const pin =
+      index === 0 && clientEnrolled ? clientPin() : `${String(index).repeat(64)}`.slice(0, 64);
     const { device } = store.enrollDevice({
       clientId: `agent-${tag}-${index}`,
       clientType: 'claude-code',
@@ -162,12 +174,14 @@ async function startRemote({
   tag = 'admission',
   pinCount = 1,
   revokedCount = 0,
+  clientEnrolled = true,
   sessionClock,
   enrollmentManager,
 } = {}) {
   const port = await freePort();
-  const { storePath, records, store } = trustStore(tag, pinCount, revokedCount);
+  const { storePath, records, store } = trustStore(tag, pinCount, revokedCount, clientEnrolled);
   const registry = new WorkspaceRegistry();
+  const audit = new AuditLogger();
   const sessionManager =
     sessionClock === undefined
       ? undefined
@@ -175,7 +189,7 @@ async function startRemote({
   const server = new ArcMcpServer(
     registry,
     new SecurityKernel(registry),
-    new AuditLogger(),
+    audit,
     new FilesystemSubsystem(),
     new GitSubsystem(),
     {
@@ -200,7 +214,7 @@ async function startRemote({
     sessionManager,
   );
   await server.start();
-  return { server, port, storePath, records, store };
+  return { server, port, storePath, records, store, audit };
 }
 
 /** One real HTTPS request over mTLS. */
@@ -464,15 +478,54 @@ function drainBudget(limiter, key) {
   return drained;
 }
 
-/** Asserts the frozen external `RATE_LIMIT_EXCEEDED` refusal (§21.1 Layer C). */
-function assertRateLimited(res, label) {
-  assert.equal(res.status, 429, `${label}: ${res.status} ${res.body}`);
-  assert.deepEqual(JSON.parse(res.body), JSON.parse(remoteRateLimitResponseBody()), label);
+/**
+ * Asserts one response is an MCP JSON-RPC error envelope carrying `arcCode`.
+ *
+ * §25 orders the error model by LAYER. The transport layers own status-only
+ * refusals — Layer A drops the connection, Layer B answers `429` with no MCP
+ * body, and 404/405/413 stay transport-level — while every refusal that happens
+ * once a session is in play on `/mcp` is an MCP JSON-RPC error. So the shape is
+ * asserted exactly: the JSON-RPC envelope, the MCP-channel error code, and the
+ * ARC semantic code in `error.data.code`, with NOTHING else in the error object.
+ *
+ * A bare `429` is asserted against explicitly, because that is precisely the
+ * Layer B transport model this refusal must not be confused with.
+ */
+function assertMcpRefusal(res, label, { status, arcCode, jsonRpcCode = MCP_ADMISSION_ERROR_CODE }) {
+  assert.equal(res.status, status, `${label}: ${res.status} ${res.body}`);
+  assert.notEqual(res.status, 429, `${label}: this is not the Layer B transport refusal`);
   assert.equal(res.headers['content-type'], 'application/json', label);
-  // A computed retry delay would disclose how full the bucket is, and no
-  // browser origin is ever granted access.
-  assert.equal(res.headers['retry-after'], undefined, label);
+  const parsed = JSON.parse(res.body);
+  assert.equal(parsed.jsonrpc, '2.0', label);
+  assert.deepEqual(Object.keys(parsed).sort(), ['error', 'id', 'jsonrpc'], label);
+  assert.equal(parsed.error.code, jsonRpcCode, label);
+  assert.equal(parsed.error.data.code, arcCode, label);
+  // The refusal carries the frozen code and message and nothing else: no limiter
+  // key, token count, retry-after, session identifier, or peer identity.
+  assert.deepEqual(Object.keys(parsed.error).sort(), ['code', 'data', 'message'], label);
+  assert.deepEqual(Object.keys(parsed.error.data), ['code'], label);
+  assert.equal(typeof parsed.error.message, 'string', label);
+  // No browser origin is ever granted access.
   assert.equal(res.headers['access-control-allow-origin'], undefined, label);
+  return parsed;
+}
+
+/**
+ * Asserts the frozen `RATE_LIMIT_EXCEEDED` refusal (§21.1 Layer C, §26 C-3).
+ *
+ * The observable semantic code is unchanged; only its framing is: Layer C runs
+ * after authentication, so it answers on the MCP application channel and must
+ * not reuse Layer B's bare status-and-body transport refusal.
+ */
+function assertRateLimited(res, label, { id, status = MCP_POST_REPLY_STATUS } = {}) {
+  const parsed = assertMcpRefusal(res, label, { status, arcCode: 'RATE_LIMIT_EXCEEDED' });
+  // The id is stated by every call site: a POST carries a JSON-RPC request the
+  // reply must answer by id, and a GET/DELETE carries none and must use `null`.
+  assert.equal(parsed.id, id, label);
+  assert.equal(parsed.error.message, remoteRateLimitFailure().message, label);
+  // A computed retry delay would disclose how full the bucket is.
+  assert.equal(res.headers['retry-after'], undefined, label);
+  return parsed;
 }
 
 /** Asserts the ONE uniform Host/Origin refusal (§10/§11). */
@@ -581,13 +634,14 @@ describe('CesSpace ARC — RC-05 Task 8 correction: gateway admission gaps', () 
       assert.ok(firstDrain > 0, 'the session starts with a spendable budget');
 
       const refusedKinds = [
-        ['tools/list POST', { method: 'POST', body: nonToolBody(3, 'tools/list') }],
-        ['ping POST', { method: 'POST', body: nonToolBody(4, 'ping') }],
-        ['tools/call POST', { method: 'POST', body: toolCallBody(5) }],
-        ['GET SSE', { method: 'GET' }],
+        ['tools/list POST', { method: 'POST', body: nonToolBody(3, 'tools/list') }, 3],
+        ['ping POST', { method: 'POST', body: nonToolBody(4, 'ping') }, 4],
+        ['tools/call POST', { method: 'POST', body: toolCallBody(5) }, 5],
+        // A GET carries no JSON-RPC request, so its refusal cannot echo an id.
+        ['GET SSE', { method: 'GET' }, null],
       ];
 
-      for (const [label, shape] of refusedKinds) {
+      for (const [label, shape, expectedId] of refusedKinds) {
         for (let attempt = 0; ; attempt += 1) {
           drainBudget(limiter, key);
           // Measured from the moment the budget was emptied: a token can only
@@ -602,8 +656,13 @@ describe('CesSpace ARC — RC-05 Task 8 correction: gateway admission gaps', () 
                   body: shape.body,
                 });
           const elapsed = performance.now() - drainedAt;
-          if (res.status === 429) {
-            assertRateLimited(res, label);
+          // Layer C is refused on the MCP channel, so the refusal is recognised
+          // by its JSON-RPC error code rather than by an HTTP status.
+          if (res.body.includes('RATE_LIMIT_EXCEEDED')) {
+            assertRateLimited(res, label, {
+              id: expectedId,
+              status: shape.method === 'GET' ? MCP_STREAM_REPLY_STATUS : MCP_POST_REPLY_STATUS,
+            });
             break;
           }
           assert.ok(
@@ -728,10 +787,11 @@ describe('CesSpace ARC — RC-05 Task 8 correction: gateway admission gaps', () 
       }
       assert.equal(limiter.getHolderCount(key), MAX_OUTSTANDING_REQUESTS_PER_SESSION);
 
-      for (const [label, shape] of [
-        ['GET SSE', { method: 'GET' }],
-        ['tools/list POST', { method: 'POST', body: nonToolBody(2, 'tools/list') }],
-        ['tools/call POST', { method: 'POST', body: toolCallBody(3) }],
+      for (const [label, shape, expectedId] of [
+        // A GET carries no JSON-RPC request, so its refusal cannot echo an id.
+        ['GET SSE', { method: 'GET' }, null],
+        ['tools/list POST', { method: 'POST', body: nonToolBody(2, 'tools/list') }, 2],
+        ['tools/call POST', { method: 'POST', body: toolCallBody(3) }, 3],
       ]) {
         const startedAt = performance.now();
         const res =
@@ -743,7 +803,10 @@ describe('CesSpace ARC — RC-05 Task 8 correction: gateway admission gaps', () 
                 body: shape.body,
               });
         const elapsed = performance.now() - startedAt;
-        assertRateLimited(res, label);
+        assertRateLimited(res, label, {
+          id: expectedId,
+          status: shape.method === 'GET' ? MCP_STREAM_REPLY_STATUS : MCP_POST_REPLY_STATUS,
+        });
         // Refused, never queued: the refusal is immediate, so no work is
         // retained behind the session.
         assert.ok(elapsed < 1000, `${label}: refuse immediately, took ${elapsed}ms`);
@@ -801,7 +864,7 @@ describe('CesSpace ARC — RC-05 Task 8 correction: gateway admission gaps', () 
         headers: { ...MCP_POST_HEADERS, ...sessionHeaders(first.sessionId, first.token) },
         body: nonToolBody(2, 'tools/list'),
       });
-      assert.equal(refused.status, 429, `${refused.status} ${refused.body}`);
+      assertRateLimited(refused, 'the first session is refused', { id: 2 });
 
       // The SECOND session is untouched: it keeps its own budget, and its own
       // concurrency, and the first session's state is invisible to it.
@@ -887,7 +950,7 @@ describe('CesSpace ARC — RC-05 Task 8 correction: gateway admission gaps', () 
         headers: { ...MCP_POST_HEADERS, ...sessionHeaders(sessionId, token) },
         body: nonToolBody(4, 'tools/list'),
       });
-      assert.equal(refused.status, 429, `${refused.status} ${refused.body}`);
+      assertRateLimited(refused, 'a rate refusal', { id: 4 });
       assert.equal(await drained(), true, 'a refusal returns its slot');
 
       // The refusal above emptied the budget on purpose, so the remaining steps
@@ -1027,11 +1090,11 @@ describe('CesSpace ARC — RC-05 Task 8 correction: gateway admission gaps', () 
         headers: { ...MCP_POST_HEADERS, ...sessionHeaders(sessionId, token) },
         body: nonToolBody(2, 'tools/list'),
       });
-      assert.equal(presented.status, 401, `${presented.status} ${presented.body}`);
-      assert.deepEqual(JSON.parse(presented.body), {
-        code: 'INVALID_SESSION_TOKEN',
-        message: 'Invalid or expired session token',
+      const refusal = assertMcpRefusal(presented, 'a reaped session', {
+        status: MCP_POST_REPLY_STATUS,
+        arcCode: 'INVALID_SESSION_TOKEN',
       });
+      assert.equal(refusal.id, 2, 'the refusal answers the request it refused');
       assert.equal(surface.sessions.has(sessionId), false, 'the revoked entry is reclaimed');
       assert.equal(observed.closed, 1, 'its SDK transport was closed');
       assert.equal(surface.getActiveSessionCount(), 0);
@@ -1057,7 +1120,7 @@ describe('CesSpace ARC — RC-05 Task 8 correction: gateway admission gaps', () 
       // A wrong bearer token is an authentication failure, not evidence that the
       // session is gone. Reaping on that basis would let any caller destroy a
       // legitimate session by presenting a bad credential.
-      for (const [label, shape] of [
+      for (const [label, shape, expectedId, expectedStatus] of [
         [
           'POST with a wrong token',
           {
@@ -1065,14 +1128,20 @@ describe('CesSpace ARC — RC-05 Task 8 correction: gateway admission gaps', () 
             headers: sessionHeaders(sessionId, 'b'.repeat(64)),
             body: nonToolBody(2, 'tools/list'),
           },
+          2,
+          MCP_POST_REPLY_STATUS,
         ],
         [
           'GET with a wrong token',
           { method: 'GET', headers: sessionHeaders(sessionId, 'c'.repeat(64)) },
+          null,
+          MCP_STREAM_REPLY_STATUS,
         ],
         [
           'DELETE with a wrong token',
           { method: 'DELETE', headers: sessionHeaders(sessionId, 'd'.repeat(64)) },
+          null,
+          MCP_STREAM_REPLY_STATUS,
         ],
       ]) {
         const res = await request(port, {
@@ -1083,7 +1152,15 @@ describe('CesSpace ARC — RC-05 Task 8 correction: gateway admission gaps', () 
           },
           ...(shape.body === undefined ? {} : { body: shape.body }),
         });
-        assert.equal(res.status, 401, `${label}: ${res.status} ${res.body}`);
+        // §25: a wrong token is a post-session admission failure, so it is
+        // MCP-framed and never discloses which of the several possible causes it
+        // was. The session itself must survive it.
+        const refusal = assertMcpRefusal(res, label, {
+          status: expectedStatus,
+          arcCode: 'INVALID_SESSION_TOKEN',
+        });
+        assert.equal(refusal.id, expectedId, label);
+        assert.equal(res.body.includes(token), false, `${label}: no credential is echoed`);
         assert.equal(surface.sessions.has(sessionId), true, `${label}: the entry must survive`);
         assert.equal(
           server.sessionManager.hasSession(sessionId),
@@ -1548,6 +1625,602 @@ describe('CesSpace ARC — RC-05 Task 8 correction: gateway admission gaps', () 
       assert.equal(surface.sessions.has(sessionId), false);
       assert.equal(surface.getActiveSessionCount(), 1);
       assert.equal(server.sessionManager.getActiveSessionCount(), 1);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  // =========================================================================
+  // §21.1 Layer C / §26 C-3: a JSON-RPC batch cannot amortize one admission
+  // =========================================================================
+
+  /** A JSON-RPC batch of `count` tool calls — removed from MCP in `2025-06-18`. */
+  function batchBody(count) {
+    const messages = [];
+    for (let index = 0; index < count; index += 1) {
+      messages.push({
+        jsonrpc: '2.0',
+        id: index + 1,
+        method: 'tools/call',
+        params: { name: 'health', arguments: {} },
+      });
+    }
+    return JSON.stringify(messages);
+  }
+
+  /** Asserts one POST /mcp body was refused AS A BATCH, before anything ran. */
+  function assertBatchRefused(res, label) {
+    // A batch is not ONE Request object, so it is refused as a malformed Request
+    // (`-32600`), not as an admission refusal (`-32000`).
+    const parsed = assertMcpRefusal(res, label, {
+      status: MCP_POST_REPLY_STATUS,
+      arcCode: 'INVALID_REQUEST_SCHEMA',
+      jsonRpcCode: MCP_INVALID_REQUEST_ERROR_CODE,
+    });
+    // A batch is not one Request, so there is no request to answer by id.
+    assert.equal(parsed.id, null, label);
+    assert.equal(res.headers['mcp-session-id'], undefined, label);
+    assert.equal(res.headers['arc-session-token'], undefined, label);
+    return parsed;
+  }
+
+  /**
+   * Establishes a session AND spends the first authenticated request.
+   *
+   * A tokenless `initialize` is bounded pre-session and takes no Layer C key, so
+   * the session's bucket comes into existence on its first AUTHENTICATED request.
+   * Measuring Layer C requires that request to have happened.
+   */
+  async function warmSession(port, sessionId, token) {
+    const warm = await request(port, {
+      method: 'POST',
+      headers: { ...MCP_POST_HEADERS, ...sessionHeaders(sessionId, token) },
+      body: nonToolBody(99, 'tools/list'),
+    });
+    assertSucceeded(warm, 99, 'the warm-up request');
+  }
+
+  test('RC05-NEG-56: an authenticated batch of two tool calls is refused as one malformed Request', async () => {
+    const { server, port, records, audit } = await startRemote({ tag: 'batch-two' });
+    try {
+      const limiter = layerC(server);
+      const { sessionId, token } = await initializeSession(port);
+      const key = keyFor(records[0], sessionId);
+      await warmSession(port, sessionId, token);
+
+      const auditBefore = audit.getRecords().length;
+      const res = await request(port, {
+        method: 'POST',
+        headers: { ...MCP_POST_HEADERS, ...sessionHeaders(sessionId, token) },
+        body: batchBody(2),
+      });
+      assertBatchRefused(res, 'a batch of two tool calls');
+
+      // The SDK would have invoked its handler ONCE PER MEMBER. Neither member
+      // reached the tool catalog, the shared RC-04 pipeline, policy, approval, or
+      // a subsystem — the audit chain proves it, since a single accepted call on
+      // this same composition writes to it (asserted at the end of this case).
+      assert.equal(audit.getRecords().length, auditBefore, 'no member was dispatched');
+      assert.equal(res.body.includes('"result"'), false, 'no member produced a result');
+      assert.equal(limiter.getHolderCount(key), 0, 'the batch held no concurrency slot');
+
+      // The single request that follows proves the audit chain is live and that
+      // the batch was refused rather than the composition being inert.
+      const single = await request(port, {
+        method: 'POST',
+        headers: { ...MCP_POST_HEADERS, ...sessionHeaders(sessionId, token) },
+        body: toolCallBody(9),
+      });
+      assertSucceeded(single, 9, 'the following single tool call');
+      assert.ok(
+        audit.getRecords().length > auditBefore,
+        'an accepted tool call on this composition does write to the audit chain',
+      );
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test('RC05-NEG-56: a batch of 60 requests is refused before any tool, policy, or subsystem work', async () => {
+    const { server, port, records, audit } = await startRemote({ tag: 'batch-many' });
+    try {
+      const limiter = layerC(server);
+      const { sessionId, token } = await initializeSession(port);
+      const key = keyFor(records[0], sessionId);
+      await warmSession(port, sessionId, token);
+
+      const auditBefore = audit.getRecords().length;
+      const tokensBefore = effectiveTokens(limiter, key);
+      const res = await request(port, {
+        method: 'POST',
+        headers: { ...MCP_POST_HEADERS, ...sessionHeaders(sessionId, token) },
+        body: batchBody(60),
+      });
+      assertBatchRefused(res, 'a batch of 60 requests');
+      assert.equal(audit.getRecords().length, auditBefore, 'nothing was dispatched or audited');
+
+      // ONE HTTP request must not be able to carry 60 MCP requests on a single
+      // admission. The refusal happens BEFORE the admission authority runs, so
+      // the batch did not even spend the ONE token it would otherwise have been
+      // charged: the accounting is not "one token for many requests", it is
+      // "no requests at all".
+      const tokensAfter = effectiveTokens(limiter, key);
+      assert.ok(
+        tokensAfter >= tokensBefore,
+        `a refused batch spends no Layer C token, ${tokensBefore} -> ${tokensAfter}`,
+      );
+      assert.equal(limiter.getHolderCount(key), 0, 'a refused batch holds no concurrency slot');
+      assert.equal(
+        limiter.getRetainedKeysForTests().includes(key),
+        true,
+        'the session key is intact',
+      );
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test('RC05-NEG-41: a batch carrying initialize is refused and mints no session', async () => {
+    const { server, port } = await startRemote({ tag: 'batch-init' });
+    try {
+      const res = await request(port, {
+        method: 'POST',
+        headers: MCP_POST_HEADERS,
+        body: JSON.stringify([
+          {
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'initialize',
+            params: {
+              protocolVersion: '2025-06-18',
+              capabilities: {},
+              clientInfo: { name: 'rc05-batch-test', version: '1.0.0' },
+            },
+          },
+          { jsonrpc: '2.0', id: 2, method: 'tools/list' },
+        ]),
+      });
+      assertBatchRefused(res, 'a batch carrying initialize');
+
+      // No session, no reservation, no registry entry, and no token.
+      assert.equal(server.sessionManager.getActiveSessionCount(), 0);
+      assert.equal(server.sessionManager.getReservedSessionIdCount(), 0);
+      assert.equal(server.remoteGateway.mcpSurface.getActiveSessionCount(), 0);
+
+      // A normal tokenless initialize on the same composition still works, so the
+      // refusal above is a decision about the batch and not a broken composition.
+      const init = await initializeSession(port);
+      assert.equal(init.res.status, 200, `${init.res.status} ${init.res.body}`);
+      assert.ok(init.sessionId, 'the following single initialize mints a session');
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test('RC05-NEG-56: a refused batch leaves Layer C at zero holders and the session untouched', async () => {
+    const { server, port, records } = await startRemote({ tag: 'batch-side-effects' });
+    try {
+      const surface = server.remoteGateway.mcpSurface;
+      const limiter = layerC(server);
+      const { sessionId, token } = await initializeSession(port);
+      const key = keyFor(records[0], sessionId);
+      const entry = surface.sessions.get(sessionId);
+      assert.ok(entry);
+      const observed = observeClose(entry);
+      await warmSession(port, sessionId, token);
+      const keysBefore = limiter.getRetainedKeysForTests();
+
+      for (const [label, body] of [
+        ['two tool calls', batchBody(2)],
+        ['sixty tool calls', batchBody(60)],
+        ['a member with no method', JSON.stringify([{ jsonrpc: '2.0', id: 1 }])],
+      ]) {
+        const res = await request(port, {
+          method: 'POST',
+          headers: { ...MCP_POST_HEADERS, ...sessionHeaders(sessionId, token) },
+          body,
+        });
+        assertBatchRefused(res, label);
+      }
+
+      // The refusal is a decision about the request, not about the session: the
+      // session, its registry entry, its SDK transport, and its Layer C key all
+      // survive it exactly as they were.
+      assert.equal(surface.sessions.has(sessionId), true, 'the registry entry survives');
+      assert.equal(server.sessionManager.hasSession(sessionId), true, 'the session survives');
+      assert.equal(observed.closed, 0, 'the SDK transport was not closed');
+      assert.equal(surface.getActiveSessionCount(), 1);
+      assert.equal(surface.liveAdmissions.size, 0, 'no admission was left outstanding');
+      assert.equal(limiter.getHolderCount(key), 0);
+      assert.deepEqual(limiter.getRetainedKeysForTests(), keysBefore, 'no key was created or lost');
+
+      // ...and the session is still fully usable afterwards.
+      const ok = await request(port, {
+        method: 'POST',
+        headers: { ...MCP_POST_HEADERS, ...sessionHeaders(sessionId, token) },
+        body: nonToolBody(4, 'tools/list'),
+      });
+      assertSucceeded(ok, 4, 'the session still serves normal single messages');
+    } finally {
+      await server.stop();
+    }
+  });
+
+  // =========================================================================
+  // §25 error model: Layer C is MCP-framed, Layer B stays transport-level
+  // =========================================================================
+
+  test('RC05-NEG-56: the Layer C refusal is an MCP JSON-RPC error, never the Layer B transport model', async () => {
+    const { server, port, records, audit } = await startRemote({ tag: 'layer-c-framing' });
+    try {
+      const limiter = layerC(server);
+      const { sessionId, token } = await initializeSession(port);
+      const key = keyFor(records[0], sessionId);
+      drainBudget(limiter, key);
+
+      const auditBefore = audit.getRecords().length;
+      const refused = await request(port, {
+        method: 'POST',
+        headers: { ...MCP_POST_HEADERS, ...sessionHeaders(sessionId, token) },
+        body: toolCallBody(7),
+      });
+
+      // The frozen observable semantic code is unchanged; the framing is not a
+      // bare HTTP 429 with a `{code, message}` body, which is the Layer B model
+      // and would let a client confuse a post-session refusal with the
+      // pre-session transport limit.
+      const parsed = assertRateLimited(refused, 'the Layer C refusal', { id: 7 });
+      assert.equal(
+        parsed.error.message,
+        'Request rate or concurrency limit exceeded for this session.',
+      );
+      assert.equal(refused.body.includes('retryable'), false, 'no extra fields are emitted');
+
+      // The refusal happened BEFORE the tool call existed: no policy, approval,
+      // or subsystem work, and no audit record.
+      assert.equal(
+        audit.getRecords().length,
+        auditBefore,
+        'policy and subsystems stayed unreachable',
+      );
+      assert.equal(refused.body.includes('"result"'), false, 'no tool ran');
+
+      // The session survives the refusal, and its slot is returned.
+      assert.equal(server.sessionManager.hasSession(sessionId), true);
+      assert.equal(server.remoteGateway.mcpSurface.sessions.has(sessionId), true);
+      assert.equal(
+        await waitFor(() => limiter.getHolderCount(key) === 0),
+        true,
+        'a refusal returns its slot',
+      );
+
+      // Only a REFILL may make the session admissible again, and then the very
+      // same request succeeds — proving the refusal was about budget, not state.
+      assert.equal(
+        await waitFor(() => effectiveTokens(limiter, key) >= 1.05, 5000),
+        true,
+        'the session budget refills',
+      );
+      const recovered = await request(port, {
+        method: 'POST',
+        headers: { ...MCP_POST_HEADERS, ...sessionHeaders(sessionId, token) },
+        body: toolCallBody(8),
+      });
+      assertSucceeded(recovered, 8, 'the session recovers after a refill');
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test('RC05-NEG-56: a Layer C refusal on GET and DELETE is MCP-framed with a null id', async () => {
+    const { server, port, records } = await startRemote({ tag: 'layer-c-stream-framing' });
+    try {
+      const limiter = layerC(server);
+      const { sessionId, token } = await initializeSession(port);
+      const key = keyFor(records[0], sessionId);
+
+      // A GET and a DELETE carry no JSON-RPC request, so the envelope's id is
+      // `null`; the ARC semantic code still travels in `error.data.code`.
+      const refusedGet = await getBounded(port, sessionId, token);
+      assert.equal(refusedGet.status, 200, `${refusedGet.status} ${refusedGet.body}`);
+      drainBudget(limiter, key);
+      const refusedGet2 = await getBounded(port, sessionId, token);
+      assertRateLimited(refusedGet2, 'a rate-refused GET', {
+        id: null,
+        status: MCP_STREAM_REPLY_STATUS,
+      });
+      refusedGet.req?.destroy();
+
+      const refusedDelete = await request(port, {
+        method: 'DELETE',
+        headers: sessionHeaders(sessionId, token),
+      });
+      assertRateLimited(refusedDelete, 'a rate-refused DELETE', {
+        id: null,
+        status: MCP_STREAM_REPLY_STATUS,
+      });
+
+      // A refused DELETE must NOT have terminated the session: the refusal is
+      // about budget, and §13 termination requires a proven credential.
+      assert.equal(server.sessionManager.hasSession(sessionId), true);
+      assert.equal(server.remoteGateway.mcpSurface.sessions.has(sessionId), true);
+      assert.equal(limiter.getHolderCount(key), 0, 'neither refusal leaked a slot');
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test('RC05-NEG-55: the pre-session transport layers are untouched by the MCP framing', async () => {
+    const { server, port } = await startRemote({ tag: 'layer-a-unchanged' });
+    try {
+      // Layer A (60 connections/minute, burst 20) is STRICTLY tighter than Layer B
+      // (120 requests/minute, burst 30) and is evaluated first, so a single peer
+      // can never reach Layer B over the wire — Layer A drops the connection
+      // instead. That ordering is a frozen property of §21.1 and is asserted here,
+      // because it is what makes the framing change safe: nothing the MCP layer
+      // now emits can be confused with a transport refusal a client never sees.
+      //
+      // Layer B's own 429 — a bare status with a `text/plain` body and NO JSON-RPC
+      // frame — is exercised with the gateway's Layer B seam in
+      // `rc05-resource-bounds.test.js` (`RC05-NEG-55: Layer B refuses a peer before
+      // routing with a sanitized 429`), which this change does not touch.
+      let dropped = false;
+      for (let attempt = 0; attempt < 60 && !dropped; attempt += 1) {
+        try {
+          await request(port, {
+            method: 'POST',
+            headers: MCP_POST_HEADERS,
+            body: nonToolBody(attempt + 1, 'tools/list'),
+          });
+        } catch (err) {
+          // Layer A's model is a DROPPED connection, never an MCP reply.
+          assert.match(String(err.code), /ECONNRESET|EPIPE|ECONNREFUSED/, String(err));
+          dropped = true;
+        }
+      }
+      assert.equal(dropped, true, 'Layer A must still drop before Layer B is reachable');
+
+      // No session, no credential, and no MCP message was ever involved.
+      assert.equal(server.sessionManager.getActiveSessionCount(), 0);
+      assert.equal(server.remoteGateway.mcpSurface.getActiveSessionCount(), 0);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  // =========================================================================
+  // §25 error model: /mcp admission failures are MCP-framed and anti-oracle
+  // =========================================================================
+
+  /**
+   * Runs one ordinary authenticated request shape against one composition and
+   * returns the refusal response plus the secrets that must not appear in it.
+   */
+  async function refusalCase(tag, shape) {
+    const harness = await startRemote({ ...shape.start, tag });
+    const { server, port } = harness;
+    try {
+      const res = await request(port, shape.request(port, harness));
+      const forbidden = [
+        ...(shape.forbidden?.(harness) ?? []),
+        // No raw token, session identifier, SPKI pin, or device identifier may
+        // appear in any refusal body.
+        'Authorization',
+        'Bearer',
+      ];
+      for (const secret of forbidden.filter((value) => typeof value === 'string' && value.length)) {
+        assert.equal(res.body.includes(secret), false, `${tag}: the refusal leaks ${secret}`);
+      }
+      return { res, server, harness };
+    } finally {
+      await server.stop();
+    }
+  }
+
+  test('RC05-NEG-39/41: every pre-session device failure is the SAME MCP UNAUTHENTICATED error', async () => {
+    const shapes = [
+      [
+        'zero enrolled devices',
+        {
+          start: { pinCount: 0 },
+          request: () => ({ headers: MCP_POST_HEADERS, body: toolCallBody(11) }),
+        },
+      ],
+      [
+        'the store has devices but not this SPKI',
+        {
+          start: { pinCount: 1, clientEnrolled: false },
+          request: () => ({ headers: MCP_POST_HEADERS, body: toolCallBody(11) }),
+        },
+      ],
+      [
+        'the device behind this SPKI is revoked',
+        {
+          start: { pinCount: 1, revokedCount: 1 },
+          request: () => ({ headers: MCP_POST_HEADERS, body: toolCallBody(11) }),
+        },
+      ],
+      [
+        'a tokenless initialize from an unknown device',
+        {
+          start: { pinCount: 0 },
+          request: () => ({ headers: MCP_POST_HEADERS, body: INITIALIZE_BODY }),
+        },
+      ],
+    ];
+
+    const bodies = [];
+    for (const [label, shape] of shapes) {
+      const { res } = await refusalCase(`pre-${bodies.length}`, shape);
+      assertMcpRefusal(res, label, {
+        status: MCP_POST_REPLY_STATUS,
+        arcCode: 'UNAUTHENTICATED',
+      });
+      assert.equal(JSON.parse(res.body).error.message, 'Authentication failed', label);
+      bodies.push(res.body.replace(/"id":\d+/, '"id":0'));
+    }
+
+    // Anti-oracle: whether a device exists, whether it is revoked, whether the
+    // SPKI is recognized, or whether a session ever existed is NOT observable —
+    // all four produce the same bytes.
+    for (const body of bodies) {
+      assert.equal(body, bodies[0], 'every pre-session device failure is indistinguishable');
+    }
+  });
+
+  test('RC05-NEG-40: every post-session failure is the SAME MCP INVALID_SESSION_TOKEN error', async () => {
+    // Each shape builds a real session first, then presents credentials that must
+    // fail — for a different reason in every case.
+    const shapes = [
+      [
+        'missing token on a known session',
+        {
+          request: async (port, harness) => {
+            const init = await initializeSession(port);
+            harness.sessionId = init.sessionId;
+            harness.token = init.token;
+            return {
+              headers: { ...MCP_POST_HEADERS, 'Mcp-Session-Id': init.sessionId },
+              body: toolCallBody(11),
+            };
+          },
+        },
+      ],
+      [
+        'wrong token for a live session',
+        {
+          request: async (port, harness) => {
+            const init = await initializeSession(port);
+            harness.sessionId = init.sessionId;
+            harness.token = init.token;
+            return {
+              headers: { ...MCP_POST_HEADERS, ...sessionHeaders(init.sessionId, 'e'.repeat(64)) },
+              body: toolCallBody(11),
+            };
+          },
+        },
+      ],
+      [
+        'unknown session id with a real token',
+        {
+          request: async (port, harness) => {
+            const init = await initializeSession(port);
+            harness.sessionId = init.sessionId;
+            harness.token = init.token;
+            return {
+              headers: {
+                ...MCP_POST_HEADERS,
+                ...sessionHeaders('f'.repeat(64), init.token),
+              },
+              body: toolCallBody(11),
+            };
+          },
+        },
+      ],
+      [
+        'expired session',
+        {
+          start: { sessionClock: { now: 9_000_000 } },
+          request: async (port, harness) => {
+            const init = await initializeSession(port);
+            harness.sessionId = init.sessionId;
+            harness.token = init.token;
+            // Past the idle timeout: the authority expires it before the surface
+            // ever sees the request.
+            harness.server.sessionManager.expireIdleSessions?.();
+            harness.clock.now += (SESSION_IDLE_TIMEOUT_SECONDS + 1) * 1000;
+            return {
+              headers: { ...MCP_POST_HEADERS, ...sessionHeaders(init.sessionId, init.token) },
+              body: toolCallBody(11),
+            };
+          },
+        },
+      ],
+    ];
+
+    const bodies = [];
+    for (const [label, shape] of shapes) {
+      const clock = shape.start?.sessionClock;
+      const harness = await startRemote({ ...shape.start, tag: `post-${bodies.length}` });
+      const { server, port } = harness;
+      try {
+        const requestShape = await shape.request(port, { ...harness, clock });
+        const res = await request(port, { method: 'POST', ...requestShape });
+        assertMcpRefusal(res, label, {
+          status: MCP_POST_REPLY_STATUS,
+          arcCode: 'INVALID_SESSION_TOKEN',
+        });
+        assert.equal(JSON.parse(res.body).error.message, 'Invalid or expired session token', label);
+        assert.equal(
+          res.body.includes(harness.sessionId ?? '\u0000'),
+          false,
+          `${label}: no session id`,
+        );
+        assert.equal(res.body.includes(harness.token ?? '\u0000'), false, `${label}: no token`);
+        bodies.push(res.body.replace(/"id":\d+/, '"id":0'));
+      } finally {
+        await server.stop();
+      }
+    }
+
+    for (const body of bodies) {
+      assert.equal(body, bodies[0], 'every post-session failure is indistinguishable');
+    }
+  });
+
+  test('RC05-NEG-40: an identity mismatch is refused exactly like a bad token', async () => {
+    const { server, port, records, audit } = await startRemote({ tag: 'identity-mismatch' });
+    try {
+      const init = await initializeSession(port);
+      assert.equal(init.res.status, 200, `${init.res.status} ${init.res.body}`);
+
+      // Cause 1: a WRONG token for a live session.
+      const wrongToken = await request(port, {
+        method: 'POST',
+        headers: { ...MCP_POST_HEADERS, ...sessionHeaders(init.sessionId, 'e'.repeat(64)) },
+        body: toolCallBody(11),
+      });
+      assertMcpRefusal(wrongToken, 'a wrong token', {
+        status: MCP_POST_REPLY_STATUS,
+        arcCode: 'INVALID_SESSION_TOKEN',
+      });
+      assert.equal(wrongToken.body.includes(init.token), false, 'no credential is echoed');
+
+      // Cause 2: the device behind the SAME SPKI stops resolving to an active
+      // identity — the certificate is unchanged and the session is live, but the
+      // identity the request resolves to no longer matches the session's device.
+      // This is the out-of-band revocation the surface must observe, resolved from
+      // the CURRENT trust store on every request.
+      const auditBefore = audit.getRecords().length;
+      const authoritative = server.remoteGateway.bootstrap.authoritativeTrustStore;
+      authoritative.revokeDevice(records[0].deviceId);
+      assert.equal(
+        server.remoteGateway.getEnrolledDeviceCount(),
+        0,
+        'the device really is revoked in the authoritative store',
+      );
+
+      const mismatched = await request(port, {
+        method: 'POST',
+        headers: { ...MCP_POST_HEADERS, ...sessionHeaders(init.sessionId, init.token) },
+        body: toolCallBody(11),
+      });
+
+      // Anti-oracle: the two DIFFERENT causes produce the SAME bytes. The refusal
+      // discloses neither the device, nor the SPKI, nor the session, nor which of
+      // the two things went wrong.
+      assert.equal(mismatched.body, wrongToken.body, 'the two causes are indistinguishable');
+      assertMcpRefusal(mismatched, 'an identity mismatch', {
+        status: MCP_POST_REPLY_STATUS,
+        arcCode: 'INVALID_SESSION_TOKEN',
+      });
+      assert.equal(mismatched.body.includes(records[0].deviceId), false, 'no device id escapes');
+      assert.equal(mismatched.body.includes(clientPin()), false, 'no SPKI pin escapes');
+      assert.equal(
+        audit.getRecords().length,
+        auditBefore,
+        'no policy or subsystem work was reached',
+      );
     } finally {
       await server.stop();
     }

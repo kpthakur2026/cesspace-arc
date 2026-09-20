@@ -25,6 +25,11 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { createArcMcpServer } from '../apps/mcp-server/dist/index.js';
+import {
+  MCP_ADMISSION_ERROR_CODE,
+  MCP_POST_REPLY_STATUS,
+  MCP_STREAM_REPLY_STATUS,
+} from '../apps/mcp-server/dist/remote-execution.js';
 import { DeviceTrustStore, deriveSpkiPin } from '../packages/auth/dist/index.js';
 import { createEmptyTrustStore, createTestPki, hasOpenssl } from './helpers/rc05-test-pki.mjs';
 
@@ -195,6 +200,37 @@ function responseMessages(res) {
     return sseMessages(res.body);
   }
   return res.body.length > 0 ? [JSON.parse(res.body)] : [];
+}
+
+/**
+ * Asserts one `/mcp` application-level refusal is an MCP JSON-RPC error (§25).
+ *
+ * §25 orders the error model by LAYER: the transport layers answer with a status
+ * and no MCP body (Layer B's `429`, the 404/405/413 transport refusals), while a
+ * device/session admission failure on `/mcp` is an MCP JSON-RPC error carrying
+ * the frozen ARC code in `error.data.code`. The envelope is asserted EXACTLY —
+ * the code and the message and nothing else — because the anti-oracle property
+ * depends on every refusal being indistinguishable from every other.
+ */
+function assertMcpRefusal(res, label, { status, arcCode }) {
+  assert.equal(res.status, status, `${label}: ${res.status} ${res.body}`);
+  assert.notEqual(res.status, 429, `${label}: this is not the Layer B transport refusal`);
+  assert.notEqual(res.status, 401, `${label}: a bare 401 body is not MCP framing`);
+  assert.equal(res.headers['content-type'], 'application/json', label);
+  const parsed = JSON.parse(res.body);
+  assert.equal(parsed.jsonrpc, '2.0', label);
+  assert.deepEqual(Object.keys(parsed).sort(), ['error', 'id', 'jsonrpc'], label);
+  assert.equal(parsed.error.code, MCP_ADMISSION_ERROR_CODE, label);
+  // `arcCode` is stated by every case that knows which refusal it is exercising.
+  // A case that accepts either anti-oracle variant omits it and asserts itself.
+  if (arcCode !== undefined) {
+    assert.equal(parsed.error.data.code, arcCode, label);
+  } else {
+    assert.equal(typeof parsed.error.data.code, 'string', label);
+  }
+  assert.deepEqual(Object.keys(parsed.error).sort(), ['code', 'data', 'message'], label);
+  assert.deepEqual(Object.keys(parsed.error.data), ['code'], label);
+  return parsed;
 }
 
 const INITIALIZE_BODY = JSON.stringify({
@@ -464,11 +500,12 @@ describe('CesSpace ARC — RC-05 Task 8: Streamable HTTP Gateway', () => {
           params: { name: 'health', arguments: {} },
         }),
       });
-      assert.equal(res.status, 401, `${res.status} ${res.body}`);
-      assert.deepEqual(JSON.parse(res.body), {
-        code: 'UNAUTHENTICATED',
-        message: 'Authentication failed',
+      const refusal = assertMcpRefusal(res, 'tokenless ordinary request', {
+        status: MCP_POST_REPLY_STATUS,
+        arcCode: 'UNAUTHENTICATED',
       });
+      assert.equal(refusal.id, 2, 'the refusal answers the request it refused');
+      assert.equal(refusal.error.message, 'Authentication failed');
       assert.equal(res.headers['mcp-session-id'], undefined);
       assert.equal(res.headers['arc-session-token'], undefined);
       assert.equal(server.sessionManager.getActiveSessionCount(), 0);
@@ -508,13 +545,15 @@ describe('CesSpace ARC — RC-05 Task 8: Streamable HTTP Gateway', () => {
           headers: { ...MCP_POST_HEADERS, ...headers },
           body: call,
         });
-        assert.equal(res.status, 401, `${label}: ${res.status} ${res.body}`);
-        const parsed = JSON.parse(res.body);
+        const parsed = assertMcpRefusal(res, label, { status: MCP_POST_REPLY_STATUS });
         assert.equal(
-          parsed.code === 'UNAUTHENTICATED' || parsed.code === 'INVALID_SESSION_TOKEN',
+          parsed.error.data.code === 'UNAUTHENTICATED' ||
+            parsed.error.data.code === 'INVALID_SESSION_TOKEN',
           true,
           `${label}: ${res.body}`,
         );
+        assert.equal(parsed.id, 3, label);
+        assert.equal(res.body.includes(token), false, `${label}: no credential is echoed`);
       }
 
       // The real pair works.
@@ -602,11 +641,13 @@ describe('CesSpace ARC — RC-05 Task 8: Streamable HTTP Gateway', () => {
     try {
       // Unauthenticated GET: no stream, generic refusal.
       const anon = await request(port, { method: 'GET' });
-      assert.equal(anon.status, 401, `${anon.status} ${anon.body}`);
-      assert.deepEqual(JSON.parse(anon.body), {
-        code: 'UNAUTHENTICATED',
-        message: 'Authentication failed',
+      // A GET carries no JSON-RPC request, so its refusal cannot echo an id.
+      const refusal = assertMcpRefusal(anon, 'anonymous GET', {
+        status: MCP_STREAM_REPLY_STATUS,
+        arcCode: 'UNAUTHENTICATED',
       });
+      assert.equal(refusal.id, null);
+      assert.equal(refusal.error.message, 'Authentication failed');
 
       const { sessionId, token } = await initializeSession(port);
 
@@ -674,7 +715,14 @@ describe('CesSpace ARC — RC-05 Task 8: Streamable HTTP Gateway', () => {
             params: { name: 'health', arguments: {} },
           }),
         });
-        assert.equal(res.status, 401, `${res.status} ${res.body}`);
+        // A torn-down session is a POST-SESSION failure, and §25 frames it as an
+        // MCP JSON-RPC error. Whether the caller presented the dead ID, only the
+        // dead token, or both is not disclosed.
+        const refusal = assertMcpRefusal(res, 'torn-down credentials', {
+          status: MCP_POST_REPLY_STATUS,
+          arcCode: 'INVALID_SESSION_TOKEN',
+        });
+        assert.equal(refusal.id, 6);
       }
 
       // The surviving session still works.
@@ -720,7 +768,10 @@ describe('CesSpace ARC — RC-05 Task 8: Streamable HTTP Gateway', () => {
       // An unenrolled device cannot bootstrap a session, and cannot create a
       // device through MCP either.
       const init = await initializeSession(port);
-      assert.equal(init.res.status, 401, `${init.res.status} ${init.res.body}`);
+      assertMcpRefusal(init.res, 'unauthenticated initialize', {
+        status: MCP_POST_REPLY_STATUS,
+        arcCode: 'UNAUTHENTICATED',
+      });
       assert.equal(init.sessionId, undefined);
       assert.equal(init.token, undefined);
       assert.equal(server.sessionManager.getActiveSessionCount(), 0);
@@ -955,7 +1006,13 @@ describe('CesSpace ARC — RC-05 Task 8: Streamable HTTP Gateway', () => {
             params: { name: 'health', arguments: {} },
           }),
         });
-        assert.equal(res.status, 401, `${JSON.stringify(headers)}: ${res.status} ${res.body}`);
+        // Pre-restart credentials are a post-session admission failure: MCP
+        // JSON-RPC framed, and the same refusal whichever of the three the
+        // caller kept, so the shape says nothing about what survived.
+        assertMcpRefusal(res, `pre-restart credentials ${JSON.stringify(headers)}`, {
+          status: MCP_POST_REPLY_STATUS,
+          arcCode: 'INVALID_SESSION_TOKEN',
+        });
         assert.equal(res.headers['mcp-session-id'], undefined);
       }
 

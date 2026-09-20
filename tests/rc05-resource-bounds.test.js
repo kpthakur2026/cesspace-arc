@@ -884,8 +884,17 @@ describe('RC-05 Task 7: §21.1 Layer B pre-session limiter', () => {
       assert.equal(refused.headers['content-type'], 'text/plain; charset=utf-8');
       assert.equal(refused.headers.connection, 'close');
       // No MCP JSON-RPC frame, no device/session oracle, no limiter internals.
+      //
+      // §25 splits the error model by LAYER, and this is the transport half:
+      // Layer B is pre-session, so it answers with a bare HTTP status and a
+      // non-MCP body. Layer C — which runs only AFTER a session has been
+      // authenticated — must NOT look like this; it answers with an MCP JSON-RPC
+      // error carrying `RATE_LIMIT_EXCEEDED` (asserted in
+      // `rc05-gateway-admission.test.js`). Neither may drift into the other.
       assert.equal(refused.body.includes('{'), false);
       assert.equal(refused.body.includes('jsonrpc'), false);
+      assert.equal(refused.body.includes('RATE_LIMIT_EXCEEDED'), false);
+      assert.equal(refused.body.includes('data'), false);
       assert.equal(refused.body.includes('192.0.2'), false);
       assert.equal(refused.body.includes('127.0.0.1'), false);
       assert.equal(refused.body.includes('unknown-peer'), false);

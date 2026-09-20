@@ -36,8 +36,25 @@
  * - Identity is the gateway-derived SPKI pin and the ACTIVE enrolled device
  *   behind it. No JSON field, tool parameter, `Host`, `Origin`, `X-Forwarded-*`,
  *   or client-supplied session identifier is ever an identity input.
- * - Every refusal is the same bounded, non-secret body; nothing here discloses
- *   whether a session, device, or revocation exists.
+ * - Every APPLICATION-LEVEL refusal is the SAME bounded MCP JSON-RPC error
+ *   envelope (§25): device/session admission failures, the Layer C
+ *   rate/concurrency refusal, and a refused JSON-RPC batch are all framed
+ *   identically, so the shape of a refusal discloses nothing and never names
+ *   whether a session, device, or revocation exists. Transport-level refusals —
+ *   Host/Origin, Layer B, method, size, and read bounds — stay transport-level
+ *   and keep failing BEFORE any MCP framing, exactly as §25 orders them.
+ * - Layer C is the MCP application channel, not the transport channel. Its
+ *   refusal is NOT a bare HTTP 429: §25 reserves status-only refusals for the
+ *   TRANSPORT layers (Layer A drops the connection, Layer B answers 429 with no
+ *   MCP body, and 404/405/413 stay transport-level). Layer C runs only AFTER a
+ *   session has been authenticated, so its refusal is a JSON-RPC error reply.
+ * - JSON-RPC batching is REFUSED. MCP `2025-06-18` removed batching from the
+ *   protocol and the frozen scope requires no batch support, so a batch array is
+ *   refused as ONE malformed Request before the SDK sees it. The SDK would
+ *   otherwise invoke its handler once per member while ARC had spent a single
+ *   Layer C token and a single §26 C-3 slot for the whole batch — a way to
+ *   amortize one admission across arbitrarily many MCP requests. Refusing is
+ *   fail-closed and needs no per-member accounting.
  * - The SDK's deprecated `allowedHosts`, `allowedOrigins`, and
  *   `enableDnsRebindingProtection` options are NOT used: §10/§11 require ARC's
  *   own gateway-side validation, which runs before the SDK sees the request.
@@ -47,6 +64,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
+import type { ArcError } from '@cesspace-arc/protocol';
 import {
   ARC_SESSION_TOKEN_HEADER,
   MAX_ACTIVE_SESSIONS_GLOBAL,
@@ -54,9 +72,17 @@ import {
   type TrustedSessionIdentity,
 } from '@cesspace-arc/auth';
 import {
+  MCP_POST_REPLY_STATUS,
+  MCP_STREAM_REPLY_STATUS,
   isAdmittedRemoteRequest,
-  remoteRateLimitResponseBody,
+  jsonRpcRequestId,
+  mcpAdmissionErrorBody,
+  mcpBatchRefusalBody,
+  remoteAuthenticationFailure,
+  remoteRateLimitFailure,
+  remoteSessionFailure,
   type AdmittedRemoteRequest,
+  type JsonRpcRequestId,
   type RemoteRequestAdmission,
 } from './remote-execution.js';
 import { checkRequestAuthority, writeAuthorityRefusal } from './remote-request-authority.js';
@@ -75,16 +101,19 @@ export {
   normalizeHostHeader,
 } from './remote-request-authority.js';
 
-/** §7 pre-session refusal. Byte-identical to the Task-4 deny-only placeholder. */
+/**
+ * The Task-4/§7 `UNAUTHENTICATED` body for a request that never became an MCP
+ * message: an unreadable body (this module) and the deny-only `/mcp` placeholder
+ * `enrollment-bootstrap.ts` answers with when no surface is composed.
+ *
+ * An ADMISSION failure does NOT use this shape any more — §25 frames those as
+ * MCP JSON-RPC errors (see `sendMcpRefusal`). The post-session counterpart is
+ * the same envelope carrying `INVALID_SESSION_TOKEN`, so there is no separate
+ * bare post-session body constant to keep in step.
+ */
 export const UNAUTHENTICATED_BODY = JSON.stringify({
   code: 'UNAUTHENTICATED',
   message: 'Authentication failed',
-});
-
-/** §7 post-session refusal. Generic; never names the cause. */
-export const INVALID_SESSION_TOKEN_BODY = JSON.stringify({
-  code: 'INVALID_SESSION_TOKEN',
-  message: 'Invalid or expired session token',
 });
 
 /** §4: `/mcp` supports exactly these three methods. */
@@ -175,23 +204,44 @@ interface RemoteSessionEntry {
 }
 
 /**
- * True when the request is a JSON-RPC `initialize` request.
+ * True when the request is a single JSON-RPC `initialize` request.
  *
- * Mirrors the SDK's own classification: a batch counts when ANY member is an
- * `initialize`, because that is exactly the case the SDK treats as session
- * establishment. This decides only which admission question to ask Task 5; it
- * establishes nothing by itself, and a request merely CLAIMING to be
- * `initialize` still has to satisfy `admitRequest` to reach the transport.
+ * Mirrors the SDK's own classification for one message. There is no batch arm
+ * because a batch never reaches this function: `handlePost` refuses a JSON-RPC
+ * array immediately after parsing, before classification and before admission,
+ * so "initialize plus something else" cannot be classified as a bootstrap at all.
+ *
+ * This decides only which admission question to ask Task 5; it establishes
+ * nothing by itself, and a request merely CLAIMING to be `initialize` still has
+ * to satisfy `admitRequest` to reach the transport.
  */
 function isInitializeRequest(body: unknown): boolean {
-  const isOne = (message: unknown): boolean =>
-    typeof message === 'object' &&
-    message !== null &&
-    (message as { method?: unknown }).method === 'initialize';
-  if (Array.isArray(body)) {
-    return body.some(isOne);
-  }
-  return isOne(body);
+  return (
+    typeof body === 'object' &&
+    body !== null &&
+    !Array.isArray(body) &&
+    (body as { method?: unknown }).method === 'initialize'
+  );
+}
+
+/**
+ * Maps an admission refusal to its canonical anti-oracle `ArcError`.
+ *
+ * `ADMITTED` is not a refusal and is not accepted here, so a caller cannot
+ * accidentally frame a success as an error. `BOOTSTRAP_TOKENLESS` IS accepted
+ * and maps to the pre-session failure: it means the request presented no
+ * credential at all, which for the session-bound GET/DELETE that can reach this
+ * mapping is exactly `UNAUTHENTICATED`. `POST` handles its bootstrap before
+ * reaching here. This is the ONLY mapping from an admission outcome to a
+ * client-facing failure, so the surface cannot invent a second, differently
+ * shaped refusal.
+ */
+function admissionFailure(
+  outcome: 'UNAUTHENTICATED' | 'INVALID_SESSION_TOKEN' | 'BOOTSTRAP_TOKENLESS',
+): ArcError {
+  return outcome === 'INVALID_SESSION_TOKEN'
+    ? remoteSessionFailure()
+    : remoteAuthenticationFailure();
 }
 
 /** Reads one header as a verbatim string, or null when absent or repeated. */
@@ -354,6 +404,9 @@ export class RemoteMcpSurface {
           return;
         }
       }
+      // Ingress failure, not an admission decision: the body could not be read
+      // at all, so there is no request to frame a JSON-RPC reply to. §25 keeps
+      // request-size and read bounds transport-level, and this stays with them.
       this.send(res, 400, UNAUTHENTICATED_BODY);
       return;
     }
@@ -370,12 +423,40 @@ export class RemoteMcpSurface {
       parsedBody = undefined;
     }
 
+    // §21.1 Layer C / §26 C-3 / MCP `2025-06-18`: a JSON-RPC BATCH is refused.
+    //
+    // This is the ONLY point at which a batch can be stopped before it costs
+    // anything. The installed SDK accepts an array, maps it to messages, and
+    // calls its handler ONCE PER MEMBER — while ARC spends exactly one Layer C
+    // rate token and takes exactly one §26 C-3 concurrency slot for the whole
+    // HTTP request. One POST could therefore carry unbounded MCP requests on a
+    // single admission, which is precisely the accounting the frozen bounds
+    // forbid (max 300 MCP REQUESTS/min, max 4 outstanding MCP REQUESTS per
+    // session).
+    //
+    // Refusing is the fail-closed reading of the frozen scope: MCP `2025-06-18`
+    // removed batching, and the scope requires no batch support, so there is no
+    // baseline control to preserve. The check runs on the ALREADY-BOUNDED,
+    // ALREADY-PARSED body, before `admit`, so no member of the batch reaches the
+    // SDK, the tool catalog, the shared RC-04 pipeline, policy, approval, or any
+    // subsystem; no Layer C token or concurrency slot is ever created for it; no
+    // session is minted; and the request's active session, if it named one, is
+    // left untouched. The refusal is one bounded MCP JSON-RPC error with a
+    // `null` id — there is no single request to echo an id for.
+    if (Array.isArray(parsedBody)) {
+      this.send(res, MCP_POST_REPLY_STATUS, mcpBatchRefusalBody());
+      return;
+    }
+
     const presentedSessionId = readSingleHeader(req, 'mcp-session-id');
     const authorizationHeader = readSingleHeader(req, 'authorization');
     const existing =
       presentedSessionId !== null ? this.sessions.get(presentedSessionId) : undefined;
-    const kind =
-      parsedBody !== undefined && isInitializeRequest(parsedBody) ? 'initialize' : 'ordinary';
+    const kind = isInitializeRequest(parsedBody) ? 'initialize' : 'ordinary';
+    // The id every MCP-framed refusal below replies to. Computed once from the
+    // bounded body that was already parsed for classification — nothing is read
+    // a second time to obtain it, and a body that yielded no id yields `null`.
+    const requestId: JsonRpcRequestId = jsonRpcRequestId(parsedBody);
 
     // ONE admission per request: identity/session authentication, the Layer C
     // rate token, and the §26 C-3 concurrency slot, for EVERY authenticated MCP
@@ -391,21 +472,28 @@ export class RemoteMcpSurface {
     });
 
     if (decision.outcome === 'BOOTSTRAP_TOKENLESS') {
-      await this.bootstrapSession(req, res, spkiPin, decision.identity, parsedBody);
+      await this.bootstrapSession(req, res, spkiPin, decision.identity, parsedBody, requestId);
       return;
     }
 
     if (decision.outcome === 'RATE_LIMITED') {
       // §21.1 Layer C / §26 C-3: one sanitized refusal for both the rate and the
-      // concurrency bound, with the frozen `RATE_LIMIT_EXCEEDED` code.
-      this.send(res, 429, remoteRateLimitResponseBody());
+      // concurrency bound, with the frozen `RATE_LIMIT_EXCEEDED` code. An
+      // authenticated session exists at this point, so the refusal is an MCP
+      // JSON-RPC error on the MCP channel — NOT a bare HTTP 429, which §25
+      // reserves for Layer B, the pre-session transport limit.
+      this.sendMcpRefusal(res, 'POST', remoteRateLimitFailure(), requestId);
       return;
     }
 
     if (decision.outcome !== 'ADMITTED') {
+      // §25: a pre-session device failure is `UNAUTHENTICATED` and a post-session
+      // failure is `INVALID_SESSION_TOKEN`, both MCP JSON-RPC framed. The two
+      // remain indistinguishable from each other in shape, and neither discloses
+      // whether the device exists, is revoked, whether the SPKI is recognized, or
+      // whether a session ever existed.
       await this.reapPresentedSession(presentedSessionId);
-      const invalidSession = decision.outcome === 'INVALID_SESSION_TOKEN';
-      this.send(res, 401, invalidSession ? INVALID_SESSION_TOKEN_BODY : UNAUTHENTICATED_BODY);
+      this.sendMcpRefusal(res, 'POST', admissionFailure(decision.outcome), requestId);
       return;
     }
 
@@ -419,7 +507,7 @@ export class RemoteMcpSurface {
       // Nothing can serve this request, so the admission it holds is released
       // immediately rather than held for a response that will never use it.
       decision.admission.release();
-      this.send(res, 401, INVALID_SESSION_TOKEN_BODY);
+      this.sendMcpRefusal(res, 'POST', remoteSessionFailure(), requestId);
       return;
     }
 
@@ -466,7 +554,11 @@ export class RemoteMcpSurface {
     });
 
     if (decision.outcome === 'RATE_LIMITED') {
-      this.send(res, 429, remoteRateLimitResponseBody());
+      // MCP-framed like the POST refusal, but on the status the installed SDK
+      // itself uses for a GET/DELETE it cannot serve. A GET/DELETE carries no
+      // JSON-RPC request, so there is no id to echo and the envelope's id is
+      // `null`. The ARC semantic code still travels in `error.data.code`.
+      this.sendMcpRefusal(res, method, remoteRateLimitFailure(), null);
       return;
     }
 
@@ -477,15 +569,14 @@ export class RemoteMcpSurface {
       // pre-session case stays uniformly `UNAUTHENTICATED` and only a request
       // that actually presented a session context gets the session failure.
       await this.reapPresentedSession(presentedSessionId);
-      const invalidSession = decision.outcome === 'INVALID_SESSION_TOKEN';
-      this.send(res, 401, invalidSession ? INVALID_SESSION_TOKEN_BODY : UNAUTHENTICATED_BODY);
+      this.sendMcpRefusal(res, method, admissionFailure(decision.outcome), null);
       return;
     }
 
     const entry = this.sessions.get(decision.admission.session.sessionId);
     if (entry === undefined) {
       decision.admission.release();
-      this.send(res, 401, INVALID_SESSION_TOKEN_BODY);
+      this.sendMcpRefusal(res, method, remoteSessionFailure(), null);
       return;
     }
 
@@ -537,7 +628,7 @@ export class RemoteMcpSurface {
       // it is released here rather than held for a response that will not run.
       admission.release();
       await this.discard(sessionId);
-      this.send(res, 401, INVALID_SESSION_TOKEN_BODY);
+      this.sendMcpRefusal(res, method, remoteSessionFailure(), jsonRpcRequestId(parsedBody));
       return;
     }
 
@@ -611,6 +702,7 @@ export class RemoteMcpSurface {
     spkiPin: string,
     identity: TrustedSessionIdentity,
     parsedBody: unknown,
+    requestId: JsonRpcRequestId,
   ): Promise<void> {
     // BEFORE registry occupancy is used as a capacity decision, the registry is
     // reconciled against the authoritative session manager. An entry whose
@@ -622,7 +714,10 @@ export class RemoteMcpSurface {
     await this.reapOrphanedSessions();
 
     if (this.sessions.size >= MAX_ACTIVE_SESSIONS_GLOBAL) {
-      this.send(res, 401, UNAUTHENTICATED_BODY);
+      // Capacity, not a credential: refused with the same `UNAUTHENTICATED`
+      // envelope as any other pre-session failure so it cannot be used to probe
+      // how many sessions exist.
+      this.sendMcpRefusal(res, 'POST', remoteAuthenticationFailure(), requestId);
       return;
     }
 
@@ -786,6 +881,32 @@ export class RemoteMcpSurface {
       await entry.server.close().catch(() => undefined);
       await entry.transport.close().catch(() => undefined);
     }
+  }
+
+  /**
+   * Answers ONE application-level refusal with the shared MCP JSON-RPC envelope
+   * (§25).
+   *
+   * `POST` replies on {@link MCP_POST_REPLY_STATUS} — the MCP application
+   * channel, where the envelope carries the outcome and the status does not.
+   * `GET`/`DELETE` carry no JSON-RPC request, so they reply on
+   * {@link MCP_STREAM_REPLY_STATUS}, the status the installed SDK itself uses
+   * for a stream request it cannot serve. Neither is the Layer B transport
+   * model: there is no bare 429 here and no `{code, message}` body.
+   *
+   * The envelope is built from the canonical `ArcError`, so the observable
+   * semantic code is the frozen ARC code and the message is the frozen message,
+   * with nothing else added — no limiter key, token count, retry-after, session
+   * identifier, or peer identity.
+   */
+  private sendMcpRefusal(
+    res: ServerResponse,
+    method: 'POST' | 'GET' | 'DELETE',
+    failure: ArcError,
+    id: JsonRpcRequestId,
+  ): void {
+    const status = method === 'POST' ? MCP_POST_REPLY_STATUS : MCP_STREAM_REPLY_STATUS;
+    this.send(res, status, mcpAdmissionErrorBody(failure, id));
   }
 
   /** Bounded, non-secret refusal. Never carries peer-supplied text. */
