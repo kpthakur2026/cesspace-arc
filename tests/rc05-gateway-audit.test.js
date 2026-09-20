@@ -265,7 +265,7 @@ describe('CesSpace ARC — RC-05 Task 10: Gateway Lifecycle Audit Catalog & Secr
       token: 'secret-token-value',
       secret: 'one-time-secret',
       privateKey: '-----BEGIN PRIVATE KEY-----',
-      peerAddress: '192.168.1.1',
+      peerAddress: 'peer-network-address',
       limiterBucket: 42,
     });
 
