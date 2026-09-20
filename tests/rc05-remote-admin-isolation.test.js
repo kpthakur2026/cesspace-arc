@@ -12,13 +12,20 @@
  *
  *   1. `tools/list` does not contain the administrative name at all, so there
  *      is no tool to call;
- *   2. an attempted `tools/call` naming it does not reach any administrative
- *      handler, discloses no administrative state, and mutates nothing;
- *   3. a direct JSON-RPC request naming it returns the transport's own `-32601`
- *      Method not found, which is only possible because NO handler is
+ *   2. an attempted `tools/call` naming it is answered with EXACTLY JSON-RPC
+ *      `-32601` Method not found — a protocol-level unknown-tool refusal, not a
+ *      `CallToolResult` carrying `isError: true`. The weaker `isError` shape
+ *      would mean the call entered the shared execution pipeline and was only
+ *      rejected there, which is what these controls forbid;
+ *   3. a direct JSON-RPC request naming it as a top-level METHOD returns the
+ *      transport's own `-32601`, which is only possible because NO handler is
  *      registered for it anywhere in the composition;
  *   4. every piece of local state those actions would have touched is
- *      unchanged afterwards.
+ *      unchanged afterwards;
+ *   5. the rule producing (2) is GENERIC — membership in the one registered
+ *      `ALL_TOOL_DEFINITIONS` catalog — and not a denylist of administrative
+ *      names. Proven both ways: arbitrary unregistered names are refused, and
+ *      every registered name still executes normally through the same handler.
  *
  * A same-fixture LOCAL admin channel is composed alongside, so each case can
  * also prove the capability genuinely EXISTS locally and is withheld remotely
@@ -377,22 +384,28 @@ function readStoreFile(storePath) {
 }
 
 /**
- * Asserts that an attempted administrative remote action reached no handler.
+ * Asserts an attempted administrative remote `tools/call` is answered with
+ * EXACTLY JSON-RPC `-32601` (Method not found).
  *
- * The request is either refused as an unknown tool or answered as an ordinary
- * tool error. Both mean "there is no administrative handler"; what must never
- * appear is a successful administrative result.
+ * This is deliberately strict. A `CallToolResult` carrying `isError: true` is
+ * NOT acceptable here: that shape means the call entered the shared execution
+ * pipeline, was schema-rejected by the internal tool lookup, and came back as
+ * an ordinary tool error — policy was evaluated and an approval may have been
+ * considered. The controls require the call to be refused at the protocol
+ * boundary, as an unknown tool, with the pipeline never entered.
+ *
+ * The response must therefore be a JSON-RPC error object and nothing else:
+ * no `result` member in any form, and no Arc admission envelope.
  */
-function assertNoAdminHandler(res, label) {
+function assertUnknownTool(res, label) {
   assert.equal(res.status, MCP_POST_REPLY_STATUS, `${label}: ${res.status} ${res.body}`);
   const payload = payloadOf(res.body);
   assert.equal(payload.jsonrpc, '2.0', label);
-  if (payload.error !== undefined) {
-    assert.equal(payload.error.code, MCP_ADMISSION_ERROR_CODE, `${label}: ${res.body}`);
-    assert.equal(typeof payload.error.data.code, 'string', label);
-  } else {
-    assert.equal(payload.result.isError, true, `${label} must not succeed: ${res.body}`);
-  }
+  assert.notEqual(payload.error, undefined, `${label} must be a JSON-RPC error: ${res.body}`);
+  assert.equal(payload.error.code, METHOD_NOT_FOUND, `${label}: ${res.body}`);
+  // Not a tool result, and specifically not the weaker `isError` admission.
+  assert.equal(payload.result, undefined, `${label} must not return a CallToolResult`);
+  assert.equal('data' in payload.error, false, `${label}: ${res.body}`);
   return payload;
 }
 
@@ -541,10 +554,11 @@ describe('CesSpace ARC — RC-05 Task 9: Remote administration isolation', () =>
     try {
       const session = await initializeSession(fixture.port, fixture.client);
       const storeBefore = trustStoreBytes(fixture.storePath);
+      const policyHashBefore = policyHashOf(fixture);
 
       for (const [name, args] of FORBIDDEN_REMOTE_ADMIN_TOOLS) {
         const res = await remoteToolCall(fixture, session, name, args);
-        assertNoAdminHandler(res, name);
+        assertUnknownTool(res, name);
 
         // Nothing administrative is disclosed, in any framing.
         for (const leaked of [
@@ -574,6 +588,296 @@ describe('CesSpace ARC — RC-05 Task 9: Remote administration isolation', () =>
       // No administrative state moved.
       assert.deepEqual(trustStoreBytes(fixture.storePath), storeBefore, 'trust store unchanged');
       assert.deepEqual(fixture.approvals.listActive(), [], 'no approval was created or changed');
+      assert.equal(policyHashOf(fixture), policyHashBefore, 'the policy engine is unchanged');
+    } finally {
+      await fixture.server.stop();
+    }
+  });
+
+  test('RC05-NEG-74..79: every covered control category returns exact -32601 on the real tools/call path', async () => {
+    const fixture = await startIsolated({ tag: 'per-control' });
+    try {
+      // A REAL pending approval exists, so a pipeline-reached `approve` would
+      // have something to act on, and a REAL second live session exists, so a
+      // pipeline-reached `session.revoke` would have something to destroy.
+      const pending = fixture.approvals.createOrReusePending({
+        toolName: 'write_file',
+        executionPayloadHash: 'a'.repeat(64),
+        binding: {
+          actor: { clientId: 'agent-alpha', clientType: 'claude-code' },
+          workspace: { workspaceId: 'ws', workspaceRootHash: 'b'.repeat(64) },
+          policyHash: 'c'.repeat(64),
+        },
+        reviewMaterial: '--- a/secret.txt\n+++ b/secret.txt\n@@ -1 +1 @@\n-old\n+new\n',
+      });
+      const session = await initializeSession(fixture.port, fixture.client);
+      const other = await initializeSession(fixture.port, fixture.client);
+
+      const approvalsBefore = JSON.stringify(fixture.approvals.listActive());
+      const storeBefore = trustStoreBytes(fixture.storePath);
+      const policyHashBefore = policyHashOf(fixture);
+      const decisionBefore = await remoteReadFile(fixture, session, 'README.md');
+      const sessionsBefore = fixture.server.sessionManager.getActiveSessionCount();
+
+      // The six control categories, each with the argument set a real
+      // administrative call would carry.
+      const CATEGORIES = [
+        ['RC05-NEG-74', [['approve', { requestId: pending.requestId, reason: 'remote override' }]]],
+        ['RC05-NEG-75', [['reject', { requestId: pending.requestId, reason: 'remote override' }]]],
+        [
+          'RC05-NEG-76',
+          [
+            ['approvals.list', {}],
+            ['approvals.inspect', { requestId: pending.requestId }],
+          ],
+        ],
+        [
+          'RC05-NEG-77',
+          [
+            ['enrollment.create', { clientId: 'attacker', clientType: 'claude-code' }],
+            ['devices.list', {}],
+            ['devices.inspect', { deviceId: fixture.device.deviceId }],
+            ['device.revoke', { deviceId: fixture.device.deviceId }],
+            ['device.rename', { deviceId: fixture.device.deviceId, displayLabel: 'pwned' }],
+            ['device.pin.add', { deviceId: fixture.device.deviceId, spkiPin: 'e'.repeat(64) }],
+            [
+              'device.pin.remove',
+              { deviceId: fixture.device.deviceId, spkiPin: fixture.clientPin },
+            ],
+          ],
+        ],
+        [
+          'RC05-NEG-78',
+          [
+            ['policy.set', { policy: { rules: [{ effect: 'ALLOW', tool: '*' }] } }],
+            ['policy.update', { policy: { rules: [] } }],
+            ['policy.reload', {}],
+          ],
+        ],
+        [
+          'RC05-NEG-79',
+          [
+            ['sessions.list', {}],
+            ['session.revoke', { sessionId: other.sessionId }],
+          ],
+        ],
+      ];
+
+      for (const [control, attempts] of CATEGORIES) {
+        for (const [name, args] of attempts) {
+          const res = await remoteToolCall(fixture, session, name, args);
+          assertUnknownTool(res, `${control} ${name}`);
+
+          // Nothing administrative and no review material is disclosed.
+          for (const leaked of [
+            fixture.device.deviceId,
+            fixture.clientPin,
+            'alpha-laptop',
+            'secret.txt',
+            pending.requestId,
+            other.sessionId,
+            other.token,
+            'reviewMaterial',
+          ]) {
+            assert.equal(
+              res.body.includes(leaked),
+              false,
+              `${control} ${name} disclosed ${leaked}`,
+            );
+          }
+        }
+      }
+
+      // RC05-NEG-74/75: approval state unchanged, no token ever minted.
+      assert.equal(JSON.stringify(fixture.approvals.listActive()), approvalsBefore);
+      assert.equal(fixture.approvals.getRequest(pending.requestId).state, 'PENDING');
+      assert.equal(fixture.approvals.getRequest(pending.requestId).token, undefined);
+
+      // RC05-NEG-77: the trust store is byte-for-byte unchanged on disk.
+      assert.deepEqual(trustStoreBytes(fixture.storePath), storeBefore, 'trust store unchanged');
+      const onDisk = readStoreFile(fixture.storePath);
+      assert.equal(onDisk.devices.length, 1);
+      assert.equal(onDisk.devices[0].revoked, false);
+      assert.equal(onDisk.devices[0].displayLabel, 'alpha-laptop');
+      assert.deepEqual(onDisk.devices[0].pins, [fixture.clientPin]);
+
+      // RC05-NEG-78: the policy engine was never reached by an admin action and
+      // still evaluates normally.
+      assert.equal(policyHashOf(fixture), policyHashBefore, 'the policy is unchanged');
+      assert.deepEqual(
+        await remoteReadFile(fixture, session, 'README.md'),
+        decisionBefore,
+        'policy evaluation is unchanged',
+      );
+
+      // RC05-NEG-79: the target session is untouched and still usable.
+      assert.equal(fixture.server.sessionManager.getActiveSessionCount(), sessionsBefore);
+      assert.equal(fixture.server.sessionManager.hasSession(other.sessionId), true);
+      assert.equal(fixture.server.sessionManager.hasSession(session.sessionId), true);
+      const stillLive = await remoteMcp(
+        fixture,
+        other,
+        JSON.stringify({ jsonrpc: '2.0', id: 31, method: 'tools/list' }),
+      );
+      assert.equal(stillLive.status, 200, stillLive.body);
+      assert.equal(payloadOf(stillLive.body).error, undefined, stillLive.body);
+    } finally {
+      await fixture.server.stop();
+    }
+  });
+
+  test('RC05-NEG-74..79: the unknown-tool rule is generic catalog membership, not a name denylist', async () => {
+    const fixture = await startIsolated({ tag: 'generic' });
+    try {
+      const session = await initializeSession(fixture.port, fixture.client);
+
+      // Names that appear NOWHERE in the implementation, including a real
+      // registered name with padding, an object-prototype key, and a
+      // case-variant. A denylist of administrative names could not refuse these;
+      // a catalog-membership test refuses them all identically.
+      const arbitrary = [
+        'totally-made-up-tool',
+        'devices',
+        'session',
+        'DEVICES.LIST',
+        'read_file ',
+        'read_file\u0000',
+        '__proto__',
+        'constructor',
+      ];
+      for (const name of arbitrary) {
+        const res = await remoteToolCall(fixture, session, name, {});
+        assertUnknownTool(res, `unregistered:${JSON.stringify(name)}`);
+      }
+
+      // Conversely, registered tools spanning all THREE contributing catalogs
+      // are NOT refused as unknown: the rule admits the catalog rather than
+      // denying a subset of it. Each may still fail for its OWN reasons
+      // (missing required arguments, policy, filesystem), but never as -32601.
+      //
+      // The whole-catalog direction is covered structurally as well: the
+      // `tools/list` case above asserts the advertised catalog is exactly
+      // `ALL_TOOL_DEFINITIONS`, which is the same list the gate is derived from,
+      // so there is no registered name the gate does not admit and no admitted
+      // name that is not advertised.
+      for (const name of ['read_file', 'system_status', 'run_command']) {
+        assert.equal(
+          ALL_TOOL_DEFINITIONS.some((tool) => tool.name === name),
+          true,
+          `${name} is a registered tool`,
+        );
+        const res = await remoteToolCall(fixture, session, name, {});
+        const payload = payloadOf(res.body);
+        assert.notEqual(
+          payload.error?.code,
+          METHOD_NOT_FOUND,
+          `registered tool ${name} must not be refused as unknown: ${res.body}`,
+        );
+      }
+
+      // Nothing moved while probing either way.
+      assert.deepEqual(fixture.approvals.listActive(), []);
+      const onDisk = readStoreFile(fixture.storePath);
+      assert.equal(onDisk.devices.length, 1);
+      assert.equal(onDisk.devices[0].revoked, false);
+    } finally {
+      await fixture.server.stop();
+    }
+  });
+
+  test('RC05-NEG-74..79: registered tools still execute normally through the same handler', async () => {
+    const fixture = await startIsolated({ tag: 'non-vacuity' });
+    try {
+      const session = await initializeSession(fixture.port, fixture.client);
+
+      // The gate admits the catalog: a real side-effect-free tool runs the full
+      // pipeline and returns an ordinary successful tool result, so the -32601
+      // assertions above are not passing because every call fails.
+      const health = await remoteMcp(
+        fixture,
+        session,
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: 60,
+          method: 'tools/call',
+          params: { name: 'health', arguments: {} },
+        }),
+      );
+      assert.equal(health.status, MCP_POST_REPLY_STATUS, health.body);
+      const healthPayload = payloadOf(health.body);
+      assert.equal(healthPayload.error, undefined, health.body);
+      assert.notEqual(healthPayload.result.isError, true, health.body);
+      const report = JSON.parse(healthPayload.result.content[0].text);
+      assert.equal(report.transportMode, 'remote');
+      assert.equal(report.remoteGatewayActive, true);
+      assert.equal(report.activeSessionsCount, 1);
+
+      // A real filesystem tool executes through the SAME handler and returns
+      // real content.
+      const readResult = await remoteReadFile(fixture, session, 'README.md');
+      assert.notEqual(readResult.isError, true, JSON.stringify(readResult));
+      assert.equal(
+        readResult.content[0].text.includes('# workspace'),
+        true,
+        JSON.stringify(readResult),
+      );
+
+      // A REGISTERED tool with invalid arguments is still handled by the shared
+      // pipeline — a tool error or a policy/admission refusal, never -32601 —
+      // which is the behavior the gate must not alter.
+      const badArgs = await remoteToolCall(fixture, session, 'read_file', { path: 42 });
+      const badPayload = payloadOf(badArgs.body);
+      assert.notEqual(badPayload.error?.code, METHOD_NOT_FOUND, badArgs.body);
+      assert.ok(
+        badPayload.error !== undefined || badPayload.result?.isError === true,
+        `a registered tool with bad args is not an unknown tool: ${badArgs.body}`,
+      );
+
+      // The session continues to work after all of it.
+      assert.equal(fixture.server.sessionManager.hasSession(session.sessionId), true);
+    } finally {
+      await fixture.server.stop();
+    }
+  });
+
+  test('RC05-NEG-74..79: the stdio/local tools/call boundary applies the same -32601 gate', async () => {
+    const fixture = await startIsolated({ tag: 'stdio-gate' });
+    try {
+      // The SDK `Server` is where BOTH `CallToolRequestSchema` handlers live, and
+      // `server.server` is the constructed SDK object. The registered handler is
+      // read directly for the same reason `rc04-mcp-approval.test.js` reads
+      // `_serverInfo`: exposing a production accessor solely for a test would
+      // widen the server's surface. Invoking it calls the exact function the SDK
+      // would call for a real `tools/call`.
+      const sdkServer = fixture.server.server;
+      const callToolsCall = (name, args) =>
+        sdkServer._requestHandlers.get('tools/call')(
+          { method: 'tools/call', params: { name, arguments: args } },
+          {},
+        );
+
+      // An unregistered tool is a JSON-RPC -32601 at the LOCAL boundary too, so
+      // stdio and remote cannot disagree about what "unknown tool" means.
+      for (const [name, args] of FORBIDDEN_REMOTE_ADMIN_TOOLS) {
+        await assert.rejects(
+          () => callToolsCall(name, args),
+          (err) => {
+            assert.equal(err.code, METHOD_NOT_FOUND, `${name}: ${err.message}`);
+            assert.equal(err.name, 'McpError', name);
+            // Not a tool result in any shape.
+            assert.equal(err.message.includes('isError'), false, name);
+            return true;
+          },
+          `${name} must be refused as an unknown tool locally`,
+        );
+      }
+
+      // ...and a registered tool is NOT refused: the same gate admits the
+      // catalog on the local boundary.
+      const localHealth = await callToolsCall('health', {});
+      assert.notEqual(localHealth.isError, true, JSON.stringify(localHealth));
+      const report = JSON.parse(localHealth.content[0].text);
+      assert.equal(report.transportMode, 'remote');
     } finally {
       await fixture.server.stop();
     }
@@ -645,7 +949,7 @@ describe('CesSpace ARC — RC-05 Task 9: Remote administration isolation', () =>
           requestId: pending.requestId,
           reason: 'remote override',
         });
-        assertNoAdminHandler(res, name);
+        assertUnknownTool(res, name);
 
         // No review material, no approval token, no request identifier.
         assert.equal(res.body.includes('secret.txt'), false, `${name} leaked review material`);
@@ -692,7 +996,7 @@ describe('CesSpace ARC — RC-05 Task 9: Remote administration isolation', () =>
         const res = await remoteToolCall(fixture, session, name, {
           requestId: pending.requestId,
         });
-        assertNoAdminHandler(res, name);
+        assertUnknownTool(res, name);
         for (const secret of [
           'classified.txt',
           pending.requestId,
@@ -737,7 +1041,7 @@ describe('CesSpace ARC — RC-05 Task 9: Remote administration isolation', () =>
           clientType: 'claude-code',
           spkiPin: 'e'.repeat(64),
         });
-        assertNoAdminHandler(res, name);
+        assertUnknownTool(res, name);
         for (const secret of [
           fixture.device.deviceId,
           fixture.clientPin,
@@ -793,7 +1097,7 @@ describe('CesSpace ARC — RC-05 Task 9: Remote administration isolation', () =>
           policy: { version: 1, rules: [{ effect: 'ALLOW', tool: '*' }] },
           effect: 'ALLOW',
         });
-        assertNoAdminHandler(res, name);
+        assertUnknownTool(res, name);
       }
 
       // The policy document is unchanged: the same fingerprint ...
@@ -822,7 +1126,7 @@ describe('CesSpace ARC — RC-05 Task 9: Remote administration isolation', () =>
         const res = await remoteToolCall(fixture, attacker, name, {
           sessionId: target.sessionId,
         });
-        assertNoAdminHandler(res, name);
+        assertUnknownTool(res, name);
 
         // No session identifier, device identifier, or token is disclosed.
         for (const secret of [target.sessionId, target.token, fixture.device.deviceId]) {

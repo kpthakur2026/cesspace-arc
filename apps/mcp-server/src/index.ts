@@ -6,7 +6,9 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
   CallToolRequestSchema,
+  ErrorCode,
   ListToolsRequestSchema,
+  McpError,
   type Tool,
 } from '@modelcontextprotocol/sdk/types.js';
 
@@ -890,6 +892,50 @@ export const ALL_TOOL_DEFINITIONS: Tool[] = withArcApprovalSchemaOnTools([
 ]);
 
 /**
+ * The authoritative set of REGISTERED MCP tool names.
+ *
+ * Derived from {@link ALL_TOOL_DEFINITIONS} rather than maintained beside it, so
+ * the catalog a caller sees from `tools/list` and the catalog this process will
+ * execute are the same object. There is no second list to drift and no
+ * name-specific rule anywhere: a name is executable if and only if it is in
+ * this set.
+ */
+const REGISTERED_TOOL_NAMES: ReadonlySet<string> = new Set(
+  ALL_TOOL_DEFINITIONS.map((tool) => tool.name),
+);
+
+/**
+ * True when `name` is a registered MCP tool.
+ *
+ * Deliberately GENERIC. This is not a denylist of administrative or otherwise
+ * sensitive names: it is the positive membership test against the one
+ * registered catalog, so a name that is not a tool is not callable regardless
+ * of what it is called or who calls it.
+ */
+function isRegisteredToolName(name: string): boolean {
+  return REGISTERED_TOOL_NAMES.has(name);
+}
+
+/**
+ * The single JSON-RPC error for a `tools/call` naming an unregistered tool.
+ *
+ * Identical — code AND message — to the error the SDK itself returns for an
+ * unregistered JSON-RPC METHOD. An unknown tool name is therefore
+ * indistinguishable from an unknown method name: a caller cannot probe which
+ * names exist, and no administrative or otherwise sensitive name is confirmed
+ * or denied by the shape of the answer.
+ *
+ * Thrown from the `CallToolRequestSchema` boundary, BEFORE the shared execution
+ * pipeline is entered, so no policy evaluation, approval state, or subsystem
+ * call is ever reached for such a call. The HTTP admission a remote request
+ * already paid for at the transport is unaffected and is not refunded: the gate
+ * adds no accounting of its own and changes no rate or concurrency semantics.
+ */
+function unknownToolError(): McpError {
+  return new McpError(ErrorCode.MethodNotFound, 'Method not found');
+}
+
+/**
  * Rebuilds one MCP tool result as a fresh object.
  *
  * The SDK's `CallToolResult` union is only assignable from an anonymous object
@@ -1539,6 +1585,14 @@ export class ArcMcpServer implements IArcMcpServer {
 
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const toolName = request.params.name;
+      // The generic registered-tool gate. An unregistered name is a JSON-RPC
+      // `-32601` here, at the protocol boundary, and never becomes a tool
+      // result: it does not reach the shared execution pipeline, policy, the
+      // approval manager, or any subsystem. Identical to the remote boundary
+      // below, so both transports answer an unknown tool the same way.
+      if (!isRegisteredToolName(toolName)) {
+        throw unknownToolError();
+      }
       const params = (request.params.arguments || {}) as Record<string, unknown>;
       return this.dispatchToolCall(toolName, params);
     });
@@ -3147,6 +3201,25 @@ export class ArcMcpServer implements IArcMcpServer {
       }
 
       const toolName = request.params.name;
+
+      // The generic registered-tool gate, applied AFTER the authentication
+      // check above and BEFORE the bridge: an authenticated caller naming an
+      // unregistered tool gets the transport-level `-32601`, exactly as it
+      // would for an unregistered JSON-RPC method.
+      //
+      // It is intentionally ordered after the fail-closed context check so an
+      // UNAUTHENTICATED caller still receives the SAME generic refusal for
+      // every name, registered or not: the registration check must not become
+      // an oracle that tells an unauthenticated prober which names exist.
+      //
+      // No administrative name list appears here. The rule is membership in the
+      // one registered catalog, so no administrative capability can be reached
+      // through the remote call path by any name, and no administrative name is
+      // confirmed or denied by the shape of the answer.
+      if (!isRegisteredToolName(toolName)) {
+        throw unknownToolError();
+      }
+
       const parameters = (request.params.arguments || {}) as Record<string, unknown>;
 
       try {
