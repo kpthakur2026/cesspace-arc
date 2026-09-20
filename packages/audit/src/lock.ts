@@ -1,6 +1,6 @@
 import fs, { constants as fsConstants } from 'node:fs';
 import path from 'node:path';
-import { getProcessUid, validateFileDescriptorAuthority } from './storage.js';
+import { canonicalJsonV1, getProcessUid, validateFileDescriptorAuthority } from './storage.js';
 
 export const LOCK_FILENAME = 'audit.lock';
 
@@ -83,42 +83,29 @@ export function acquireWriterLock(options: AuditLockOptions): AuditLockAcquisiti
     validateFileDescriptorAuthority(fd, 0o600, expectedUid);
 
     const payload =
-      JSON.stringify({
+      canonicalJsonV1({
         pid: process.pid,
         startedAt: new Date().toISOString(),
       }) + '\n';
 
-    fs.writeSync(fd, Buffer.from(payload, 'utf8'));
+    const buf = Buffer.from(payload, 'utf8');
+    let offset = 0;
+    while (offset < buf.length) {
+      const written = fs.writeSync(fd, buf, offset, buf.length - offset, null);
+      if (written <= 0) {
+        throw createCodedError('SHORT_WRITE', 'zero bytes written to audit.lock');
+      }
+      offset += written;
+    }
     fs.fsyncSync(fd);
 
+    const parentFd = fs.openSync(auditDir, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY);
     try {
-      const parentFd = fs.openSync(auditDir, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY);
-      try {
-        fs.fsyncSync(parentFd);
-      } finally {
-        fs.closeSync(parentFd);
-      }
-    } catch {
-      // directory fsync
+      fs.fsyncSync(parentFd);
+    } finally {
+      fs.closeSync(parentFd);
     }
   } catch (err) {
-    try {
-      fs.closeSync(fd);
-    } catch {
-      // ignore
-    }
-    try {
-      fs.unlinkSync(lockPath);
-    } catch {
-      // ignore
-    }
-    throw err;
-  }
-
-  let released = false;
-  const release = (): void => {
-    if (released) return;
-    released = true;
     try {
       fs.closeSync(fd);
     } catch {
@@ -131,6 +118,26 @@ export function acquireWriterLock(options: AuditLockOptions): AuditLockAcquisiti
     } catch {
       // ignore
     }
+    throw err;
+  }
+
+  let released = false;
+  const release = (): void => {
+    if (released) return;
+    released = true;
+    let releaseError: unknown = null;
+    try {
+      fs.closeSync(fd);
+    } catch (err) {
+      releaseError = releaseError ?? err;
+    }
+    try {
+      if (fs.existsSync(lockPath)) {
+        fs.unlinkSync(lockPath);
+      }
+    } catch (err) {
+      releaseError = releaseError ?? err;
+    }
     try {
       const parentFd = fs.openSync(auditDir, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY);
       try {
@@ -138,8 +145,13 @@ export function acquireWriterLock(options: AuditLockOptions): AuditLockAcquisiti
       } finally {
         fs.closeSync(parentFd);
       }
-    } catch {
-      // ignore
+    } catch (err) {
+      releaseError = releaseError ?? err;
+    }
+    if (releaseError) {
+      throw createCodedError('LOCK_RELEASE_FAILED', 'failed to cleanly release writer lock', {
+        cause: releaseError,
+      });
     }
   };
 

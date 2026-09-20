@@ -8,6 +8,9 @@
  * - Canonical V1 JSON representation and non-circular hash preimage
  * - PersistentAuditStorage append engine
  * - All frozen Task-1 negative security controls RC06-NEG-01..29
+ * - Hardened strict V1 schema and parser canonicality
+ * - Storage state machine and failure bounds
+ * - Initialization rollback and lock cleanup
  */
 
 import { test, describe, before, after } from 'node:test';
@@ -22,16 +25,21 @@ import { MAX_RECORD_BYTES } from '../packages/protocol/dist/index.js';
 
 import {
   PersistentAuditStorage,
+  createTestPersistentAuditStorage,
   canonicalJsonV1,
+  computeRecordHashPreimageV1,
   computeRecordHashV1,
   serializeRecordV1,
   parseAndValidateRecordLineV1,
+  validatePersistentRecordV1,
+  validateIntegrityObjectV1,
   validateAuditDirectory,
   validateFileDescriptorAuthority,
   validatePlatformCapabilities,
   acquireWriterLock,
   createStoreMetadataFile,
   loadStoreMetadataFile,
+  normalizeStoreMetadataConfig,
   validateStoreMetadataConsistency,
   ACTIVE_SEGMENT_FILENAME,
   METADATA_FILENAME,
@@ -125,6 +133,7 @@ describe('CesSpace ARC — RC-06 Task 1: Persistent Append Storage Foundation', 
 
       assert.equal(storage.getCurrentSequence(), 1);
       assert.equal(storage.getLastRecordHash(), '0'.repeat(64));
+      assert.equal(storage.getState(), 'ACTIVE');
 
       storage.close();
     });
@@ -193,6 +202,9 @@ describe('CesSpace ARC — RC-06 Task 1: Persistent Append Storage Foundation', 
       const parsed = parseAndValidateRecordLineV1(line);
       assert.equal(parsed.computedHash, hash);
 
+      const preimage = computeRecordHashPreimageV1(candidate);
+      assert.ok(typeof preimage === 'string' && preimage.length > 0);
+
       const lineWithoutNewline = line.slice(0, -1);
       const directLineHash = createHash('sha256').update(lineWithoutNewline, 'utf8').digest('hex');
       assert.notEqual(
@@ -205,14 +217,16 @@ describe('CesSpace ARC — RC-06 Task 1: Persistent Append Storage Foundation', 
     test('Durability and cursor safety on simulated write failure and short write', async () => {
       const auditDir = path.join(tempBaseDir, 'store-failure');
 
-      const storageFail = new PersistentAuditStorage({
-        directory: auditDir,
-        createIfMissing: true,
-        metadata: {
-          checkpointPublicKeyFingerprint: '4'.repeat(64),
+      const storageFail = createTestPersistentAuditStorage(
+        {
+          directory: auditDir,
+          createIfMissing: true,
+          metadata: {
+            checkpointPublicKeyFingerprint: '4'.repeat(64),
+          },
         },
-        simulateWriteFailure: true,
-      });
+        { writeFault: 'error' },
+      );
       storageFail.initialize();
 
       await assert.rejects(async () => {
@@ -221,17 +235,29 @@ describe('CesSpace ARC — RC-06 Task 1: Persistent Append Storage Foundation', 
 
       assert.equal(storageFail.getCurrentSequence(), 1, 'cursor must not advance on failure');
       assert.equal(storageFail.getLastRecordHash(), '0'.repeat(64));
+      assert.equal(storageFail.getState(), 'FAILED');
+
+      // Subsequent append must fail with AUDIT_STORAGE_FAILED
+      await assert.rejects(
+        async () => {
+          await storageFail.append(createSampleRecordCandidate());
+        },
+        (err) => err.code === 'AUDIT_STORAGE_FAILED',
+      );
+
       storageFail.close();
 
       const auditDirShort = path.join(tempBaseDir, 'store-short-write');
-      const storageShort = new PersistentAuditStorage({
-        directory: auditDirShort,
-        createIfMissing: true,
-        metadata: {
-          checkpointPublicKeyFingerprint: '4'.repeat(64),
+      const storageShort = createTestPersistentAuditStorage(
+        {
+          directory: auditDirShort,
+          createIfMissing: true,
+          metadata: {
+            checkpointPublicKeyFingerprint: '4'.repeat(64),
+          },
         },
-        simulateShortWrite: true,
-      });
+        { writeFault: 'partial' },
+      );
       storageShort.initialize();
 
       await assert.rejects(async () => {
@@ -239,6 +265,16 @@ describe('CesSpace ARC — RC-06 Task 1: Persistent Append Storage Foundation', 
       }, /SHORT_WRITE/);
 
       assert.equal(storageShort.getCurrentSequence(), 1, 'cursor must not advance on short write');
+      assert.equal(storageShort.getState(), 'FAILED');
+
+      // Subsequent append must fail with AUDIT_STORAGE_FAILED
+      await assert.rejects(
+        async () => {
+          await storageShort.append(createSampleRecordCandidate());
+        },
+        (err) => err.code === 'AUDIT_STORAGE_FAILED',
+      );
+
       storageShort.close();
     });
 
@@ -519,6 +555,25 @@ describe('CesSpace ARC — RC-06 Task 1: Persistent Append Storage Foundation', 
         (err) => err.code === 'UNSUPPORTED_METADATA_VERSION',
       );
 
+      // Unknown field in metadata
+      fs.writeFileSync(
+        metaFile,
+        JSON.stringify({
+          version: 1,
+          storeId: 'f47ac10b-58cc-4372-a567-0e02b2c3d479',
+          createdAt: '2026-09-20T18:00:00.000Z',
+          checkpointPublicKeyFingerprint: 'a'.repeat(64),
+          anchorMode: 'DISABLED',
+          unknownField: 'forbidden',
+        }) + '\n',
+        { mode: 0o600 },
+      );
+      assert.throws(
+        () => loadStoreMetadataFile(auditDir),
+        (err) => err.code === 'INVALID_METADATA',
+      );
+
+      // Non-canonical createdAt format (missing milliseconds)
       fs.writeFileSync(
         metaFile,
         JSON.stringify({
@@ -527,7 +582,6 @@ describe('CesSpace ARC — RC-06 Task 1: Persistent Append Storage Foundation', 
           createdAt: '2026-09-20T18:00:00Z',
           checkpointPublicKeyFingerprint: 'a'.repeat(64),
           anchorMode: 'DISABLED',
-          unknownField: 'forbidden',
         }) + '\n',
         { mode: 0o600 },
       );
@@ -544,7 +598,7 @@ describe('CesSpace ARC — RC-06 Task 1: Persistent Append Storage Foundation', 
       createStoreMetadataFile(auditDir, {
         version: 1,
         storeId: 'f47ac10b-58cc-4372-a567-0e02b2c3d479',
-        createdAt: '2026-09-20T18:00:00Z',
+        createdAt: '2026-09-20T18:00:00.000Z',
         checkpointPublicKeyFingerprint: 'a'.repeat(64),
         anchorMode: 'DISABLED',
       });
@@ -566,7 +620,7 @@ describe('CesSpace ARC — RC-06 Task 1: Persistent Append Storage Foundation', 
       createStoreMetadataFile(auditDir, {
         version: 1,
         storeId: 'f47ac10b-58cc-4372-a567-0e02b2c3d479',
-        createdAt: '2026-09-20T18:00:00Z',
+        createdAt: '2026-09-20T18:00:00.000Z',
         checkpointPublicKeyFingerprint: 'a'.repeat(64),
         anchorMode: 'ENABLED',
         anchorReceiptPublicKeyFingerprint: 'b'.repeat(64),
@@ -591,7 +645,7 @@ describe('CesSpace ARC — RC-06 Task 1: Persistent Append Storage Foundation', 
       createStoreMetadataFile(auditDir, {
         version: 1,
         storeId: 'f47ac10b-58cc-4372-a567-0e02b2c3d479',
-        createdAt: '2026-09-20T18:00:00Z',
+        createdAt: '2026-09-20T18:00:00.000Z',
         checkpointPublicKeyFingerprint: 'a'.repeat(64),
         anchorMode: 'DISABLED',
       });
@@ -740,6 +794,16 @@ describe('CesSpace ARC — RC-06 Task 1: Persistent Append Storage Foundation', 
       );
 
       assert.equal(storage.getCurrentSequence(), 1, 'cursor must not advance on oversized record');
+      assert.equal(
+        storage.getState(),
+        'ACTIVE',
+        'storage must remain active after oversized record rejected',
+      );
+
+      // Ensure storage remains healthy and can append next valid record
+      const valid = await storage.append(createSampleRecordCandidate());
+      assert.equal(valid.sequenceNumber, 1);
+
       storage.close();
     });
 
@@ -774,6 +838,534 @@ describe('CesSpace ARC — RC-06 Task 1: Persistent Append Storage Foundation', 
       assert.throws(
         () => parseAndValidateRecordLineV1(falseLine),
         (err) => err.code === 'HASH_MISMATCH',
+      );
+    });
+  });
+
+  describe('Strict V1 Schema, Preimage and Canonical Parser Invariants', () => {
+    test('Valid semantic record with reordered keys rejected as NON_CANONICAL_RECORD', () => {
+      const candidate = {
+        ...createSampleRecordCandidate(),
+        schemaVersion: 1,
+        sequenceNumber: 1,
+        integrity: { previousRecordHash: '0'.repeat(64), recordHash: '' },
+      };
+      candidate.integrity.recordHash = computeRecordHashV1(candidate);
+
+      // Construct non-canonical JSON with inverted key ordering
+      const nonCanonicalJson =
+        '{"schemaVersion":1,"timestamp":"2026-09-20T18:00:00.000Z","eventId":"f47ac10b-58cc-4372-a567-0e02b2c3d479",' +
+        `"actor":${canonicalJsonV1(candidate.actor)},"target":${canonicalJsonV1(candidate.target)},"invocation":${canonicalJsonV1(candidate.invocation)},` +
+        `"policy":${canonicalJsonV1(candidate.policy)},"execution":${canonicalJsonV1(candidate.execution)},"integrity":${canonicalJsonV1(candidate.integrity)},"sequenceNumber":1}\n`;
+
+      assert.throws(
+        () => parseAndValidateRecordLineV1(nonCanonicalJson),
+        (err) => err.code === 'NON_CANONICAL_RECORD',
+      );
+    });
+
+    test('Valid record with extra insignificant spaces rejected as NON_CANONICAL_RECORD', () => {
+      const candidate = {
+        ...createSampleRecordCandidate(),
+        schemaVersion: 1,
+        sequenceNumber: 1,
+        integrity: { previousRecordHash: '0'.repeat(64), recordHash: '' },
+      };
+      candidate.integrity.recordHash = computeRecordHashV1(candidate);
+      const canonicalLine = serializeRecordV1(candidate);
+      const nonCanonicalWithSpaces = canonicalLine.replace('{"actor"', '{ "actor"');
+
+      assert.throws(
+        () => parseAndValidateRecordLineV1(nonCanonicalWithSpaces),
+        (err) => err.code === 'NON_CANONICAL_RECORD',
+      );
+    });
+
+    test('Unknown field in integrity object rejected with UNKNOWN_FIELD', () => {
+      assert.throws(
+        () =>
+          validateIntegrityObjectV1({
+            previousRecordHash: '0'.repeat(64),
+            recordHash: '1'.repeat(64),
+            unhashedExtra: 'attacker-controlled',
+          }),
+        (err) => err.code === 'UNKNOWN_FIELD',
+      );
+    });
+
+    test('Regression: Unknown field in integrity cannot survive with old hash', () => {
+      const candidate = {
+        ...createSampleRecordCandidate(),
+        schemaVersion: 1,
+        sequenceNumber: 1,
+        integrity: {
+          previousRecordHash: '0'.repeat(64),
+          recordHash: '',
+        },
+      };
+      const initialHash = computeRecordHashV1(candidate);
+      candidate.integrity.recordHash = initialHash;
+
+      // Tamper integrity with unhashedExtra
+      const tamperedRecord = {
+        ...candidate,
+        integrity: {
+          previousRecordHash: '0'.repeat(64),
+          recordHash: initialHash,
+          unhashedExtra: 'attacker-controlled',
+        },
+      };
+
+      const tamperedLine = canonicalJsonV1(tamperedRecord) + '\n';
+      assert.throws(
+        () => parseAndValidateRecordLineV1(tamperedLine),
+        (err) => err.code === 'UNKNOWN_FIELD',
+      );
+    });
+
+    test('Wrong actor type or missing required actor fields rejected with INVALID_RECORD', () => {
+      const badActorRecord = {
+        ...createSampleRecordCandidate(),
+        schemaVersion: 1,
+        sequenceNumber: 1,
+        actor: 'not-an-object',
+        integrity: { previousRecordHash: '0'.repeat(64), recordHash: 'a'.repeat(64) },
+      };
+      assert.throws(
+        () => validatePersistentRecordV1(badActorRecord),
+        (err) => err.code === 'INVALID_RECORD',
+      );
+
+      const missingFieldActor = {
+        ...createSampleRecordCandidate(),
+        schemaVersion: 1,
+        sequenceNumber: 1,
+        actor: { clientId: 'c1', clientType: 'admin', deviceId: 'd1' }, // missing sessionId
+        integrity: { previousRecordHash: '0'.repeat(64), recordHash: 'a'.repeat(64) },
+      };
+      assert.throws(
+        () => validatePersistentRecordV1(missingFieldActor),
+        (err) => err.code === 'INVALID_RECORD',
+      );
+    });
+
+    test('Unknown field in closed actor structure rejected with UNKNOWN_FIELD', () => {
+      const extraActorField = {
+        ...createSampleRecordCandidate(),
+        schemaVersion: 1,
+        sequenceNumber: 1,
+        actor: {
+          clientId: 'c1',
+          clientType: 'admin',
+          deviceId: 'd1',
+          sessionId: 's1',
+          extraActorKey: 'invalid',
+        },
+        integrity: { previousRecordHash: '0'.repeat(64), recordHash: 'a'.repeat(64) },
+      };
+      assert.throws(
+        () => validatePersistentRecordV1(extraActorField),
+        (err) => err.code === 'UNKNOWN_FIELD',
+      );
+    });
+
+    test('sequenceNumber not a safe positive integer or 0 rejected with INVALID_RECORD', () => {
+      const seqZero = {
+        ...createSampleRecordCandidate(),
+        schemaVersion: 1,
+        sequenceNumber: 0,
+        integrity: { previousRecordHash: '0'.repeat(64), recordHash: 'a'.repeat(64) },
+      };
+      assert.throws(
+        () => validatePersistentRecordV1(seqZero),
+        (err) => err.code === 'INVALID_RECORD',
+      );
+
+      const seqString = {
+        ...createSampleRecordCandidate(),
+        schemaVersion: 1,
+        sequenceNumber: '1',
+        integrity: { previousRecordHash: '0'.repeat(64), recordHash: 'a'.repeat(64) },
+      };
+      assert.throws(
+        () => validatePersistentRecordV1(seqString),
+        (err) => err.code === 'INVALID_RECORD',
+      );
+    });
+
+    test('Bad lifecycle operationId or phase rejected with INVALID_RECORD', () => {
+      const badOpId = {
+        ...createSampleRecordCandidate(),
+        schemaVersion: 1,
+        sequenceNumber: 1,
+        lifecycle: {
+          operationId: 'not-a-uuid',
+          phase: 'STARTED',
+        },
+        integrity: { previousRecordHash: '0'.repeat(64), recordHash: 'a'.repeat(64) },
+      };
+      assert.throws(
+        () => validatePersistentRecordV1(badOpId),
+        (err) => err.code === 'INVALID_RECORD',
+      );
+
+      const badPhase = {
+        ...createSampleRecordCandidate(),
+        schemaVersion: 1,
+        sequenceNumber: 1,
+        lifecycle: {
+          operationId: 'f47ac10b-58cc-4372-a567-0e02b2c3d479',
+          phase: 'UNKNOWN_PHASE',
+        },
+        integrity: { previousRecordHash: '0'.repeat(64), recordHash: 'a'.repeat(64) },
+      };
+      assert.throws(
+        () => validatePersistentRecordV1(badPhase),
+        (err) => err.code === 'INVALID_RECORD',
+      );
+    });
+
+    test('Invalid execution status, duration, or non-string changedFiles rejected with INVALID_RECORD', () => {
+      const badStatus = {
+        ...createSampleRecordCandidate(),
+        schemaVersion: 1,
+        sequenceNumber: 1,
+        execution: {
+          ...createSampleRecordCandidate().execution,
+          status: 'INVALID_STATUS',
+        },
+        integrity: { previousRecordHash: '0'.repeat(64), recordHash: 'a'.repeat(64) },
+      };
+      assert.throws(
+        () => validatePersistentRecordV1(badStatus),
+        (err) => err.code === 'INVALID_RECORD',
+      );
+
+      const badChangedFiles = {
+        ...createSampleRecordCandidate(),
+        schemaVersion: 1,
+        sequenceNumber: 1,
+        execution: {
+          ...createSampleRecordCandidate().execution,
+          changedFiles: [123, 'valid.txt'],
+        },
+        integrity: { previousRecordHash: '0'.repeat(64), recordHash: 'a'.repeat(64) },
+      };
+      assert.throws(
+        () => validatePersistentRecordV1(badChangedFiles),
+        (err) => err.code === 'INVALID_RECORD',
+      );
+    });
+
+    test('Invalid payloadHash rejected with INVALID_RECORD', () => {
+      const badPayloadHash = {
+        ...createSampleRecordCandidate(),
+        schemaVersion: 1,
+        sequenceNumber: 1,
+        invocation: {
+          ...createSampleRecordCandidate().invocation,
+          payloadHash: 'short-hash',
+        },
+        integrity: { previousRecordHash: '0'.repeat(64), recordHash: 'a'.repeat(64) },
+      };
+      assert.throws(
+        () => validatePersistentRecordV1(badPayloadHash),
+        (err) => err.code === 'INVALID_RECORD',
+      );
+    });
+  });
+
+  describe('Storage Append Boundary, Pre-Write Validation & Failure Invariants', () => {
+    test('Storage append rejects candidate with unknown top-level field before disk write', async () => {
+      const auditDir = path.join(tempBaseDir, 'store-unknown-field');
+      const storage = new PersistentAuditStorage({
+        directory: auditDir,
+        createIfMissing: true,
+        metadata: { checkpointPublicKeyFingerprint: 'a'.repeat(64) },
+      });
+      storage.initialize();
+
+      const candidateWithUnknown = {
+        ...createSampleRecordCandidate(),
+        unknownExtraField: 'malicious',
+      };
+
+      await assert.rejects(
+        async () => {
+          await storage.append(candidateWithUnknown);
+        },
+        (err) => err.code === 'UNKNOWN_FIELD',
+      );
+
+      assert.equal(
+        storage.getCurrentSequence(),
+        1,
+        'cursor must not advance on rejected candidate',
+      );
+      assert.equal(
+        storage.getState(),
+        'ACTIVE',
+        'storage remains ACTIVE after pre-write rejection',
+      );
+
+      // Segment file must remain completely empty (0 bytes)
+      const segmentBytes = fs.readFileSync(path.join(auditDir, ACTIVE_SEGMENT_FILENAME));
+      assert.equal(segmentBytes.length, 0, 'no bytes written to disk');
+
+      // Subsequent valid append succeeds
+      const validRec = await storage.append(createSampleRecordCandidate());
+      assert.equal(validRec.sequenceNumber, 1);
+      assert.equal(storage.getCurrentSequence(), 2);
+
+      storage.close();
+    });
+
+    test('Storage append rejects candidate with unknown closed nested field before disk write', async () => {
+      const auditDir = path.join(tempBaseDir, 'store-unknown-nested');
+      const storage = new PersistentAuditStorage({
+        directory: auditDir,
+        createIfMissing: true,
+        metadata: { checkpointPublicKeyFingerprint: 'a'.repeat(64) },
+      });
+      storage.initialize();
+
+      const candidateWithBadActor = {
+        ...createSampleRecordCandidate(),
+        actor: {
+          ...createSampleRecordCandidate().actor,
+          nestedUnknownKey: 'invalid',
+        },
+      };
+
+      await assert.rejects(
+        async () => {
+          await storage.append(candidateWithBadActor);
+        },
+        (err) => err.code === 'UNKNOWN_FIELD',
+      );
+
+      assert.equal(storage.getCurrentSequence(), 1);
+      assert.equal(storage.getState(), 'ACTIVE');
+
+      storage.close();
+    });
+
+    test('Invariant: Every successfully appended record produces an independently parseable canonical line', async () => {
+      const auditDir = path.join(tempBaseDir, 'store-independent-parse');
+      const storage = new PersistentAuditStorage({
+        directory: auditDir,
+        createIfMissing: true,
+        metadata: { checkpointPublicKeyFingerprint: 'a'.repeat(64) },
+      });
+      storage.initialize();
+
+      for (let i = 1; i <= 5; i++) {
+        const appended = await storage.append({
+          ...createSampleRecordCandidate(),
+          invocation: {
+            toolName: `tool_${i}`,
+            parametersRedacted: { index: i },
+            payloadHash: createHash('sha256').update(String(i)).digest('hex'),
+          },
+        });
+
+        assert.equal(appended.sequenceNumber, i);
+      }
+
+      storage.close();
+
+      const lines = fs
+        .readFileSync(path.join(auditDir, ACTIVE_SEGMENT_FILENAME), 'utf8')
+        .split('\n');
+      assert.equal(lines.length, 6); // 5 records + empty trailing
+      assert.equal(lines[5], '');
+
+      for (let i = 0; i < 5; i++) {
+        const lineWithNl = lines[i] + '\n';
+        const parsed = parseAndValidateRecordLineV1(lineWithNl);
+        assert.equal(parsed.record.sequenceNumber, i + 1);
+        assert.equal(parsed.computedHash, parsed.record.integrity.recordHash);
+      }
+    });
+
+    test('Deterministic injected fdatasync failure poisons writer to FAILED state and rejects subsequent appends', async () => {
+      const auditDir = path.join(tempBaseDir, 'store-sync-failure');
+      const storage = createTestPersistentAuditStorage(
+        {
+          directory: auditDir,
+          createIfMissing: true,
+          metadata: { checkpointPublicKeyFingerprint: 'a'.repeat(64) },
+        },
+        { fdatasyncFault: true },
+      );
+      storage.initialize();
+
+      await assert.rejects(async () => {
+        await storage.append(createSampleRecordCandidate());
+      }, /SIMULATED_SYNC_FAILURE/);
+
+      assert.equal(
+        storage.getCurrentSequence(),
+        1,
+        'cursor must remain unadvanced on sync failure',
+      );
+      assert.equal(storage.getState(), 'FAILED', 'storage state must transition to FAILED');
+
+      // Subsequent appends must throw AUDIT_STORAGE_FAILED
+      await assert.rejects(
+        async () => {
+          await storage.append(createSampleRecordCandidate());
+        },
+        (err) => err.code === 'AUDIT_STORAGE_FAILED',
+      );
+
+      storage.close();
+    });
+  });
+
+  describe('Initialization Cleanup, Rollback & Recovery Invariants', () => {
+    test('Initialization cleanup on malformed metadata: lock acquired then released, audit.lock absent afterward', () => {
+      const auditDir = path.join(tempBaseDir, 'cleanup-malformed-meta');
+      fs.mkdirSync(auditDir, { mode: 0o700, recursive: true });
+      fs.writeFileSync(path.join(auditDir, METADATA_FILENAME), 'not valid json', { mode: 0o600 });
+
+      const storage = new PersistentAuditStorage({
+        directory: auditDir,
+        metadata: { checkpointPublicKeyFingerprint: 'a'.repeat(64) },
+      });
+
+      assert.throws(
+        () => storage.initialize(),
+        (err) => err.code === 'INVALID_METADATA',
+      );
+
+      assert.ok(
+        !fs.existsSync(path.join(auditDir, 'audit.lock')),
+        'audit.lock must be cleaned up after initialization failure',
+      );
+    });
+
+    test('Initialization cleanup on active segment permission failure: lock acquired then released, audit.lock absent afterward', () => {
+      const auditDir = path.join(tempBaseDir, 'cleanup-insecure-perms');
+      fs.mkdirSync(auditDir, { mode: 0o700, recursive: true });
+      createStoreMetadataFile(auditDir, {
+        version: 1,
+        storeId: 'f47ac10b-58cc-4372-a567-0e02b2c3d479',
+        createdAt: '2026-09-20T18:00:00.000Z',
+        checkpointPublicKeyFingerprint: 'a'.repeat(64),
+        anchorMode: 'DISABLED',
+      });
+
+      const activePath = path.join(auditDir, ACTIVE_SEGMENT_FILENAME);
+      fs.writeFileSync(activePath, '', { mode: 0o644 });
+      fs.chmodSync(activePath, 0o644);
+
+      const storage = new PersistentAuditStorage({
+        directory: auditDir,
+        metadata: { checkpointPublicKeyFingerprint: 'a'.repeat(64) },
+      });
+
+      assert.throws(
+        () => storage.initialize(),
+        (err) => err.code === 'INSECURE_PERMISSIONS',
+      );
+
+      assert.ok(
+        !fs.existsSync(path.join(auditDir, 'audit.lock')),
+        'audit.lock must be cleaned up after permission failure',
+      );
+    });
+
+    test('Existing non-empty active segment throws AUDIT_RECOVERY_REQUIRED: file bytes unchanged, audit.lock removed', () => {
+      const auditDir = path.join(tempBaseDir, 'cleanup-recovery-required');
+      fs.mkdirSync(auditDir, { mode: 0o700, recursive: true });
+      createStoreMetadataFile(auditDir, {
+        version: 1,
+        storeId: 'f47ac10b-58cc-4372-a567-0e02b2c3d479',
+        createdAt: '2026-09-20T18:00:00.000Z',
+        checkpointPublicKeyFingerprint: 'a'.repeat(64),
+        anchorMode: 'DISABLED',
+      });
+
+      const activePath = path.join(auditDir, ACTIVE_SEGMENT_FILENAME);
+      const priorContent = 'prior-audit-line-bytes\n';
+      fs.writeFileSync(activePath, priorContent, { mode: 0o600 });
+
+      const storage = new PersistentAuditStorage({
+        directory: auditDir,
+        metadata: { checkpointPublicKeyFingerprint: 'a'.repeat(64) },
+      });
+
+      assert.throws(
+        () => storage.initialize(),
+        (err) => err.code === 'AUDIT_RECOVERY_REQUIRED',
+      );
+
+      const activeBytes = fs.readFileSync(activePath, 'utf8');
+      assert.equal(activeBytes, priorContent, 'active segment must remain byte-for-byte unchanged');
+
+      assert.ok(
+        !fs.existsSync(path.join(auditDir, 'audit.lock')),
+        'audit.lock must be cleaned up after AUDIT_RECOVERY_REQUIRED',
+      );
+    });
+  });
+
+  describe('Tier-3 Metadata Configuration Normalization & Consistency', () => {
+    test('Existing ENABLED store rejected when caller omits anchorMode (STORE_RECONFIGURATION_FORBIDDEN)', () => {
+      const auditDir = path.join(tempBaseDir, 'meta-omission-check');
+      fs.mkdirSync(auditDir, { mode: 0o700, recursive: true });
+
+      createStoreMetadataFile(auditDir, {
+        version: 1,
+        storeId: 'f47ac10b-58cc-4372-a567-0e02b2c3d479',
+        createdAt: '2026-09-20T18:00:00.000Z',
+        checkpointPublicKeyFingerprint: 'a'.repeat(64),
+        anchorMode: 'ENABLED',
+        anchorReceiptPublicKeyFingerprint: 'b'.repeat(64),
+      });
+
+      const loaded = loadStoreMetadataFile(auditDir);
+      // Caller passes only checkpoint fingerprint (omitting anchorMode)
+      assert.throws(
+        () =>
+          validateStoreMetadataConsistency(loaded, {
+            checkpointPublicKeyFingerprint: 'a'.repeat(64),
+          }),
+        (err) => err.code === 'STORE_RECONFIGURATION_FORBIDDEN',
+      );
+    });
+
+    test('Partial metadata configurations rejected by normalizeStoreMetadataConfig with INVALID_METADATA_CONFIG', () => {
+      // anchorMode omitted + anchorReceiptPublicKeyFingerprint present
+      assert.throws(
+        () =>
+          normalizeStoreMetadataConfig({
+            checkpointPublicKeyFingerprint: 'a'.repeat(64),
+            anchorReceiptPublicKeyFingerprint: 'b'.repeat(64),
+          }),
+        (err) => err.code === 'INVALID_METADATA_CONFIG',
+      );
+
+      // anchorMode DISABLED + anchorReceiptPublicKeyFingerprint present
+      assert.throws(
+        () =>
+          normalizeStoreMetadataConfig({
+            checkpointPublicKeyFingerprint: 'a'.repeat(64),
+            anchorMode: 'DISABLED',
+            anchorReceiptPublicKeyFingerprint: 'b'.repeat(64),
+          }),
+        (err) => err.code === 'INVALID_METADATA_CONFIG',
+      );
+
+      // anchorMode ENABLED + anchorReceiptPublicKeyFingerprint absent
+      assert.throws(
+        () =>
+          normalizeStoreMetadataConfig({
+            checkpointPublicKeyFingerprint: 'a'.repeat(64),
+            anchorMode: 'ENABLED',
+          }),
+        (err) => err.code === 'INVALID_METADATA_CONFIG',
       );
     });
   });
