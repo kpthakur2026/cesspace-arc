@@ -108,8 +108,8 @@ In **RC-04**, this exact kernel is extended with configurable YAML rules, AST co
 ### 3.3. ARC Remote Gateway & Auth (`packages/auth`, RC-05)
 
 - Manages mutual authentication between agent clients and the host execution daemon.
-- Supports local stdio operation (inheriting user session privileges) and remote authenticated HTTPS/SSE connections.
-- Implements device enrollment, token lifecycle management, and session pinning.
+- Supports local stdio operation and remote authenticated Streamable HTTP over TLS 1.3 with SSE response framing (mutually exclusive listeners, no concurrent binding, no WebSocket).
+- Implements device enrollment, volatile token lifecycle management, and session pinning (binding requests strictly to `(Mcp-Session-Id, deviceId, SPKI, clientId)`).
 - Completely separates authentication ("who is the caller") from authorization ("what is the caller permitted to do").
 
 ### 3.4. Host Execution Subsystems (`packages/*`)

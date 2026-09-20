@@ -91,6 +91,7 @@ import {
   RequestBodyError,
   readBoundedRequestBody,
 } from './remote-request-bounds.js';
+import type { GatewayAuditSink } from './gateway-audit.js';
 
 // The Host (§10) and Origin (§11) refusals and their normalization are owned by
 // the ONE shared authority module, so `/mcp` and `/enroll/complete` cannot
@@ -194,6 +195,17 @@ export interface RemoteMcpSurfaceDeps {
   createSessionServer: RemoteSessionServerFactory;
   /** The configured public hostname. The single accepted `Host` value (§10). */
   publicHostname: string;
+  /**
+   * THE ONE gateway lifecycle audit sink (rc05 §24).
+   *
+   * The SAME sink instance the gateway, the enrollment bootstrap, and the local
+   * admin channel write through, so a session transition recorded here lands in
+   * the one existing `AuditLogger` chain rather than in a second one. It is
+   * MANDATORY: the surface owns the only authority on when a session is issued,
+   * expires, is revoked, or is closed, so a surface that could not record those
+   * transitions would leave the chain silently incomplete.
+   */
+  auditSink: GatewayAuditSink;
 }
 
 /** One live remote MCP session: its SDK transport and its MCP server. */
@@ -356,6 +368,14 @@ export class RemoteMcpSurface {
     // Observed BEFORE the discard, which is what makes the answer truthful
     // about whether a transport actually existed for this session.
     const transportClosed = this.sessions.has(sessionId);
+    if (revoked) {
+      // ONE record per authoritative operator revocation, emitted only for a
+      // session the authority actually held. An unknown, already-expired, or
+      // already-revoked identifier revokes nothing and therefore records
+      // nothing, so a repeated `session.revoke` cannot manufacture a second
+      // revocation of a session that was already gone.
+      this.deps.auditSink.emit({ eventType: 'SESSION_REVOKED', mcpSessionId: sessionId });
+    }
     await this.discard(sessionId);
     return { revoked, transportClosed };
   }
@@ -378,7 +398,29 @@ export class RemoteMcpSurface {
   public async revokeDeviceSessionsForAdmin(
     deviceId: string,
   ): Promise<{ sessionsRevoked: number; transportsClosed: number }> {
+    // The identifiers bound to this device are read from the session authority
+    // BEFORE the revoke, because after it the authority retains nothing to read:
+    // a revoked session leaves no record and no tombstone. `listSessions()` only
+    // ever returns live sessions, so every identifier collected here is one the
+    // call below genuinely revokes.
+    const boundSessionIds = this.deps.sessionManager
+      .listSessions()
+      .filter((session) => session.deviceId === deviceId)
+      .map((session) => session.sessionId);
+
     const sessionsRevoked = this.deps.sessionManager.revokeSessionsForDevice(deviceId);
+
+    for (const sessionId of boundSessionIds) {
+      // Emitted from the pre-revoke snapshot rather than from the post-revoke
+      // registry sweep, so a session that had a live credential but no transport
+      // entry is still recorded as revoked, and one identifier yields exactly one
+      // record rather than one per collection it appeared in.
+      this.deps.auditSink.emit({
+        eventType: 'SESSION_REVOKED',
+        deviceId,
+        mcpSessionId: sessionId,
+      });
+    }
 
     let transportsClosed = 0;
     for (const sessionId of [...this.sessions.keys()]) {
@@ -537,6 +579,7 @@ export class RemoteMcpSurface {
       // authenticated session exists at this point, so the refusal is an MCP
       // JSON-RPC error on the MCP channel — NOT a bare HTTP 429, which §25
       // reserves for Layer B, the pre-session transport limit.
+      this.recordRateLimited();
       this.sendMcpRefusal(res, 'POST', remoteRateLimitFailure(), requestId);
       return;
     }
@@ -547,6 +590,7 @@ export class RemoteMcpSurface {
       // remain indistinguishable from each other in shape, and neither discloses
       // whether the device exists, is revoked, whether the SPKI is recognized, or
       // whether a session ever existed.
+      this.recordAuthFailed();
       await this.reapPresentedSession(presentedSessionId);
       this.sendMcpRefusal(res, 'POST', admissionFailure(decision.outcome), requestId);
       return;
@@ -613,6 +657,7 @@ export class RemoteMcpSurface {
       // itself uses for a GET/DELETE it cannot serve. A GET/DELETE carries no
       // JSON-RPC request, so there is no id to echo and the envelope's id is
       // `null`. The ARC semantic code still travels in `error.data.code`.
+      this.recordRateLimited();
       this.sendMcpRefusal(res, method, remoteRateLimitFailure(), null);
       return;
     }
@@ -623,6 +668,7 @@ export class RemoteMcpSurface {
       // post-session here would disclose whether a session ID exists, so the
       // pre-session case stays uniformly `UNAUTHENTICATED` and only a request
       // that actually presented a session context gets the session failure.
+      this.recordAuthFailed();
       await this.reapPresentedSession(presentedSessionId);
       this.sendMcpRefusal(res, method, admissionFailure(decision.outcome), null);
       return;
@@ -682,10 +728,33 @@ export class RemoteMcpSurface {
       // names. The admission was granted on that same authoritative answer, so
       // it is released here rather than held for a response that will not run.
       admission.release();
+      // A registry entry the authority no longer holds was never revoked or
+      // closed through this surface — every explicit revocation and close
+      // removes the entry synchronously in the same call — so the authority
+      // dropped it on its own expiry. Recorded as the expiry it is, never as a
+      // revocation or a close the operator did not perform.
+      this.deps.auditSink.emit({ eventType: 'SESSION_EXPIRED', mcpSessionId: sessionId });
       await this.discard(sessionId);
       this.sendMcpRefusal(res, method, remoteSessionFailure(), jsonRpcRequestId(parsedBody));
       return;
     }
+
+    // §24 AUTH_SUCCEEDED. Emitted once per AUTHENTICATED request, at the point
+    // the identity, the session credential, AND the transport binding have all
+    // been confirmed — so the record cannot claim an authentication that was
+    // never completed. It carries only server-derived identifiers: the gateway's
+    // own SPKI pin, and the identity the session authority resolved from the
+    // enrolled trust store. The presented `Authorization` value, the presented
+    // `Mcp-Session-Id` when it was not adopted, and every other raw header stay
+    // out of the record entirely.
+    this.deps.auditSink.emit({
+      eventType: 'AUTH_SUCCEEDED',
+      spkiPin: context.spkiPin,
+      mcpSessionId: sessionId,
+      deviceId: admission.session.deviceId,
+      clientId: admission.session.clientId,
+      clientType: admission.session.clientType,
+    });
 
     this.holdAdmission(res, admission);
 
@@ -802,6 +871,27 @@ export class RemoteMcpSurface {
         const issuance = this.deps.sessionManager.issueSession({ sessionId, identity });
         res.setHeader(ARC_SESSION_TOKEN_HEADER, issuance.token);
         this.sessions.set(sessionId, { sessionId, transport, server: entryServer });
+
+        // §24 SESSION_ISSUED, emitted at ACTIVATION — after the session authority
+        // has minted and retained the credential and after this surface has
+        // registered the transport that will serve it. It records the transition
+        // that actually committed, so no record exists for a reservation that
+        // `issueSession` refused or for an initialize the SDK never accepted.
+        //
+        // The raw token is NOT a field of this event type and cannot become one:
+        // the record carries the server-issued `Mcp-Session-Id` and the resolved
+        // enrolled-device identity, and the credential itself exists only in
+        // `issuance.token`, which is written once to the response header and
+        // never retained. There is no digest of it here either — the audit chain
+        // is a lifecycle record, not a second credential store.
+        this.deps.auditSink.emit({
+          eventType: 'SESSION_ISSUED',
+          mcpSessionId: sessionId,
+          spkiPin: identity.spkiPin,
+          deviceId: identity.deviceId,
+          clientId: identity.clientId,
+          clientType: identity.clientType,
+        });
       },
       onsessionclosed: (sessionId: string) => {
         this.teardownSession(sessionId);
@@ -878,7 +968,49 @@ export class RemoteMcpSurface {
     if (this.deps.sessionManager.hasSession(presentedSessionId)) {
       return;
     }
+    // Recorded exactly once, on the entry's only removal path: the entry is
+    // discarded here and cannot be reaped again, and the caller's own resolution
+    // for the same request does not reap a second time. An idle or absolute
+    // expiry is therefore not re-audited on every later request that happens to
+    // name the same dead session.
+    this.recordSessionExpired(presentedSessionId);
     await this.discard(presentedSessionId);
+  }
+
+  /**
+   * Records ONE session expiry for a session the authority no longer holds.
+   *
+   * Guarded by the registry entry itself, which is the surface's only record
+   * that a session was ever live here: a session that never had an entry has no
+   * transition to record, and an entry is removed by the same call that records
+   * it, so neither a repeated sweep nor a repeated request can produce a second
+   * record for one expiry.
+   */
+  private recordSessionExpired(sessionId: string): void {
+    if (!this.sessions.has(sessionId)) {
+      return;
+    }
+    this.deps.auditSink.emit({ eventType: 'SESSION_EXPIRED', mcpSessionId: sessionId });
+  }
+
+  /** Records ONE Layer C refusal. Bounded layer only; never a key or a peer. */
+  private recordRateLimited(): void {
+    this.deps.auditSink.emit({ eventType: 'RATE_LIMITED', admissionLayer: 'C' });
+  }
+
+  /**
+   * Records ONE authentication refusal.
+   *
+   * Deliberately carries nothing beyond the event name. The refused request
+   * presented no proven identity, so there is no server-derived identifier to
+   * attach; attaching the presented `Mcp-Session-Id`, the presented
+   * `Authorization` value, or the SPKI pin would make the audit log answer the
+   * very questions §24 forbids it from answering — whether a session exists,
+   * whether a pin is recognized, and whether a device is revoked. The refusal
+   * remains bounded and generic here exactly as it is on the wire.
+   */
+  private recordAuthFailed(): void {
+    this.deps.auditSink.emit({ eventType: 'AUTH_FAILED' });
   }
 
   /**
@@ -893,6 +1025,7 @@ export class RemoteMcpSurface {
   private async reapOrphanedSessions(): Promise<void> {
     for (const sessionId of [...this.sessions.keys()]) {
       if (!this.deps.sessionManager.hasSession(sessionId)) {
+        this.recordSessionExpired(sessionId);
         await this.discard(sessionId);
       }
     }
@@ -910,6 +1043,15 @@ export class RemoteMcpSurface {
     if (entry === undefined) {
       return;
     }
+    // §24 SESSION_CLOSED is the EXPLICIT client-initiated end of a session — the
+    // MCP `DELETE /mcp` path, which is the only path that reaches this callback.
+    // An idle expiry is SESSION_EXPIRED, an operator teardown is
+    // SESSION_REVOKED, and a shutdown close records neither: those transitions
+    // are owned by their own call sites, so this record can never be confused
+    // with them. The SDK raises `onsessionclosed` once per transport close, and
+    // the entry is deleted immediately below, so a repeated close records
+    // nothing.
+    this.deps.auditSink.emit({ eventType: 'SESSION_CLOSED', mcpSessionId: sessionId });
     this.sessions.delete(sessionId);
     void entry.server.close().catch(() => undefined);
   }

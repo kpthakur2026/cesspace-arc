@@ -48,6 +48,7 @@ import type { DeviceTrustStore, EnrolledDeviceRecord, SessionManager } from '@ce
 
 import type { EnrollmentBootstrap, TrustStoreMutationOutcome } from './enrollment-bootstrap.js';
 import type { RemoteMcpSurface } from './remote-mcp-surface.js';
+import type { GatewayAuditSink } from './gateway-audit.js';
 
 /**
  * The slice of the gateway's `EnrollmentBootstrap` that administration needs.
@@ -154,6 +155,14 @@ export class GatewayDeviceAdministration implements DeviceAdministrationAuthorit
     private readonly sessionManager: SessionManager,
     /** Resolved per call: the surface is attached before the listener binds. */
     private readonly getMcpSurface: () => RemoteMcpSurface | undefined,
+    /**
+     * The ONE gateway lifecycle audit sink (rc05 §24).
+     *
+     * Optional so a caller that composes administration over a trust store with
+     * no audit chain — as the focused administration tests do — can construct
+     * the authority directly; the server composition always supplies it.
+     */
+    private readonly auditSink?: GatewayAuditSink,
   ) {}
 
   /**
@@ -216,6 +225,13 @@ export class GatewayDeviceAdministration implements DeviceAdministrationAuthorit
     if (!mutation.ok) {
       return mutation;
     }
+
+    // §24 DEVICE_REVOKED, emitted AFTER the durable transaction committed, so a
+    // refused or non-durable revocation is never recorded as one. It precedes
+    // the session records the next step emits, which is the order the §9
+    // sequence actually performs them in: the device trust state changes first,
+    // and its sessions are torn down as a consequence.
+    this.auditSink?.emit({ eventType: 'DEVICE_REVOKED', deviceId });
 
     // Steps 7-8, and they are AWAITED: the Task-5 sessions are removed and the
     // matching Task-8 transport registry entries are closed BEFORE success is

@@ -30,12 +30,14 @@ import {
   resolveActiveDeviceIdentity,
   type DeviceTrustStoreData,
   type EnrolledDeviceRecord,
+  type ConsumeOutcome,
   type EnrollmentManager,
   type PendingEnrollmentView,
   type TrustedSessionIdentity,
 } from '@cesspace-arc/auth';
 import { RequestBodyError, readBoundedRequestBody } from './remote-request-bounds.js';
 import type { RemoteMcpSurface } from './remote-mcp-surface.js';
+import type { GatewayAuditSink } from './gateway-audit.js';
 
 /** The only path that can attempt enrollment completion. */
 export const ENROLL_COMPLETE_PATH = '/enroll/complete';
@@ -160,6 +162,26 @@ function trustStateFingerprint(store: DeviceTrustStore): string {
   return JSON.stringify({ version: 1, devices });
 }
 
+/**
+ * Maps one enrollment refusal to its closed-vocabulary audit category (§24).
+ *
+ * Total over `ConsumeOutcome`, so a refusal can never reach the chain with a
+ * missing or invented category, and none of the values is derived from anything
+ * the caller submitted.
+ */
+const ENROLLMENT_REJECTION_REASON: Readonly<
+  Record<
+    Extract<ConsumeOutcome, { ok: false }>['reason'],
+    'NO_PENDING_RECORD' | 'EXPIRED' | 'SECRET_MISMATCH' | 'LOCKED_OUT' | 'ACTIVATION_FAILED'
+  >
+> = {
+  UNKNOWN_ENROLLMENT: 'NO_PENDING_RECORD',
+  EXPIRED: 'EXPIRED',
+  SECRET_MISMATCH: 'SECRET_MISMATCH',
+  LOCKED_OUT: 'LOCKED_OUT',
+  ACTIVATION_FAILED: 'ACTIVATION_FAILED',
+};
+
 /** Controller driving one gateway's bootstrap HTTP surface. */
 export class EnrollmentBootstrap {
   private readonly storage: TrustStoreStorage;
@@ -183,6 +205,17 @@ export class EnrollmentBootstrap {
    * from configuration, the environment, or a request.
    */
   private mcpSurface?: RemoteMcpSurface;
+  /**
+   * The gateway lifecycle audit sink, attached by the owning gateway.
+   *
+   * This controller owns the ONLY remote enrollment completion path, so it is
+   * the only object that can witness a completed activation (`DEVICE_ENROLLED`)
+   * or a refused completion (`DEVICE_ENROLLMENT_REJECTED`). It writes through the
+   * SAME memoized sink the gateway holds, into the ONE existing audit chain.
+   * Absent means no audit chain was composed in, which is only reachable when a
+   * gateway is constructed directly without one.
+   */
+  private audit?: GatewayAuditSink;
 
   constructor(
     private readonly enrollmentManager: EnrollmentManager,
@@ -254,6 +287,18 @@ export class EnrollmentBootstrap {
    * always in place before the listener can accept a single request: there is no
    * window in which `/mcp` is reachable but uncomposed.
    */
+  /**
+   * Attaches the gateway lifecycle audit sink.
+   *
+   * Called once by the owning `RemoteGateway` when an audit chain is composed in.
+   * Attaching twice with the same sink is a no-op; the sink itself is memoized
+   * per chain, so the bootstrap, the gateway, the MCP surface, and the local
+   * admin channel all write into one chain.
+   */
+  public attachGatewayAudit(sink: GatewayAuditSink): void {
+    this.audit = sink;
+  }
+
   public attachMcpSurface(surface: RemoteMcpSurface): void {
     this.mcpSurface = surface;
   }
@@ -407,6 +452,10 @@ export class EnrollmentBootstrap {
     // writing against an authentication root it cannot vouch for. The response
     // is the same uniform body, so nothing about the storage state escapes.
     if (this.storageLatched) {
+      // §24 DEVICE_ENROLLMENT_REJECTED: the gateway refuses every completion
+      // against a trust store it cannot vouch for. The bounded category is the
+      // failed activation that set the latch; nothing about the store escapes.
+      this.audit?.emit({ eventType: 'DEVICE_ENROLLMENT_REJECTED', reason: 'ACTIVATION_FAILED' });
       this.failClosed(res);
       return;
     }
@@ -426,15 +475,24 @@ export class EnrollmentBootstrap {
           // enrollment manager is reached, so no attempt is counted and no
           // state changes. A compressed request is refused under the same
           // bounded payload response, whatever its decoded size would be.
+          this.audit?.emit({
+            eventType: 'DEVICE_ENROLLMENT_REJECTED',
+            reason: 'INVALID_REQUEST',
+          });
           this.send(res, 413, PAYLOAD_TOO_LARGE_BODY);
           return;
         }
         if (err.kind === 'READ_TIMEOUT') {
           // The reader already aborted the request and destroyed the socket:
           // there is no complete request and no connection left to answer on.
+          this.audit?.emit({
+            eventType: 'DEVICE_ENROLLMENT_REJECTED',
+            reason: 'INVALID_REQUEST',
+          });
           return;
         }
       }
+      this.audit?.emit({ eventType: 'DEVICE_ENROLLMENT_REJECTED', reason: 'INVALID_REQUEST' });
       this.failClosed(res);
       return;
     }
@@ -442,7 +500,10 @@ export class EnrollmentBootstrap {
     const secret = extractSecret(body);
     if (secret === null) {
       // Malformed JSON, a non-object, a missing secret, or a secret of the
-      // wrong type are all the same bounded failure as a wrong secret.
+      // wrong type are all the same bounded failure as a wrong secret. The
+      // submitted body, and above all the submitted secret, is NEVER recorded:
+      // the category is the whole of the evidence.
+      this.audit?.emit({ eventType: 'DEVICE_ENROLLMENT_REJECTED', reason: 'INVALID_REQUEST' });
       this.failClosed(res);
       return;
     }
@@ -457,9 +518,31 @@ export class EnrollmentBootstrap {
     });
 
     if (!outcome.ok) {
+      // §24 DEVICE_ENROLLMENT_REJECTED, with a closed-vocabulary category. A
+      // replay of a consumed single-use secret, a wrong secret, an expired
+      // challenge, an unknown challenge, a lockout, and a failed activation all
+      // arrive here as different bounded categories and none of them carries the
+      // submitted secret, the raw body, or the attacker's certificate.
+      this.audit?.emit({
+        eventType: 'DEVICE_ENROLLMENT_REJECTED',
+        reason: ENROLLMENT_REJECTION_REASON[outcome.reason],
+      });
       this.failClosed(res);
       return;
     }
+
+    // §24 DEVICE_ENROLLED: emitted only AFTER `completeBySpki` returned normally,
+    // which happens only after durable activation committed and the authoritative
+    // in-memory trust store was swapped. The record therefore describes the state
+    // that actually committed. It carries server-derived identifiers only — the
+    // one-time secret and the certificate never appear.
+    this.audit?.emit({
+      eventType: 'DEVICE_ENROLLED',
+      enrollmentId: outcome.enrollment.enrollmentId,
+      clientId: outcome.enrollment.clientId,
+      clientType: outcome.enrollment.clientType,
+      spkiPin: outcome.enrollment.spkiPin,
+    });
 
     this.send(res, 200, ENROLLED_BODY);
   }

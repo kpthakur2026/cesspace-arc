@@ -55,6 +55,7 @@ import type { ApprovalStateManager } from '@cesspace-arc/policy';
 import { EnrollmentManager, deriveOperatorId, ENROLLMENT_ID_REGEX } from '@cesspace-arc/auth';
 import { toAdminSummary } from './approval-gate.js';
 import { ApprovalAuditSink, getApprovalAuditSink } from './approval-audit.js';
+import { getGatewayAuditSink, type GatewayAuditSink } from './gateway-audit.js';
 import type { AuditLogger } from '@cesspace-arc/audit';
 import type {
   AdministrationOutcome,
@@ -202,6 +203,15 @@ export class AdminIpcServer {
   private readonly getMonotonicTimeMs: () => number;
 
   private readonly approvalAuditSink: ApprovalAuditSink;
+  /**
+   * RC-05 Task 10 gateway lifecycle sink (rc05 §24).
+   *
+   * The SAME sink instance the remote gateway, the enrollment bootstrap, and the
+   * MCP surface emit through, obtained from the per-chain memo, so an enrollment
+   * request created or cancelled here is recorded in the one existing
+   * `AuditLogger` chain rather than a gateway-only one.
+   */
+  private readonly gatewayAuditSink: GatewayAuditSink;
   /** RC-05 Task 2 volatile pending-enrollment manager. */
   private readonly enrollmentManager: EnrollmentManager;
   /** Server-derived per-operator quota key (SHA-256 of the operator SPKI key). */
@@ -282,6 +292,12 @@ export class AdminIpcServer {
     // transition would be written to the chain twice.
     this.approvalAuditSink = getApprovalAuditSink(auditLogger);
     this.approvalStateManager.registerLifecycleSink(this.approvalAuditSink);
+
+    // RC-05 Task 10: the SAME memoized-per-chain gateway lifecycle sink the
+    // gateway, the bootstrap, and the MCP surface write through, so an
+    // enrollment transition started here lands in the ONE existing chain. It is
+    // never a second logger and never a second queue over the same chain.
+    this.gatewayAuditSink = getGatewayAuditSink(auditLogger);
 
     // RC-05 Task 2: volatile pending-enrollment lifecycle. Pure domain state,
     // never persisted, never written to the trust store.
@@ -1012,6 +1028,20 @@ export class AdminIpcServer {
     }
   }
 
+  /**
+   * Commits buffered gateway lifecycle evidence before the operator observes a
+   * result. The gateway and the approval sink share one chain but hold separate
+   * bounded queues, so each is drained by its own owner.
+   */
+  private async flushGatewayAudit(): Promise<boolean> {
+    try {
+      await this.gatewayAuditSink.flush();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   private async handleList(): Promise<AdminResponse> {
     // Purge expired state before listing so the operator never sees a stale
     // PENDING entry.
@@ -1160,6 +1190,30 @@ export class AdminIpcServer {
       // A structural spread would also carry PendingEnrollmentView's internal
       // fields (notably the failed-attempt counter) into the response.
       const view = created.enrollment;
+
+      // §24 DEVICE_ENROLLMENT_REQUESTED, emitted only once the pending
+      // enrollment actually committed. The ONE-TIME SECRET is deliberately
+      // absent: it is returned exactly once to the operator in the response
+      // below and is never written to the audit chain, not even as a digest —
+      // the record carries the server-issued enrollment identifier, the
+      // operator-supplied client identity, the device's already-public SPKI pin,
+      // and nothing else.
+      this.gatewayAuditSink.emit({
+        eventType: 'DEVICE_ENROLLMENT_REQUESTED',
+        enrollmentId: view.enrollmentId,
+        clientId: view.clientId,
+        clientType: view.clientType,
+        spkiPin: view.spkiPin,
+      });
+
+      // The one-time secret leaves the process in the response below, so the
+      // record of the request that created it is committed FIRST. An operator is
+      // never handed a credential for a transition the audit chain does not
+      // record.
+      if (!(await this.flushGatewayAudit())) {
+        return errorResponse('INTERNAL_ERROR');
+      }
+
       return {
         ok: true,
         result: {
@@ -1193,6 +1247,19 @@ export class AdminIpcServer {
       const cancelled = this.enrollmentManager.cancel(enrollmentId);
       if (!cancelled) {
         return errorResponse('NOT_FOUND_OR_NOT_PENDING');
+      }
+      // §24 DEVICE_ENROLLMENT_REJECTED. An operator cancellation ends a pending
+      // enrollment without enrolling a device, so it is the CANCELLED member of
+      // the frozen bounded reason vocabulary and never a free-text explanation.
+      // Emitted only when the cancellation actually took effect, so a repeated
+      // cancel of an identifier that is already gone records nothing.
+      this.gatewayAuditSink.emit({
+        eventType: 'DEVICE_ENROLLMENT_REJECTED',
+        reason: 'CANCELLED',
+        enrollmentId,
+      });
+      if (!(await this.flushGatewayAudit())) {
+        return errorResponse('INTERNAL_ERROR');
       }
       return { ok: true, result: { enrollmentId, state: 'CANCELLED' } };
     } catch {

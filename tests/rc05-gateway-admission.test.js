@@ -440,6 +440,27 @@ function keyFor(record, sessionId) {
   return `${record.deviceId}:${sessionId}`;
 }
 
+/**
+ * Audit records that describe actual control-plane WORK.
+ *
+ * RC-05 Task 10 commits gateway LIFECYCLE transitions — a session transition, an
+ * authentication outcome, an admission refusal — into the same append-only chain
+ * that already carries ordinary MCP tool records and RC-04 approval lifecycle
+ * records (§24). A lifecycle record describes the refusal itself; it is not
+ * evidence that a policy evaluation, an approval transition, a tool dispatch, or
+ * a subsystem call was reached.
+ *
+ * Counting those records out keeps an assertion about "nothing else ran" exactly
+ * about the property it names, rather than about the total size of a chain that
+ * legitimately also holds the refusal's own lifecycle record. It does not widen
+ * what the case tolerates: every record that is NOT a gateway lifecycle record
+ * — every tool record, policy decision, and approval transition — still has to
+ * be absent for the count to be unchanged.
+ */
+function workRecords(audit) {
+  return audit.getRecords().filter((record) => record.gateway === undefined);
+}
+
 /** The only retained key of a single-session case, asserted to be the expected one. */
 function onlyKey(limiter, expected) {
   assert.deepEqual(limiter.getRetainedKeysForTests(), [expected]);
@@ -1858,7 +1879,7 @@ describe('CesSpace ARC — RC-05 Task 8 correction: gateway admission gaps', () 
       const key = keyFor(records[0], sessionId);
       drainBudget(limiter, key);
 
-      const auditBefore = audit.getRecords().length;
+      const auditBefore = workRecords(audit).length;
       const refused = await request(port, {
         method: 'POST',
         headers: { ...MCP_POST_HEADERS, ...sessionHeaders(sessionId, token) },
@@ -1877,11 +1898,20 @@ describe('CesSpace ARC — RC-05 Task 8 correction: gateway admission gaps', () 
       assert.equal(refused.body.includes('retryable'), false, 'no extra fields are emitted');
 
       // The refusal happened BEFORE the tool call existed: no policy, approval,
-      // or subsystem work, and no audit record.
+      // or subsystem work, and no record of any of it. The refusal's OWN
+      // lifecycle record is written, and is the only new record there is.
       assert.equal(
-        audit.getRecords().length,
+        workRecords(audit).length,
         auditBefore,
         'policy and subsystems stayed unreachable',
+      );
+      assert.equal(
+        await waitFor(
+          () =>
+            audit.getRecords().filter((r) => r.gateway?.eventType === 'RATE_LIMITED').length === 1,
+        ),
+        true,
+        'the Layer C refusal is itself recorded exactly once',
       );
       assert.equal(refused.body.includes('"result"'), false, 'no tool ran');
 
@@ -2068,6 +2098,74 @@ describe('CesSpace ARC — RC-05 Task 8 correction: gateway admission gaps', () 
     }
   });
 
+  test('RC05-NEG-63: a tokenless initialize from a REVOKED device is UNAUTHENTICATED and discloses nothing', async () => {
+    // The two causes differ ONLY in the trust store: the same certificate, the
+    // same SPKI pin, the same network path, the same request. One device is
+    // enrolled and revoked; the other was never enrolled at all.
+    const revoked = await startRemote({
+      tag: 'neg63-revoked',
+      pinCount: 1,
+      revokedCount: 1,
+    });
+    const unknown = await startRemote({
+      tag: 'neg63-unknown',
+      pinCount: 0,
+    });
+
+    try {
+      const revokedRes = await request(revoked.port, {
+        method: 'POST',
+        headers: MCP_POST_HEADERS,
+        body: INITIALIZE_BODY,
+      });
+      const unknownRes = await request(unknown.port, {
+        method: 'POST',
+        headers: MCP_POST_HEADERS,
+        body: INITIALIZE_BODY,
+      });
+
+      assertMcpRefusal(revokedRes, 'a revoked device', {
+        status: MCP_POST_REPLY_STATUS,
+        arcCode: 'UNAUTHENTICATED',
+      });
+      assertMcpRefusal(unknownRes, 'an unknown device', {
+        status: MCP_POST_REPLY_STATUS,
+        arcCode: 'UNAUTHENTICATED',
+      });
+
+      // Anti-oracle: revocation status is not observable. The refused peer cannot
+      // tell that it was ever enrolled, so the control is not a membership test.
+      assert.equal(
+        revokedRes.body.replace(/"id":\d+/, '"id":0'),
+        unknownRes.body.replace(/"id":\d+/, '"id":0'),
+        'revocation status is not disclosed',
+      );
+
+      // The refusal is PRE-session: nothing was reserved, minted, or registered,
+      // and no raw token or session identifier exists to be leaked.
+      assert.equal(revoked.server.sessionManager.getActiveSessionCount(), 0);
+      assert.equal(revoked.server.sessionManager.getReservedSessionIdCount(), 0);
+      assert.equal(revoked.server.remoteGateway.mcpSurface.getActiveSessionCount(), 0);
+      assert.equal(revokedRes.headers['arc-session-token'], undefined);
+      assert.equal(revokedRes.body.includes(revoked.records[0].deviceId), false);
+      assert.equal(revokedRes.body.includes(clientPin()), false);
+
+      // The refusal is recorded as an authentication failure — generic, and no
+      // more of an oracle than the wire response is.
+      await waitFor(() =>
+        revoked.audit.getRecords().some((record) => record.gateway?.eventType === 'AUTH_FAILED'),
+      );
+      const failure = revoked.audit
+        .getRecords()
+        .find((record) => record.gateway?.eventType === 'AUTH_FAILED');
+      assert.equal(JSON.stringify(failure).includes(revoked.records[0].deviceId), false);
+      assert.equal(JSON.stringify(failure).includes(clientPin()), false);
+    } finally {
+      await revoked.server.stop();
+      await unknown.server.stop();
+    }
+  });
+
   test('RC05-NEG-40: every post-session failure is the SAME MCP INVALID_SESSION_TOKEN error', async () => {
     // Each shape builds a real session first, then presents credentials that must
     // fail — for a different reason in every case.
@@ -2191,7 +2289,8 @@ describe('CesSpace ARC — RC-05 Task 8 correction: gateway admission gaps', () 
       // identity the request resolves to no longer matches the session's device.
       // This is the out-of-band revocation the surface must observe, resolved from
       // the CURRENT trust store on every request.
-      const auditBefore = audit.getRecords().length;
+      const auditBefore = workRecords(audit).length;
+      const lifecyclesBefore = audit.getRecords().filter((r) => r.gateway !== undefined).length;
       const authoritative = server.remoteGateway.bootstrap.authoritativeTrustStore;
       authoritative.revokeDevice(records[0].deviceId);
       assert.equal(
@@ -2216,10 +2315,37 @@ describe('CesSpace ARC — RC-05 Task 8 correction: gateway admission gaps', () 
       });
       assert.equal(mismatched.body.includes(records[0].deviceId), false, 'no device id escapes');
       assert.equal(mismatched.body.includes(clientPin()), false, 'no SPKI pin escapes');
+      // The refusal is recorded as an authentication lifecycle event and nothing
+      // else: no policy evaluation, no approval transition, no tool dispatch, and
+      // no subsystem call was reached. The record is deliberately generic — it
+      // names neither the device nor the SPKI, so the audit chain is no more of
+      // an oracle than the wire response is.
       assert.equal(
-        audit.getRecords().length,
+        workRecords(audit).length,
         auditBefore,
         'no policy or subsystem work was reached',
+      );
+      assert.equal(
+        await waitFor(
+          () => audit.getRecords().filter((r) => r.gateway !== undefined).length > lifecyclesBefore,
+        ),
+        true,
+        'the refusal is recorded as a gateway lifecycle event',
+      );
+      const failure = audit
+        .getRecords()
+        .filter((r) => r.gateway !== undefined)
+        .at(-1);
+      assert.equal(failure.gateway.eventType, 'AUTH_FAILED');
+      assert.equal(
+        JSON.stringify(failure).includes(records[0].deviceId),
+        false,
+        'the failure record is not a device oracle',
+      );
+      assert.equal(
+        JSON.stringify(failure).includes(clientPin()),
+        false,
+        'the failure record is not a pin oracle',
       );
     } finally {
       await server.stop();

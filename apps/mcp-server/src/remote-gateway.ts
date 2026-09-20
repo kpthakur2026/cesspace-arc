@@ -53,6 +53,8 @@ import {
 import { checkRequestAuthority, writeAuthorityRefusal } from './remote-request-authority.js';
 import type { RemoteMcpSurface } from './remote-mcp-surface.js';
 import type { DeviceTrustAuthority } from './device-administration.js';
+import { getGatewayAuditSink, type GatewayAuditSink } from './gateway-audit.js';
+import type { AuditLogger } from '@cesspace-arc/audit';
 import {
   AdmissionLimiter,
   type AdmissionLimiterOptions,
@@ -188,6 +190,22 @@ export interface RemoteGatewayOptions {
   onAdmitted?: (context: PeerAdmissionContext) => void;
   /** Invoked when Layer A refuses a connection. */
   onRefused?: (reason: AdmissionRefusalReason) => void;
+  /**
+   * The ONE audit chain every gateway lifecycle event is committed to (rc05 §24).
+   *
+   * Production composition (`ArcMcpServer.start`) ALWAYS supplies the process-wide
+   * `AuditLogger`, so `GATEWAY_STARTED`, `GATEWAY_STOPPED`, `AUTH_FAILED`,
+   * `RATE_LIMITED`, and `REMOTE_DISCONNECTED` are emitted at the real lifecycle
+   * transitions and share the chain that already carries ordinary MCP and RC-04
+   * approval records.
+   *
+   * When omitted — only reachable by constructing a `RemoteGateway` directly —
+   * the gateway emits nothing. That is correct for an admission-only unit test
+   * with no audit chain to write to; it is never how a composed `ArcMcpServer`
+   * behaves, and this option is not reachable from RemoteConfig, the
+   * environment, or a request.
+   */
+  auditLogger?: AuditLogger;
 }
 
 interface ConnectionState {
@@ -297,6 +315,14 @@ export class RemoteGateway {
    * transport is composed and `/mcp` remains deny-only.
    */
   private mcpSurface?: RemoteMcpSurface;
+  /**
+   * The gateway lifecycle audit sink, when an audit chain was composed in.
+   *
+   * Memoized per `AuditLogger`, so the gateway, the MCP surface, the enrollment
+   * bootstrap, and the local admin channel all write through ONE sink into ONE
+   * chain and no lifecycle transition can be recorded twice.
+   */
+  private readonly audit?: GatewayAuditSink;
 
   /** Server key material, held only until the listener consumes it. */
   private privateKeyMaterial?: ReturnType<typeof loadServerPrivateKey>;
@@ -393,6 +419,14 @@ export class RemoteGateway {
           : { bodyReadTimeoutMsForTests: options.bodyReadTimeoutMsForTests }),
       },
     );
+    // The bootstrap owns the remote enrollment completion path, so it is the
+    // only object that can witness `DEVICE_ENROLLED` and a rejected completion.
+    // It writes through the SAME sink the gateway holds, into the same chain.
+    this.audit =
+      options.auditLogger === undefined ? undefined : getGatewayAuditSink(options.auditLogger);
+    if (this.audit !== undefined) {
+      this.bootstrap.attachGatewayAudit(this.audit);
+    }
 
     const keyMaterial = loadServerPrivateKey(this.config.privateKey);
     try {
@@ -566,6 +600,17 @@ export class RemoteGateway {
 
     this.server = server;
     this.started = true;
+
+    // §24 GATEWAY_STARTED: emitted only HERE, once the listener has actually
+    // bound and is serving. Every failure path above — invalid configuration, an
+    // unreadable certificate or key, a rejected trust store, a TLS startup
+    // failure, and a bind failure — throws before this line, so none of them can
+    // emit a start event, and no listener is left bound.
+    //
+    // The record carries the transport mode and nothing about the socket, the
+    // bind address, the certificate, the key, the client CA, or the trust-store
+    // path.
+    this.audit?.emit({ eventType: 'GATEWAY_STARTED', transportMode: 'remote' });
   }
 
   /** True once the listener is bound and serving. */
@@ -663,9 +708,15 @@ export class RemoteGateway {
 
     if (server === undefined) {
       // A second stop finds nothing tracked, nothing to destroy, and counters
-      // that are already zero, so it is a structural no-op.
+      // that are already zero, so it is a structural no-op. §24 GATEWAY_STOPPED
+      // is emitted past this point only, so a repeated or idempotent stop — and
+      // the all-or-nothing `stop()` a failed startup performs before any
+      // listener existed — can never produce a second or spurious stop event.
       return;
     }
+
+    this.audit?.emit({ eventType: 'GATEWAY_STOPPED', transportMode: 'remote' });
+
     await new Promise<void>((resolve) => {
       const timer = setTimeout(() => {
         resolve();
@@ -676,6 +727,13 @@ export class RemoteGateway {
         resolve();
       });
     });
+
+    // Commits every buffered lifecycle event before the gateway reports itself
+    // stopped, and fails closed when required evidence could not be written.
+    // The queue is bounded and the drain is continuous, so this is a final
+    // barrier rather than the only write opportunity; it is what makes
+    // "the gateway stopped" and "the stop is recorded" inseparable.
+    await this.audit?.flush();
   }
 
   // -------------------------------------------------------------------------
@@ -711,6 +769,10 @@ export class RemoteGateway {
     const decision = this.limiter.admit(peerKey);
     if (!decision.admitted) {
       this.options.onRefused?.(decision.reason);
+      // §24 RATE_LIMITED / §21.1 Layer A. The record names the layer and nothing
+      // else: no peer address, no limiter key, no bucket contents, no remaining
+      // token count, no refusal reason, and no retry hint.
+      this.audit?.emit({ eventType: 'RATE_LIMITED', admissionLayer: 'A' });
       socket.destroy();
       return;
     }
@@ -762,6 +824,19 @@ export class RemoteGateway {
     this.settleHandshakeFor(tuple);
     state.release();
     this.connectionStates.delete(tuple);
+
+    // §24 REMOTE_DISCONNECTED: a "remote connection" is an AUTHENTICATED one, so
+    // only a connection that reached post-handshake admission and resolved an
+    // identity produces this event. It is emitted AFTER the registry entry is
+    // deleted and the slot released, and appears at most once per connection
+    // because `connectionSettled` was set above.
+    //
+    // The only identifier carried is the connection's SPKI pin — the approved
+    // public-key digest of §7/§8. No socket is retained for auditing and no peer
+    // address or network topology is recorded.
+    if (state.spkiPin !== undefined) {
+      this.audit?.emit({ eventType: 'REMOTE_DISCONNECTED', spkiPin: state.spkiPin });
+    }
   }
 
   /**
@@ -777,6 +852,7 @@ export class RemoteGateway {
     // A handshake that began before expiry but completed after it must still be
     // refused: the runtime check is repeated at the post-handshake boundary.
     if (this.isServerCertificateExpiredOrLatched()) {
+      this.recordPostHandshakeAuthFailure(tuple);
       this.settleConnection(tuple);
       socket.destroy();
       return;
@@ -784,6 +860,7 @@ export class RemoteGateway {
 
     const peerCertificate = socket.getPeerCertificate(true);
     if (peerCertificate === undefined || !socket.authorized || peerCertificate.raw === undefined) {
+      this.recordPostHandshakeAuthFailure(tuple);
       this.settleConnection(tuple);
       socket.destroy();
       return;
@@ -793,6 +870,7 @@ export class RemoteGateway {
     try {
       spkiPin = deriveSpkiPin(peerCertificate.raw);
     } catch {
+      this.recordPostHandshakeAuthFailure(tuple);
       this.settleConnection(tuple);
       socket.destroy();
       return;
@@ -817,9 +895,44 @@ export class RemoteGateway {
     this.options.onAdmitted?.({ spkiPin, socket });
   }
 
-  /** Handshake failure: settle the slot and drop the socket. */
+  /**
+   * Records one post-handshake authentication refusal.
+   *
+   * §24 AUTH_FAILED for the TLS layer's own refusals — a certificate that
+   * reached notAfter mid-handshake, a peer certificate the TLS stack would not
+   * authorize, and a certificate whose SPKI cannot be derived. Bounded and
+   * generic, exactly like {@link handleHandshakeFailure}, and guarded by the
+   * same exactly-once flag so one connection records one refusal.
+   */
+  private recordPostHandshakeAuthFailure(tuple: string): void {
+    const state = this.connectionStates.get(tuple);
+    if (state !== undefined && !state.connectionSettled) {
+      this.audit?.emit({ eventType: 'AUTH_FAILED' });
+    }
+  }
+
+  /**
+   * Handshake failure: record the refusal, settle the slot, drop the socket.
+   *
+   * §24 AUTH_FAILED, emitted ONLY for a connection this gateway admitted to the
+   * TLS layer. A socket refused at Layer A never began a handshake, and its
+   * refusal is already recorded as `RATE_LIMITED`.
+   *
+   * The record is deliberately generic: it carries no reason, no certificate,
+   * no pin, no peer address, and no token, so the chain cannot be read as an
+   * oracle for whether a presented certificate was unknown, unenrolled, expired,
+   * revoked, or bound to a different client.
+   */
   private handleHandshakeFailure(socket: TLSSocket): void {
-    this.settleConnection(connectionTuple(socket));
+    const tuple = connectionTuple(socket);
+    const state = this.connectionStates.get(tuple);
+    // `connectionSettled` is the same exactly-once guard `settleConnection`
+    // applies, so a repeated TLS error for one connection cannot record two
+    // AUTH_FAILED events for one failed handshake.
+    if (state !== undefined && !state.connectionSettled) {
+      this.audit?.emit({ eventType: 'AUTH_FAILED' });
+    }
+    this.settleConnection(tuple);
     socket.destroy();
   }
 
@@ -885,6 +998,9 @@ export class RemoteGateway {
     // §21.1 Layer B: secure HTTP pre-session admission.
     const admitted = this.layerB.consume(peerKey);
     if (!admitted.consumed) {
+      // §24 RATE_LIMITED / §21.1 Layer B. Same bounded shape as the Layer A
+      // record: the layer is the whole of the evidence.
+      this.audit?.emit({ eventType: 'RATE_LIMITED', admissionLayer: 'B' });
       this.sendSanitized(res, 429, RATE_LIMITED_BODY);
       return;
     }

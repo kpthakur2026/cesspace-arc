@@ -41,6 +41,7 @@ import {
 } from './remote-execution.js';
 import type { BoundedRequestLimiter } from './remote-resource-limits.js';
 import { ApprovalAuditSink, getApprovalAuditSink } from './approval-audit.js';
+import { getGatewayAuditSink } from './gateway-audit.js';
 import { RemoteGateway, type RemoteGatewayStatus } from './remote-gateway.js';
 import { readRemoteRequestContext, RemoteMcpSurface } from './remote-mcp-surface.js';
 import { GatewayDeviceAdministration } from './device-administration.js';
@@ -1545,7 +1546,7 @@ export class ArcMcpServer implements IArcMcpServer {
     this.server = new Server(
       {
         name: 'cesspace-arc',
-        version: '0.4.0-rc04',
+        version: '0.5.0-rc05',
       },
       {
         capabilities: {
@@ -2604,8 +2605,8 @@ export class ArcMcpServer implements IArcMcpServer {
               : gatewayDegradedForHealth
                 ? 'DEGRADED'
                 : 'HEALTHY',
-            version: '0.4.0-rc04',
-            stage: 'RC-04',
+            version: '0.5.0-rc05',
+            stage: 'RC-05',
             policyEngineActive,
             auditActive: true,
             authorizedWorkspacesCount: this.workspaceRegistry.getWorkspaces().length,
@@ -3017,6 +3018,12 @@ export class ArcMcpServer implements IArcMcpServer {
       // cross-process or cross-instance synchronization.
       const gateway = new RemoteGateway(remoteConfig, {
         enrollmentManager: this.enrollmentManager,
+        // RC-05 Task 10: the ONE audit chain. The gateway, the enrollment
+        // bootstrap, the MCP surface, and the local admin channel all write
+        // their lifecycle evidence into THIS logger's existing append-only
+        // chain — there is no second logger, no gateway-only chain, and no
+        // external persistence (RC-06 owns that).
+        auditLogger: this.auditLogger,
       });
 
       // ONE admission authority per process, over the ONE process-wide Layer C
@@ -3056,6 +3063,9 @@ export class ArcMcpServer implements IArcMcpServer {
           admission,
           createSessionServer: () => this.createRemoteSessionServer(),
           publicHostname: remoteConfig.publicHostname,
+          // The memoized-per-chain sink, so the surface writes into the SAME
+          // chain and the SAME queue the gateway already emits through.
+          auditSink: getGatewayAuditSink(this.auditLogger),
         });
         gateway.attachMcpSurface(surface);
 
@@ -3076,6 +3086,7 @@ export class ArcMcpServer implements IArcMcpServer {
               gateway.getDeviceTrustAuthority(),
               this.sessionManager,
               () => surface,
+              getGatewayAuditSink(this.auditLogger),
             ),
           );
         }
@@ -3173,7 +3184,7 @@ export class ArcMcpServer implements IArcMcpServer {
     const server = new Server(
       {
         name: 'cesspace-arc',
-        version: '0.4.0-rc04',
+        version: '0.5.0-rc05',
       },
       {
         capabilities: {

@@ -825,18 +825,18 @@ describe('CesSpace ARC — RC-03 MCP Policy & Audit Integration', () => {
   // ==========================================================================
 
   describe('Section 8: Health Response', () => {
-    test('RC03-HEALTH-01: health response reports the current RC-04 version', async () => {
+    test('RC03-HEALTH-01: health response reports the current RC-05 version', async () => {
       const res = await server.dispatchToolCall('health', {});
       assert.ok(!res.isError, 'health must succeed');
       const body = JSON.parse(res.content[0].text);
-      assert.equal(body.version, '0.4.0-rc04');
+      assert.equal(body.version, '0.5.0-rc05');
     });
 
-    test('RC03-HEALTH-02: health response reports stage RC-03', async () => {
+    test('RC03-HEALTH-02: health response reports stage RC-05', async () => {
       const res = await server.dispatchToolCall('health', {});
       assert.ok(!res.isError, 'health must succeed');
       const body = JSON.parse(res.content[0].text);
-      assert.equal(body.stage, 'RC-04');
+      assert.equal(body.stage, 'RC-05');
     });
   });
 

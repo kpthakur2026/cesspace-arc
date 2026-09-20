@@ -1,5 +1,13 @@
 import { createHash, randomUUID } from 'node:crypto';
-import type { AuditRecord } from '@cesspace-arc/protocol';
+import {
+  GATEWAY_AUDIT_EVENT_TYPES,
+  GATEWAY_AUDIT_REASONS,
+  type AuditGatewayMetadata,
+  type AuditRecord,
+  type GatewayAuditAdmissionLayer,
+  type GatewayAuditEventType,
+  type GatewayAuditReason,
+} from '@cesspace-arc/protocol';
 
 /**
  * Interface definition for the CesSpace ARC Audit Logger.
@@ -45,13 +53,38 @@ export function redactAbsolutePaths(value: string): string {
   return sanitized;
 }
 
+/**
+ * High-confidence secret shapes removed from ANY string that reaches a stored
+ * record, whatever key it arrived under (rc05 §24, RC05-NEG-73).
+ *
+ * Two families, both deterministic and both bounded:
+ *
+ * - Private-key blocks (`-----BEGIN [A-Z ]+PRIVATE KEY-----`), which cover RSA,
+ *   EC, OPENSSH, and the unqualified `PRIVATE KEY` form.
+ * - Certificate blocks (`-----BEGIN CERTIFICATE-----`), so a full PEM
+ *   certificate blob cannot reach a record even when a caller puts it under an
+ *   innocent key name such as `detail` or `notes`. The `cert(ificate)?` KEY
+ *   pattern only helps when the field is honestly NAMED for what it holds; this
+ *   covers the value wherever it lands.
+ *
+ * Deliberately NOT included: a bare 64-character hexadecimal string. SHA-256
+ * digests are intentional, safe audit references — the trust store's workspace
+ * root digest, the session token DIGEST, and every SPKI pin are all exactly that
+ * shape — so redacting that shape would destroy legitimate evidence rather than
+ * protect anything. Secrets reach this layer as VALUES under a sensitive key
+ * name (caught by {@link SENSITIVE_KEY_PATTERNS}) or as one of the block forms
+ * above, never as a bare digest that ARC minted itself.
+ */
 export const SENSITIVE_VALUE_REGEXES = [
   /AKIA[0-9A-Z]{16}/g,
   /ghp_[a-zA-Z0-9]{36}/g,
   /gho_[a-zA-Z0-9]{36}/g,
   /sk-[a-zA-Z0-9]{20,}/g,
   /Bearer\s+[a-zA-Z0-9._-]+/gi,
-  /-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+PRIVATE KEY-----/g,
+  /Arc-Session-Token[:\s=]+[a-zA-Z0-9._-]+/gi,
+  /Authorization[:\s=]+[a-zA-Z0-9._-]+/gi,
+  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g,
+  /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g,
 ];
 
 export function redactValue(value: unknown): unknown {
@@ -150,6 +183,101 @@ export function redactRecord(payload: Record<string, unknown>): Record<string, u
   return result;
 }
 
+// ---------------------------------------------------------------------------
+// Central gateway-event projection (rc05 §24)
+// ---------------------------------------------------------------------------
+
+/**
+ * Maximum length of an operator-visible client identifier or client type in a
+ * gateway record.
+ *
+ * Matches the Task-1 `MAX_CLIENT_ID_CHARS` bound; redeclared here because
+ * `packages/audit` depends only on `packages/protocol` and must not reach into
+ * `packages/auth` for a constant.
+ */
+export const MAX_GATEWAY_IDENTIFIER_CHARS = 128;
+
+/** Opaque 32-lowercase-hex identifier: device and enrollment identifiers. */
+const GATEWAY_HEX32_REGEX = /^[0-9a-f]{32}$/;
+
+/** Server-issued 64-lowercase-hex identifier: the `Mcp-Session-Id` value. */
+const GATEWAY_HEX64_REGEX = /^[0-9a-f]{64}$/;
+
+/** Printable ASCII, no control character and no NUL, bounded in length. */
+const GATEWAY_IDENTIFIER_REGEX = new RegExp(`^[\\x20-\\x7e]{1,${MAX_GATEWAY_IDENTIFIER_CHARS}}$`);
+
+const GATEWAY_ADMISSION_LAYERS: readonly GatewayAuditAdmissionLayer[] = ['A', 'B', 'C'];
+
+function isGatewayEventType(value: unknown): value is GatewayAuditEventType {
+  return (
+    typeof value === 'string' && (GATEWAY_AUDIT_EVENT_TYPES as readonly string[]).includes(value)
+  );
+}
+
+function isGatewayReason(value: unknown): value is GatewayAuditReason {
+  return typeof value === 'string' && (GATEWAY_AUDIT_REASONS as readonly string[]).includes(value);
+}
+
+/**
+ * Reduces arbitrary input to the bounded, closed gateway metadata shape.
+ *
+ * This is CENTRAL defense-in-depth, not a convention callers are trusted to
+ * follow. Every field is validated against the frozen vocabulary or a fixed
+ * identifier shape, and any key this function does not know is DROPPED rather
+ * than copied. A caller therefore cannot widen the gateway block into a carrier
+ * for a token, a secret, a certificate, a peer address, or a raw limiter key,
+ * however the input object was built.
+ *
+ * Returns `undefined` — dropping the whole block — when the required
+ * `eventType` is absent or is not one of the fourteen frozen names. A record can
+ * never claim a gateway event outside the catalog, and an unknown event is never
+ * silently relabelled as a known one.
+ */
+export function projectGatewayMetadata(metadata: unknown): AuditGatewayMetadata | undefined {
+  if (metadata === null || typeof metadata !== 'object' || Array.isArray(metadata)) {
+    return undefined;
+  }
+  const source = metadata as Record<string, unknown>;
+  if (!isGatewayEventType(source.eventType)) {
+    return undefined;
+  }
+
+  const projected: AuditGatewayMetadata = { eventType: source.eventType };
+
+  if (isGatewayReason(source.reason)) {
+    projected.reason = source.reason;
+  }
+  if (
+    typeof source.admissionLayer === 'string' &&
+    GATEWAY_ADMISSION_LAYERS.includes(source.admissionLayer as GatewayAuditAdmissionLayer)
+  ) {
+    projected.admissionLayer = source.admissionLayer as GatewayAuditAdmissionLayer;
+  }
+  if (typeof source.mcpSessionId === 'string' && GATEWAY_HEX64_REGEX.test(source.mcpSessionId)) {
+    projected.mcpSessionId = source.mcpSessionId;
+  }
+  if (typeof source.deviceId === 'string' && GATEWAY_HEX32_REGEX.test(source.deviceId)) {
+    projected.deviceId = source.deviceId;
+  }
+  if (typeof source.spkiPin === 'string' && GATEWAY_HEX64_REGEX.test(source.spkiPin)) {
+    projected.spkiPin = source.spkiPin;
+  }
+  if (typeof source.enrollmentId === 'string' && GATEWAY_HEX32_REGEX.test(source.enrollmentId)) {
+    projected.enrollmentId = source.enrollmentId;
+  }
+  if (typeof source.clientId === 'string' && GATEWAY_IDENTIFIER_REGEX.test(source.clientId)) {
+    projected.clientId = source.clientId;
+  }
+  if (typeof source.clientType === 'string' && GATEWAY_IDENTIFIER_REGEX.test(source.clientType)) {
+    projected.clientType = source.clientType;
+  }
+  if (source.transportMode === 'stdio' || source.transportMode === 'remote') {
+    projected.transportMode = source.transportMode;
+  }
+
+  return projected;
+}
+
 export function computeSha256(data: string): string {
   return createHash('sha256').update(data, 'utf8').digest('hex');
 }
@@ -229,21 +357,57 @@ export class AuditLogger implements IAuditLogger {
       errorRecord.message = redactString(errorRecord.message);
     }
 
+    // Central gateway-metadata projection and redaction, applied HERE for every
+    // caller (rc05 §24). The allowlist projection runs first, so only the
+    // bounded, closed-vocabulary fields can survive; the redaction pass then
+    // runs over the survivors, so even an allowlisted field whose value happens
+    // to carry a credential shape is sanitized before it is stored. Neither step
+    // depends on the writer having remembered to sanitize anything.
+    const projectedGateway = projectGatewayMetadata(recordData.gateway);
+    const gatewayRecord =
+      projectedGateway === undefined
+        ? undefined
+        : (this.redact(
+            projectedGateway as unknown as Record<string, unknown>,
+          ) as unknown as AuditGatewayMetadata);
+
+    // Every remaining record section goes through the SAME central redaction
+    // pass as the parameters above (rc05 §24, RC05-NEG-73). `copyBounded` alone
+    // preserves a value verbatim, so a caller that put PEM key material, a
+    // certificate blob, an Authorization value, or an absolute host path into
+    // `actor`, `policy`, `execution`, or `approval` would have stored it. The
+    // pass is central, so no writer has to remember it, and it is monotone: it
+    // can only remove material, never introduce it. Every own key is preserved
+    // (see {@link copyBounded}), so the canonical form and therefore the hash
+    // chain are unaffected for the ordinary values these sections carry —
+    // identifiers, timestamps, enumerations, and counts.
     const baseRecord: AuditRecord = {
       eventId,
       timestamp: recordData.timestamp,
       sequenceNumber,
-      actor: copyBounded(recordData.actor),
+      actor: this.redact(
+        recordData.actor as unknown as Record<string, unknown>,
+      ) as AuditRecord['actor'],
       target: this.minimizeTarget(recordData.target),
       invocation: {
         toolName: recordData.invocation.toolName,
         parametersRedacted,
         payloadHash: recordData.invocation.payloadHash || fallbackPayloadHash,
       },
-      policy: copyBounded(recordData.policy),
-      execution: copyBounded(recordData.execution),
+      policy: this.redact(
+        recordData.policy as unknown as Record<string, unknown>,
+      ) as AuditRecord['policy'],
+      execution: this.redact(
+        recordData.execution as unknown as Record<string, unknown>,
+      ) as AuditRecord['execution'],
       error: errorRecord,
-      approval: recordData.approval ? copyBounded(recordData.approval) : undefined,
+      approval:
+        recordData.approval === undefined
+          ? undefined
+          : (this.redact(
+              recordData.approval as unknown as Record<string, unknown>,
+            ) as AuditRecord['approval']),
+      gateway: gatewayRecord,
       integrity: {
         previousRecordHash,
         recordHash: '',
