@@ -101,9 +101,12 @@ RC-06 is governed by an absolute architectural invariant:
    "session logs". Subsystems MUST NOT maintain unchained or independent audit files.
 3. **No Unaudited Bypasses:** No caller, subsystem, or transport mode can bypass the canonical
    `AuditLogger` pipeline.
-4. **Identity of Hashed and Stored Data:** The exact canonical JSON representation computed for
-   the SHA-256 `recordHash` is what is durably serialized to disk. The disk layer must never
-   re-serialize or alter record fields.
+4. **Authoritative Record and Preimage Contract:**
+   - The authoritative sanitized `PersistentAuditRecordV1` is the source of both hashing and persistence.
+   - `recordHash` is computed from the canonical V1 record with only `integrity.recordHash` omitted.
+   - After `recordHash` is populated, the complete canonical V1 record is serialized as the JSONL line.
+   - No persistence layer may mutate, re-redact, or reorder semantic record content after hash construction.
+   - The verifier reconstructs the exact same preimage deterministically.
 
 ---
 
@@ -232,13 +235,18 @@ Universal auditability applies to **ALL privileged operations**, including read-
 Every privileged operation records distinct lifecycle events bound by a server-generated `operationId`:
 
 ```typescript
-export type AuditLifecyclePhase = 'STARTED' | 'COMPLETED' | 'DENIED';
+export type AuditLifecyclePhase = 'STARTED' | 'COMPLETED' | 'DENIED' | 'RECOVERY_INDETERMINATE';
 
 export interface AuditLifecycleMetadata {
   operationId: string; // Server-generated UUIDv4
   phase: AuditLifecyclePhase;
 }
 ```
+
+- `COMPLETED` signifies that the underlying subsystem executed and returned a terminal outcome;
+  the existing `execution.status` field captures whether that outcome was success, error, timeout, or cancelled.
+- `RECOVERY_INDETERMINATE` signifies that ARC cannot establish whether the operation completed
+  before a process crash or power loss.
 
 ### 7.2 Strict Execution State Machine
 
@@ -282,29 +290,103 @@ For every privileged tool invocation (filesystem reads, Git reads, terminal/proc
    - Only bounded local operator audit status and verification commands remain accessible.
 3. **Denied Requests:** A policy `DENY` produces one durable `DENIED` record before returning the denial error.
 
+### 7.3 Crash Recovery for Dangling `STARTED` Operations
+
+A process crash may occur after:
+
+```text
+durable STARTED → subsystem may or may not have executed → process dies before durable COMPLETED
+```
+
+This state MUST NOT be silently interpreted as success or failure.
+
+On startup, after full historical integrity verification and before privileged service begins:
+
+1. Scan lifecycle records across all retained segments by `operationId`.
+2. Identify any `STARTED` operation lacking a corresponding `COMPLETED`, `DENIED`, or prior `RECOVERY_INDETERMINATE` record.
+3. Append exactly one durable `RECOVERY_INDETERMINATE` primary audit record to the active chain with:
+   - The same `operationId`.
+   - System-derived actor/source (`actor.type = 'SYSTEM'`).
+   - Sanitized error code `AUDIT_OUTCOME_INDETERMINATE`.
+   - No claim that the underlying read or mutation succeeded or failed.
+4. Durably sync the record via `fdatasync()`.
+5. Privileged MCP tool service may begin ONLY after every dangling operation has received a durable recovery record.
+
+If the reconciliation append itself fails:
+**Startup fails closed.**
+
+The recovery record is part of the authoritative primary chain, consumes the next sequential audit
+sequence number, and participates in normal SHA-256 hash chaining. No separate journal is introduced.
+Total indeterminate recoveries are tracked in health metadata under `audit.indeterminateRecoveries`.
+
 ---
 
-## 8. Local Audit Storage Security & Filesystem Authority
+## 8. Local Audit Storage Security, Store Metadata & Filesystem Authority
 
-### 8.1 Directory Security
+### 8.1 Platform Security Primitives Contract
 
-- Configured via `audit.directory`. Default: `~/.cesspace-arc/audit/`.
-- Must be an absolute path resolved via `fs.realpathSync`.
-- Directory permissions MUST be exactly `0700` (`rwx------`). Group/world access is forbidden.
-- Directory MUST be owned by the real process UID (`process.getuid()`).
-- The directory and all parent components MUST NOT be symbolic links.
+RC-06 persistent audit mode requires an underlying platform providing robust POSIX-style security primitives:
+
+- Real UID ownership checks (`process.getuid()`).
+- POSIX mode bits (`0700` directories, `0600` files).
+- File descriptor `O_NOFOLLOW` open semantics.
+- Atomic exclusive file creation (`O_CREAT | O_EXCL`).
+- File descriptor inspection via `fstat()`.
+- Directory persistence syncing via `fsync()`.
+
+If any required security primitive is unsupported or unavailable on the host environment:
+Startup halts immediately with `AUDIT_PLATFORM_UNSUPPORTED` and fails closed.
+No weaker fallback mechanism or relaxed permission mode is permitted in production.
+
+### 8.2 Directory Security & Path Resolution
+
+- Configured via `audit.directory`. Default: `path.join(os.homedir(), '.cesspace-arc', 'audit')`.
+- Configured custom paths MUST already be absolute. Paths containing literal shell-style `~` are rejected
+  rather than shell-expanded.
+- The directory may be created when absent using exclusive creation with mode `0700` (`rwx------`), then validated.
+- Must resolve without traversing symlinks; parent directory trust and ownership are verified.
+- Directory permissions MUST be exactly `0700`. Group or world access is forbidden.
+- Directory MUST be owned by the real process UID.
+- The audit directory and all parent path components MUST NOT be symbolic links.
 - The audit directory MUST NOT reside inside, overlap with, or be a subdirectory of any agent workspace.
 
-### 8.2 File Security Authority
+### 8.3 Persistent Store Metadata (`audit-store.json`)
 
-For all active, archived, checkpoint, spool, and receipt files:
+To eliminate ambiguity across audit stores and bind ledger identity, fresh stores initialize a protected
+metadata artifact: `audit-store.json` (mode `0600`).
 
-- Must be **regular files only** (`stats.isFile() === true`). FIFOs, sockets, and device nodes are rejected.
+```typescript
+export interface AuditStoreMetadataV1 {
+  version: 1;
+  storeId: string; // UUIDv4
+  createdAt: string; // ISO-8601 UTC
+  checkpointPublicKeyFingerprint: string; // 64 lowercase hex SHA-256 of Ed25519 SPKI
+  anchorMode: 'DISABLED' | 'ENABLED';
+  anchorReceiptPublicKeyFingerprint?: string; // required iff anchorMode === 'ENABLED'
+}
+```
+
+Rules:
+
+1. Created exactly once for a fresh audit store using atomic exclusive creation (`O_CREAT | O_EXCL`).
+2. Mode `0600`, owner real UID, regular file, `nlink === 1`, symlinks rejected.
+3. Validated descriptor verified via `fstat()` after open.
+4. File and parent directory `fsync()`ed before the first audit record is accepted.
+5. Existing non-empty stores require valid `audit-store.json`. Missing, tampered, or unsupported metadata fails startup.
+6. `storeId` is an immutable UUIDv4 identifying the audit ledger for its entire operational lifetime.
+7. `checkpointPublicKeyFingerprint` is immutable in RC-06; attempting to start an existing store with a different checkpoint signer fails closed.
+8. Changing `anchorMode` or `anchorReceiptPublicKeyFingerprint` on an existing non-empty store is strictly OUT OF SCOPE for RC-06.
+
+### 8.4 File Security Authority
+
+For all active, archived, checkpoint, metadata, spool, and receipt files:
+
+- Must be **regular files only** (`stats.isFile() === true`). FIFOs, sockets, character/block devices are rejected.
 - Hard link count MUST be exactly 1 (`stats.nlink === 1`). Hard-linked files are rejected.
 - File permissions MUST be exactly `0600` (`rw-------`).
 - File ownership MUST match the process real UID.
-- Files are opened using `O_NOFOLLOW` semantics where supported, and the resulting file descriptor
-  is verified via `fstat()` prior to any I/O. Subsequent operations use the validated descriptor.
+- Files are opened using `O_NOFOLLOW`, and the resulting file descriptor is verified via `fstat()` prior to I/O.
+- Subsequent reads, writes, and syncs use the validated descriptor.
 
 ---
 
@@ -314,7 +396,7 @@ To prevent concurrent appends, sequence collisions, or competing rotations:
 
 1. **Lock Mechanism:** The server acquires an exclusive lock by atomically creating `audit.lock`
    using `O_CREAT | O_EXCL` (`'wx'`) open flags.
-2. **Lock Properties:** Mode `0600`, regular file, no symlinks, no hard links.
+2. **Lock Properties:** Mode `0600`, regular file, no symlinks, no hard links (`nlink === 1`).
 3. **Payload:** Contains bounded diagnostic JSON metadata: `{ "pid": <number>, "startedAt": "<ISO-8601>" }`.
 4. **Collision Behavior:** If `audit.lock` exists (`EEXIST`), startup fails immediately with `AUDIT_STORE_LOCKED`.
 5. **No Automatic Stale-Lock Takeover:** Heartbeat-based automatic takeover is strictly forbidden.
@@ -324,7 +406,7 @@ To prevent concurrent appends, sequence collisions, or competing rotations:
 
 ---
 
-## 10. Segment Rotation & Compression Contract
+## 10. Segment Rotation & Streaming Compression Contract
 
 ### 10.1 Rotation Triggers
 
@@ -332,8 +414,8 @@ Active segments rotate when EITHER threshold is met:
 
 1. **Size Threshold (Hard Security Limit):** Active segment reaches or exceeds **10 MiB** (`10,485,760` bytes).
 2. **Time Threshold (Operational Convenience):** Exactly **24 hours** (`86,400` seconds) elapsed since first record.
-   - _Clock Skew Semantics:_ Wall-clock forward jumps may trigger early rotation; wall-clock rollbacks
-     may delay the time trigger, but cannot bypass the 10 MiB hard limit.
+   - _Clock Skew Semantics:_ Clock manipulation cannot alter record order, sequence continuity, hash integrity,
+     checkpoint coverage, or the hard 10 MiB rotation limit. It may affect only the operational 24-hour convenience trigger.
 
 ### 10.2 Naming Convention & Determinism
 
@@ -356,11 +438,14 @@ audit-<YYYYMMDDTHHMMSSZ>-seq<startSeq>-seq<endSeq>.jsonl.gz
 - The first record in the next segment contains `sequenceNumber = endSeq + 1` and
   `integrity.previousRecordHash` equal to the `recordHash` of the terminal record in the rotated segment.
 
-### 10.4 Compression & Deletion Contract
+### 10.4 Streaming Compression & Deletion Contract
 
 - Rotated segments are compressed using streaming `gzip` (`node:zlib`).
+- Gzip compression, verification, and SHA-256 chain verification operate strictly in a streaming manner.
+- No complete 10 MiB segment is loaded or buffered in memory.
+- Decompressed bytes are validated record-by-record under `MAX_RECORD_BYTES`.
 - The uncompressed `.jsonl` file MUST NOT be deleted until the resulting `.jsonl.gz` file has been
-  decompressed in memory, verified against the SHA-256 chain, and verified intact.
+  stream-decompressed, verified against the SHA-256 chain, and verified intact.
 - The `.jsonl.gz` archive is assigned `0600` permissions.
 
 ---
@@ -401,6 +486,7 @@ Every entry is an `AuditCheckpointV1` canonical JSON line:
 ```typescript
 export interface AuditCheckpointV1 {
   version: 1;
+  storeId: string; // UUIDv4 matching audit-store.json
   checkpointId: string; // UUIDv4
   sequenceStart: number; // Positive integer
   sequenceEnd: number; // Terminal primary audit record sequence covered
@@ -428,6 +514,7 @@ The checkpoint signature and hash preimages avoid self-reference:
 domain = "CESSPACE-ARC-CHECKPOINT-V1\0"
 unsignedCheckpoint = canonicalJson({
   version: 1,
+  storeId,
   checkpointId,
   sequenceStart,
   sequenceEnd,
@@ -441,6 +528,7 @@ signature = Ed25519.sign(domain || UTF8(unsignedCheckpoint), privateKey)
 
 checkpointHash = SHA256(canonicalJson({
   version: 1,
+  storeId,
   checkpointId,
   sequenceStart,
   sequenceEnd,
@@ -457,52 +545,142 @@ Genesis checkpoint uses the 64-zero hex digest for `previousCheckpointHash`.
 
 ---
 
-## 13. Checkpoint Signing Key Management & Security
+## 13. Trust Roots & Checkpoint Signing Key Authority
 
-### 13.1 Key Format & Algorithm
+### 13.1 Signing Key Authority (`audit.signingKeyPath`)
 
 - Algorithm: **Ed25519 (RFC 8032)** via native `node:crypto`.
 - Format: PKCS#8 Ed25519 private key PEM file.
 - Bound: Maximum key file size **4 KiB** (`MAX_SIGNING_KEY_BYTES = 4,096` bytes).
-
-### 13.2 Filesystem Authority & Loading Rules
-
-- Configured via `audit.signingKeyPath`.
-- Must be a regular file, mode `0600`, realprocess UID owned, hard-link count == 1 (`nlink == 1`), symlinks rejected.
+- Authority: Regular file, mode `0600`, real process UID owned, `nlink === 1`, symlinks rejected.
 - Must reside outside all agent workspaces.
 - Opened with `O_NOFOLLOW` and validated via `fstat()` prior to parsing.
 - Strictly prohibited: `process.argv`, ambient environment variables, MCP headers, configuration literals, logs.
 - Memory hygiene: Transient PEM input buffers are zeroized (`.fill(0)`) where practical after `createPrivateKey()`. Key descriptors are closed promptly.
 
-### 13.3 Key Lifecycle & Pinned Identity
+### 13.2 Trust Root File Authority (`audit.publicKeyPath` & `audit.anchorReceiptPublicKeyPath`)
 
-- A fresh audit store pins the SHA-256 fingerprint of the configured Ed25519 public key.
-- Every subsequent checkpoint MUST use the same key fingerprint.
-- Starting an existing non-empty store with a mismatched signing key fails closed immediately.
-- Automatic/live key rotation is OUT OF SCOPE for RC-06.
+`audit.publicKeyPath` and `audit.anchorReceiptPublicKeyPath` are security-sensitive trust roots even though
+their contents are public keys. Both files are strictly validated under the same security authority:
+
+- Regular file only (`stats.isFile() === true`).
+- Mode exactly `0600`.
+- Owner real process UID.
+- Hard link count strictly 1 (`stats.nlink === 1`).
+- Symlinks strictly rejected.
+- Maximum size 4 KiB (`MAX_SIGNING_KEY_BYTES = 4,096` bytes).
+- Opened with `O_NOFOLLOW` and validated via `fstat()` prior to reading.
+- Parse from validated file descriptor; malformed or non-Ed25519 keys rejected.
+
+### 13.3 Pinned Store Fingerprints
+
+- On fresh store initialization, the SHA-256 fingerprint of the configured checkpoint public key is
+  written to `audit-store.json.checkpointPublicKeyFingerprint`.
+- Every checkpoint emitted must use that fingerprint.
+- Starting a non-empty store with a different checkpoint public key fails startup closed.
+- When Tier 3 is enabled, the configured receipt public key fingerprint must match
+  `audit-store.json.anchorReceiptPublicKeyFingerprint`.
+- A fingerprint identifies a key; cryptographic verification uses the actual public key bytes.
 
 ---
 
-## 14. Tier 3: External Anchoring & Receipt Verification Contract
+## 14. Tier 3: External Anchoring, Deterministic Spool & Receipt Verification Contract
 
 Tier 3 establishes independent external non-repudiation by submitting signed checkpoints to an
 external HTTPS anchor receiver and obtaining cryptographically signed receipts.
 
-### 14.1 Anchored Payload
+### 14.1 Deployment Modes (Disabled vs. Enabled)
 
-Only **signed checkpoints** (`AuditCheckpointV1`) are transmitted.
-Raw audit records, parameters, and tokens are NEVER transmitted to the anchor.
+Tier 1 and Tier 2 are mandatory in every RC-06 production audit store.
+Tier 3 is an implemented but explicitly selectable deployment mode:
 
-### 14.2 Transport & Receipt Verification
+#### Anchor Disabled Mode
 
-- **Transport:** HTTPS over TLS 1.3 with standard server certificate validation. No plaintext HTTP.
-- **No Bearer Tokens:** Authentication is application-level cryptographic proof:
-  ARC presents its Ed25519-signed checkpoint; the anchor returns an Ed25519-signed receipt.
-- **Trusted Receipt Key:** ARC is configured with `audit.anchorReceiptPublicKeyPath`.
+```text
+anchorMode = DISABLED
+anchorEndpoint absent
+anchorReceiptPublicKeyPath absent
+```
+
+- No anchor spool directory created; no receipts required.
+- `anchorState = DISABLED`.
+- Offline verifier validates Tier 1 and Tier 2 and explicitly reports that external anchoring is not configured.
+- The system MUST NOT claim Tier-3 or full-host-compromise protection.
+
+#### Anchor Enabled Mode
+
+```text
+anchorMode = ENABLED
+anchorEndpoint required
+anchorReceiptPublicKeyPath required
+```
+
+- Both `anchorEndpoint` and `anchorReceiptPublicKeyPath` MUST be configured together.
+- Partial configuration (e.g. endpoint present without key, or key without endpoint) fails startup immediately.
+- Tier-3 positive acceptance flows remain mandatory for RC-06 implementation even when deployment chooses DISABLED.
+
+### 14.2 Anchor Endpoint Validation
+
+When Tier 3 is enabled:
+
+- URI scheme MUST be exactly `https:`. Plaintext HTTP is strictly rejected.
+- Embedded credentials (username or password) and URL fragments (`#`) are strictly prohibited.
+- Maximum serialized endpoint string length: 2 KiB.
+- Transport: TLS 1.3 minimum (`minVersion: 'TLSv1.3'`).
+- Hostname and CA certificate verification is strictly mandatory; disabling certificate validation is impossible.
+- HTTP redirects (3xx) are NOT automatically followed.
+- Response body size is bounded to `MAX_ANCHOR_RECEIPT_BYTES = 2,048` bytes (2 KiB).
+
+### 14.3 Request Timeout & Idempotency
+
+- Total per-attempt network timeout: **5,000 ms** (`ANCHOR_REQUEST_TIMEOUT_MS = 5_000`), covering
+  DNS resolution, TLS handshake, request transmission, and receipt body acquisition.
+- `checkpointHash` serves as the Tier-3 idempotency key.
+- Every anchor submission includes HTTP header:
+  ```text
+  Idempotency-Key: <checkpointHash>
+  ```
+- The external anchor contract guarantees that repeat submissions for the same `checkpointHash` return
+  the identical logical receipt.
+- ARC accepts repeat receipts with matching signatures as idempotent duplicates without duplicate acknowledgement.
+- Conflicting receipts for an already acknowledged checkpoint cause ARC to reject the receipt and enter degraded anchor state.
+
+### 14.4 Crash-Recoverable Spool Directory (`anchor-spool/`)
+
+To guarantee crash recovery, pending checkpoints are spooled to individual files in a dedicated directory:
+
+```text
+anchor-spool/
+  <checkpointHash>.json
+```
+
+Each file contains canonical JSON of the pending `AuditCheckpointV1`.
+
+- Directory mode `0700`, owner real UID, no symlinks.
+- Spool file mode `0600`, owner real UID, `nlink === 1`, no symlinks, created via `O_CREAT | O_EXCL`.
+- Filename MUST match the lowercase 64-hex `checkpointHash`.
+
+**Mandatory Persistence Ordering:**
+
+```text
+checkpoint artifact durably appended to audit-checkpoints.jsonl
+  │
+  ▼
+spool file durably created in anchor-spool/ AND directory fsync()ed
+  │
+  ▼
+network transmission to anchor endpoint may begin
+```
+
+A checkpoint MUST NEVER be transmitted before its crash-recoverable spool file is durably synced.
+
+### 14.5 Receipt Persistence Ordering & Verification
+
 - **Receipt Schema (`AnchorReceiptV1`):**
   ```typescript
   export interface AnchorReceiptV1 {
     version: 1;
+    storeId: string; // UUIDv4 matching audit-store.json
     receiptId: string;
     checkpointHash: string; // 64 lowercase hex
     anchorTimestamp: string; // ISO-8601 UTC
@@ -510,18 +688,58 @@ Raw audit records, parameters, and tokens are NEVER transmitted to the anchor.
     signature: string; // Base64url Ed25519 signature
   }
   ```
-- **Receipt Validation:**
+- **Receipt Verification:**
   ```text
   receiptDomain = "CESSPACE-ARC-ANCHOR-RECEIPT-V1\0"
-  unsignedReceipt = canonicalJson({ version: 1, receiptId, checkpointHash, anchorTimestamp, anchorKeyFingerprint })
+  unsignedReceipt = canonicalJson({
+    version: 1,
+    storeId,
+    receiptId,
+    checkpointHash,
+    anchorTimestamp,
+    anchorKeyFingerprint
+  })
   Ed25519.verify(receiptDomain || UTF8(unsignedReceipt), signature, anchorReceiptPublicKey) === true
   ```
 - HTTP 200/201 alone is NOT acknowledgement; only a cryptographically verified receipt acknowledges a checkpoint.
-- Verified receipts are appended to `audit-anchors.jsonl` (mode `0600`).
 
-### 14.3 Spooling, Retries & Backpressure
+**Mandatory Receipt Persistence Ordering:**
 
-- Checkpoints awaiting receipt are spooled in `audit-anchor-spool.jsonl` (mode `0600`).
+```text
+verify receipt signature, storeId binding, and checkpointHash binding
+  │
+  ▼
+append receipt durably to audit-anchors.jsonl
+  │
+  ▼
+fdatasync() receipt file
+  │
+  ▼
+unlink the pending spool file anchor-spool/<checkpointHash>.json
+  │
+  ▼
+fsync() anchor-spool/ directory
+```
+
+### 14.6 Anchor Crash Recovery States
+
+On startup before network retry:
+
+- **State A (Acknowledged):** Checkpoint exists + valid receipt exists in `audit-anchors.jsonl` + spool file absent:
+  Checkpoint is fully `ACKNOWLEDGED`.
+- **State B (Pending):** Checkpoint exists + no receipt + spool file exists:
+  Checkpoint is `PENDING`; network retry schedule continues.
+- **State C (Spool Missing):** Checkpoint exists + no receipt + spool file missing:
+  Reconstruct spool file durably from checkpoint artifact before serving privileged operations.
+- **State D (Stale Spool File):** Checkpoint exists + valid receipt exists + spool file still exists:
+  Receipt wins; delete the stale spool file and `fsync()` spool directory.
+- **State E (Orphan Spool Entry):** Spool entry exists but no matching checkpoint in `audit-checkpoints.jsonl`:
+  Integrity failure; startup fails closed.
+- **State F (Orphan Receipt):** Receipt exists in `audit-anchors.jsonl` with no matching checkpoint:
+  Integrity failure; startup fails closed.
+
+### 14.7 Spool Backoff & Backpressure Limits
+
 - Retry Schedule: Exactly 5 attempts with fixed backoff: `1s, 2s, 4s, 8s, 16s`.
   After 5 failures, the checkpoint remains in the spool to retry on the next recovery cycle.
 - **Backpressure Limits:**
@@ -556,16 +774,18 @@ running server and requiring **public verification keys only**:
 
 1. **Required Public Keys:**
    - Checkpoint public key (`audit.publicKeyPath`).
-   - Anchor receipt public key (`audit.anchorReceiptPublicKeyPath`).
+   - Anchor receipt public key (`audit.anchorReceiptPublicKeyPath`, when anchor mode is enabled).
 2. **Verification Pipeline:**
+   - Validates `audit-store.json` schema V1 and verifies pinned key fingerprints.
    - Validates JSON syntax and schema V1 structure (`schemaVersion: 1`).
    - Verifies contiguous sequence numbers (`1, 2, 3, ...`) with zero gaps or duplicates.
    - Verifies that `previousRecordHash` links match preceding records.
    - Recomputes canonical hash preimages and verifies `integrity.recordHash`.
-   - Validates segment transitions and rotation continuity across uncompressed and `.jsonl.gz` files.
-   - Verifies all checkpoint signatures against the checkpoint public key.
+   - Validates segment transitions and rotation continuity across uncompressed and `.jsonl.gz` files via streaming verification.
+   - Verifies all checkpoint signatures against the checkpoint public key and verifies `storeId` binding.
    - Verifies the checkpoint hash chain (`previousCheckpointHash`).
-   - Validates anchor receipts in `audit-anchors.jsonl` against the anchor public key and checkpoint hashes.
+   - When anchor mode is enabled, validates anchor receipts in `audit-anchors.jsonl` against the anchor public key, `storeId`, and checkpoint hashes.
+   - In anchor disabled mode, reports Tier 1 + Tier 2 verified and notes external anchoring not configured.
 3. **Exit Codes:** Clean exit (0) on full verification; non-zero exit with precise diagnostics on failure.
 
 ---
@@ -574,9 +794,9 @@ running server and requiring **public verification keys only**:
 
 ### 17.1 Local CLI Commands
 
-1. `arc audit status`: Reports storage path, active segment, total segments, current sequence,
-   last checkpoint sequence, unanchored checkpoint count, and health.
-2. `arc audit verify [--dir <path>]`: Runs the full offline verification pipeline.
+1. `arc audit status`: Reports storage path, store ID, active segment, total segments, current sequence,
+   last checkpoint sequence, unanchored checkpoint count, indeterminate recoveries, and health.
+2. `arc audit verify [--dir <path>]`: Runs the full offline verification pipeline using public keys only.
 3. `arc audit inspect [--from <seq>] [--to <seq>] [--limit <n>]`: Displays bounded sanitized
    records (maximum `MAX_INSPECT_RECORDS = 100`).
 4. `arc audit export --output <dir> [--from <seq>] [--to <seq>]`: Generates a deterministic evidence bundle directory.
@@ -594,13 +814,19 @@ Node has no built-in tar/zip packager; export is standardized as a **directory b
   public-keys/
 ```
 
-- The destination directory MUST NOT already exist; created exclusively with mode `0700`.
-- Destination MUST NOT reside inside the audit store or any agent workspace. Symlinks rejected.
+Export Security Rules:
+
+- The destination directory MUST NOT already exist; no overwrite is permitted.
+- Destination MUST NOT be a symlink, and no parent component may be a symlink.
+- Destination directory MUST NOT reside inside the audit store or any agent workspace.
 - Maximum export size: **1 GiB** (`MAX_EXPORT_BYTES = 1,073,741,824` bytes).
+- If export fails partially, the created output directory is removed ONLY if ARC created it fresh and
+  cleanup can be executed safely; otherwise, export fails without touching pre-existing data.
 - `manifest.json`:
   ```json
   {
     "version": 1,
+    "storeId": "...",
     "sequenceRange": { "start": 1, "end": 5000 },
     "files": {
       "audit/audit-20260920-seq1-seq1000.jsonl.gz": { "sha256": "...", "bytes": 12345 }
@@ -610,7 +836,7 @@ Node has no built-in tar/zip packager; export is standardized as a **directory b
   }
   ```
 - Authenticity is derived from the manifest file hashes, included checkpoint signatures, and anchor receipts.
-  No private key is required during export.
+  No private key is required or accessed during export.
 
 ---
 
@@ -622,7 +848,7 @@ Remote MCP clients (stdio or mTLS gateway) MUST NOT receive any tools or endpoin
 - Trigger log rotation manually.
 - Alter audit configuration, paths, or thresholds.
 - View, export, or search audit logs across sessions.
-- Modify or inspect checkpoint signing keys or anchor credentials.
+- Modify or inspect checkpoint signing keys, trust roots, or anchor credentials.
 
 Audit administration is restricted strictly to local operator shell commands.
 
@@ -645,6 +871,7 @@ No caller or subsystem can bypass redaction.
   3. High-confidence regex token scanners (`SENSITIVE_VALUE_REGEXES`).
   4. Absolute host path redaction (`redactAbsolutePaths`).
   5. Parameter omissions (`content`, `patch`, `env`, `stdout`, `stderr`).
+  6. Environment variable value redaction: raw environment variables cannot enter persistent JSONL.
 
 ---
 
@@ -662,30 +889,56 @@ No caller or subsystem can bypass redaction.
 1. **Monotonic Source:** Monotonic sequence numbers (`sequenceNumber`) are the sole authoritative
    ordering mechanism for the hash chain.
 2. **Timestamp Role:** The ISO 8601 UTC timestamp is operational metadata, not a cryptographic ordering source.
-3. **Clock Skew Resistance:** A wall-clock rollback or forward jump cannot:
-   - Reorder records in the chain.
-   - Reset the sequence number.
-   - Bypass rotation or retention thresholds.
-   - Invalidate previously signed checkpoints.
+3. **Clock Skew Resistance:** Clock manipulation cannot alter record order, sequence continuity, hash integrity,
+   checkpoint coverage, or the hard 10 MiB rotation limit. It may affect only the operational 24-hour convenience trigger.
 
 ---
 
-## 22. Startup Full-History Verification & Health Reporting
+## 22. Startup Full-History Verification, Reconciliation & Health Reporting
 
-### 22.1 Full-History Verification on Startup
+### 22.1 Exact Full-History Startup Sequence
 
-Before stdio or remote MCP tool service begins, startup MUST verify the complete retained history:
+Before stdio or remote MCP tool service begins, startup MUST execute the following exact sequence:
 
-- Every retained compressed archive (`.jsonl.gz`).
-- Every retained uncompressed segment (`.jsonl`).
-- Sequence continuity from sequence 1 through the active segment.
-- Cryptographic hash continuity (`previousRecordHash`).
-- Checkpoint artifact chain and signatures in `audit-checkpoints.jsonl`.
-- Anchor receipt signatures in `audit-anchors.jsonl`.
-- Anchor spool integrity in `audit-anchor-spool.jsonl`.
-- Final recoverable torn-tail handling in the active segment.
+```text
+1.  Validate platform security primitives (Linux/POSIX, UID, 0600/0700, O_NOFOLLOW, O_CREAT|O_EXCL, fstat, fsync)
+     │
+     ▼
+2.  Acquire single-writer process lock (audit.lock via O_CREAT | O_EXCL)
+     │
+     ▼
+3.  Validate audit-store metadata (audit-store.json) and verify pinned trust roots
+     │
+     ▼
+4.  Verify all retained primary segments (compressed archives and active segment)
+     │
+     ▼
+5.  Verify checkpoint artifact chain and Ed25519 signatures in audit-checkpoints.jsonl
+     │
+     ▼
+6.  Verify anchor receipts in audit-anchors.jsonl when anchor mode is enabled
+     │
+     ▼
+7.  Reconcile anchor spool directory state (States A through F)
+     │
+     ▼
+8.  Recover allowed torn active tail (up to 64 KiB to sidecar) if present
+     │
+     ▼
+9.  Detect dangling STARTED operations lacking terminal records
+     │
+     ▼
+10. Append and fdatasync() durable RECOVERY_INDETERMINATE records for all dangling operations
+     │
+     ▼
+11. Establish runtime cursors (next sequence number, previousRecordHash, cache)
+     │
+     ▼
+12. Begin privileged MCP tool service
+```
 
-Any missing or corrupted historical segment fails startup closed.
+Any error, validation failure, or integrity breach occurring before step 12 halts startup immediately
+and fails closed: **no privileged tool dispatch is permitted**.
 
 ### 22.2 Health Reporting
 
@@ -698,7 +951,8 @@ Safe health metadata exposes:
   sequence: number,
   lastCheckpointSequence: number | null,
   unanchoredCheckpoints: number,
-  anchorState: 'HEALTHY' | 'DEGRADED' | 'FULL'
+  anchorState: 'DISABLED' | 'HEALTHY' | 'DEGRADED' | 'FULL',
+  indeterminateRecoveries: number
 }
 ```
 
@@ -708,15 +962,16 @@ Exposing filesystem paths, private keys, public key bodies, or anchor endpoints 
 
 ## 23. Process Restart & Recovery Semantics
 
-| State Component           | Durability across Restart | Post-Restart Behavior                                   |
-| :------------------------ | :------------------------ | :------------------------------------------------------ |
-| Record Chain & Sequence   | **Persistent**            | Resumes from `lastRecord.sequenceNumber + 1`            |
-| `previousRecordHash`      | **Persistent**            | Initialized to `lastRecord.integrity.recordHash`        |
-| Checkpoint History        | **Persistent**            | Loaded and bound to `previousCheckpointHash`            |
-| Anchor Receipts           | **Persistent**            | Loaded from `audit-anchors.jsonl`                       |
-| Unanchored Checkpoint Q   | **Persistent**            | Loaded from `audit-anchor-spool.jsonl`; resumes retries |
-| Active Single-Writer Lock | **Volatile**              | Re-acquired exclusively on startup (`O_CREAT            | O_EXCL`) |
-| In-Flight Append State    | **Volatile**              | Cleared; re-entrant state initialized fresh             |
+| State Component           | Durability across Restart | Post-Restart Behavior                                    |
+| :------------------------ | :------------------------ | :------------------------------------------------------- |
+| Record Chain & Sequence   | **Persistent**            | Resumes from `lastRecord.sequenceNumber + 1`             |
+| `previousRecordHash`      | **Persistent**            | Initialized to `lastRecord.integrity.recordHash`         |
+| Checkpoint History        | **Persistent**            | Loaded and bound to `previousCheckpointHash`             |
+| Anchor Receipts           | **Persistent**            | Loaded from `audit-anchors.jsonl`                        |
+| Unanchored Checkpoint Q   | **Persistent**            | Reconciled from `anchor-spool/`; resumes retries         |
+| Store Metadata & Pin      | **Persistent**            | Verified from `audit-store.json`                         |
+| Active Single-Writer Lock | **Volatile**              | Re-acquired exclusively on startup (`O_CREAT \| O_EXCL`) |
+| In-Flight Append State    | **Volatile**              | Cleared; re-entrant state initialized fresh              |
 
 ---
 
@@ -736,6 +991,7 @@ CHECKPOINT_INTERVAL = 1,000 primary audit records
 MAX_PENDING_ANCHOR_CHECKPOINTS = 100
 MAX_ANCHOR_SPOOL_BYTES = 1,048,576 (1 MiB)
 MAX_ANCHOR_RECEIPT_BYTES = 2,048 (2 KiB)
+ANCHOR_REQUEST_TIMEOUT_MS = 5,000 (5 seconds total network timeout)
 MAX_TORN_TAIL_BYTES = 65,536 (64 KiB)
 MAX_INSPECT_RECORDS = 100
 MAX_EXPORT_BYTES = 1,073,741,824 (1 GiB)
@@ -747,15 +1003,15 @@ RECENT_RECORDS_CACHE_LIMIT = 256 records
 
 ```typescript
 export interface AuditConfig {
-  /** Storage directory path. Default: '~/.cesspace-arc/audit/'. */
+  /** Storage directory path. Default: path.join(os.homedir(), '.cesspace-arc', 'audit'). */
   directory?: string;
   /** Path to Ed25519 private key PEM file for Tier 2 signing. Mandatory. */
   signingKeyPath: string;
   /** Path to Ed25519 public key PEM file for checkpoint verification. Mandatory. */
   publicKeyPath: string;
-  /** External Tier 3 anchor HTTPS endpoint. Optional. */
+  /** External Tier 3 anchor HTTPS endpoint. Optional; required if anchor mode enabled. */
   anchorEndpoint?: string;
-  /** Path to Ed25519 public key PEM file for anchor receipt verification. Optional. */
+  /** Path to Ed25519 public key PEM file for anchor receipt verification. Optional; required if anchor mode enabled. */
   anchorReceiptPublicKeyPath?: string;
 }
 ```
@@ -771,7 +1027,7 @@ Production audit logging holds a bounded memory footprint:
 - The persistent logger holds only the current sequence number, current `recordHash`, and a ring cache
   of the most recent **256 records** (`RECENT_RECORDS_CACHE_LIMIT = 256`).
 - Full-history inspection, verification, rotation compression, and evidence export stream from disk.
-- At no point is the 1 GiB history loaded into memory.
+- At no point is the 1 GiB history or a 10 MiB uncompressed segment loaded into memory.
 
 ---
 
@@ -781,6 +1037,8 @@ Production audit logging holds a bounded memory footprint:
 2. **Integrity Corruption:** Startup halts immediately; surfaces `AUDIT_CORRUPTION_DETECTED` in local console.
 3. **Lock Conflict:** Exits immediately with `AUDIT_STORE_LOCKED`.
 4. **Anchor Spool Exhaustion:** Server enters `ANCHOR_SPOOL_FULL`; rejects all privileged tool executions.
+5. **Platform Unsupported:** Startup halts immediately with `AUDIT_PLATFORM_UNSUPPORTED`.
+6. **Recovery Reconciliation Failure:** Startup halts immediately with `AUDIT_RECOVERY_FAILED`.
 
 ---
 
@@ -819,16 +1077,17 @@ The following items are explicitly deferred beyond RC-06:
 7. User/role permission management for audit access beyond OS user boundaries.
 8. Automatic audit segment deletion / pruning.
 9. Automatic or live checkpoint signing-key rotation.
-10. RC-07 composite engineering tools.
-11. RC-08 adversarial fuzzing and penetration testing.
+10. Changing `anchorMode` or anchor trust key on an existing non-empty audit store.
+11. RC-07 composite engineering tools.
+12. RC-08 adversarial fuzzing and penetration testing.
 
 ---
 
-## 30. Negative Security Control Catalog (RC06-NEG-01..96)
+## 30. Negative Security Control Catalog (RC06-NEG-01..108)
 
-All 96 controls are contiguous, mandatory, and directly testable:
+All 108 controls are contiguous, mandatory, and directly testable:
 
-### Category 1: Filesystem Authority & Locking (RC06-NEG-01..13)
+### Category 1: Filesystem Authority, Platform Primitives & Locking (RC06-NEG-01..15)
 
 - **`RC06-NEG-01`**: Audit directory is a symlink. Startup rejected; throws `INVALID_AUDIT_PATH`.
 - **`RC06-NEG-02`**: Active audit segment file is a symlink. Write rejected; throws `SYMLINK_DETECTED`.
@@ -840,144 +1099,161 @@ All 96 controls are contiguous, mandatory, and directly testable:
 - **`RC06-NEG-08`**: Target audit path attempts directory traversal (`../`). Path rejected.
 - **`RC06-NEG-09`**: Active audit segment file has hard-link count > 1 (`nlink != 1`). Write rejected.
 - **`RC06-NEG-10`**: `O_NOFOLLOW` / `fstat` descriptor check detects symlink substitution during open. Rejected.
-- **`RC06-NEG-11`**: Second ARC process attempts lock on existing `audit.lock` (`O_CREAT|O_EXCL` fails with `EEXIST`). Startup halts with `AUDIT_STORE_LOCKED`.
-- **`RC06-NEG-12`**: Stale lock takeover attempted without operator intervention. Automatic takeover rejected.
-- **`RC06-NEG-13`**: Audit lock file is a symlink or hard link. Startup fails immediately.
+- **`RC06-NEG-11`**: Unsupported platform lacking `O_NOFOLLOW` or required POSIX primitives. Startup halts with `AUDIT_PLATFORM_UNSUPPORTED`.
+- **`RC06-NEG-12`**: Second ARC process attempts lock on existing `audit.lock` (`O_CREAT | O_EXCL` fails with `EEXIST`). Startup halts with `AUDIT_STORE_LOCKED`.
+- **`RC06-NEG-13`**: Stale lock takeover attempted without operator intervention. Automatic takeover rejected.
+- **`RC06-NEG-14`**: Audit lock file is a symlink or hard link. Startup fails immediately.
+- **`RC06-NEG-15`**: Configured audit directory path contains unexpanded literal `~`. Startup fails; shell expansion prohibited.
 
-### Category 2: Record Format & Schema V1 Validation (RC06-NEG-14..22)
+### Category 2: Store Metadata & Trust Roots (RC06-NEG-16..20)
 
-- **`RC06-NEG-14`**: Record line missing terminating newline character (`\n`). Line rejected as malformed.
-- **`RC06-NEG-15`**: Record line containing carriage return character (`\r`). Line rejected as malformed.
-- **`RC06-NEG-16`**: Record containing raw `undefined` or `NaN`/`Infinity` values. Canonicalization fails.
-- **`RC06-NEG-17`**: Record containing unescaped control characters (< `0x20` or NUL). Line rejected.
-- **`RC06-NEG-18`**: Record with unsupported `schemaVersion` (e.g. `2` or `0`). Verifier rejects with `UNSUPPORTED_SCHEMA_VERSION`.
-- **`RC06-NEG-19`**: Record missing mandatory top-level `schemaVersion: 1` field. Verification fails.
-- **`RC06-NEG-20`**: Record containing unknown top-level field outside V1 schema. Verification fails.
-- **`RC06-NEG-21`**: Single record exceeding `MAX_RECORD_BYTES` (64 KiB). Append rejected with `RECORD_TOO_LARGE`.
-- **`RC06-NEG-22`**: Direct hash of stored line bytes asserted as `recordHash`. Rejected; verifier enforces hash preimage omission of `integrity.recordHash`.
+- **`RC06-NEG-16`**: `audit-store.json` missing on non-empty audit store. Startup fails closed.
+- **`RC06-NEG-17`**: Tampered or malformed `audit-store.json` metadata. Startup fails closed.
+- **`RC06-NEG-18`**: Configured checkpoint public key fingerprint does not match `audit-store.json.checkpointPublicKeyFingerprint`. Startup fails closed.
+- **`RC06-NEG-19`**: Configured anchor receipt public key fingerprint does not match `audit-store.json.anchorReceiptPublicKeyFingerprint` when anchor mode is enabled. Startup fails closed.
+- **`RC06-NEG-20`**: Attempting to change checkpoint signer or anchor trust settings on existing non-empty store. Rejected.
 
-### Category 3: Chain Continuity & Record Tampering (RC06-NEG-23..32)
+### Category 3: Record Format & Schema V1 Validation (RC06-NEG-21..29)
 
-- **`RC06-NEG-23`**: Sequence number gap introduced in persistent record stream. Verification fails.
-- **`RC06-NEG-24`**: Duplicate sequence number in persistent record stream. Verification fails.
-- **`RC06-NEG-25`**: Broken `previousRecordHash` link between adjacent records. Verification fails.
-- **`RC06-NEG-26`**: Tampered record payload with original `recordHash`. Recomputation flags mismatch.
-- **`RC06-NEG-27`**: Tampered `recordHash` with original payload. Verification flags mismatch.
-- **`RC06-NEG-28`**: Middle record deletion from audit segment. Chain link break detected.
-- **`RC06-NEG-29`**: Tail record truncation detectable relative to trusted signed checkpoint. Truncation detected.
-- **`RC06-NEG-30`**: Torn final record line from crash. Recovers cleanly via sidecar; historical chain preserved.
-- **`RC06-NEG-31`**: Torn final record line accompanied by corrupted historical records. Startup fails closed.
-- **`RC06-NEG-32`**: Attempted sequence number reset to 1 on restart with non-empty store. Rejected.
+- **`RC06-NEG-21`**: Record line missing terminating newline character (`\n`). Line rejected as malformed.
+- **`RC06-NEG-22`**: Record line containing carriage return character (`\r`). Line rejected as malformed.
+- **`RC06-NEG-23`**: Record containing raw `undefined` or `NaN`/`Infinity` values. Canonicalization fails.
+- **`RC06-NEG-24`**: Record containing unescaped control characters (< `0x20` or NUL). Line rejected.
+- **`RC06-NEG-25`**: Record with unsupported `schemaVersion` (e.g. `2` or `0`). Verifier rejects with `UNSUPPORTED_SCHEMA_VERSION`.
+- **`RC06-NEG-26`**: Record missing mandatory top-level `schemaVersion: 1` field. Verification fails.
+- **`RC06-NEG-27`**: Record containing unknown top-level field outside V1 schema. Verification fails.
+- **`RC06-NEG-28`**: Single record exceeding `MAX_RECORD_BYTES` (64 KiB). Append rejected with `RECORD_TOO_LARGE`.
+- **`RC06-NEG-29`**: Direct hash of stored line bytes asserted as `recordHash`. Rejected; verifier enforces hash preimage omission of `integrity.recordHash`.
 
-### Category 4: Universal Lifecycle & Execution Ordering (RC06-NEG-33..38)
+### Category 4: Chain Continuity & Record Tampering (RC06-NEG-30..39)
 
-- **`RC06-NEG-33`**: `STARTED` audit append failure before privileged read operation. Read aborted; zero execution.
-- **`RC06-NEG-34`**: `STARTED` audit append failure before privileged mutation operation. Mutation aborted; zero side effects.
-- **`RC06-NEG-35`**: `COMPLETED` audit append failure after privileged read. Gateway enters global `DEGRADED_AUDIT_FAILURE`.
-- **`RC06-NEG-36`**: `COMPLETED` audit append failure after irreversible mutation. Gateway enters global `DEGRADED_AUDIT_FAILURE`.
-- **`RC06-NEG-37`**: Subsequent privileged read attempt while in `DEGRADED_AUDIT_FAILURE`. Rejected immediately.
-- **`RC06-NEG-38`**: Subsequent privileged mutation attempt while in `DEGRADED_AUDIT_FAILURE`. Rejected immediately.
+- **`RC06-NEG-30`**: Sequence number gap introduced in persistent record stream. Verification fails.
+- **`RC06-NEG-31`**: Duplicate sequence number in persistent record stream. Verification fails.
+- **`RC06-NEG-32`**: Broken `previousRecordHash` link between adjacent records. Verification fails.
+- **`RC06-NEG-33`**: Tampered record payload with original `recordHash`. Recomputation flags mismatch.
+- **`RC06-NEG-34`**: Tampered `recordHash` with original payload. Verification flags mismatch.
+- **`RC06-NEG-35`**: Middle record deletion from audit segment. Chain link break detected.
+- **`RC06-NEG-36`**: Tail record truncation detectable relative to trusted signed checkpoint. Truncation detected.
+- **`RC06-NEG-37`**: Torn final record line from crash. Recovers cleanly via sidecar; historical chain preserved.
+- **`RC06-NEG-38`**: Torn final record line accompanied by corrupted historical records. Startup fails closed.
+- **`RC06-NEG-39`**: Attempted sequence number reset to 1 on restart with non-empty store. Rejected.
 
-### Category 5: Rotation, Compression & Full-History Startup (RC06-NEG-39..50)
+### Category 5: Universal Lifecycle, Crash Recovery & Execution Ordering (RC06-NEG-40..47)
 
-- **`RC06-NEG-39`**: Rotation boundary sequence discontinuity between segments. Verifier flags sequence gap.
-- **`RC06-NEG-40`**: Rotation boundary `previousRecordHash` mismatch between segments. Verifier flags chain break.
-- **`RC06-NEG-41`**: Corrupted gzip archive in rotated segment detected during startup. Startup fails closed.
-- **`RC06-NEG-42`**: Missing intermediate rotated segment in archive sequence detected during startup. Startup fails closed.
-- **`RC06-NEG-43`**: Premature uncompressed segment deletion before gzip integrity verification. Deletion prohibited.
-- **`RC06-NEG-44`**: Rapid rotation causing filename timestamp collision. Sequence range suffix prevents overwrite.
-- **`RC06-NEG-45`**: Rotated segment file permissions wider than `0600`. Verification flags insecure permissions.
-- **`RC06-NEG-46`**: Compressed archive permissions wider than `0600`. Verification flags insecure permissions.
-- **`RC06-NEG-47`**: Compressed archive hard-link count > 1 (`nlink != 1`). Archive loading rejected.
-- **`RC06-NEG-48`**: Wall-clock rollback attempt to delay 24h rotation. Defeated by 10 MiB hard limit.
-- **`RC06-NEG-49`**: Wall-clock forward jump attempt to bypass retention. Defeated by non-deletion policy.
-- **`RC06-NEG-50`**: Startup against non-empty store with corrupted intermediate segment. Fails closed.
+- **`RC06-NEG-40`**: `STARTED` audit append failure before privileged read operation. Read aborted; zero execution.
+- **`RC06-NEG-41`**: `STARTED` audit append failure before privileged mutation operation. Mutation aborted; zero side effects.
+- **`RC06-NEG-42`**: `COMPLETED` audit append failure after privileged read. Gateway enters global `DEGRADED_AUDIT_FAILURE`.
+- **`RC06-NEG-43`**: `COMPLETED` audit append failure after irreversible mutation. Gateway enters global `DEGRADED_AUDIT_FAILURE`.
+- **`RC06-NEG-44`**: Subsequent privileged read attempt while in `DEGRADED_AUDIT_FAILURE`. Rejected immediately.
+- **`RC06-NEG-45`**: Subsequent privileged mutation attempt while in `DEGRADED_AUDIT_FAILURE`. Rejected immediately.
+- **`RC06-NEG-46`**: Dangling `STARTED` after simulated crash. Emits durable `RECOVERY_INDETERMINATE` record before serving.
+- **`RC06-NEG-47`**: Recovery reconciliation append failure for dangling `STARTED`. Startup halts fail-closed.
 
-### Category 6: Storage Bounds & Non-Deletion Retention (RC06-NEG-51..54)
+### Category 6: Rotation, Compression & Full-History Startup (RC06-NEG-48..59)
 
-- **`RC06-NEG-51`**: Disk full (`ENOSPC`) during audit append. Append throws; state remains consistent.
-- **`RC06-NEG-52`**: Short write during audit append. Partial write detected; rolls back or fails closed.
-- **`RC06-NEG-53`**: Archived segment count reaches `MAX_ARCHIVE_SEGMENTS` (100). Halts privileged ops; zero auto-deletion.
-- **`RC06-NEG-54`**: Cumulative storage budget reaches `TOTAL_AUDIT_BUDGET_BYTES` (1 GiB). Halts privileged ops; zero auto-deletion.
+- **`RC06-NEG-48`**: Rotation boundary sequence discontinuity between segments. Verifier flags sequence gap.
+- **`RC06-NEG-49`**: Rotation boundary `previousRecordHash` mismatch between segments. Verifier flags chain break.
+- **`RC06-NEG-50`**: Corrupted gzip archive in rotated segment detected during startup. Startup fails closed.
+- **`RC06-NEG-51`**: Missing intermediate rotated segment in archive sequence detected during startup. Startup fails closed.
+- **`RC06-NEG-52`**: Premature uncompressed segment deletion before streaming gzip integrity verification. Deletion prohibited.
+- **`RC06-NEG-53`**: Rapid rotation causing filename timestamp collision. Sequence range suffix prevents overwrite.
+- **`RC06-NEG-54`**: Rotated segment file permissions wider than `0600`. Verification flags insecure permissions.
+- **`RC06-NEG-55`**: Compressed archive permissions wider than `0600`. Verification flags insecure permissions.
+- **`RC06-NEG-56`**: Compressed archive hard-link count > 1 (`nlink != 1`). Archive loading rejected.
+- **`RC06-NEG-57`**: Wall-clock rollback attempt to delay 24h rotation. Defeated by 10 MiB hard limit.
+- **`RC06-NEG-58`**: Wall-clock forward jump attempt to bypass retention. Defeated by non-deletion policy.
+- **`RC06-NEG-59`**: Startup against non-empty store with corrupted intermediate segment. Fails closed.
 
-### Category 7: Tier 2 Signed Checkpoint Artifacts (RC06-NEG-55..64)
+### Category 7: Storage Bounds & Non-Deletion Retention (RC06-NEG-60..63)
 
-- **`RC06-NEG-55`**: Checkpoint artifact assigned audit `sequenceNumber`. Rejected; checkpoints are separate artifacts.
-- **`RC06-NEG-56`**: Checkpoint sequence range mismatch with covered primary audit records. Verification fails.
-- **`RC06-NEG-57`**: Checkpoint `terminalRecordHash` mismatch with actual terminal record. Verification fails.
-- **`RC06-NEG-58`**: Checkpoint `previousCheckpointHash` chain link break. Verifier flags broken checkpoint chain.
-- **`RC06-NEG-59`**: Tampered checkpoint signature bytes. Signature verification fails.
-- **`RC06-NEG-60`**: Checkpoint verified with wrong Ed25519 public key. Signature verification fails.
-- **`RC06-NEG-61`**: Checkpoint signature algorithm downgrade attempt (e.g. RSA, none). Rejected.
-- **`RC06-NEG-62`**: Replayed checkpoint from prior sequence range. Sequence validation fails.
-- **`RC06-NEG-63`**: Out-of-order checkpoint artifact in `audit-checkpoints.jsonl`. Sequence continuity check fails.
-- **`RC06-NEG-64`**: Checkpoint artifact file permissions wider than `0600` or hard-linked. Loading rejected.
+- **`RC06-NEG-60`**: Disk full (`ENOSPC`) during audit append. Append throws; state remains consistent.
+- **`RC06-NEG-61`**: Short write during audit append. Partial write detected; rolls back or fails closed.
+- **`RC06-NEG-62`**: Archived segment count reaches `MAX_ARCHIVE_SEGMENTS` (100). Halts privileged ops; zero auto-deletion.
+- **`RC06-NEG-63`**: Cumulative storage budget reaches `TOTAL_AUDIT_BUDGET_BYTES` (1 GiB). Halts privileged ops; zero auto-deletion.
 
-### Category 8: Checkpoint Signing Key Authority (RC06-NEG-65..73)
+### Category 8: Tier 2 Signed Checkpoint Artifacts (RC06-NEG-64..74)
 
-- **`RC06-NEG-65`**: Signing key provided via command-line argument (`argv`). Startup fails immediately.
-- **`RC06-NEG-66`**: Signing key provided via ambient environment variable. Startup fails immediately.
-- **`RC06-NEG-67`**: Signing key supplied via remote MCP header or tool argument. Rejected.
-- **`RC06-NEG-68`**: Checkpoint signing key file is a symlink. Key loading rejected.
-- **`RC06-NEG-69`**: Checkpoint signing key file has hard-link count > 1 (`nlink != 1`). Key loading rejected.
-- **`RC06-NEG-70`**: Checkpoint signing key file permissions wider than `0600`. Key loading rejected.
-- **`RC06-NEG-71`**: Checkpoint signing key file owned by different UID. Key loading rejected.
-- **`RC06-NEG-72`**: Checkpoint signing key exceeds `MAX_SIGNING_KEY_BYTES` (4 KiB). Key loading rejected.
-- **`RC06-NEG-73`**: Different signing key loaded on non-empty store with pinned fingerprint. Fails closed.
+- **`RC06-NEG-64`**: Checkpoint artifact assigned audit `sequenceNumber`. Rejected; checkpoints are separate artifacts.
+- **`RC06-NEG-65`**: Checkpoint sequence range mismatch with covered primary audit records. Verification fails.
+- **`RC06-NEG-66`**: Checkpoint `terminalRecordHash` mismatch with actual terminal record. Verification fails.
+- **`RC06-NEG-67`**: Checkpoint `previousCheckpointHash` chain link break. Verifier flags broken checkpoint chain.
+- **`RC06-NEG-68`**: Checkpoint `storeId` mismatch with `audit-store.json`. Verifier flags ledger identity mismatch.
+- **`RC06-NEG-69`**: Tampered checkpoint signature bytes. Signature verification fails.
+- **`RC06-NEG-70`**: Checkpoint verified with wrong Ed25519 public key. Signature verification fails.
+- **`RC06-NEG-71`**: Checkpoint signature algorithm downgrade attempt (e.g. RSA, none). Rejected.
+- **`RC06-NEG-72`**: Replayed checkpoint from prior sequence range. Sequence validation fails.
+- **`RC06-NEG-73`**: Out-of-order checkpoint artifact in `audit-checkpoints.jsonl`. Sequence continuity check fails.
+- **`RC06-NEG-74`**: Checkpoint artifact file permissions wider than `0600` or hard-linked. Loading rejected.
 
-### Category 9: Tier 3 External Anchoring & Cryptographic Receipts (RC06-NEG-74..82)
+### Category 9: Trust Roots & Key Authority (RC06-NEG-75..83)
 
-- **`RC06-NEG-74`**: External anchor connection attempt over plaintext HTTP. Rejected; HTTPS required.
-- **`RC06-NEG-75`**: External anchor HTTPS connection timeout. Checkpoint spooled; backoff retry initiated.
-- **`RC06-NEG-76`**: External anchor returns HTTP 5xx error. Checkpoint spooled; backoff retry initiated.
-- **`RC06-NEG-77`**: HTTP 200 returned without cryptographic receipt. Not accepted as acknowledgement.
-- **`RC06-NEG-78`**: Anchor receipt signed by untrusted key not matching `anchorReceiptPublicKeyPath`. Rejected.
-- **`RC06-NEG-79`**: Anchor receipt bound to wrong `checkpointHash`. Receipt rejected.
-- **`RC06-NEG-80`**: Duplicate/conflicting receipt for already acknowledged checkpoint. Receipt rejected.
-- **`RC06-NEG-81`**: Anchor spool queue exceeds `MAX_PENDING_ANCHOR_CHECKPOINTS` (100). Halts privileged ops.
-- **`RC06-NEG-82`**: Anchor spool size exceeds `MAX_ANCHOR_SPOOL_BYTES` (1 MiB). Halts privileged ops.
+- **`RC06-NEG-75`**: Signing key provided via command-line argument (`argv`). Startup fails immediately.
+- **`RC06-NEG-76`**: Signing key provided via ambient environment variable. Startup fails immediately.
+- **`RC06-NEG-77`**: Signing key supplied via remote MCP header or tool argument. Rejected.
+- **`RC06-NEG-78`**: Checkpoint signing key file is a symlink. Key loading rejected.
+- **`RC06-NEG-79`**: Checkpoint signing key file has hard-link count > 1 (`nlink != 1`). Key loading rejected.
+- **`RC06-NEG-80`**: Checkpoint signing key file permissions wider than `0600`. Key loading rejected.
+- **`RC06-NEG-81`**: Checkpoint signing key file owned by different UID. Key loading rejected.
+- **`RC06-NEG-82`**: Checkpoint signing key exceeds `MAX_SIGNING_KEY_BYTES` (4 KiB). Key loading rejected.
+- **`RC06-NEG-83`**: Checkpoint public key or anchor receipt public key trust root is a symlink, hard-linked, non-0600, or non-UID owned. Loading rejected.
 
-### Category 10: Anchor Spool Integrity & Redaction Secrecy (RC06-NEG-83..92)
+### Category 10: Tier 3 External Anchoring, Spool & Receipts (RC06-NEG-84..99)
 
-- **`RC06-NEG-83`**: Anchor spool file is a symlink or hard-linked. Spool loading rejected.
-- **`RC06-NEG-84`**: Tampered persistent anchor spool entry detected during startup. Fails closed without drop.
-- **`RC06-NEG-85`**: Raw `Arc-Session-Token` secret in persistent JSONL. Centrally redacted to `[REDACTED_SECRET]`.
-- **`RC06-NEG-86`**: Raw enrollment one-time secret in persistent JSONL. Centrally redacted.
-- **`RC06-NEG-87`**: Raw HTTP `Authorization` header in persistent JSONL. Centrally redacted.
-- **`RC06-NEG-88`**: Raw PKCS#8 private key block in persistent JSONL. Centrally redacted.
-- **`RC06-NEG-89`**: Raw X.509 certificate PEM block in persistent JSONL. Centrally redacted.
-- **`RC06-NEG-90`**: Raw tool `content` parameter in persistent JSONL. Omitted; byte length recorded.
-- **`RC06-NEG-91`**: Raw tool `patch` parameter in persistent JSONL. Omitted; byte length recorded.
-- **`RC06-NEG-92`**: Raw process `stdout`/`stderr` in persistent JSONL. Omitted; byte counts recorded.
+- **`RC06-NEG-84`**: Partial Tier-3 configuration (e.g. endpoint present without key or vice versa). Startup fails closed.
+- **`RC06-NEG-85`**: External anchor connection attempt over plaintext HTTP. Rejected; HTTPS required.
+- **`RC06-NEG-86`**: External anchor endpoint with embedded credentials or fragment. Startup rejected.
+- **`RC06-NEG-87`**: External anchor request exceeds `ANCHOR_REQUEST_TIMEOUT_MS` (5,000 ms). Timeout enforced; checkpoint spooled.
+- **`RC06-NEG-88`**: External anchor returns HTTP 5xx error. Checkpoint retained in spool; backoff retry initiated.
+- **`RC06-NEG-89`**: HTTP 200 returned without cryptographic receipt. Not accepted as acknowledgement.
+- **`RC06-NEG-90`**: Anchor receipt signed by untrusted key not matching `anchorReceiptPublicKeyPath`. Rejected.
+- **`RC06-NEG-91`**: Anchor receipt bound to wrong `checkpointHash` or wrong `storeId`. Receipt rejected.
+- **`RC06-NEG-92`**: Conflicting receipt identity for an already acknowledged checkpoint. Rejected; enters degraded anchor state.
+- **`RC06-NEG-93`**: Repeat submission for same `checkpointHash` with same valid receipt accepted as idempotent duplicate.
+- **`RC06-NEG-94`**: Anchor spool entry exists without matching checkpoint artifact in `audit-checkpoints.jsonl`. Startup fails closed.
+- **`RC06-NEG-95`**: Checkpoint exists without receipt and spool file missing. Spool file reconstructed during startup before serving.
+- **`RC06-NEG-96`**: Receipt persisted but stale spool file remains after crash. Reconciled cleanly without duplicate acknowledgement.
+- **`RC06-NEG-97`**: Anchor spool queue exceeds `MAX_PENDING_ANCHOR_CHECKPOINTS` (100). Halts privileged ops.
+- **`RC06-NEG-98`**: Anchor spool size exceeds `MAX_ANCHOR_SPOOL_BYTES` (1 MiB). Halts privileged ops.
+- **`RC06-NEG-99`**: Anchor spool directory or file permissions wider than 0700/0600 or symlink. Loading rejected.
 
-### Category 11: Administrative Isolation & Export Integrity (RC06-NEG-93..96)
+### Category 11: Central Redaction & Secrecy Hardening (RC06-NEG-100..104)
 
-- **`RC06-NEG-93`**: Remote MCP tool call attempting audit log deletion or truncation. Rejected with `UNKNOWN_TOOL`.
-- **`RC06-NEG-94`**: Remote MCP tool call attempting manual log rotation. Rejected with `UNKNOWN_TOOL`.
-- **`RC06-NEG-95`**: Evidence export destination directory already exists. Rejected; no overwrite permitted.
-- **`RC06-NEG-96`**: Evidence export exceeding `MAX_EXPORT_BYTES` (1 GiB). Rejected; export halted.
+- **`RC06-NEG-100`**: Raw `Arc-Session-Token` secret in persistent JSONL. Centrally redacted to `[REDACTED_SECRET]`.
+- **`RC06-NEG-101`**: Raw enrollment one-time secret or HTTP `Authorization` header in persistent JSONL. Centrally redacted.
+- **`RC06-NEG-102`**: Raw PKCS#8 private key or X.509 certificate PEM in persistent JSONL. Centrally redacted.
+- **`RC06-NEG-103`**: Raw environment variable values in persistent JSONL. Centrally omitted or masked to byte count.
+- **`RC06-NEG-104`**: Absolute host workspace paths in persistent JSONL. Centrally redacted to `[REDACTED_PATH]` / root hash.
+
+### Category 12: Administrative Isolation & Evidence Export Integrity (RC06-NEG-105..108)
+
+- **`RC06-NEG-105`**: Remote MCP tool call attempting audit log deletion, truncation, or manual rotation. Rejected with `UNKNOWN_TOOL`.
+- **`RC06-NEG-106`**: Evidence export destination directory already exists or attempts overwrite. Rejected.
+- **`RC06-NEG-107`**: Evidence export destination is a symlink or contains symlink parent components. Rejected.
+- **`RC06-NEG-108`**: Evidence export inside audit directory or inside an agent workspace, or exceeding `MAX_EXPORT_BYTES` (1 GiB). Rejected.
 
 ---
 
 ## 31. Threat-to-Control Matrix
 
-| Threat Description                              | Primary Defense Mechanism                          | Enforcement Tier | Negative Controls |
-| :---------------------------------------------- | :------------------------------------------------- | :--------------- | :---------------- |
-| Host user edits historical JSONL records        | SHA-256 hash chaining + Ed25519 signatures         | Tier 1 & 2       | NEG-25..28        |
-| Tail truncation to conceal malicious tool run   | Tier 2 signed checkpoints & Tier 3 anchor receipts | Tier 2 & 3       | NEG-29, 57        |
-| Secret extraction from audit trail              | Centralized pre-hash redaction & minimization      | Tier 1           | NEG-85..92        |
-| Disk exhaustion denial-of-service via log flood | Segment size caps, rotation & bounded budgets      | Tier 1           | NEG-21, 53, 54    |
-| Side-effect execution without audit record      | Pre-dispatch sync & fail-closed execution order    | Tier 1           | NEG-33..38        |
-| Concurrent process audit log corruption         | Exclusive single-writer lockfile (`O_CREAT         | EXCL`)           | Tier 1            | NEG-11, 12, 13 |
-| Host root rewrites local chain & checkpoints    | Tier 3 external anchor cryptographic receipts      | Tier 3           | NEG-74..80        |
-| Remote MCP agent tampers with audit subsystem   | Strict local operator isolation & no MCP tools     | Architecture     | NEG-93, 94        |
-| Signing key exfiltration from environment       | Restricted 0600 file / FD-only key loading         | Tier 2           | NEG-65..72        |
+| Threat Description                              | Primary Defense Mechanism                                 | Enforcement Tier | Negative Controls |
+| :---------------------------------------------- | :-------------------------------------------------------- | :--------------- | :---------------- |
+| Host user edits historical JSONL records        | SHA-256 hash chaining + Ed25519 signatures                | Tier 1 & 2       | NEG-30..35        |
+| Tail truncation to conceal malicious tool run   | Tier 2 signed checkpoints & Tier 3 anchor receipts        | Tier 2 & 3       | NEG-36, 66        |
+| Secret extraction from audit trail              | Centralized pre-hash redaction & minimization             | Tier 1           | NEG-100..104      |
+| Disk exhaustion denial-of-service via log flood | Segment size caps, rotation & bounded budgets             | Tier 1           | NEG-28, 62, 63    |
+| Side-effect execution without audit record      | Pre-dispatch sync & fail-closed execution order           | Tier 1           | NEG-40..45        |
+| Crash after STARTED leaves dangling operation   | Startup reconciliation to RECOVERY_INDETERMINATE          | Tier 1           | NEG-46, 47        |
+| Concurrent process audit log corruption         | Exclusive single-writer lockfile (`O_CREAT \| O_EXCL`)    | Tier 1           | NEG-12, 13, 14    |
+| Host root rewrites local chain & checkpoints    | Tier 3 external anchor cryptographic receipts             | Tier 3           | NEG-85..93        |
+| Remote MCP agent tampers with audit subsystem   | Strict local operator isolation & no MCP tools            | Architecture     | NEG-105           |
+| Signing key exfiltration from environment       | Restricted 0600 file / FD-only key loading                | Tier 2           | NEG-75..82        |
+| Evidence export directory path traversal        | Strict directory export validation & workspace separation | Tool / Operator  | NEG-106..108      |
 
 ---
 
-## 32. Positive Acceptance Flows (Flows 1..20)
+## 32. Positive Acceptance Flows (Flows 1..23)
 
-1. **Flow 1: Fresh Persistent Store Initialization:** Server boots with clean audit directory; creates `audit.lock` and active segment; logs first record (`seq: 1`, `prevHash: 000...000` virtual genesis hash); file permissions verified `0600`.
+1. **Flow 1: Fresh Persistent Store Initialization:** Server boots with clean audit directory; creates `audit-store.json`, `audit.lock`, and active segment; logs first record (`seq: 1`, `prevHash: 000...000` virtual genesis hash); file permissions verified `0600`.
 2. **Flow 2: Standard Stdio Read-Only Tool Execution:** Client calls `read_file`; emits durable `STARTED`, executes read, emits durable `COMPLETED`; both records bound by `operationId`.
 3. **Flow 3: Standard Stdio Mutation Tool Execution:** Client calls `create_file`; emits durable `STARTED`, executes mutation, emits durable `COMPLETED`.
 4. **Flow 4: Remote Authenticated Gateway Tool Execution:** Remote client executes tool; actor metadata (deviceId, spkiPin, mcpSessionId) recorded in unified chain; zero secrets leaked.
@@ -988,52 +1264,59 @@ All 96 controls are contiguous, mandatory, and directly testable:
 9. **Flow 9: Gateway Restart & Hash Continuity:** Server restarts against non-empty store; reads terminal record; next record increments sequence and links `previousRecordHash`.
 10. **Flow 10: Size-Based Rotation Trigger:** Active segment reaches 10 MiB; rotates to timestamped `.jsonl`; new segment begins with sequence continuity.
 11. **Flow 11: Time-Based Operational Rotation Trigger:** Clock passes 24 hours; segment rotates cleanly.
-12. **Flow 12: Compressed Archive Generation & Verified Deletion:** Rotated segment compressed to `.jsonl.gz`; uncompressed file verified before removal; permissions verified `0600`.
-13. **Flow 13: Tier 2 Checkpoint Artifact Generation:** Chain reaches 1,000 records; generates signed checkpoint in `audit-checkpoints.jsonl`; verifies Ed25519 signature.
+12. **Flow 12: Compressed Archive Generation & Verified Deletion:** Rotated segment compressed to `.jsonl.gz`; uncompressed file verified via streaming decompression before removal; permissions verified `0600`.
+13. **Flow 13: Tier 2 Checkpoint Artifact Generation:** Chain reaches 1,000 records; generates signed checkpoint in `audit-checkpoints.jsonl` with `storeId`; verifies Ed25519 signature.
 14. **Flow 14: Offline Public-Key Checkpoint Verification:** Standalone verifier validates checkpoint signature using public key without accessing private key.
 15. **Flow 15: Tier 3 External Anchor Dispatch & Cryptographic Receipt:** Checkpoint transmitted via HTTPS to anchor service; valid signed receipt received and recorded in `audit-anchors.jsonl`.
-16. **Flow 16: Anchor Outage Spooling & Automatic Backoff Catch-Up:** Anchor server temporarily down; checkpoints queued in `audit-anchor-spool.jsonl`; server recovers and catches up.
-17. **Flow 17: Local Operator `arc audit status`:** Operator executes CLI status command; receives accurate summary of store health and sequence count.
+16. **Flow 16: Anchor Outage Spooling & Automatic Backoff Catch-Up:** Anchor server temporarily down; checkpoints queued in `anchor-spool/<checkpointHash>.json`; server recovers and catches up.
+17. **Flow 17: Local Operator `arc audit status`:** Operator executes CLI status command; receives accurate summary of store health, store ID, sequence count, and recoveries.
 18. **Flow 18: Local Operator `arc audit inspect`:** Operator pages through recent records; receives redacted records within bounded limit.
 19. **Flow 19: Universal Pre-Dispatch Durability:** Privileged read and privileged mutation each demonstrate durable `STARTED` -> subsystem dispatch -> durable `COMPLETED`, bound by `operationId`.
 20. **Flow 20: Full Restart Verification of Retained History:** Server restarts with compressed archives, active segment, checkpoints, and receipts; verifies full retained history before serving.
+21. **Flow 21: Crash-Indeterminate Lifecycle Reconciliation:** Simulate crash after durable `STARTED` before terminal record; on restart, engine detects dangling `operationId`, appends durable `RECOVERY_INDETERMINATE` record, and begins privileged service only after durable sync succeeds.
+22. **Flow 22: Standalone Offline Verification Command:** Run `arc audit verify` against multi-segment history with checkpoints, receipts when enabled, and compressed archives; full verification succeeds using public keys only.
+23. **Flow 23: Deterministic Evidence Export Verification:** Run `arc audit export --output <new-dir>`; verify directory bundle structure, recompute every manifest digest, verify selected sequence range and checkpoint signatures, and confirm no private key was read.
 
 ---
 
 ## 33. Historical Documentation Reconciliation
 
-| Historical Document & Section           | Stale / Ambiguous Claim                            | RC-06 Normative Specification                                                                  |
-| :-------------------------------------- | :------------------------------------------------- | :--------------------------------------------------------------------------------------------- |
-| `audit-model.md §5`                     | Ambient default path `~/.cesspace-arc/audit/`      | Configured via `audit.directory` with strict `0700` permissions, UID check, symlink rejection. |
-| `audit-model.md §5`                     | 50 MB segment rotation threshold                   | Reduced to **10 MiB** to optimize in-memory verification and streaming hash performance.       |
-| `audit-model.md §4.2` & `ADR-0004 §2.3` | Tier 2: "Signed HMAC / Private Key"                | Resolved normatively to **asymmetric digital signatures (Ed25519 / RFC 8032)**.                |
-| `audit-model.md §4.2`                   | "Supervisor daemon signs checkpoints"              | Integrated in-process cryptographic engine signing via secure 0600 key file or inherited FD.   |
-| `audit-model.md §3.2` & `ADR-0004 §2.2` | "Entropy Analysis" for credential detection        | **Explicitly rejected** due to false positives; replaced with allowlist, key-names, & regex.   |
-| `audit-model.md §2`                     | `sequenceNumber` described as "per session"        | Unified into **one process-wide monotonic sequence space** across all sessions and gateway.    |
-| `audit-model.md §2`                     | Audit schema lacks approval & gateway metadata     | Formally incorporated `AuditApprovalMetadata` and `AuditGatewayMetadata` from RC-04 & RC-05.   |
-| `package-ownership.md`                  | "Evidence packager" assigned to `packages/audit`   | Assigned to `packages/audit` engine with CLI exposure in `apps/cli` (`arc audit export`).      |
-| `rc05-scope-acceptance.md §16`          | Persistent storage and external anchoring deferred | Fully implemented and closed by RC-06.                                                         |
-| Prior Scope Draft                       | Self-referential full-line record hash             | Resolved to explicit hash preimage omitting `integrity.recordHash`.                            |
-| Prior Scope Draft                       | Synthetic "genesis record" terminology             | Corrected to virtual zero genesis previous hash.                                               |
-| Prior Scope Draft                       | Automatic retention deletion on anchor             | Removed; capacity limits are fail-closed; no auto-deletion of raw evidence in RC-06.           |
-| Prior Scope Draft                       | Tar/ZIP evidence export                            | Resolved to deterministic directory bundle export (no external compression libraries).         |
-| Prior Scope Draft                       | `fcntl/flock` portable locking                     | Resolved to atomic `O_CREAT                                                                    | O_EXCL` lockfile creation. |
-| Prior Scope Draft                       | Bearer token anchor authentication                 | Removed; sender/receiver Ed25519 cryptographic signatures provide mutual authenticity.         |
+| Historical Document & Section           | Stale / Ambiguous Claim                            | RC-06 Normative Specification                                                                |
+| :-------------------------------------- | :------------------------------------------------- | :------------------------------------------------------------------------------------------- |
+| `audit-model.md §5`                     | Ambient default path `~/.cesspace-arc/audit/`      | Resolved to `path.join(os.homedir(), '.cesspace-arc', 'audit')`; literal `~` rejected.       |
+| `audit-model.md §5`                     | 50 MB segment rotation threshold                   | Reduced to **10 MiB** to optimize in-memory verification and streaming hash performance.     |
+| `audit-model.md §4.2` & `ADR-0004 §2.3` | Tier 2: "Signed HMAC / Private Key"                | Resolved normatively to **asymmetric digital signatures (Ed25519 / RFC 8032)**.              |
+| `audit-model.md §4.2`                   | "Supervisor daemon signs checkpoints"              | Integrated in-process cryptographic engine signing via secure 0600 key file or inherited FD. |
+| `audit-model.md §3.2` & `ADR-0004 §2.2` | "Entropy Analysis" for credential detection        | **Explicitly rejected** due to false positives; replaced with allowlist, key-names, & regex. |
+| `audit-model.md §2`                     | `sequenceNumber` described as "per session"        | Unified into **one process-wide monotonic sequence space** across all sessions and gateway.  |
+| `audit-model.md §2`                     | Audit schema lacks approval & gateway metadata     | Formally incorporated `AuditApprovalMetadata` and `AuditGatewayMetadata` from RC-04 & RC-05. |
+| `package-ownership.md`                  | "Evidence packager" assigned to `packages/audit`   | Assigned to `packages/audit` engine with CLI exposure in `apps/cli` (`arc audit export`).    |
+| `rc05-scope-acceptance.md §16`          | Persistent storage and external anchoring deferred | Fully implemented and closed by RC-06.                                                       |
+| Prior Scope Draft                       | Self-referential full-line record hash             | Resolved to explicit hash preimage omitting `integrity.recordHash`.                          |
+| Prior Scope Draft                       | Synthetic "genesis record" terminology             | Corrected to virtual zero genesis previous hash.                                             |
+| Prior Scope Draft                       | Automatic retention deletion on anchor             | Removed; capacity limits are fail-closed; no auto-deletion of raw evidence in RC-06.         |
+| Prior Scope Draft                       | Tar/ZIP evidence export                            | Resolved to deterministic directory bundle export (no external compression libraries).       |
+| Prior Scope Draft                       | `fcntl/flock` portable locking                     | Resolved to atomic `O_CREAT \| O_EXCL` lockfile creation.                                    |
+| Prior Scope Draft                       | Bearer token anchor authentication                 | Removed; sender/receiver Ed25519 cryptographic signatures provide mutual authenticity.       |
+| Prior Scope Draft                       | Spool JSONL file                                   | Resolved to crash-recoverable spool directory `anchor-spool/<checkpointHash>.json`.          |
+| Prior Scope Draft                       | Unspecified crash outcome for dangling operations  | Resolved to explicit `RECOVERY_INDETERMINATE` reconciliation record on startup.              |
+| Prior Scope Draft                       | Unpinned store identity                            | Resolved to protected `audit-store.json` metadata artifact pinning `storeId` and signer.     |
+| Prior Scope Draft                       | Decompressing full 10 MiB segment in memory        | Corrected to streaming gzip decompression and streaming verification.                        |
 
 ---
 
 ## 34. Implementation Breakdown (Tasks 1..8)
 
-| #   | Title                                               | Scope                                                            | Expected Files                                                                                                                | Invariants & Quality Standards                  | Controls         | Depends On | Stop Boundary                     |
-| :-- | :-------------------------------------------------- | :--------------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------- | :---------------------------------------------- | :--------------- | :--------- | :-------------------------------- |
-| 1   | Persistent Append Storage, Protocol & Lockfile      | Protocol schema V1, disk append engine, 0700/0600, lockfile      | `packages/protocol/src/audit.ts`, `packages/audit/src/storage.ts`, `packages/audit/src/lock.ts`, `tests/rc06-storage.test.js` | Inv-13, O_CREAT\|EXCL, hash preimage rules      | NEG-01..22       | None       | Storage tests pass cleanly        |
-| 2   | Restart Recovery, Torn Tails & Chain Continuity     | Virtual genesis, restart continuation, torn-tail recovery        | `packages/audit/src/recovery.ts`, `tests/rc06-recovery.test.js`                                                               | Strict continuity, no sequence reset            | NEG-23..32       | Task 1     | Recovery tests pass cleanly       |
-| 3   | Segment Rotation, Compression & Storage Caps        | 10 MiB / 24h rotation, `.jsonl.gz`, fail-closed retention budget | `packages/audit/src/rotation.ts`, `tests/rc06-rotation.test.js`                                                               | Safe uncompressed delete, no auto-delete        | NEG-39..54       | Task 2     | Rotation tests pass cleanly       |
-| 4   | Tier 2 Ed25519 Checkpoint Artifacts & Key Security  | Ed25519 signing engine, key security, checkpoint artifact file   | `packages/audit/src/checkpoint.ts`, `tests/rc06-checkpoint.test.js`                                                           | RFC 8032, no key in argv/env, public key verify | NEG-55..73       | Task 3     | Checkpoint tests pass cleanly     |
-| 5   | Tier 3 External Anchoring Client, Spool & Receipts  | HTTPS anchor client, spool queue, retry backoff, signed receipts | `packages/audit/src/anchor.ts`, `tests/rc06-anchor.test.js`                                                                   | Bounded spool, backpressure, no bearer tokens   | NEG-74..84       | Task 4     | Anchor tests pass cleanly         |
-| 6   | Universal Lifecycle & Full-History Startup Engine   | Wire `ArcMcpServer`, `STARTED`/`COMPLETED` sync, full verify     | `apps/mcp-server/src/index.ts`, `tests/rc06-runtime-durability.test.js`                                                       | INV-13, fail-closed on read/mutation failures   | NEG-33..38       | Task 5     | Runtime tests pass cleanly        |
-| 7   | Local Operator CLI & Standalone Offline Verifier    | `arc audit status/verify/inspect/export` & directory bundle pack | `apps/cli/src/audit.ts`, `packages/audit/src/verify.ts`, `tests/rc06-cli-verifier.test.js`                                    | Public key only verifier, directory export      | NEG-93..96       | Task 6     | CLI & verifier tests pass cleanly |
-| 8   | Secrecy Hardening, Acceptance & Public Version Bump | Central redaction tests, 96 negative controls, 20 flows, bump    | `tests/rc06-negative-controls.test.js`, `tests/rc06-positive-flows.test.js`, `verify-rc06`                                    | Version 0.6.0-rc06, all 96 controls pass        | NEG-85..92 (All) | Task 7     | All 20 quality gates pass         |
+| #   | Title                                                | Scope                                                                                                              | Expected Files                                                                                                                                                  | Invariants & Quality Standards                           | Controls               | Depends On | Stop Boundary                     |
+| :-- | :--------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------- | :------------------------------------------------------- | :--------------------- | :--------- | :-------------------------------- |
+| 1   | Persistent Append Storage, Protocol, Metadata & Lock | Protocol schema V1, `AuditStoreMetadataV1`, disk append engine, 0700/0600, lockfile, POSIX platform capability     | `packages/protocol/src/audit.ts`, `packages/audit/src/storage.ts`, `packages/audit/src/metadata.ts`, `packages/audit/src/lock.ts`, `tests/rc06-storage.test.js` | Inv-13, O_CREAT\|EXCL, hash preimage, store metadata     | NEG-01..29             | None       | Storage tests pass cleanly        |
+| 2   | Restart Recovery, Torn Tails & Dangling Operations   | Virtual genesis, restart continuation, torn-tail recovery, dangling STARTED reconciliation, cursors                | `packages/audit/src/recovery.ts`, `tests/rc06-recovery.test.js`                                                                                                 | Strict continuity, RECOVERY_INDETERMINATE append         | NEG-30..39, 46..47     | Task 1     | Recovery tests pass cleanly       |
+| 3   | Segment Rotation, Streaming Compression & Budget     | 10 MiB / 24h rotation, streaming `.jsonl.gz`, fail-closed retention budget, bounded ring cache                     | `packages/audit/src/rotation.ts`, `tests/rc06-rotation.test.js`                                                                                                 | Streaming verification, no auto-delete, 256-cache        | NEG-48..63             | Task 2     | Rotation tests pass cleanly       |
+| 4   | Tier 2 Ed25519 Checkpoint Artifacts & Key Authority  | Ed25519 signing engine, key security, trust roots, `AuditCheckpointV1`, storeId binding, checkpoint artifact file  | `packages/audit/src/checkpoint.ts`, `tests/rc06-checkpoint.test.js`                                                                                             | RFC 8032, no key in argv/env, public key verify, storeId | NEG-64..83             | Task 3     | Checkpoint tests pass cleanly     |
+| 5   | Tier 3 External Anchoring Client, Spool & Receipts   | Optional anchor mode, HTTPS client, timeout, spool directory, retry/idempotency, `AnchorReceiptV1`, crash recovery | `packages/audit/src/anchor.ts`, `tests/rc06-anchor.test.js`                                                                                                     | Bounded spool dir, backpressure, signed receipts         | NEG-84..99             | Task 4     | Anchor tests pass cleanly         |
+| 6   | Universal Lifecycle & Full-History Startup Engine    | Wire `ArcMcpServer`, `STARTED`/`COMPLETED` sync, full-history verify, fail-closed DEGRADED_AUDIT_FAILURE, health   | `apps/mcp-server/src/index.ts`, `tests/rc06-runtime-durability.test.js`                                                                                         | INV-13, fail-closed on read/mutation, health status      | NEG-40..45             | Task 5     | Runtime tests pass cleanly        |
+| 7   | Local Operator CLI & Standalone Offline Verifier     | `arc audit status/verify/inspect/export`, directory bundle pack, path isolation                                    | `apps/cli/src/audit.ts`, `packages/audit/src/verify.ts`, `packages/audit/src/export.ts`, `tests/rc06-cli-verifier.test.js`                                      | Public key only verifier, directory export bounds        | NEG-105..108           | Task 6     | CLI & verifier tests pass cleanly |
+| 8   | Secrecy Hardening, Acceptance & Public Version Bump  | Central redaction, env/workspace path masking, 108 negative controls, 23 flows, verify script, version bump        | `tests/rc06-negative-controls.test.js`, `tests/rc06-positive-flows.test.js`, `scripts/verify-rc06.sh`                                                           | Version 0.6.0-rc06, all 108 controls & 23 flows pass     | NEG-100..104 (All 108) | Task 7     | All quality gates pass            |
 
 ---
 
@@ -1041,23 +1324,36 @@ All 96 controls are contiguous, mandatory, and directly testable:
 
 RC-06 is complete and ready for merge when:
 
-1. **Persistent Single-Chain Storage:** All audit records are written to canonical JSONL files with sequential SHA-256 hash chaining under schema V1.
-2. **Universal Lifecycle Durability:** Pre-dispatch audit syncing (`STARTED` phase) satisfies INV-13 for all reads and mutations; torn crash tails are safely recovered without history corruption.
-3. **Filesystem Security & Exclusivity:** Auditing operates strictly within owner-only (`0700`/`0600`) directories protected by exclusive `O_CREAT | O_EXCL` writer locks.
-4. **Rotation & Compression:** Active segments rotate deterministically at 10 MiB or 24h and compress to `.jsonl.gz` after verified decompression.
-5. **Storage Budget Bounds:** Retention limits prevent log-saturation DoS with zero automatic deletion of raw evidence.
-6. **Tier 2 Signed Checkpoints:** Checkpoint artifacts signed with Ed25519 are recorded in `audit-checkpoints.jsonl` every 1,000 records or upon segment rotation.
-7. **Tier 3 External Anchoring:** Signed checkpoints are dispatched over HTTPS to independent anchors with bounded spooling, backpressure, and verified cryptographic receipts.
-8. **Full-History Startup Verification:** Startup verifies all retained archives, uncompressed segments, and cryptographic links before serving MCP tools.
-9. **Bounded Production Memory:** Production logger holds bounded cursor and 256-record ring cache; all heavy operations stream from disk.
-10. **Offline Verifier:** Standalone CLI tool validates full history and checkpoint signatures using public keys only.
-11. **Local Operator Interface:** `arc audit status`, `verify`, `inspect`, and directory-bundle `export` operate locally without exposing remote MCP endpoints.
-12. **Universal Redaction:** Central pre-hash redaction guarantees that secrets, tokens, keys, and absolute paths never reach persistent logs.
-13. **Negative Controls:** All 96 frozen negative controls (`RC06-NEG-01..96`) are implemented, contiguous, and passing.
-14. **Positive Flows:** All 20 integration flows are implemented and verified.
-15. **Verification Script:** `scripts/verify-rc06.sh` executes all quality gates cleanly.
-16. **CI Passes:** Monorepo tests, lint, formatting, typecheck, doc links, secret scanning, and dependency audit pass with zero failures.
-17. **Public Version:** Version bumped to `0.6.0-rc06` and health stage reports `RC-06`.
+1. **Persistent canonical V1 single-chain audit storage:** All audit records are written to canonical JSONL files with sequential SHA-256 hash chaining under schema V1.
+2. **Universal durable lifecycle for reads and mutations:** Pre-dispatch audit syncing (`STARTED` phase) satisfies INV-13 for all reads and mutations; terminal outcomes recorded via `COMPLETED` or `DENIED`.
+3. **Crash-indeterminate operation reconciliation:** Unfinished `STARTED` operations are reconciled on startup with durable `RECOVERY_INDETERMINATE` records before privileged tool dispatch begins.
+4. **Secure store metadata and pinned checkpoint identity:** Fresh audit stores initialize `audit-store.json` with immutable `storeId` and pinned checkpoint public key fingerprint.
+5. **Secure filesystem authority and Linux/POSIX primitive enforcement:** Auditing operates strictly within owner-only (`0700`/`0600`) directories protected by exclusive `O_CREAT | O_EXCL` writer locks and POSIX platform primitives.
+6. **Full-history startup verification:** Startup verifies all retained archives, uncompressed segments, checkpoints, and receipts before serving MCP tools.
+7. **Streaming rotation/compression verification:** Active segments rotate deterministically at 10 MiB or 24h and compress to `.jsonl.gz` after streaming verification.
+8. **Bounded production memory:** Production logger holds bounded cursor and 256-record ring cache; all verification, inspection, and export procedures stream from disk.
+9. **Zero automatic raw-evidence deletion:** Retention limits prevent log-saturation DoS with zero automatic deletion or wrapping of raw evidence.
+10. **Ed25519 checkpoint artifacts:** Checkpoint artifacts signed with Ed25519 are recorded in `audit-checkpoints.jsonl` every 1,000 records or upon segment rotation.
+11. **Tier-3 anchor implementation with signed receipts and deterministic crash recovery:** Signed checkpoints are dispatched over HTTPS to independent anchors with crash-recoverable spool directory, backpressure, and verified cryptographic receipts.
+12. **Optional deployment semantics for Tier 3 with honest health/security claims:** Anchor mode is selectable (`DISABLED` vs `ENABLED`); disabled mode reports no external anchoring and claims no Tier-3 protections.
+13. **Offline verifier:** Standalone CLI tool validates full history and checkpoint signatures using public keys only.
+14. **Local-only audit status/verify/inspect/export:** `arc audit status`, `verify`, `inspect`, and `export` operate locally without exposing remote MCP endpoints.
+15. **Deterministic evidence-directory export:** Generates self-contained directory bundles with canonical `manifest.json` and strict destination path isolation.
+16. **Central redaction/secrecy:** Central pre-hash redaction guarantees that secrets, tokens, keys, raw environment variables, and absolute paths never reach persistent logs.
+17. **All 108 negative controls contiguous and passing:** Every control from `RC06-NEG-01` through `RC06-NEG-108` is implemented, contiguous, and verified.
+18. **All 23 positive acceptance flows passing:** Every flow from Flow 1 through Flow 23 is implemented and verified.
+19. **Complete RC-01 through RC-05 regression green:** Existing unit, integration, and gateway test suites pass cleanly.
+20. **`scripts/verify-rc06.sh`:** Complete verification script implemented, passing, and runnable.
+21. **`pnpm run verify:rc06`:** Package script registered and passing cleanly.
+22. **RC-06 final integration report written and accurate:** Comprehensive integration report documenting final architecture, evidence, and verification.
+23. **Public version `0.6.0-rc06`; health stage `RC-06`:** Version bumped and health metadata updated.
+24. **Exact-head feature push CI green:** GitHub Actions push-CI passes cleanly on feature head.
+25. **Final PR opened from reviewed feature head to `main`:** Formal pull request created with verified commits and diff.
+26. **PR CI green including Dependency Review:** PR validation passes all checks including GitHub Dependency Review.
+27. **Independent final PR review:** PR receives independent sign-off prior to merge.
+28. **Merge without unreviewed history mutation:** Merged to `main` preserving exact commit history.
+29. **Exact merge-head `main` CI green:** Post-merge CI on `main` passes cleanly.
+30. **RC-06 closure only after post-merge independent verification:** Formal milestone closure following independent post-merge audit.
 
 ---
 
