@@ -67,6 +67,8 @@ import {
 } from '../apps/mcp-server/dist/remote-resource-limits.js';
 import {
   BODY_READ_TIMEOUT_MS,
+  HEADER_READ_CHECK_INTERVAL_MS,
+  HEADER_READ_TIMEOUT_MS,
   MAX_REMOTE_BODY_BYTES,
   MAX_REQUEST_HEADER_BYTES,
   MAX_REQUEST_TARGET_BYTES,
@@ -77,6 +79,8 @@ import {
   readBoundedRequestBody,
   requestTargetBytes,
   resolveBodyReadTimeoutMs,
+  resolveHeaderReadCheckIntervalMs,
+  resolveHeaderReadTimeoutMs,
 } from '../apps/mcp-server/dist/remote-request-bounds.js';
 import {
   RemoteExecutionBridge,
@@ -2073,6 +2077,242 @@ describe('RC-05 Task 7: §20 bounds enforced at the gateway', () => {
     }
   });
 
+  test('RC05-NEG-61: an incomplete header block is aborted by the header-read deadline', async () => {
+    // §20 slowloris, HEADER phase. The header block is NEVER completed, so the
+    // request handler, the router, and the body reader are none of them reached:
+    // the only mechanism that can end this connection is the header-read bound.
+    //
+    // The seam shortens the frozen 10 s so the case runs quickly; the TOTAL
+    // request deadline is left at its production 60 s, so an abort that arrives
+    // promptly cannot be the total deadline expiring.
+    const layerA = nonInterferingLayerA();
+    const layerB = frozenLayerB(4096);
+    let enrollmentCalls = 0;
+    const { gateway, port } = await startGateway(
+      {},
+      {
+        admissionLimiterForTests: layerA,
+        layerBLimiterForTests: layerB,
+        enrollmentManager: {
+          completeBySpki: () => {
+            enrollmentCalls += 1;
+            return { ok: false };
+          },
+        },
+        headerReadTimeoutMsForTests: 150,
+      },
+    );
+    try {
+      assert.equal(gateway.totalRequestTimeoutMs, TOTAL_REQUEST_TIMEOUT_MS);
+      assert.equal(gateway.headerReadTimeoutMs, 150);
+
+      // (1) A REAL TLS 1.3 mutual-authentication handshake completes. The server
+      // only reaches its post-handshake admission once it has validated the
+      // client certificate, so a held live-connection slot proves the handshake
+      // was accepted rather than merely attempted.
+      const socket = tls.connect({
+        host: '127.0.0.1',
+        port,
+        servername: publicHostname,
+        ca: [fs.readFileSync(pki.trustedCaCertPath)],
+        ...clientMaterial(),
+        rejectUnauthorized: false,
+      });
+      await new Promise((resolve) => socket.once('secureConnect', resolve));
+      assert.equal(
+        await waitFor(() => layerA.getLiveConnectionCount() === 1, 1500),
+        true,
+        'the mTLS connection was admitted',
+      );
+
+      // (2)/(3) The request head is STARTED and deliberately left incomplete: a
+      // request line and one header, with no terminating blank line, and no
+      // further bytes ever written. This is exactly the slowloris shape.
+      const startedAt = Date.now();
+      socket.write('POST /enroll/complete HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Pad: ');
+
+      const outcome = await new Promise((resolve) => {
+        let raw = '';
+        let settled = false;
+        const finish = (result) => {
+          if (settled) return;
+          settled = true;
+          resolve(result);
+        };
+        socket.on('data', (chunk) => {
+          raw += chunk.toString('utf8');
+        });
+        // A server-side abort destroys the socket, which surfaces on this side
+        // as `close` (and possibly `error` first).
+        socket.on('close', () => finish({ raw, elapsedMs: Date.now() - startedAt }));
+        socket.on('error', () => {});
+        setTimeout(
+          () => finish({ raw, elapsedMs: Date.now() - startedAt, budget: true }),
+          6000,
+        ).unref();
+      });
+
+      // (5) The connection was ABORTED, and by the header-read deadline rather
+      // than by the test budget or the 60 s total request deadline.
+      assert.equal(outcome.budget, undefined, 'the abort came from a deadline, not the budget');
+      assert.equal(
+        outcome.elapsedMs >= 150,
+        true,
+        `aborted no earlier than the deadline: ${outcome.elapsedMs} ms`,
+      );
+      assert.equal(
+        outcome.elapsedMs < 5_000,
+        true,
+        `aborted long before the 60 s total request deadline: ${outcome.elapsedMs} ms`,
+      );
+
+      // The peer never receives a routed answer. Node refuses the stalled header
+      // block itself (408) and destroys the socket; it never produces any of the
+      // gateway's endpoint bodies, because no endpoint ever ran.
+      assert.equal(
+        outcome.raw === '' || outcome.raw.startsWith('HTTP/1.1 408 '),
+        true,
+        `unexpected bytes from a header-timeout abort: ${JSON.stringify(outcome.raw)}`,
+      );
+      assert.equal(outcome.raw.includes('Enrollment failed'), false);
+      assert.equal(outcome.raw.includes('UNAUTHENTICATED'), false);
+
+      // (6) The request handler and the router were NEVER reached. Layer B's
+      // `consume` is the first accounting step `handleRequest` performs, and the
+      // enrollment verifier sits behind routing, so neither having been touched
+      // is a direct proof that no complete request ever existed.
+      assert.equal(layerB.getRetainedKeyCount(), 0, 'the handler never ran');
+      assert.equal(enrollmentCalls, 0, 'the router never ran');
+      assert.equal(gateway.getEnrolledDeviceCount(), 0);
+
+      // (7) Connection and admission state are RELEASED. Both slots an admitted
+      // connection holds — the in-flight handshake slot and the live connection
+      // slot — return to zero, so the abort leaves no leaked capacity behind.
+      assert.equal(
+        await waitFor(
+          () => layerA.getLiveConnectionCount() === 0 && layerA.getInFlightHandshakeCount() === 0,
+          3000,
+        ),
+        true,
+        'the admission slots were released after the abort',
+      );
+
+      // The capacity is genuinely reusable: the same peer is admitted again.
+      const next = tls.connect({
+        host: '127.0.0.1',
+        port,
+        servername: publicHostname,
+        ca: [fs.readFileSync(pki.trustedCaCertPath)],
+        ...clientMaterial(),
+        rejectUnauthorized: false,
+      });
+      await new Promise((resolve) => next.once('secureConnect', resolve));
+      assert.equal(await waitFor(() => layerA.getLiveConnectionCount() === 1, 1500), true);
+      next.destroy();
+      assert.equal(await waitFor(() => layerA.getLiveConnectionCount() === 0, 1500), true);
+    } finally {
+      await gateway.stop();
+    }
+  });
+
+  test('RC05-NEG-61: a longer-than-production seam cannot weaken the frozen 10 s', async () => {
+    // Every one of these seams is at or above the frozen bound, or is not a
+    // positive integer at all. None of them may widen the header-read window:
+    // the resolved deadline stays the frozen 10 s and the check granularity
+    // stays derived from it.
+    for (const seam of [
+      HEADER_READ_TIMEOUT_MS,
+      HEADER_READ_TIMEOUT_MS + 1,
+      60_000,
+      600_000,
+      Number.MAX_SAFE_INTEGER,
+      0,
+      -1,
+      1.5,
+      Number.NaN,
+      Number.POSITIVE_INFINITY,
+    ]) {
+      assert.equal(
+        resolveHeaderReadTimeoutMs(seam),
+        HEADER_READ_TIMEOUT_MS,
+        `the seam ${seam} must not widen the header-read deadline`,
+      );
+      const { gateway } = await startGateway(
+        {},
+        { admissionLimiterForTests: nonInterferingLayerA(), headerReadTimeoutMsForTests: seam },
+      );
+      try {
+        assert.equal(gateway.headerReadTimeoutMs, HEADER_READ_TIMEOUT_MS, `seam ${seam}`);
+        assert.equal(gateway.headerReadCheckIntervalMs, HEADER_READ_CHECK_INTERVAL_MS);
+      } finally {
+        await gateway.stop();
+      }
+    }
+
+    // Production, with no seam at all: the frozen 10 s and its 1 s granularity.
+    assert.equal(resolveHeaderReadTimeoutMs(undefined), 10_000);
+    assert.equal(HEADER_READ_TIMEOUT_MS, 10_000);
+    assert.equal(HEADER_READ_CHECK_INTERVAL_MS, 1_000);
+    assert.equal(resolveHeaderReadCheckIntervalMs(HEADER_READ_TIMEOUT_MS), 1_000);
+    // A shortened deadline tightens the sweep with it, never the reverse.
+    assert.equal(resolveHeaderReadCheckIntervalMs(150), 150);
+    assert.equal(resolveHeaderReadCheckIntervalMs(60_000), 1_000);
+
+    // LIVE proof, at the real frozen 10 s: with a 600 s seam supplied, an
+    // incomplete header block is still aborted at ~10 s. If the seam had been
+    // honoured, this connection would have stayed open for ten minutes.
+    const { gateway, port } = await startGateway(
+      {},
+      {
+        admissionLimiterForTests: nonInterferingLayerA(),
+        headerReadTimeoutMsForTests: 600_000,
+      },
+    );
+    try {
+      assert.equal(gateway.headerReadTimeoutMs, 10_000, 'the 600 s seam was ignored');
+      assert.notEqual(gateway.headerReadTimeoutMs, 600_000);
+
+      const socket = tls.connect({
+        host: '127.0.0.1',
+        port,
+        servername: publicHostname,
+        ca: [fs.readFileSync(pki.trustedCaCertPath)],
+        ...clientMaterial(),
+        rejectUnauthorized: false,
+      });
+      await new Promise((resolve) => socket.once('secureConnect', resolve));
+      const startedAt = Date.now();
+      socket.write('POST /enroll/complete HTTP/1.1\r\nHost: 127.0.0.1\r\nX-Pad: ');
+
+      const outcome = await new Promise((resolve) => {
+        let settled = false;
+        const finish = (result) => {
+          if (settled) return;
+          settled = true;
+          resolve(result);
+        };
+        socket.on('close', () => finish({ elapsedMs: Date.now() - startedAt }));
+        socket.on('data', () => {});
+        socket.on('error', () => {});
+        setTimeout(
+          () => finish({ elapsedMs: Date.now() - startedAt, budget: true }),
+          14_000,
+        ).unref();
+      });
+
+      assert.equal(outcome.budget, undefined, 'the connection was aborted, not left open');
+      // Aborted at the frozen 10 s, plus at most one 1 s sweep — and nowhere
+      // near the 600 s the seam asked for, nor the 60 s total request deadline.
+      assert.equal(
+        outcome.elapsedMs >= 10_000 && outcome.elapsedMs < 13_000,
+        true,
+        `aborted at the frozen 10 s bound, not the 600 s seam: ${outcome.elapsedMs} ms`,
+      );
+    } finally {
+      await gateway.stop();
+    }
+  });
+
   test('RC05-NEG-60: the gateway wires the frozen parser bounds', () => {
     const source = fs.readFileSync(
       new URL('../apps/mcp-server/src/remote-gateway.ts', import.meta.url),
@@ -2082,7 +2322,20 @@ describe('RC-05 Task 7: §20 bounds enforced at the gateway', () => {
     // could drift, and not as anything a configuration could supply.
     assert.equal(source.includes('maxHeaderSize: MAX_REQUEST_HEADER_BYTES'), true);
     assert.equal(source.includes('requestTimeout: TOTAL_REQUEST_TIMEOUT_MS'), true);
-    assert.equal(source.includes('headersTimeout: TOTAL_REQUEST_TIMEOUT_MS'), true);
+    // §20/RC05-NEG-61: the header-read deadline is its OWN frozen 10 s bound, not
+    // the 60 s total request deadline reused. It is supplied together with the
+    // sweep interval that makes it enforceable, because `headersTimeout` alone
+    // is evaluated on a periodic sweep rather than at the deadline itself.
+    assert.equal(source.includes('headersTimeout: this.headerReadTimeoutMs'), true);
+    assert.equal(
+      source.includes('headersTimeout: TOTAL_REQUEST_TIMEOUT_MS'),
+      false,
+      'the header phase must not be bounded by the 60 s total request deadline',
+    );
+    assert.equal(
+      source.includes('connectionsCheckingInterval: this.headerReadCheckIntervalMs'),
+      true,
+    );
     assert.equal(source.includes('handshakeTimeout: this.handshakeTimeoutMs'), true);
     // No bound is read from the environment, a file, or a request.
     for (const forbidden of ['process.env', 'JSON.parse', 'readFileSync']) {

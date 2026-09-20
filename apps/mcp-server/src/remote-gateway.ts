@@ -63,6 +63,8 @@ import {
   TOTAL_REQUEST_TIMEOUT_MS,
   hasContentEncoding,
   requestTargetBytes,
+  resolveHeaderReadCheckIntervalMs,
+  resolveHeaderReadTimeoutMs,
 } from './remote-request-bounds.js';
 
 /**
@@ -144,6 +146,11 @@ export interface RemoteGatewayOptions {
    * Never populated from configuration, the environment, or a request.
    */
   totalRequestTimeoutMsForTests?: number;
+  /**
+   * @internal Test-only header-read deadline. May only SHORTEN the frozen 10 s.
+   * Never populated from configuration, the environment, or a request.
+   */
+  headerReadTimeoutMsForTests?: number;
   /**
    * The pending-enrollment authority used by `POST /enroll/complete`.
    *
@@ -237,6 +244,25 @@ export class RemoteGateway {
    * deadline and the 10 s body-read deadline.
    */
   public readonly totalRequestTimeoutMs: number;
+  /**
+   * Resolved header-read deadline in milliseconds.
+   *
+   * Always the frozen 10 s header-read bound in production; only the internal
+   * test seam may resolve it lower. This is the slowloris bound for the HEADER
+   * phase and is enforced by the HTTP parser before any handler runs, so an
+   * incomplete header block is aborted at 10 s rather than being carried toward
+   * the 60 s total request deadline.
+   */
+  public readonly headerReadTimeoutMs: number;
+  /**
+   * Sweep granularity Node uses to enforce {@link headerReadTimeoutMs}.
+   *
+   * Always at most the frozen 1 s, and never longer than the resolved deadline.
+   * `headersTimeout` is evaluated by a periodic connections checker rather than a
+   * per-socket timer, so without this the frozen 10 s would be enforced at Node's
+   * default 30 s sweep instead. It bounds the OVERSHOOT, never the deadline.
+   */
+  public readonly headerReadCheckIntervalMs: number;
   private readonly limiter: AdmissionLimiter;
   /**
    * Layer B: the secure HTTP pre-session limiter (§21.1 Layer B).
@@ -301,6 +327,12 @@ export class RemoteGateway {
       requestedTotalTimeout < TOTAL_REQUEST_TIMEOUT_MS
         ? requestedTotalTimeout
         : TOTAL_REQUEST_TIMEOUT_MS;
+    // §20/RC05-NEG-61: the HEADER phase has its own frozen 10 s slowloris bound,
+    // resolved through the shared shorten-only rule so it can never be widened.
+    this.headerReadTimeoutMs = resolveHeaderReadTimeoutMs(options.headerReadTimeoutMsForTests);
+    // The sweep is derived from the RESOLVED deadline, so a shortened test seam
+    // is enforced promptly instead of waiting out the production sweep.
+    this.headerReadCheckIntervalMs = resolveHeaderReadCheckIntervalMs(this.headerReadTimeoutMs);
     this.limiter =
       options.admissionLimiterForTests ?? new AdmissionLimiter(options.admission ?? {});
     this.layerB =
@@ -407,8 +439,25 @@ export class RemoteGateway {
           // Node answers an over-long header block itself and destroys the
           // socket, which is exactly the required refusal.
           maxHeaderSize: MAX_REQUEST_HEADER_BYTES,
+          // §20: the WHOLE request — parser, routing, and handler — is bounded
+          // by the frozen 60 s total request deadline.
           requestTimeout: TOTAL_REQUEST_TIMEOUT_MS,
-          headersTimeout: TOTAL_REQUEST_TIMEOUT_MS,
+          // §20/RC05-NEG-61: the HEADER phase is bounded separately and far more
+          // tightly. `headersTimeout` is evaluated by the HTTP parser while the
+          // header block is still incomplete, so a trickled request line or a
+          // never-terminated header block is refused and its socket destroyed
+          // without ever reaching a handler. It can never be carried toward the
+          // 60 s total deadline. Node requires `headersTimeout <= requestTimeout`.
+          headersTimeout: this.headerReadTimeoutMs,
+          // §20/RC05-NEG-61: `headersTimeout` alone does NOT abort at its own
+          // value — Node evaluates it from a periodic sweep, whose default 30 s
+          // interval would let a stalled header block outlive the frozen 10 s
+          // bound several times over. Supplying the sweep interval is what makes
+          // the 10 s real; the abort lands at the deadline plus at most one
+          // sweep. This is a check granularity, never a deadline: it cannot
+          // extend the bound, and it also tightens the 60 s requestTimeout
+          // backstop above.
+          connectionsCheckingInterval: this.headerReadCheckIntervalMs,
         },
         (req: IncomingMessage, res: ServerResponse) => {
           // Reached ONLY after a completed, CA-validated mTLS handshake: with

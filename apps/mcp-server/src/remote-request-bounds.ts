@@ -47,14 +47,57 @@ export const MAX_REQUEST_HEADER_BYTES = 16 * 1024;
 /** Frozen request-target (URL) ceiling: 2 KiB, measured before routing. */
 export const MAX_REQUEST_TARGET_BYTES = 2 * 1024;
 
+/**
+ * Frozen header-read deadline: 10 s — an incomplete header block is aborted.
+ *
+ * This is the slowloris bound for the HEADER phase, and it is deliberately the
+ * same 10 s as the body-read deadline: a peer that trickles a request line, a
+ * header name, or a header terminator gets exactly one 10 s window in which to
+ * deliver a complete header block, whichever half of the request it is stalling.
+ *
+ * It is enforced by Node's HTTP parser as `headersTimeout`, so it runs BEFORE a
+ * complete request exists: an incomplete header block is refused and its socket
+ * destroyed without the request ever reaching a handler. The body-read deadline
+ * cannot cover this case, because the body reader is not constructed until the
+ * header block has already completed.
+ *
+ * `headersTimeout` is not self-arming: Node evaluates it from a periodic
+ * connections checker, so the value alone does not decide when a stalled header
+ * block is aborted. {@link HEADER_READ_CHECK_INTERVAL_MS} bounds that
+ * granularity, and both values are supplied to the server together.
+ */
+export const HEADER_READ_TIMEOUT_MS = 10_000;
+
+/**
+ * Frozen granularity of Node's connections checker: 1 s.
+ *
+ * Node does NOT arm a per-socket timer for `headersTimeout`. It evaluates the
+ * deadline from a periodic sweep, so an incomplete header block is aborted at
+ * the first sweep AFTER the deadline — never at the deadline itself. With Node's
+ * own default sweep interval (30 s) a frozen 10 s `headersTimeout` would not be
+ * enforced until roughly 30-40 s, which is not the 10 s slowloris boundary.
+ *
+ * Supplying this as the sweep interval makes the 10 s bound real: an incomplete
+ * header block is aborted at 10 s plus at most one 1 s sweep — an order of
+ * magnitude below the 60 s total request deadline it must never reach.
+ *
+ * It is a CHECK GRANULARITY, not a deadline: it never extends the header-read
+ * deadline, and lowering it cannot raise any bound.
+ */
+export const HEADER_READ_CHECK_INTERVAL_MS = 1_000;
+
 /** Frozen body-read deadline: 10 s — a body that has not fully arrived is aborted. */
 export const BODY_READ_TIMEOUT_MS = 10_000;
 
 /**
  * Frozen total request deadline: 60 s.
  *
- * Distinct from the 5 s TLS handshake deadline and the 10 s body-read deadline,
- * and armed at HTTP request admission.
+ * Distinct from the 5 s TLS handshake deadline, the 10 s header-read deadline,
+ * and the 10 s body-read deadline. It bounds the WHOLE request — parser,
+ * routing, and handler — and is armed at HTTP request admission.
+ *
+ * It is never a substitute for either 10 s deadline: a slowloris stalled in the
+ * header phase is aborted at 10 s by {@link HEADER_READ_TIMEOUT_MS}, not at 60 s.
  */
 export const TOTAL_REQUEST_TIMEOUT_MS = 60_000;
 
@@ -96,12 +139,44 @@ export function getActiveBodyReadDeadlineCountForTests(): number {
  * request can weaken the slowloris bound.
  */
 export function resolveBodyReadTimeoutMs(bodyReadTimeoutMsForTests?: number): number {
-  return typeof bodyReadTimeoutMsForTests === 'number' &&
-    Number.isInteger(bodyReadTimeoutMsForTests) &&
-    bodyReadTimeoutMsForTests > 0 &&
-    bodyReadTimeoutMsForTests < BODY_READ_TIMEOUT_MS
-    ? bodyReadTimeoutMsForTests
-    : BODY_READ_TIMEOUT_MS;
+  return resolveShortenedDeadline(bodyReadTimeoutMsForTests, BODY_READ_TIMEOUT_MS);
+}
+
+/**
+ * Resolves the header-read deadline, applying the internal test seam.
+ *
+ * Production always resolves the frozen {@link HEADER_READ_TIMEOUT_MS}. The seam
+ * may only SHORTEN it: a value at or above the frozen 10 s — and any value that
+ * is not a positive integer — resolves to the frozen bound, so no test,
+ * configuration, environment variable, or request can widen the slowloris window.
+ */
+export function resolveHeaderReadTimeoutMs(headerReadTimeoutMsForTests?: number): number {
+  return resolveShortenedDeadline(headerReadTimeoutMsForTests, HEADER_READ_TIMEOUT_MS);
+}
+
+/**
+ * Resolves the sweep granularity Node uses to enforce the header-read deadline.
+ *
+ * ALWAYS at most {@link HEADER_READ_CHECK_INTERVAL_MS}, and never longer than the
+ * resolved header-read deadline: a checker that swept less often than the
+ * deadline it enforces would let the bound slip. Deriving it from the resolved
+ * deadline is what keeps a shortened test seam fast — the sweep must tighten
+ * with the deadline, or a shortened deadline would still wait out a full 1 s.
+ */
+export function resolveHeaderReadCheckIntervalMs(headerReadTimeoutMs: number): number {
+  return Math.min(headerReadTimeoutMs, HEADER_READ_CHECK_INTERVAL_MS);
+}
+
+/**
+ * The ONE place "a seam may only shorten a frozen deadline" is decided.
+ *
+ * Both request-phase deadlines resolve through here, so the shorten-only rule
+ * cannot drift between them.
+ */
+function resolveShortenedDeadline(seam: number | undefined, frozenMs: number): number {
+  return typeof seam === 'number' && Number.isInteger(seam) && seam > 0 && seam < frozenMs
+    ? seam
+    : frozenMs;
 }
 
 /** Inputs for one bounded read. The bound is INTERNAL; a client cannot choose it. */
