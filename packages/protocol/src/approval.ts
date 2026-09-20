@@ -8,6 +8,15 @@
 export type ApprovalState =
   'PENDING' | 'APPROVED' | 'REJECTED' | 'EXPIRED' | 'CONSUMED' | 'INVALIDATED';
 
+export const APPROVAL_STATES = [
+  'PENDING',
+  'APPROVED',
+  'REJECTED',
+  'EXPIRED',
+  'CONSUMED',
+  'INVALIDATED',
+] as const;
+
 /**
  * Terminal states in the Approval State Machine.
  * Once entered, zero transitions out are permitted.
@@ -171,6 +180,17 @@ export type ApprovalAuditEventType =
   | 'APPROVED_EXECUTION_SUCCEEDED'
   | 'APPROVED_EXECUTION_FAILED';
 
+export const APPROVAL_AUDIT_EVENT_TYPES = [
+  'APPROVAL_REQUESTED',
+  'APPROVAL_GRANTED',
+  'APPROVAL_REJECTED',
+  'APPROVAL_EXPIRED',
+  'APPROVAL_CONSUMED',
+  'APPROVAL_INVALIDATED',
+  'APPROVED_EXECUTION_SUCCEEDED',
+  'APPROVED_EXECUTION_FAILED',
+] as const;
+
 /**
  * Safe, bounded approval lifecycle event emitted synchronously by
  * ApprovalStateManager at the moment a state transition is committed.
@@ -211,6 +231,15 @@ export type ApprovalFailureReasonCode =
   | 'WORKSPACE_BINDING_MISMATCH'
   | 'POLICY_BINDING_MISMATCH'
   | 'ALREADY_CONSUMED';
+
+export const APPROVAL_FAILURE_REASON_CODES = [
+  'TOKEN_MISMATCH',
+  'PAYLOAD_BINDING_MISMATCH',
+  'ACTOR_BINDING_MISMATCH',
+  'WORKSPACE_BINDING_MISMATCH',
+  'POLICY_BINDING_MISMATCH',
+  'ALREADY_CONSUMED',
+] as const;
 
 /**
  * Default limits and resource quotas for RC-04 approval state.

@@ -3,9 +3,15 @@ import path from 'node:path';
 import os from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import {
+  APPROVAL_AUDIT_EVENT_TYPES,
+  APPROVAL_FAILURE_REASON_CODES,
+  APPROVAL_STATES,
   GATEWAY_AUDIT_EVENT_TYPES,
   GATEWAY_AUDIT_REASONS,
   MAX_RECORD_BYTES,
+  type ApprovalAuditEventType,
+  type ApprovalFailureReasonCode,
+  type ApprovalState,
   type AuditRecord,
   type AuditStoreMetadataV1,
   type PersistentAuditRecordV1,
@@ -24,19 +30,16 @@ export const ACTIVE_SEGMENT_FILENAME = 'audit-active.jsonl';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const HEX64_REGEX = /^[0-9a-f]{64}$/;
+const HEX32_REGEX = /^[0-9a-f]{32}$/;
+const PRINTABLE_ASCII_128_REGEX = /^[\x20-\x7e]{1,128}$/;
 const ISO_TIMESTAMP_REGEX = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/;
 
 const POLICY_DECISION_SET = new Set(['ALLOW', 'DENY', 'REQUIRE_APPROVAL']);
 const EXECUTION_STATUS_SET = new Set(['SUCCESS', 'ERROR', 'DENIED', 'TIMEOUT', 'CANCELLED']);
 const LIFECYCLE_PHASE_SET = new Set(['STARTED', 'COMPLETED', 'DENIED', 'RECOVERY_INDETERMINATE']);
-const APPROVAL_EVENT_TYPE_SET = new Set([
-  'REQUESTED',
-  'GRANTED',
-  'DENIED',
-  'TIMED_OUT',
-  'CANCELLED',
-]);
-const APPROVAL_STATE_SET = new Set(['PENDING', 'APPROVED', 'DENIED', 'TIMED_OUT', 'CANCELLED']);
+const APPROVAL_EVENT_TYPE_SET = new Set(APPROVAL_AUDIT_EVENT_TYPES);
+const APPROVAL_STATE_SET = new Set(APPROVAL_STATES);
+const APPROVAL_FAILURE_REASON_CODE_SET = new Set(APPROVAL_FAILURE_REASON_CODES);
 const APPROVAL_SOURCE_SET = new Set(['MCP', 'LOCAL_OPERATOR', 'SYSTEM']);
 const GATEWAY_AUDIT_EVENT_SET = new Set(GATEWAY_AUDIT_EVENT_TYPES);
 const GATEWAY_AUDIT_REASON_SET = new Set(GATEWAY_AUDIT_REASONS);
@@ -757,7 +760,8 @@ export function validatePersistentRecordV1(input: unknown, requireRecordHash = t
     }
     if (
       app.eventType !== undefined &&
-      (typeof app.eventType !== 'string' || !APPROVAL_EVENT_TYPE_SET.has(app.eventType))
+      (typeof app.eventType !== 'string' ||
+        !APPROVAL_EVENT_TYPE_SET.has(app.eventType as ApprovalAuditEventType))
     ) {
       throw createCodedError('INVALID_RECORD', 'approval.eventType has invalid value');
     }
@@ -766,7 +770,7 @@ export function validatePersistentRecordV1(input: unknown, requireRecordHash = t
     }
     if (
       app.state !== undefined &&
-      (typeof app.state !== 'string' || !APPROVAL_STATE_SET.has(app.state))
+      (typeof app.state !== 'string' || !APPROVAL_STATE_SET.has(app.state as ApprovalState))
     ) {
       throw createCodedError('INVALID_RECORD', 'approval.state has invalid value');
     }
@@ -776,8 +780,12 @@ export function validatePersistentRecordV1(input: unknown, requireRecordHash = t
     ) {
       throw createCodedError('INVALID_RECORD', 'approval.source has invalid value');
     }
-    if (app.reasonCode !== undefined && typeof app.reasonCode !== 'string') {
-      throw createCodedError('INVALID_RECORD', 'approval.reasonCode must be a string');
+    if (
+      app.reasonCode !== undefined &&
+      (typeof app.reasonCode !== 'string' ||
+        !APPROVAL_FAILURE_REASON_CODE_SET.has(app.reasonCode as ApprovalFailureReasonCode))
+    ) {
+      throw createCodedError('INVALID_RECORD', 'approval.reasonCode has invalid value');
     }
     if (
       app.operatorReasonProvided !== undefined &&
@@ -817,23 +825,59 @@ export function validatePersistentRecordV1(input: unknown, requireRecordHash = t
     ) {
       throw createCodedError('INVALID_RECORD', 'gateway.admissionLayer has invalid value');
     }
-    if (gw.mcpSessionId !== undefined && typeof gw.mcpSessionId !== 'string') {
-      throw createCodedError('INVALID_RECORD', 'gateway.mcpSessionId must be a string');
+    if (
+      gw.mcpSessionId !== undefined &&
+      (typeof gw.mcpSessionId !== 'string' || !HEX64_REGEX.test(gw.mcpSessionId))
+    ) {
+      throw createCodedError(
+        'INVALID_RECORD',
+        'gateway.mcpSessionId must be exactly 64 lowercase hex characters',
+      );
     }
-    if (gw.deviceId !== undefined && typeof gw.deviceId !== 'string') {
-      throw createCodedError('INVALID_RECORD', 'gateway.deviceId must be a string');
+    if (
+      gw.deviceId !== undefined &&
+      (typeof gw.deviceId !== 'string' || !HEX32_REGEX.test(gw.deviceId))
+    ) {
+      throw createCodedError(
+        'INVALID_RECORD',
+        'gateway.deviceId must be exactly 32 lowercase hex characters',
+      );
     }
-    if (gw.spkiPin !== undefined && typeof gw.spkiPin !== 'string') {
-      throw createCodedError('INVALID_RECORD', 'gateway.spkiPin must be a string');
+    if (
+      gw.spkiPin !== undefined &&
+      (typeof gw.spkiPin !== 'string' || !HEX64_REGEX.test(gw.spkiPin))
+    ) {
+      throw createCodedError(
+        'INVALID_RECORD',
+        'gateway.spkiPin must be exactly 64 lowercase hex characters',
+      );
     }
-    if (gw.clientId !== undefined && typeof gw.clientId !== 'string') {
-      throw createCodedError('INVALID_RECORD', 'gateway.clientId must be a string');
+    if (
+      gw.enrollmentId !== undefined &&
+      (typeof gw.enrollmentId !== 'string' || !HEX32_REGEX.test(gw.enrollmentId))
+    ) {
+      throw createCodedError(
+        'INVALID_RECORD',
+        'gateway.enrollmentId must be exactly 32 lowercase hex characters',
+      );
     }
-    if (gw.clientType !== undefined && typeof gw.clientType !== 'string') {
-      throw createCodedError('INVALID_RECORD', 'gateway.clientType must be a string');
+    if (
+      gw.clientId !== undefined &&
+      (typeof gw.clientId !== 'string' || !PRINTABLE_ASCII_128_REGEX.test(gw.clientId))
+    ) {
+      throw createCodedError(
+        'INVALID_RECORD',
+        'gateway.clientId must be printable ASCII with length between 1 and 128',
+      );
     }
-    if (gw.enrollmentId !== undefined && typeof gw.enrollmentId !== 'string') {
-      throw createCodedError('INVALID_RECORD', 'gateway.enrollmentId must be a string');
+    if (
+      gw.clientType !== undefined &&
+      (typeof gw.clientType !== 'string' || !PRINTABLE_ASCII_128_REGEX.test(gw.clientType))
+    ) {
+      throw createCodedError(
+        'INVALID_RECORD',
+        'gateway.clientType must be printable ASCII with length between 1 and 128',
+      );
     }
     if (
       gw.transportMode !== undefined &&
@@ -908,6 +952,11 @@ export interface StorageTestFaults {
   fdatasyncFault?: boolean;
 }
 
+export interface StorageTestHooks {
+  beforeFinalOpen?: () => void;
+  testFaults?: StorageTestFaults;
+}
+
 export interface PersistentAuditStorageConfig {
   directory?: string;
   metadata: {
@@ -934,16 +983,15 @@ export class PersistentAuditStorage {
   private appendInProgress = false;
   private state: StorageState = 'UNINITIALIZED';
   private readonly _testFaults?: StorageTestFaults;
+  private readonly _testHooks?: StorageTestHooks;
 
-  constructor(
-    config: PersistentAuditStorageConfig,
-    internalHooks?: { testFaults?: StorageTestFaults },
-  ) {
+  constructor(config: PersistentAuditStorageConfig, internalHooks?: StorageTestHooks) {
     this.config = config;
     this.expectedUid = config.expectedUid ?? getProcessUid();
     this.auditDir = config.directory ?? DEFAULT_AUDIT_DIR;
     this.activePath = path.join(this.auditDir, ACTIVE_SEGMENT_FILENAME);
     this._testFaults = internalHooks?.testFaults;
+    this._testHooks = internalHooks;
   }
 
   public getState(): StorageState {
@@ -975,42 +1023,40 @@ export class PersistentAuditStorage {
 
     try {
       const metadataPath = path.join(this.auditDir, METADATA_FILENAME);
-      let activeExists = false;
-      let activeSize = 0;
-
-      if (fs.existsSync(this.activePath)) {
-        activeExists = true;
-        const lstat = fs.lstatSync(this.activePath);
-        if (lstat.isSymbolicLink()) {
-          throw createCodedError('SYMLINK_DETECTED', 'active segment is a symbolic link');
-        }
-
-        let probeFd: number;
-        try {
-          probeFd = fs.openSync(this.activePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-        } catch (err: unknown) {
-          const errCode =
-            typeof err === 'object' && err !== null && 'code' in err
-              ? (err as { code: unknown }).code
-              : undefined;
-
-          if (errCode === 'ELOOP') {
-            throw createCodedError('SYMLINK_DETECTED', 'active segment is a symbolic link');
-          }
-          throw err;
-        }
-
-        try {
-          const stats = validateFileDescriptorAuthority(probeFd, 0o600, this.expectedUid);
-          activeSize = stats.size;
-        } finally {
-          fs.closeSync(probeFd);
-        }
-      }
 
       if (!fs.existsSync(metadataPath)) {
-        if (activeExists && activeSize > 0) {
-          throw createCodedError('METADATA_MISSING', 'audit-store.json missing on non-empty store');
+        if (fs.existsSync(this.activePath)) {
+          const lstat = fs.lstatSync(this.activePath);
+          if (lstat.isSymbolicLink()) {
+            throw createCodedError('SYMLINK_DETECTED', 'active segment is a symbolic link');
+          }
+
+          let probeFd: number;
+          try {
+            probeFd = fs.openSync(this.activePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+          } catch (err: unknown) {
+            const errCode =
+              typeof err === 'object' && err !== null && 'code' in err
+                ? (err as { code: unknown }).code
+                : undefined;
+
+            if (errCode === 'ELOOP') {
+              throw createCodedError('SYMLINK_DETECTED', 'active segment is a symbolic link');
+            }
+            throw err;
+          }
+
+          try {
+            const probeStats = validateFileDescriptorAuthority(probeFd, 0o600, this.expectedUid);
+            if (probeStats.size > 0) {
+              throw createCodedError(
+                'METADATA_MISSING',
+                'audit-store.json missing on non-empty store',
+              );
+            }
+          } finally {
+            fs.closeSync(probeFd);
+          }
         }
 
         const freshMetadata: AuditStoreMetadataV1 = {
@@ -1036,12 +1082,7 @@ export class PersistentAuditStorage {
         this.metadata = loaded;
       }
 
-      if (activeExists && activeSize > 0) {
-        throw createCodedError(
-          'AUDIT_RECOVERY_REQUIRED',
-          'active audit segment is non-empty; recovery required before append',
-        );
-      }
+      this._testHooks?.beforeFinalOpen?.();
 
       let fd: number;
       try {
@@ -1066,7 +1107,15 @@ export class PersistentAuditStorage {
       }
 
       try {
-        validateFileDescriptorAuthority(fd, 0o600, this.expectedUid);
+        const stats = validateFileDescriptorAuthority(fd, 0o600, this.expectedUid);
+
+        if (stats.size > 0) {
+          throw createCodedError(
+            'AUDIT_RECOVERY_REQUIRED',
+            'active audit segment is non-empty; recovery required before append',
+          );
+        }
+
         this.activeFd = fd;
 
         const parentFd = fs.openSync(this.auditDir, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY);
@@ -1253,7 +1302,10 @@ export class PersistentAuditStorage {
 
 export function createTestPersistentAuditStorage(
   config: PersistentAuditStorageConfig,
-  testFaults?: StorageTestFaults,
+  testHooks?: StorageTestHooks | StorageTestFaults,
 ): PersistentAuditStorage {
-  return new PersistentAuditStorage(config, { testFaults });
+  if (testHooks && ('writeFault' in testHooks || 'fdatasyncFault' in testHooks)) {
+    return new PersistentAuditStorage(config, { testFaults: testHooks as StorageTestFaults });
+  }
+  return new PersistentAuditStorage(config, testHooks as StorageTestHooks);
 }

@@ -1309,10 +1309,254 @@ describe('CesSpace ARC — RC-06 Task 1: Persistent Append Storage Foundation', 
         'audit.lock must be cleaned up after AUDIT_RECOVERY_REQUIRED',
       );
     });
+
+    test('Replacement race between initial probe and final open fails with AUDIT_RECOVERY_REQUIRED', () => {
+      const auditDir = path.join(tempBaseDir, 'cleanup-replacement-race');
+      fs.mkdirSync(auditDir, { mode: 0o700, recursive: true });
+      createStoreMetadataFile(auditDir, {
+        version: 1,
+        storeId: 'f47ac10b-58cc-4372-a567-0e02b2c3d479',
+        createdAt: '2026-09-20T18:00:00.000Z',
+        checkpointPublicKeyFingerprint: 'a'.repeat(64),
+        anchorMode: 'DISABLED',
+      });
+
+      const activePath = path.join(auditDir, ACTIVE_SEGMENT_FILENAME);
+      const injectedBytes = 'injected-during-race\n';
+
+      const storage = createTestPersistentAuditStorage(
+        {
+          directory: auditDir,
+          metadata: { checkpointPublicKeyFingerprint: 'a'.repeat(64) },
+        },
+        {
+          beforeFinalOpen: () => {
+            fs.writeFileSync(activePath, injectedBytes, { mode: 0o600 });
+          },
+        },
+      );
+
+      assert.throws(
+        () => storage.initialize(),
+        (err) => err.code === 'AUDIT_RECOVERY_REQUIRED',
+      );
+
+      const remainingBytes = fs.readFileSync(activePath, 'utf8');
+      assert.equal(remainingBytes, injectedBytes, 'replacement bytes must remain unchanged');
+
+      assert.ok(
+        !fs.existsSync(path.join(auditDir, 'audit.lock')),
+        'audit.lock must be cleaned up after replacement-race failure',
+      );
+    });
+  });
+
+  describe('Real RC-04 Approval Audit Compatibility & Invariants', () => {
+    test('Representative RC-04 approval lifecycle records append and independently parse', async () => {
+      const auditDir = path.join(tempBaseDir, 'store-approval-compat');
+      const storage = new PersistentAuditStorage({
+        directory: auditDir,
+        createIfMissing: true,
+        metadata: { checkpointPublicKeyFingerprint: 'a'.repeat(64) },
+      });
+      storage.initialize();
+
+      const approvalCases = [
+        {
+          approval: {
+            eventType: 'APPROVAL_REQUESTED',
+            requestId: 'req-01',
+            state: 'PENDING',
+            source: 'MCP',
+          },
+        },
+        {
+          approval: {
+            eventType: 'APPROVAL_GRANTED',
+            requestId: 'req-01',
+            state: 'APPROVED',
+            source: 'LOCAL_OPERATOR',
+            operatorReasonProvided: true,
+          },
+        },
+        {
+          approval: {
+            eventType: 'APPROVAL_REJECTED',
+            requestId: 'req-02',
+            state: 'REJECTED',
+            source: 'LOCAL_OPERATOR',
+            reasonCode: 'PAYLOAD_BINDING_MISMATCH',
+            operatorReasonProvided: true,
+          },
+        },
+        {
+          approval: {
+            eventType: 'APPROVAL_EXPIRED',
+            requestId: 'req-03',
+            state: 'EXPIRED',
+            source: 'SYSTEM',
+          },
+        },
+        {
+          approval: {
+            eventType: 'APPROVAL_CONSUMED',
+            requestId: 'req-01',
+            state: 'CONSUMED',
+            source: 'MCP',
+          },
+        },
+        {
+          approval: {
+            eventType: 'APPROVAL_INVALIDATED',
+            requestId: 'req-04',
+            state: 'INVALIDATED',
+            source: 'MCP',
+            reasonCode: 'TOKEN_MISMATCH',
+          },
+        },
+        {
+          approval: {
+            eventType: 'APPROVED_EXECUTION_SUCCEEDED',
+            requestId: 'req-01',
+          },
+        },
+        {
+          approval: {
+            eventType: 'APPROVED_EXECUTION_FAILED',
+            requestId: 'req-05',
+            reasonCode: 'ALREADY_CONSUMED',
+          },
+        },
+      ];
+
+      for (let i = 0; i < approvalCases.length; i++) {
+        const candidate = {
+          ...createSampleRecordCandidate(),
+          approval: approvalCases[i].approval,
+        };
+
+        const appended = await storage.append(candidate);
+        assert.equal(appended.sequenceNumber, i + 1);
+      }
+
+      storage.close();
+
+      const lines = fs
+        .readFileSync(path.join(auditDir, ACTIVE_SEGMENT_FILENAME), 'utf8')
+        .split('\n');
+      assert.equal(lines.length, approvalCases.length + 1);
+
+      for (let i = 0; i < approvalCases.length; i++) {
+        const lineWithNl = lines[i] + '\n';
+        const parsed = parseAndValidateRecordLineV1(lineWithNl);
+        assert.equal(parsed.record.sequenceNumber, i + 1);
+        assert.deepEqual(parsed.record.approval, approvalCases[i].approval);
+        assert.equal(parsed.computedHash, parsed.record.integrity.recordHash);
+      }
+    });
+
+    test('Rejection of invalid approval-vocabulary aliases and arbitrary reason codes', () => {
+      const badAliases = [
+        { approval: { eventType: 'REQUESTED' } },
+        { approval: { eventType: 'GRANTED' } },
+        { approval: { state: 'DENIED' } },
+        { approval: { state: 'TIMED_OUT' } },
+        { approval: { state: 'CANCELLED' } },
+        { approval: { reasonCode: 'ATTACKER_TEXT' } },
+        { approval: { unknownApprovalKey: 'forbidden' } },
+      ];
+
+      for (const bad of badAliases) {
+        const candidate = {
+          ...createSampleRecordCandidate(),
+          schemaVersion: 1,
+          sequenceNumber: 1,
+          ...bad,
+          integrity: { previousRecordHash: '0'.repeat(64), recordHash: 'a'.repeat(64) },
+        };
+        assert.throws(
+          () => validatePersistentRecordV1(candidate),
+          (err) => err.code === 'INVALID_RECORD' || err.code === 'UNKNOWN_FIELD',
+        );
+      }
+    });
+  });
+
+  describe('RC-05 Gateway Audit Identifier Compatibility & Shape Enforcement', () => {
+    test('Representative RC-05 gateway lifecycle records append and independently parse', async () => {
+      const auditDir = path.join(tempBaseDir, 'store-gateway-compat');
+      const storage = new PersistentAuditStorage({
+        directory: auditDir,
+        createIfMissing: true,
+        metadata: { checkpointPublicKeyFingerprint: 'a'.repeat(64) },
+      });
+      storage.initialize();
+
+      const validGatewayRecord = {
+        ...createSampleRecordCandidate(),
+        gateway: {
+          eventType: 'AUTH_SUCCEEDED',
+          reason: 'SHUTDOWN',
+          admissionLayer: 'B',
+          mcpSessionId: 'a'.repeat(64),
+          deviceId: 'b'.repeat(32),
+          spkiPin: 'c'.repeat(64),
+          enrollmentId: 'd'.repeat(32),
+          clientId: 'valid-client-id',
+          clientType: 'admin-dashboard',
+          transportMode: 'remote',
+        },
+      };
+
+      const appended = await storage.append(validGatewayRecord);
+      assert.equal(appended.sequenceNumber, 1);
+      assert.deepEqual(appended.gateway, validGatewayRecord.gateway);
+
+      storage.close();
+
+      const lines = fs
+        .readFileSync(path.join(auditDir, ACTIVE_SEGMENT_FILENAME), 'utf8')
+        .split('\n');
+      const parsed = parseAndValidateRecordLineV1(lines[0] + '\n');
+      assert.equal(parsed.record.sequenceNumber, 1);
+      assert.deepEqual(parsed.record.gateway, validGatewayRecord.gateway);
+      assert.equal(parsed.computedHash, parsed.record.integrity.recordHash);
+    });
+
+    test('Malformed gateway shapes and unknown fields rejected with INVALID_RECORD or UNKNOWN_FIELD', () => {
+      const badGatewayCases = [
+        { gateway: { eventType: 'AUTH_SUCCEEDED', mcpSessionId: 'a'.repeat(63) } }, // 63 hex
+        { gateway: { eventType: 'AUTH_SUCCEEDED', mcpSessionId: 'g'.repeat(64) } }, // non-hex
+        { gateway: { eventType: 'AUTH_SUCCEEDED', deviceId: 'b'.repeat(31) } }, // 31 hex
+        { gateway: { eventType: 'AUTH_SUCCEEDED', spkiPin: 'c'.repeat(63) } }, // 63 hex
+        { gateway: { eventType: 'AUTH_SUCCEEDED', enrollmentId: 'd'.repeat(31) } }, // 31 hex
+        { gateway: { eventType: 'AUTH_SUCCEEDED', clientId: 'bad\x01client' } }, // control char
+        { gateway: { eventType: 'AUTH_SUCCEEDED', clientId: 'x'.repeat(129) } }, // length 129
+        { gateway: { eventType: 'AUTH_SUCCEEDED', clientType: 'bad\x00client' } }, // NUL char
+        { gateway: { eventType: 'AUTH_SUCCEEDED', clientType: 'x'.repeat(129) } }, // length 129
+        { gateway: { eventType: 'UNKNOWN_EVENT' } }, // unknown event
+        { gateway: { eventType: 'AUTH_SUCCEEDED', reason: 'UNKNOWN_REASON' } }, // unknown reason
+        { gateway: { eventType: 'AUTH_SUCCEEDED', unknownGatewayField: 'forbidden' } }, // unknown key
+      ];
+
+      for (const bad of badGatewayCases) {
+        const candidate = {
+          ...createSampleRecordCandidate(),
+          schemaVersion: 1,
+          sequenceNumber: 1,
+          ...bad,
+          integrity: { previousRecordHash: '0'.repeat(64), recordHash: 'a'.repeat(64) },
+        };
+        assert.throws(
+          () => validatePersistentRecordV1(candidate),
+          (err) => err.code === 'INVALID_RECORD' || err.code === 'UNKNOWN_FIELD',
+        );
+      }
+    });
   });
 
   describe('Tier-3 Metadata Configuration Normalization & Consistency', () => {
-    test('Existing ENABLED store rejected when caller omits anchorMode (STORE_RECONFIGURATION_FORBIDDEN)', () => {
+    test('Caller omitting anchorMode against existing ENABLED store throws STORE_RECONFIGURATION_FORBIDDEN', () => {
       const auditDir = path.join(tempBaseDir, 'meta-omission-check');
       fs.mkdirSync(auditDir, { mode: 0o700, recursive: true });
 
