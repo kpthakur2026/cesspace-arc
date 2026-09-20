@@ -6,7 +6,9 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
   CallToolRequestSchema,
+  ErrorCode,
   ListToolsRequestSchema,
+  McpError,
   type Tool,
 } from '@modelcontextprotocol/sdk/types.js';
 
@@ -29,8 +31,21 @@ import {
   type WorkspaceRecord,
   RC03_MUTATION_TOOLS,
 } from '@cesspace-arc/policy';
+import { EnrollmentManager, SessionManager } from '@cesspace-arc/auth';
 import { AdminIpcError, AdminIpcServer } from './admin-ipc.js';
+import {
+  RemoteExecutionBridge,
+  RemoteRequestAdmission,
+  createAuthenticatedRequestLimiter,
+  type CompleteActor,
+} from './remote-execution.js';
+import type { BoundedRequestLimiter } from './remote-resource-limits.js';
 import { ApprovalAuditSink, getApprovalAuditSink } from './approval-audit.js';
+import { getGatewayAuditSink } from './gateway-audit.js';
+import { RemoteGateway, type RemoteGatewayStatus } from './remote-gateway.js';
+import { readRemoteRequestContext, RemoteMcpSurface } from './remote-mcp-surface.js';
+import { GatewayDeviceAdministration } from './device-administration.js';
+import type { RemoteConfig } from './remote-config.js';
 import {
   ARC_APPROVAL_KEY,
   computeExecutionPayloadHash,
@@ -56,7 +71,19 @@ import { ControlledProcessRunner, type ITerminalSubsystem } from '@cesspace-arc/
 import { z } from 'zod';
 
 export interface ArcServerConfig {
-  transport: 'stdio';
+  /**
+   * The single active transport mode for this process (§4 L-4).
+   *
+   * stdio and remote are MUTUALLY EXCLUSIVE: selecting 'remote' does not add a
+   * listener beside stdio, it replaces it. RC-04 stdio semantics are unchanged
+   * when 'stdio' is selected.
+   */
+  transport: 'stdio' | 'remote';
+  /**
+   * Remote gateway configuration. Required when transport is 'remote' and
+   * ignored (never implicitly activated) when it is 'stdio'.
+   */
+  remote?: RemoteConfig;
   authorizedRoots: Array<{ id: string; path: string }>;
   defaultWorkspaceId?: string;
   stage?: string;
@@ -865,6 +892,67 @@ export const ALL_TOOL_DEFINITIONS: Tool[] = withArcApprovalSchemaOnTools([
   ...RC03_TOOL_DEFINITIONS,
 ]);
 
+/**
+ * The authoritative set of REGISTERED MCP tool names.
+ *
+ * Derived from {@link ALL_TOOL_DEFINITIONS} rather than maintained beside it, so
+ * the catalog a caller sees from `tools/list` and the catalog this process will
+ * execute are the same object. There is no second list to drift and no
+ * name-specific rule anywhere: a name is executable if and only if it is in
+ * this set.
+ */
+const REGISTERED_TOOL_NAMES: ReadonlySet<string> = new Set(
+  ALL_TOOL_DEFINITIONS.map((tool) => tool.name),
+);
+
+/**
+ * True when `name` is a registered MCP tool.
+ *
+ * Deliberately GENERIC. This is not a denylist of administrative or otherwise
+ * sensitive names: it is the positive membership test against the one
+ * registered catalog, so a name that is not a tool is not callable regardless
+ * of what it is called or who calls it.
+ */
+function isRegisteredToolName(name: string): boolean {
+  return REGISTERED_TOOL_NAMES.has(name);
+}
+
+/**
+ * The single JSON-RPC error for a `tools/call` naming an unregistered tool.
+ *
+ * Identical — code AND message — to the error the SDK itself returns for an
+ * unregistered JSON-RPC METHOD. An unknown tool name is therefore
+ * indistinguishable from an unknown method name: a caller cannot probe which
+ * names exist, and no administrative or otherwise sensitive name is confirmed
+ * or denied by the shape of the answer.
+ *
+ * Thrown from the `CallToolRequestSchema` boundary, BEFORE the shared execution
+ * pipeline is entered, so no policy evaluation, approval state, or subsystem
+ * call is ever reached for such a call. The HTTP admission a remote request
+ * already paid for at the transport is unaffected and is not refunded: the gate
+ * adds no accounting of its own and changes no rate or concurrency semantics.
+ */
+function unknownToolError(): McpError {
+  return new McpError(ErrorCode.MethodNotFound, 'Method not found');
+}
+
+/**
+ * Rebuilds one MCP tool result as a fresh object.
+ *
+ * The SDK's `CallToolResult` union is only assignable from an anonymous object
+ * type, because an `interface` does not receive an implicit index signature.
+ * Normalizing here keeps the remote tool path returning exactly the same shape
+ * the shared stdio pipeline returns, with no cast anywhere.
+ */
+function remoteToolResult(result: {
+  isError?: boolean;
+  content: Array<{ type: 'text'; text: string }>;
+}): { isError?: boolean; content: Array<{ type: 'text'; text: string }> } {
+  return result.isError === undefined
+    ? { content: result.content }
+    : { isError: result.isError, content: result.content };
+}
+
 export interface IArcMcpServer {
   start(): Promise<void>;
   stop(): Promise<void>;
@@ -1264,6 +1352,12 @@ export function sanitizePreValidationParameters(
 export class ArcMcpServer implements IArcMcpServer {
   private server: Server;
   private transport?: StdioServerTransport;
+  /** Remote TLS admission gateway. Present only in remote mode. */
+  private remoteGateway?: RemoteGateway;
+  /** Immutable transport mode for this process. */
+  private readonly transportMode: 'stdio' | 'remote';
+  /** Remote configuration, retained only in remote mode. */
+  private readonly remoteConfig?: RemoteConfig;
   private defaultWorkspaceId?: string;
   public processRegistry?: ProcessRegistry;
   /** Approval state manager. Always present; a fresh one is created if not injected. */
@@ -1277,6 +1371,37 @@ export class ArcMcpServer implements IArcMcpServer {
   public readonly effectivePolicyEngine?: DeclarativePolicyEngine;
   /** Safe failure category when an explicitly configured policy was invalid. */
   public readonly policyInitializationFailure?: PolicyInitializationFailure;
+  /**
+   * The ONE pending-enrollment authority for this process (RC-05 Task 4).
+   *
+   * Always present. When an admin IPC channel is composed in, this IS that
+   * channel's manager — the constructor adopts it or refuses the composition —
+   * so the object the remote gateway completes against is provably the same
+   * object the operator channel creates challenges in.
+   */
+  public readonly enrollmentManager: EnrollmentManager;
+  /**
+   * The ONE process-local session authority (RC-05 Task 6).
+   *
+   * Volatile, process-local, and never configured: the frozen TTLs, quotas, and
+   * header contract are not overridable through ArcServerConfig, the
+   * environment, the CLI, or any network input. Task 8 consumes THIS object for
+   * session issuance and request authentication, so there is no second manager
+   * hidden in a transport adapter.
+   */
+  public readonly sessionManager: SessionManager;
+  /** Remote execution bridge. Present only once a remote gateway is bound. */
+  private remoteExecutionBridge?: RemoteExecutionBridge;
+  /**
+   * The ONE process-local Layer C limiter and per-session concurrency state
+   * (RC-05 Task 7).
+   *
+   * Volatile and process-local: the frozen 300/min, burst 60, 1024-key ceiling,
+   * and 4-outstanding-request bound are not overridable through ArcServerConfig,
+   * the environment, the CLI, or any network input. It is reset on shutdown, so
+   * a restart gets a clean rate and concurrency state and nothing is persisted.
+   */
+  private readonly authenticatedRequestLimiter: BoundedRequestLimiter;
 
   constructor(
     public readonly workspaceRegistry: WorkspaceRegistry,
@@ -1297,7 +1422,33 @@ export class ArcMcpServer implements IArcMcpServer {
      * launch configuration supplies both an endpoint and an operator key.
      */
     public readonly adminIpcServer?: AdminIpcServer,
+    /**
+     * The ONE pending-enrollment authority for this process (RC-05 Task 4).
+     *
+     * The authenticated local admin IPC channel creates and cancels pending
+     * challenges through it, and the remote bootstrap endpoint completes them
+     * through the SAME object. There is exactly one instance per process: no
+     * copy, no synchronization, no second remote manager, and no persistence of
+     * pending challenges, which stay volatile and die with the process.
+     *
+     * This is not merely a convention: when an admin channel is composed in, the
+     * constructor ADOPTS or VERIFIES its manager, so an invalid composition
+     * cannot reach a running state.
+     */
+    enrollmentManager?: EnrollmentManager,
+    /**
+     * Optional session authority injection for deterministic and integration
+     * tests. NOT reachable from ArcServerConfig, the environment, the CLI, or
+     * any network input: the factory always supplies exactly one instance, and a
+     * server constructed without one creates it here.
+     */
+    sessionManager?: SessionManager,
   ) {
+    // Transport mode is resolved once, at construction, and is immutable. A
+    // remote configuration supplied alongside stdio is NOT activated.
+    this.transportMode = config?.transport ?? 'stdio';
+    this.remoteConfig = this.transportMode === 'remote' ? config?.remote : undefined;
+
     // The approval state manager is mandatory for Task 4 authorization.
     this.approvalStateManager = approvalStateManager ?? new ApprovalStateManager();
 
@@ -1308,6 +1459,38 @@ export class ArcMcpServer implements IArcMcpServer {
     // double-write every transition).
     this.approvalAuditSink = getApprovalAuditSink(this.auditLogger);
     this.approvalStateManager.registerLifecycleSink(this.approvalAuditSink);
+
+    // RC-05 Task 4 composition invariant: ONE pending-enrollment authority.
+    //
+    // The local operator channel and the remote bootstrap endpoint must observe
+    // the same challenge table, and this is enforced STRUCTURALLY rather than by
+    // convention. When an admin channel is composed in, its manager is adopted
+    // (or must be the exact instance supplied). Supplying two different
+    // instances is a construction failure, so a server with an active admin IPC
+    // channel can never silently run a SECOND pending table beside it, and a
+    // remote listener can never be bound against the wrong one.
+    const composedAdminManager = this.adminIpcServer?.getEnrollmentManager();
+    if (composedAdminManager !== undefined) {
+      if (enrollmentManager !== undefined && enrollmentManager !== composedAdminManager) {
+        throw new Error(
+          'Invalid composition: the admin IPC channel and the enrollment manager must be the same instance.',
+        );
+      }
+      this.enrollmentManager = composedAdminManager;
+    } else {
+      this.enrollmentManager = enrollmentManager ?? new EnrollmentManager();
+    }
+
+    // RC-05 Task 6: exactly ONE process-local session authority. Volatile, with
+    // frozen TTLs and caps that are not configurable, and shared by every remote
+    // consumer through `getRemoteExecutionBridge()`.
+    this.sessionManager = sessionManager ?? new SessionManager();
+
+    // RC-05 Task 7: exactly ONE process-local Layer C limiter and per-session
+    // concurrency state. Volatile, with frozen bounds that are not configurable,
+    // shared by every remote consumer through the ONE execution bridge, and
+    // reset on shutdown.
+    this.authenticatedRequestLimiter = createAuthenticatedRequestLimiter();
 
     this.defaultWorkspaceId = config?.defaultWorkspaceId;
     this.processRegistry =
@@ -1363,7 +1546,7 @@ export class ArcMcpServer implements IArcMcpServer {
     this.server = new Server(
       {
         name: 'cesspace-arc',
-        version: '0.4.0-rc04',
+        version: '0.5.0-rc05',
       },
       {
         capabilities: {
@@ -1403,36 +1586,75 @@ export class ArcMcpServer implements IArcMcpServer {
 
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const toolName = request.params.name;
+      // The generic registered-tool gate. An unregistered name is a JSON-RPC
+      // `-32601` here, at the protocol boundary, and never becomes a tool
+      // result: it does not reach the shared execution pipeline, policy, the
+      // approval manager, or any subsystem. Identical to the remote boundary
+      // below, so both transports answer an unknown tool the same way.
+      if (!isRegisteredToolName(toolName)) {
+        throw unknownToolError();
+      }
       const params = (request.params.arguments || {}) as Record<string, unknown>;
       return this.dispatchToolCall(toolName, params);
     });
   }
 
   /**
-   * The single, authoritative execution pipeline:
-   * MCP request -> schema validation -> caller context -> workspace binding
-   *   -> policy admission -> filesystem/git safety checks -> tool execution
-   *   -> structured audit event -> sanitized MCP response.
+   * The stdio/local entry point into the ONE shared execution pipeline.
+   *
+   * The `actorOverride` seam exists for stdio callers and backward-compatible
+   * tests ONLY. It is deliberately NOT the remote boundary: the remote path
+   * (Task 6) passes a COMPLETE, internally derived actor to
+   * {@link executeAuthenticatedToolCall} and can never express a partial or
+   * caller-selectable actor.
    */
   public async dispatchToolCall(
     toolName: string,
     parameters: Record<string, unknown>,
     actorOverride?: Partial<PolicyEvaluationContext['actor']>,
   ): Promise<{ isError?: boolean; content: Array<{ type: 'text'; text: string }> }> {
-    const startTime = new Date().toISOString();
-    const startMs = Date.now();
-
-    // 1. Authenticated / Local Caller Context
-    const auditActor = {
+    const actor: CompleteActor = {
       clientId: actorOverride?.clientId ?? 'local-stdio-caller',
       clientType: actorOverride?.clientType ?? 'mcp-client',
       sessionId: actorOverride?.sessionId ?? 'stdio-session-01',
       deviceId: actorOverride?.deviceId ?? 'local-machine',
-    };
-
-    const actor: PolicyEvaluationContext['actor'] = {
-      ...auditActor,
       authenticated: actorOverride?.authenticated ?? true,
+    };
+    return this.executeAuthenticatedToolCall(actor, toolName, parameters);
+  }
+
+  /**
+   * The single, authoritative execution pipeline:
+   * authenticated request -> caller context -> schema validation -> workspace
+   *   binding -> policy admission -> filesystem/git safety checks -> tool
+   *   execution -> structured audit event -> sanitized MCP response.
+   *
+   * Both transports converge HERE. stdio supplies its local actor, and the
+   * RC-05 remote bridge supplies the exact actor derived from an authenticated
+   * Task-5 session; neither forks the dispatch switch, duplicates the approval
+   * gate, or reaches a subsystem directly.
+   *
+   * The actor parameter is COMPLETE by construction: there is no default, no
+   * merge, and no partial override, so a caller cannot select or fill in any
+   * authorization-relevant field.
+   *
+   * @internal Reachable from the remote bridge and from stdio; not a transport.
+   */
+  public async executeAuthenticatedToolCall(
+    actor: CompleteActor,
+    toolName: string,
+    parameters: Record<string, unknown>,
+  ): Promise<{ isError?: boolean; content: Array<{ type: 'text'; text: string }> }> {
+    const startTime = new Date().toISOString();
+    const startMs = Date.now();
+
+    // 1. Authenticated Caller Context. `auditActor` is exactly the four bound
+    //    fields, in the same order the audit chain has always recorded them.
+    const auditActor = {
+      clientId: actor.clientId,
+      clientType: actor.clientType,
+      sessionId: actor.sessionId,
+      deviceId: actor.deviceId,
     };
 
     /** Audits a denial and returns the sanitized MCP error response. */
@@ -2373,13 +2595,47 @@ export class ArcMcpServer implements IArcMcpServer {
           // usable effective Layer-2 engine was initialized. An explicitly
           // configured but invalid policy reports UNHEALTHY with no fallback.
           const policyEngineActive = this.effectivePolicyEngine !== undefined;
+          const gatewayStatus = this.remoteGateway?.getStatus();
+          // A bound listener whose certificate has expired cannot serve new
+          // sessions, so it is neither active nor healthy.
+          const gatewayDegradedForHealth = gatewayStatus?.degraded === true;
           const health: HealthResponse = {
-            status: policyEngineActive ? 'HEALTHY' : 'UNHEALTHY',
-            version: '0.4.0-rc04',
-            stage: 'RC-04',
+            status: !policyEngineActive
+              ? 'UNHEALTHY'
+              : gatewayDegradedForHealth
+                ? 'DEGRADED'
+                : 'HEALTHY',
+            version: '0.5.0-rc05',
+            stage: 'RC-05',
             policyEngineActive,
             auditActive: true,
             authorizedWorkspacesCount: this.workspaceRegistry.getWorkspaces().length,
+            transportMode: this.transportMode,
+            remoteGatewayActive: gatewayStatus?.activeAndServing ?? false,
+            // §16/§17: authentication is active only while a remote gateway is
+            // actually admitting authenticated requests. A degraded gateway has
+            // latched its certificate expiry and refuses every new TLS and
+            // session admission, so it reports authentication inactive too.
+            authenticationActive:
+              this.transportMode === 'remote' && (gatewayStatus?.activeAndServing ?? false),
+            // Counts only, from the two existing authorities: the gateway's
+            // authoritative trust store and the ONE process-local session
+            // manager. No device list, no session list, no identifier.
+            enrolledDevicesCount: this.remoteGateway?.getEnrolledDeviceCount() ?? 0,
+            activeSessionsCount: this.sessionManager.getActiveSessionCount(),
+            // Only safe, bounded fields cross this boundary: no certificate or
+            // key bytes, no file paths, no pins, no peer addresses.
+            ...(gatewayStatus === undefined
+              ? {}
+              : {
+                  remoteGatewayDegraded: gatewayStatus.degraded,
+                  ...(gatewayStatus.degradedReason === undefined
+                    ? {}
+                    : {
+                        remoteGatewayDegradedReason: gatewayStatus.degradedReason,
+                        degradedReason: gatewayStatus.degradedReason,
+                      }),
+                }),
           };
           result = health;
           break;
@@ -2748,6 +3004,121 @@ export class ArcMcpServer implements IArcMcpServer {
   }
 
   public async start(): Promise<void> {
+    // Exactly one transport mode runs per process (§4 L-4). In remote mode the
+    // stdio transport is never connected, so there is no second listener and no
+    // way for a remote failure to fall back to stdio.
+    if (this.transportMode === 'remote') {
+      const remoteConfig = this.remoteConfig;
+      if (remoteConfig === undefined) {
+        throw new Error('Remote transport requires remote gateway configuration.');
+      }
+      // The SAME pending-enrollment authority the admin IPC channel uses. A
+      // challenge created locally through the authenticated operator channel is
+      // therefore immediately completable remotely, with no copying and no
+      // cross-process or cross-instance synchronization.
+      const gateway = new RemoteGateway(remoteConfig, {
+        enrollmentManager: this.enrollmentManager,
+        // RC-05 Task 10: the ONE audit chain. The gateway, the enrollment
+        // bootstrap, the MCP surface, and the local admin channel all write
+        // their lifecycle evidence into THIS logger's existing append-only
+        // chain — there is no second logger, no gateway-only chain, and no
+        // external persistence (RC-06 owns that).
+        auditLogger: this.auditLogger,
+      });
+
+      // ONE admission authority per process, over the ONE process-wide Layer C
+      // limiter. The transport admits every authenticated MCP request with it —
+      // POST, GET SSE, DELETE, `tools/list`, `ping`, and `tools/call` alike — and
+      // the execution bridge executes against the SAME instance, so a `tools/call`
+      // is neither authenticated nor rate-charged a second time.
+      const admission = new RemoteRequestAdmission({
+        sessionManager: this.sessionManager,
+        authenticatedLimiter: this.authenticatedRequestLimiter,
+      });
+
+      // The remote execution bridge is composed over the gateway's CURRENT
+      // authoritative trust store. The resolver is called per request and is
+      // never cached, so device revocation takes effect on the next call.
+      //
+      // It is built BEFORE the listener binds, so the ONE remote execution path
+      // exists before any request can reach it.
+      this.remoteExecutionBridge = new RemoteExecutionBridge({
+        sessionManager: this.sessionManager,
+        resolveActiveDeviceIdentity: (spkiPin) => gateway.resolveActiveDeviceIdentity(spkiPin),
+        sink: this,
+        authenticatedLimiter: this.authenticatedRequestLimiter,
+        admission,
+      });
+
+      // §3/§5/RC05-NEG-06: the stateful Streamable HTTP surface is constructed
+      // and attached BEFORE the listener binds. Its constructor obtains the
+      // session-ID generator from the ONE Task-5 session authority and throws if
+      // that authority is unusable, so a missing or stateless-capable
+      // configuration fails startup with NO listener bound — there is no
+      // fallback path to a stateless transport, and no window in which `/mcp` is
+      // reachable without its transport.
+      try {
+        const surface = new RemoteMcpSurface({
+          sessionManager: this.sessionManager,
+          admission,
+          createSessionServer: () => this.createRemoteSessionServer(),
+          publicHostname: remoteConfig.publicHostname,
+          // The memoized-per-chain sink, so the surface writes into the SAME
+          // chain and the SAME queue the gateway already emits through.
+          auditSink: getGatewayAuditSink(this.auditLogger),
+        });
+        gateway.attachMcpSurface(surface);
+
+        // RC-05 Task 9: the ONE local device/session administration authority,
+        // composed over the gateway's CURRENT authoritative trust state and the
+        // Task-8 transport registry that remote requests are actually served
+        // from. It is attached before the listener binds, so there is no window
+        // in which the local operator channel answers administration requests
+        // from anything other than the running trust root.
+        //
+        // The authority is attached ONLY here, in the remote composition. A
+        // process with no authoritative remote trust state therefore has no
+        // administration authority at all, and every administration method
+        // fails closed rather than loading a second device store.
+        if (this.adminIpcServer) {
+          this.adminIpcServer.attachDeviceAdministration(
+            new GatewayDeviceAdministration(
+              gateway.getDeviceTrustAuthority(),
+              this.sessionManager,
+              () => surface,
+              getGatewayAuditSink(this.auditLogger),
+            ),
+          );
+        }
+
+        await gateway.start();
+      } catch (err: unknown) {
+        // All-or-nothing: nothing is left bound, and stdio is NOT started as a
+        // fallback.
+        await gateway.stop();
+        throw err;
+      }
+      this.remoteGateway = gateway;
+
+      // The admin channel is a LOCAL IPC channel, so starting it in remote mode
+      // adds no network surface: it remains local-only and Ed25519-authenticated,
+      // and it is the operator's device/enrollment administration path. It is
+      // started only after the gateway is bound, and a failure here tears the
+      // whole process back down rather than leaving a half-active composition.
+      if (this.adminIpcServer) {
+        try {
+          await this.adminIpcServer.start();
+        } catch (err: unknown) {
+          await this.stop();
+          if (err instanceof AdminIpcError) {
+            throw new Error(`Admin IPC channel failed to start: ${err.reason}`, { cause: err });
+          }
+          throw new Error('Admin IPC channel failed to start.', { cause: err });
+        }
+      }
+      return;
+    }
+
     this.transport = new StdioServerTransport();
     await this.server.connect(this.transport);
 
@@ -2768,6 +3139,159 @@ export class ArcMcpServer implements IArcMcpServer {
     }
   }
 
+  /** The single active transport mode for this process. */
+  public getTransportMode(): 'stdio' | 'remote' {
+    return this.transportMode;
+  }
+
+  /** Bounded, non-secret remote gateway status. Undefined in stdio mode. */
+  public getRemoteGatewayStatus(): RemoteGatewayStatus | undefined {
+    return this.remoteGateway?.getStatus();
+  }
+
+  /**
+   * The application-level remote execution entry point (RC-05 Task 6).
+   *
+   * Undefined until a remote gateway is bound, and undefined in stdio mode,
+   * which has no device trust store and no sessions. Task 8 will call this from
+   * the Streamable HTTP transport; Task 6 exposes it as an application API only
+   * — no network path reaches it, and the Task-4 `/mcp` route remains deny-only.
+   */
+  public getRemoteExecutionBridge(): RemoteExecutionBridge | undefined {
+    return this.remoteExecutionBridge;
+  }
+
+  /**
+   * Builds the MCP `Server` for ONE remote session (RC-05 Task 8).
+   *
+   * Deliberately assembled from the SAME parts as the stdio server — the same
+   * SDK `Server` shape, the same `ALL_TOOL_DEFINITIONS` catalog, and the same
+   * `CallToolRequestSchema` entry point — so remote cannot expose a tool the
+   * local catalog does not already define, and there is no second tool
+   * dispatcher anywhere.
+   *
+   * The one difference is the destination of a tool call: stdio calls
+   * `dispatchToolCall`, while a remote call routes into the EXISTING
+   * `RemoteExecutionBridge`, which is the only component that may construct a
+   * trusted remote actor. The admission the transport already granted for this
+   * HTTP request travels with it as `extra.authInfo.admission`, so the bridge
+   * authenticates nothing a second time and charges no second rate token or
+   * concurrency slot. Neither path calls a subsystem, the policy kernel, the
+   * approval manager, or the filesystem directly — both converge on
+   * `executeAuthenticatedToolCall`.
+   */
+  private createRemoteSessionServer(): Server {
+    const server = new Server(
+      {
+        name: 'cesspace-arc',
+        version: '0.5.0-rc05',
+      },
+      {
+        capabilities: {
+          tools: {},
+        },
+      },
+    );
+
+    server.setRequestHandler(ListToolsRequestSchema, async () => {
+      return {
+        tools: ALL_TOOL_DEFINITIONS,
+      };
+    });
+
+    server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+      const bridge = this.remoteExecutionBridge;
+      const requestContext = readRemoteRequestContext(extra.authInfo);
+      if (bridge === undefined || requestContext === null) {
+        // Fail closed. A remote MCP call whose gateway request context is
+        // missing cannot be attributed to a trusted mTLS identity, so it is
+        // refused with exactly the error an unauthenticated caller receives.
+        // The SPKI pin is NOT taken from the session context as a fallback:
+        // identity must come from the request that is being executed.
+        return this.remoteToolErrorResult(ArcError.unauthenticated());
+      }
+
+      const toolName = request.params.name;
+
+      // The generic registered-tool gate, applied AFTER the authentication
+      // check above and BEFORE the bridge: an authenticated caller naming an
+      // unregistered tool gets the transport-level `-32601`, exactly as it
+      // would for an unregistered JSON-RPC method.
+      //
+      // It is intentionally ordered after the fail-closed context check so an
+      // UNAUTHENTICATED caller still receives the SAME generic refusal for
+      // every name, registered or not: the registration check must not become
+      // an oracle that tells an unauthenticated prober which names exist.
+      //
+      // No administrative name list appears here. The rule is membership in the
+      // one registered catalog, so no administrative capability can be reached
+      // through the remote call path by any name, and no administrative name is
+      // confirmed or denied by the shape of the answer.
+      if (!isRegisteredToolName(toolName)) {
+        throw unknownToolError();
+      }
+
+      const parameters = (request.params.arguments || {}) as Record<string, unknown>;
+
+      try {
+        return remoteToolResult(
+          await bridge.executeRemoteToolCall({
+            trustedSpkiPin: requestContext.spkiPin,
+            presentedSessionId: requestContext.presentedSessionId,
+            authorizationHeader: requestContext.authorizationHeader,
+            hasExistingSessionContext: requestContext.presentedSessionId !== null,
+            // The admission THIS HTTP request already paid for: the tool call
+            // executes against it, so ONE Layer C rate token and ONE §26 C-3
+            // slot cover the whole request rather than being charged twice.
+            admission: requestContext.admission,
+            toolName,
+            parameters,
+          }),
+        );
+      } catch (err: unknown) {
+        // The bridge throws only bounded ArcErrors, and only BEFORE dispatch.
+        // Anything the shared pipeline itself rejects is already returned from
+        // `executeAuthenticatedToolCall` as a tool result, so it never arrives
+        // here and its semantics are unchanged.
+        return this.remoteToolErrorResult(
+          err instanceof ArcError ? err : ArcError.internalError('Tool execution failed.'),
+        );
+      }
+    });
+
+    return server;
+  }
+
+  /**
+   * Converts a pre-dispatch ArcError into a tool result.
+   *
+   * Uses the same error shape and the same message sanitizer as the shared
+   * stdio pipeline, so a remote caller observes identical error semantics.
+   */
+  private remoteToolErrorResult(arcError: ArcError): {
+    isError: true;
+    content: Array<{ type: 'text'; text: string }>;
+  } {
+    return {
+      isError: true,
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              code: arcError.code,
+              category: arcError.category,
+              message: sanitizeClientErrorMessage(arcError.message),
+              retryable: arcError.retryable,
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
+  }
+
   public async flushAudit(): Promise<void> {
     await this.approvalAuditSink.flush();
     if (this.processRegistry) {
@@ -2776,6 +3300,16 @@ export class ArcMcpServer implements IArcMcpServer {
   }
 
   public async stop(): Promise<void> {
+    if (this.remoteGateway !== undefined) {
+      await this.remoteGateway.stop();
+      this.remoteGateway = undefined;
+    }
+    // Sessions are volatile and die with the gateway that authenticated them.
+    this.remoteExecutionBridge = undefined;
+    this.sessionManager.clear();
+    // Layer C rate and concurrency state is equally volatile: a restarted
+    // gateway gets a clean budget, and nothing about it is ever persisted.
+    this.authenticatedRequestLimiter.reset();
     if (this.adminIpcServer) {
       await this.adminIpcServer.stop();
     }
@@ -2822,6 +3356,17 @@ export function createArcMcpServer(config?: Partial<ArcServerConfig>): ArcMcpSer
 
   const approvalStateManager = new ApprovalStateManager();
 
+  // RC-05 Task 4: exactly ONE pending-enrollment authority per process. It is
+  // passed to the local admin IPC channel (which creates and cancels pending
+  // challenges) and to the remote gateway (which completes them over mTLS), so
+  // both halves of an enrollment observe the same in-memory challenge table.
+  const enrollmentManager = new EnrollmentManager();
+
+  // RC-05 Task 6: exactly ONE session authority for the process. It is handed to
+  // the server, which composes the remote execution bridge over it, so session
+  // issuance and request authentication can never diverge.
+  const sessionManager = new SessionManager();
+
   // The admin channel is opt-in through trusted launch configuration only.
   // Supplying exactly one half of the pair fails closed rather than starting
   // partially configured admin access.
@@ -2843,6 +3388,8 @@ export function createArcMcpServer(config?: Partial<ArcServerConfig>): ArcMcpSer
         operatorPublicKeyB64: operatorPublicKeyB64 as string,
         approvalStateManager,
         auditLogger,
+        // The SAME instance the remote bootstrap endpoint completes against.
+        enrollmentManager,
       });
     }
   }
@@ -2858,6 +3405,8 @@ export function createArcMcpServer(config?: Partial<ArcServerConfig>): ArcMcpSer
     processRegistry,
     approvalStateManager,
     adminIpcServer,
+    enrollmentManager,
+    sessionManager,
   );
 }
 

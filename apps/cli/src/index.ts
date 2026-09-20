@@ -27,8 +27,12 @@ import {
   type PolicySourceFormat,
 } from '@cesspace-arc/policy';
 import {
+  ADMIN_DEVICE_ID_REGEX,
+  ADMIN_MAX_DISPLAY_LABEL_BYTES,
   ADMIN_MAX_REASON_BYTES,
   ADMIN_REQUEST_ID_REGEX,
+  ADMIN_SESSION_ID_REGEX,
+  ADMIN_SPKI_PIN_REGEX,
   ArcError,
   type AdminResponse,
 } from '@cesspace-arc/protocol';
@@ -36,7 +40,7 @@ import {
 import { AdminClientError, AdminIpcClient, readPrivateKeyFromFd } from './admin-client.js';
 
 export const CLI_NAME = 'arc';
-export const CLI_VERSION = '0.4.0-rc04';
+export const CLI_VERSION = '0.5.0-rc05';
 
 export const EXIT_OK = 0;
 export const EXIT_FAILURE = 1;
@@ -80,11 +84,21 @@ Usage:
   ${CLI_NAME} approvals inspect <requestId>
   ${CLI_NAME} approve <requestId>
   ${CLI_NAME} reject <requestId> [--reason <text>]
+  ${CLI_NAME} enrollment create --client-id <id> --client-type <type> --spki-pin <64hex> [--label <text>]
+  ${CLI_NAME} enrollment cancel <enrollmentId>
+  ${CLI_NAME} devices list
+  ${CLI_NAME} devices inspect <deviceId>
+  ${CLI_NAME} devices revoke <deviceId>
+  ${CLI_NAME} devices rename <deviceId> --label <text>
+  ${CLI_NAME} devices pin-add <deviceId> --spki-pin <64hex>
+  ${CLI_NAME} devices pin-remove <deviceId> --spki-pin <64hex>
+  ${CLI_NAME} sessions list
+  ${CLI_NAME} sessions revoke <sessionId>
   ${CLI_NAME} policy test <file> [options]
   ${CLI_NAME} --help
   ${CLI_NAME} --version
 
-Admin channel options (approvals, approve, reject):
+Admin channel options (approvals, approve, reject, enrollment, devices, sessions):
   --admin-socket <path>   Local admin IPC endpoint
                           (env: CESSPACE_ARC_ADMIN_SOCKET)
   --admin-key-fd <n>      Inherited file descriptor holding the operator
@@ -93,6 +107,14 @@ Admin channel options (approvals, approve, reject):
 
   The private key is read only from the inherited descriptor. It is never
   accepted through argv, the environment, a config file, or a default path.
+
+Device and session administration options:
+  --label <text>          New display label for \`devices rename\` (<= 64 UTF-8 bytes)
+  --spki-pin <64hex>      Public SPKI pin for \`devices pin-add\` / \`devices pin-remove\`
+
+  These commands are reachable ONLY over the local authenticated admin channel.
+  There is no remote, HTTP, or MCP equivalent, and no command here prints a
+  session token, a token digest, an enrollment secret, or private key material.
 
 policy test options:
   --format <json|yaml>        Policy format (inferred from .json/.yaml/.yml)
@@ -123,7 +145,7 @@ interface ParsedAdminArgs {
 }
 
 /** Reads an option value, failing closed when the value is absent. */
-function takeValue(argv: string[], index: number, option: string): string {
+function takeValue(argv: readonly string[], index: number, option: string): string {
   const value = argv[index + 1];
   if (value === undefined || value.startsWith('--')) {
     throw new UsageError(`${option} requires a value.`);
@@ -194,25 +216,220 @@ async function callAdmin(
   return client.request(method, params);
 }
 
-/** Renders a bounded admin failure on stderr. Never includes key material. */
-function reportAdminFailure(io: CliIo, response: AdminResponse): number {
+/**
+ * Bounded admin failure contexts.
+ *
+ * The context selects only the human-readable sentence; the code set is shared,
+ * so no command can introduce a new operator-visible failure vocabulary.
+ */
+type AdminFailureContext = 'approval' | 'enrollment' | 'device' | 'session';
+
+/** The per-context sentences for codes whose wording depends on the subject. */
+const NOT_FOUND_MESSAGES: Record<AdminFailureContext, string> = {
+  approval: 'No pending approval matches that request ID.\n',
+  enrollment: 'No pending enrollment matches that enrollment ID.\n',
+  device: 'No enrolled device matches that device ID.\n',
+  session: 'No live session matches that session ID.\n',
+};
+
+const EXHAUSTED_MESSAGES: Record<AdminFailureContext, string> = {
+  approval: 'Approval resource limits were reached.\n',
+  enrollment: 'Pending enrollment limits were reached.\n',
+  device: 'The device would exceed the two active SPKI pin limit.\n',
+  session: 'Session resource limits were reached.\n',
+};
+
+/**
+ * Renders a bounded admin failure on stderr. Never includes key material, and
+ * never distinguishes one internal cause from another.
+ */
+function reportAdminFailure(
+  io: CliIo,
+  response: AdminResponse,
+  context: AdminFailureContext = 'approval',
+): number {
   const code = response.error?.code ?? 'INTERNAL_ERROR';
   if (code === 'AUTHENTICATION_FAILED') {
     io.stderr('Admin authentication failed. The operator key was not accepted.\n');
   } else if (code === 'INVALID_ADMIN_REQUEST') {
     io.stderr('Admin request was rejected as invalid.\n');
   } else if (code === 'NOT_FOUND_OR_NOT_PENDING') {
-    io.stderr('No pending approval matches that request ID.\n');
+    io.stderr(NOT_FOUND_MESSAGES[context]);
   } else if (code === 'APPROVAL_EXPIRED') {
     io.stderr('The approval request has expired.\n');
   } else if (code === 'APPROVAL_REJECTED') {
     io.stderr('The approval request could not be acted on.\n');
   } else if (code === 'RESOURCE_EXHAUSTED') {
-    io.stderr('Approval resource limits were reached.\n');
+    io.stderr(EXHAUSTED_MESSAGES[context]);
+  } else if (code === 'ADMINISTRATION_UNAVAILABLE') {
+    // Deliberately undifferentiated: the operator learns that device and
+    // session administration is not currently answerable by an authoritative
+    // composition, and nothing about why or what the durable state is.
+    io.stderr('Device and session administration is unavailable on this server.\n');
   } else {
     io.stderr('Admin operation failed.\n');
   }
   return EXIT_FAILURE;
+}
+
+// ---------------------------------------------------------------------------
+// RC-05 Task 2: enrollment administration
+//
+// Wire-format bounds mirrored locally so the CLI can fail before opening a
+// connection. The server re-validates authoritatively; these are convenience
+// checks only. Authoritative definitions live in the frozen RC-05 contract.
+// ---------------------------------------------------------------------------
+
+/** Canonical SPKI pin: SHA-256 of DER SPKI, 64 lowercase hex characters. */
+const ENROLLMENT_SPKI_PIN_REGEX = /^[0-9a-f]{64}$/;
+/** Server-generated enrollment identifier: 32 lowercase hex characters. */
+const ENROLLMENT_ID_REGEX = /^[0-9a-f]{32}$/;
+/** Maximum display label size in UTF-8 bytes. */
+const ENROLLMENT_MAX_LABEL_BYTES = 64;
+/**
+ * Persisted client identity bounds, matching the authoritative domain rules in
+ * @cesspace-arc/auth: clientId <= 128 characters, clientType <= 64 characters.
+ * Character counts, not bytes, because that is what the trust-store schema
+ * enforces. The server re-validates authoritatively.
+ */
+const ENROLLMENT_MAX_CLIENT_ID_CHARS = 128;
+const ENROLLMENT_MAX_CLIENT_TYPE_CHARS = 64;
+
+interface EnrollmentCreateOptions {
+  clientId: string;
+  clientType: string;
+  spkiPin: string;
+  displayLabel?: string;
+}
+
+/** Validates a required bounded identifier supplied on the command line. */
+function validateEnrollmentIdentifier(
+  value: string | undefined,
+  option: string,
+  maxChars: number,
+): string {
+  if (value === undefined || value.trim().length === 0) {
+    throw new UsageError(`${option} is required.`);
+  }
+  if (value.includes('\u0000')) {
+    throw new UsageError(`${option} must not contain NUL.`);
+  }
+  if (value.length > maxChars) {
+    throw new UsageError(`${option} must not exceed ${maxChars} characters.`);
+  }
+  return value;
+}
+
+/** Parses `enrollment create` arguments. Rejects unknown options. */
+function parseEnrollmentCreateArgs(args: readonly string[]): EnrollmentCreateOptions {
+  let clientId: string | undefined;
+  let clientType: string | undefined;
+  let spkiPin: string | undefined;
+  let displayLabel: string | undefined;
+
+  const argv = [...args];
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--client-id') {
+      clientId = takeValue(argv, i, arg);
+      i++;
+    } else if (arg === '--client-type') {
+      clientType = takeValue(argv, i, arg);
+      i++;
+    } else if (arg === '--spki-pin') {
+      spkiPin = takeValue(argv, i, arg);
+      i++;
+    } else if (arg === '--label') {
+      displayLabel = takeValue(argv, i, arg);
+      i++;
+    } else {
+      throw new UsageError(`Unknown option for enrollment create: ${arg}`);
+    }
+  }
+
+  const validatedClientId = validateEnrollmentIdentifier(
+    clientId,
+    '--client-id',
+    ENROLLMENT_MAX_CLIENT_ID_CHARS,
+  );
+  const validatedClientType = validateEnrollmentIdentifier(
+    clientType,
+    '--client-type',
+    ENROLLMENT_MAX_CLIENT_TYPE_CHARS,
+  );
+
+  if (spkiPin === undefined) {
+    throw new UsageError('--spki-pin is required.');
+  }
+  if (!ENROLLMENT_SPKI_PIN_REGEX.test(spkiPin)) {
+    throw new UsageError('--spki-pin must be exactly 64 lowercase hexadecimal characters.');
+  }
+
+  if (displayLabel !== undefined) {
+    if (displayLabel.includes('\u0000')) {
+      throw new UsageError('--label must not contain NUL.');
+    }
+    if (Buffer.byteLength(displayLabel, 'utf8') > ENROLLMENT_MAX_LABEL_BYTES) {
+      throw new UsageError(`--label must not exceed ${ENROLLMENT_MAX_LABEL_BYTES} UTF-8 bytes.`);
+    }
+  }
+
+  return {
+    clientId: validatedClientId,
+    clientType: validatedClientType,
+    spkiPin,
+    ...(displayLabel === undefined ? {} : { displayLabel }),
+  };
+}
+
+/**
+ * Renders a successful enrollment creation.
+ *
+ * The one-time enrollment secret is displayed exactly once, on stdout, to the
+ * authenticated operator. It is never written to any file, never included in a
+ * log line, and never repeated by any later command.
+ */
+function renderEnrollmentCreate(io: CliIo, result: unknown): number {
+  if (result === null || typeof result !== 'object') {
+    io.stderr('Enrollment creation returned no result.\n');
+    return EXIT_FAILURE;
+  }
+  const enrollment = (result as { enrollment?: unknown }).enrollment;
+  const secret = (result as { secret?: unknown }).secret;
+  if (
+    enrollment === null ||
+    typeof enrollment !== 'object' ||
+    typeof secret !== 'string' ||
+    !/^[0-9a-f]{64}$/.test(secret)
+  ) {
+    io.stderr('Enrollment creation returned an unusable result.\n');
+    return EXIT_FAILURE;
+  }
+
+  const view = enrollment as Record<string, unknown>;
+  io.stdout(`Enrollment ID : ${String(view.enrollmentId)}\n`);
+  io.stdout(`Client        : ${String(view.clientId)} (${String(view.clientType)})\n`);
+  io.stdout(`SPKI pin      : ${String(view.spkiPin)}\n`);
+  if (typeof view.displayLabel === 'string' && view.displayLabel.length > 0) {
+    io.stdout(`Label         : ${view.displayLabel}\n`);
+  }
+  io.stdout(`Expires in    : ${formatSeconds(view.remainingSeconds)}s\n`);
+  io.stdout(`\n`);
+  io.stdout(`One-time enrollment secret (shown once, store it securely):\n`);
+  io.stdout(`${secret}\n`);
+  return EXIT_OK;
+}
+
+/** Renders a successful enrollment cancellation. */
+function renderEnrollmentCancel(io: CliIo, result: unknown): number {
+  if (result === null || typeof result !== 'object') {
+    io.stderr('Enrollment cancellation returned no result.\n');
+    return EXIT_FAILURE;
+  }
+  const view = result as Record<string, unknown>;
+  io.stdout(`Enrollment ID : ${String(view.enrollmentId)}\n`);
+  io.stdout(`State         : ${String(view.state)}\n`);
+  return EXIT_OK;
 }
 
 // ---------------------------------------------------------------------------
@@ -323,6 +540,216 @@ function renderApprove(io: CliIo, result: unknown): number {
 function renderReject(io: CliIo, result: unknown): number {
   const rejection = (result ?? {}) as Record<string, unknown>;
   io.stdout(`Request ${String(rejection.requestId)} ${String(rejection.state)}\n`);
+  return EXIT_OK;
+}
+
+// ---------------------------------------------------------------------------
+// RC-05 Task 9: local device and session administration
+//
+// Reachable ONLY over the local authenticated admin channel: there is no remote
+// equivalent, no HTTP or WebSocket admin API, and no MCP admin tool, and these
+// commands are useless without both an explicitly configured admin endpoint and
+// the operator private key in an inherited descriptor.
+//
+// Every argument is validated here BEFORE a connection is opened, as a
+// convenience only. The server re-validates the same bounds authoritatively, so
+// a client that skipped these checks could not reach a weaker code path.
+//
+// No command in this section prints a session token, a token digest, an
+// enrollment secret, private key material, or TLS private material.
+// ---------------------------------------------------------------------------
+
+/** Validates a `<deviceId>` positional. */
+function parseDeviceId(value: unknown): string {
+  if (typeof value !== 'string' || !ADMIN_DEVICE_ID_REGEX.test(value)) {
+    throw new UsageError('deviceId must be exactly 32 lowercase hexadecimal characters.');
+  }
+  return value;
+}
+
+/** Validates a `<sessionId>` positional. */
+function parseSessionId(value: unknown): string {
+  if (typeof value !== 'string' || !ADMIN_SESSION_ID_REGEX.test(value)) {
+    throw new UsageError('sessionId must be exactly 64 lowercase hexadecimal characters.');
+  }
+  return value;
+}
+
+/** Validates an `--spki-pin` value: the canonical 64-lowercase-hex SPKI pin. */
+function parseSpkiPin(value: unknown): string {
+  if (typeof value !== 'string' || !ADMIN_SPKI_PIN_REGEX.test(value)) {
+    throw new UsageError('--spki-pin must be exactly 64 lowercase hexadecimal characters.');
+  }
+  return value;
+}
+
+/** Validates an `--label` value against the Task-1 trust-store display bound. */
+function parseDisplayLabel(value: unknown): string {
+  if (typeof value !== 'string') {
+    throw new UsageError('--label requires a value.');
+  }
+  if (value.includes('\u0000')) {
+    throw new UsageError('--label must not contain NUL.');
+  }
+  if (Buffer.byteLength(value, 'utf8') > ADMIN_MAX_DISPLAY_LABEL_BYTES) {
+    throw new UsageError(`--label must not exceed ${ADMIN_MAX_DISPLAY_LABEL_BYTES} UTF-8 bytes.`);
+  }
+  return value;
+}
+
+interface ParsedDeviceArgs {
+  positional: string[];
+  label?: string;
+  spkiPin?: string;
+}
+
+/**
+ * Splits a `devices` subcommand's arguments into positionals and the options
+ * that subcommand accepts.
+ *
+ * `accepted` is per-subcommand, so an option that belongs to another subcommand
+ * is rejected as unknown rather than silently ignored, and surplus positionals
+ * are rejected by the caller.
+ */
+function parseDeviceArgs(args: readonly string[], accepted: readonly string[]): ParsedDeviceArgs {
+  const positional: string[] = [];
+  let label: string | undefined;
+  let spkiPin: string | undefined;
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--label' && accepted.includes('label')) {
+      label = parseDisplayLabel(takeValue(args, i, '--label'));
+      i++;
+    } else if (arg === '--spki-pin' && accepted.includes('spkiPin')) {
+      spkiPin = parseSpkiPin(takeValue(args, i, '--spki-pin'));
+      i++;
+    } else if (arg.startsWith('--')) {
+      throw new UsageError(`Unknown option for this command: ${arg}`);
+    } else {
+      positional.push(arg);
+    }
+  }
+  const parsed: ParsedDeviceArgs = { positional };
+  if (label !== undefined) parsed.label = label;
+  if (spkiPin !== undefined) parsed.spkiPin = spkiPin;
+  return parsed;
+}
+
+/** `arc devices list` — bounded metadata only. Never discloses SPKI pins. */
+function renderDevicesList(io: CliIo, result: unknown): number {
+  const devices = (result as { devices?: unknown })?.devices;
+  if (!Array.isArray(devices)) {
+    io.stderr('Admin response was malformed.\n');
+    return EXIT_FAILURE;
+  }
+  if (devices.length === 0) {
+    io.stdout('No enrolled devices.\n');
+    return EXIT_OK;
+  }
+  io.stdout(`Enrolled devices: ${devices.length}\n\n`);
+  for (const entry of devices) {
+    const device = entry as Record<string, unknown>;
+    const label =
+      typeof device.displayLabel === 'string' && device.displayLabel.length > 0
+        ? device.displayLabel
+        : '-';
+    io.stdout(`  Device:   ${String(device.deviceId)}\n`);
+    io.stdout(`  Client:   ${String(device.clientId)} (${String(device.clientType)})\n`);
+    io.stdout(`  Label:    ${label}\n`);
+    io.stdout(`  Enrolled: ${String(device.enrolledAt)}\n`);
+    io.stdout(`  State:    ${device.revoked === true ? 'REVOKED' : 'ACTIVE'}\n`);
+    io.stdout(`  Pins:     ${String(device.activePinCount)}\n\n`);
+  }
+  io.stdout('Run `arc devices inspect <deviceId>` to see active SPKI pins.\n');
+  return EXIT_OK;
+}
+
+/** `arc devices inspect <deviceId>` — includes the active public SPKI pins. */
+function renderDeviceInspect(io: CliIo, result: unknown): number {
+  if (result === null || typeof result !== 'object') {
+    io.stderr('Device inspection returned no result.\n');
+    return EXIT_FAILURE;
+  }
+  const device = result as Record<string, unknown>;
+  const label =
+    typeof device.displayLabel === 'string' && device.displayLabel.length > 0
+      ? device.displayLabel
+      : '-';
+  io.stdout(`Device:   ${String(device.deviceId)}\n`);
+  io.stdout(`Client:   ${String(device.clientId)} (${String(device.clientType)})\n`);
+  io.stdout(`Label:    ${label}\n`);
+  io.stdout(`Enrolled: ${String(device.enrolledAt)}\n`);
+  io.stdout(`State:    ${device.revoked === true ? 'REVOKED' : 'ACTIVE'}\n`);
+  io.stdout(`\nActive SPKI pins:\n`);
+  const pins = device.pins;
+  if (!Array.isArray(pins) || pins.length === 0) {
+    io.stdout('  (none)\n');
+    return EXIT_OK;
+  }
+  for (const pin of pins) {
+    io.stdout(`  ${String(pin)}\n`);
+  }
+  io.stdout('\nAt most two pins are active. Removing the final pin is refused.\n');
+  return EXIT_OK;
+}
+
+/** `arc devices revoke <deviceId>` — durable, and immediate for sessions. */
+function renderDeviceRevoke(io: CliIo, result: unknown): number {
+  const device = (result ?? {}) as Record<string, unknown>;
+  io.stdout(`Device ${String(device.deviceId)} ${String(device.revoked)}\n`);
+  io.stdout(`Sessions revoked:   ${String(device.sessionsRevoked)}\n`);
+  io.stdout(`Transports closed:  ${String(device.transportsClosed)}\n`);
+  io.stdout('The device can no longer authenticate, and its live sessions are gone.\n');
+  return EXIT_OK;
+}
+
+/** `arc devices rename <deviceId> --label <text>` — display metadata only. */
+function renderDeviceRename(io: CliIo, result: unknown): number {
+  const device = (result ?? {}) as Record<string, unknown>;
+  io.stdout(`Device ${String(device.deviceId)} renamed.\n`);
+  io.stdout(`Label: ${String(device.displayLabel)}\n`);
+  io.stdout('Identity, pins, and authorization are unchanged.\n');
+  return EXIT_OK;
+}
+
+/** `arc devices pin-add` / `arc devices pin-remove` — the overlap window. */
+function renderDevicePinMutation(io: CliIo, result: unknown, action: 'added' | 'removed'): number {
+  const device = (result ?? {}) as Record<string, unknown>;
+  io.stdout(`Device ${String(device.deviceId)}: pin ${action}.\n`);
+  io.stdout(`Active pins: ${String(device.activePinCount)}\n`);
+  return EXIT_OK;
+}
+
+/** `arc sessions list` — live sessions only. Never a token or a token digest. */
+function renderSessionsList(io: CliIo, result: unknown): number {
+  const sessions = (result as { sessions?: unknown })?.sessions;
+  if (!Array.isArray(sessions)) {
+    io.stderr('Admin response was malformed.\n');
+    return EXIT_FAILURE;
+  }
+  if (sessions.length === 0) {
+    io.stdout('No live sessions.\n');
+    return EXIT_OK;
+  }
+  io.stdout(`Live sessions: ${sessions.length}\n\n`);
+  for (const entry of sessions) {
+    const session = entry as Record<string, unknown>;
+    io.stdout(`  Session:  ${String(session.sessionId)}\n`);
+    io.stdout(`  Device:   ${String(session.deviceId)}\n`);
+    io.stdout(`  Client:   ${String(session.clientId)} (${String(session.clientType)})\n`);
+    io.stdout(`  Issued:   ${String(session.issuedAt)}\n`);
+    io.stdout(`  State:    ${String(session.state)}\n\n`);
+  }
+  io.stdout('Run `arc sessions revoke <sessionId>` to end one session.\n');
+  return EXIT_OK;
+}
+
+/** `arc sessions revoke <sessionId>` — exactly one session. */
+function renderSessionRevoke(io: CliIo, result: unknown): number {
+  const session = (result ?? {}) as Record<string, unknown>;
+  io.stdout(`Session ${String(session.sessionId)} ${String(session.state)}\n`);
+  io.stdout(`Transport closed: ${session.transportClosed === true ? 'yes' : 'no'}\n`);
+  io.stdout('The session credential is invalid immediately.\n');
   return EXIT_OK;
 }
 
@@ -538,10 +965,48 @@ export async function runCli(
   try {
     const command = args[0];
 
-    if (command === 'approvals' || command === 'approve' || command === 'reject') {
+    if (
+      command === 'approvals' ||
+      command === 'approve' ||
+      command === 'reject' ||
+      command === 'enrollment' ||
+      command === 'devices' ||
+      command === 'sessions'
+    ) {
       const config = resolveAdminConfig(args, io.env);
       const rest = stripAdminOptions(args);
       const head = rest[0];
+
+      if (head === 'enrollment') {
+        const sub = rest[1];
+        if (sub === 'create') {
+          const options = parseEnrollmentCreateArgs(rest.slice(2));
+          const params: Record<string, string> = {
+            clientId: options.clientId,
+            clientType: options.clientType,
+            spkiPin: options.spkiPin,
+          };
+          if (options.displayLabel !== undefined) params.displayLabel = options.displayLabel;
+          const response = await callAdmin(io, config, 'enrollment.create', params);
+          if (!response.ok) return reportAdminFailure(io, response, 'enrollment');
+          return renderEnrollmentCreate(io, response.result);
+        }
+        if (sub === 'cancel') {
+          if (rest.length !== 3) {
+            throw new UsageError('enrollment cancel requires exactly one <enrollmentId>.');
+          }
+          const enrollmentId = rest[2];
+          if (!ENROLLMENT_ID_REGEX.test(enrollmentId)) {
+            throw new UsageError(
+              'enrollmentId must be exactly 32 lowercase hexadecimal characters.',
+            );
+          }
+          const response = await callAdmin(io, config, 'enrollment.cancel', { enrollmentId });
+          if (!response.ok) return reportAdminFailure(io, response, 'enrollment');
+          return renderEnrollmentCancel(io, response.result);
+        }
+        throw new UsageError(`Unknown enrollment subcommand: ${String(sub)}`);
+      }
 
       if (head === 'approvals') {
         const sub = rest[1];
@@ -614,6 +1079,96 @@ export async function runCli(
         const response = await callAdmin(io, config, 'approval.reject', params);
         if (!response.ok) return reportAdminFailure(io, response);
         return renderReject(io, response.result);
+      }
+
+      if (head === 'devices') {
+        const sub = rest[1];
+        if (sub === 'list') {
+          if (rest.length !== 2) {
+            throw new UsageError('devices list takes no further arguments.');
+          }
+          const response = await callAdmin(io, config, 'devices.list', {});
+          if (!response.ok) return reportAdminFailure(io, response, 'device');
+          return renderDevicesList(io, response.result);
+        }
+        if (sub === 'inspect') {
+          if (rest.length !== 3) {
+            throw new UsageError('devices inspect requires exactly one <deviceId>.');
+          }
+          const deviceId = parseDeviceId(rest[2]);
+          const response = await callAdmin(io, config, 'devices.inspect', { deviceId });
+          if (!response.ok) return reportAdminFailure(io, response, 'device');
+          return renderDeviceInspect(io, response.result);
+        }
+        if (sub === 'revoke') {
+          if (rest.length !== 3) {
+            throw new UsageError('devices revoke requires exactly one <deviceId>.');
+          }
+          const deviceId = parseDeviceId(rest[2]);
+          const response = await callAdmin(io, config, 'device.revoke', { deviceId });
+          if (!response.ok) return reportAdminFailure(io, response, 'device');
+          return renderDeviceRevoke(io, response.result);
+        }
+        if (sub === 'rename') {
+          const parsed = parseDeviceArgs(rest.slice(2), ['label']);
+          if (parsed.positional.length !== 1) {
+            throw new UsageError('devices rename requires exactly one <deviceId>.');
+          }
+          if (parsed.label === undefined) {
+            throw new UsageError('devices rename requires --label <text>.');
+          }
+          const deviceId = parseDeviceId(parsed.positional[0]);
+          const response = await callAdmin(io, config, 'device.rename', {
+            deviceId,
+            displayLabel: parsed.label,
+          });
+          if (!response.ok) return reportAdminFailure(io, response, 'device');
+          return renderDeviceRename(io, response.result);
+        }
+        if (sub === 'pin-add' || sub === 'pin-remove') {
+          const parsed = parseDeviceArgs(rest.slice(2), ['spkiPin']);
+          if (parsed.positional.length !== 1) {
+            throw new UsageError(`devices ${sub} requires exactly one <deviceId>.`);
+          }
+          if (parsed.spkiPin === undefined) {
+            throw new UsageError(`devices ${sub} requires --spki-pin <64hex>.`);
+          }
+          const deviceId = parseDeviceId(parsed.positional[0]);
+          const method = sub === 'pin-add' ? 'device.pin.add' : 'device.pin.remove';
+          const response = await callAdmin(io, config, method, {
+            deviceId,
+            spkiPin: parsed.spkiPin,
+          });
+          if (!response.ok) return reportAdminFailure(io, response, 'device');
+          return renderDevicePinMutation(
+            io,
+            response.result,
+            sub === 'pin-add' ? 'added' : 'removed',
+          );
+        }
+        throw new UsageError(`Unknown devices subcommand: ${String(sub)}`);
+      }
+
+      if (head === 'sessions') {
+        const sub = rest[1];
+        if (sub === 'list') {
+          if (rest.length !== 2) {
+            throw new UsageError('sessions list takes no further arguments.');
+          }
+          const response = await callAdmin(io, config, 'sessions.list', {});
+          if (!response.ok) return reportAdminFailure(io, response, 'session');
+          return renderSessionsList(io, response.result);
+        }
+        if (sub === 'revoke') {
+          if (rest.length !== 3) {
+            throw new UsageError('sessions revoke requires exactly one <sessionId>.');
+          }
+          const sessionId = parseSessionId(rest[2]);
+          const response = await callAdmin(io, config, 'session.revoke', { sessionId });
+          if (!response.ok) return reportAdminFailure(io, response, 'session');
+          return renderSessionRevoke(io, response.result);
+        }
+        throw new UsageError(`Unknown sessions subcommand: ${String(sub)}`);
       }
     }
 

@@ -24,7 +24,7 @@ CesSpace ARC partitions the system into **four distinct security zones separated
                                             ▼
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
 │ ZONE 1: CONTROL PLANE INGRESS & IDENTITY DOMAIN                                        │
-│ - Transport termination (JSON-RPC stdio or HTTPS/WSS SSE)                              │
+│ - Transport termination (stdio or Streamable HTTP over TLS 1.3 with SSE response framing) │
 │ - Request schema validation and size/rate limiting                                     │
 │ - Cryptographic identity verification & session token validation (packages/auth)       │
 └───────────────────────────────────────────┬────────────────────────────────────────────┘
@@ -64,11 +64,11 @@ CesSpace ARC partitions the system into **four distinct security zones separated
   - Impersonation or session hijacking.
   - Parameter tampering (e.g., injecting shell metacharacters into JSON fields).
 - **Defensive Controls:**
-  1. **Strict Transport Layer:** All remote connections require TLS 1.3 with pinned certificates. Local connections use non-networked UNIX stdio pipes.
+  1. **Strict Transport Layer:** In-process TLS 1.3 only (no proxy termination, no WebSocket). Mutual TLS with client certificate CA chain validation plus client SPKI SHA-256 pinning against the authoritative device trust store. Local connections use non-networked UNIX stdio pipes, mutually exclusive with the remote gateway.
   2. **Schema Validation:** Strict JSON schema validation on every message before parsing domain logic. Any extra or unexpected fields trigger rejection.
-  3. **Payload Bounds:** Hard ceiling on JSON-RPC message size (default: 4 MB). Any oversized frame is dropped at the transport boundary.
-  4. **Rate Limiting:** Sliding-window rate limiter per client session preventing automated abuse or denial-of-service loops.
-  5. **Authentication Verification:** Cryptographic session tokens are validated prior to routing to the policy engine.
+  3. **Payload Bounds:** Hard ceiling of 4 MiB on raw request bodies. Any oversized frame is dropped at the transport boundary before parsing.
+  4. **Multi-Layer Resource Limits:** Three-tier rate limiting: Layer A (TCP/TLS admission rate per IP), Layer B (pre-session transport request rate per IP), and Layer C (authenticated session request rate and concurrency bounds).
+  5. **Authentication Verification:** Cryptographic session tokens (`Arc-Session-Token` + `Mcp-Session-Id`) are validated prior to routing to the policy engine; volatile sessions expire deterministically and are revoked immediately upon device revocation.
 
 ---
 

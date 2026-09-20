@@ -26,13 +26,17 @@ import { performance } from 'node:perf_hooks';
 import {
   ADMIN_CHALLENGE_ID_REGEX,
   ADMIN_CHALLENGE_TTL_MS,
+  ADMIN_DEVICE_ID_REGEX,
   ADMIN_MAX_CHALLENGE_FRAME_BYTES,
+  ADMIN_MAX_DISPLAY_LABEL_BYTES,
   ADMIN_MAX_REASON_BYTES,
   ADMIN_MAX_REQUEST_FRAME_BYTES,
   ADMIN_MAX_RESPONSE_FRAME_BYTES,
   ADMIN_METHODS,
   ADMIN_PROTOCOL_VERSION,
   ADMIN_REQUEST_ID_REGEX,
+  ADMIN_SESSION_ID_REGEX,
+  ADMIN_SPKI_PIN_REGEX,
   ArcError,
   decodeBase64Strict,
   encodeAdminPayload,
@@ -42,13 +46,21 @@ import {
   type AdminChallenge,
   type AdminErrorCode,
   type AdminMethod,
+  type AdminRequestParams,
   type AdminRequestPayload,
   type AdminResponse,
+  type AdminResult,
 } from '@cesspace-arc/protocol';
 import type { ApprovalStateManager } from '@cesspace-arc/policy';
+import { EnrollmentManager, deriveOperatorId, ENROLLMENT_ID_REGEX } from '@cesspace-arc/auth';
 import { toAdminSummary } from './approval-gate.js';
 import { ApprovalAuditSink, getApprovalAuditSink } from './approval-audit.js';
+import { getGatewayAuditSink, type GatewayAuditSink } from './gateway-audit.js';
 import type { AuditLogger } from '@cesspace-arc/audit';
+import type {
+  AdministrationOutcome,
+  DeviceAdministrationAuthority,
+} from './device-administration.js';
 
 /**
  * Conservative bound on a Unix socket path.
@@ -81,6 +93,22 @@ export interface AdminIpcServerOptions {
    * instead. No raw token ever enters the sink.
    */
   auditLogger: AuditLogger;
+  /**
+   * RC-05 Task 2 pending-enrollment manager. Optional composition seam: a fresh
+   * volatile manager is created when absent, exactly as the approval state
+   * manager behaves. It is never persisted and never written to the trust store.
+   */
+  enrollmentManager?: EnrollmentManager;
+  /**
+   * RC-05 Task 9 device/session administration authority.
+   *
+   * Optional composition seam and DELIBERATELY never defaulted. When absent —
+   * which is every deployment without an authoritative remote trust-store
+   * composition — the eight administration methods refuse with
+   * `ADMINISTRATION_UNAVAILABLE`. The channel never loads, creates, or falls
+   * back to a second trust store of its own.
+   */
+  deviceAdministration?: DeviceAdministrationAuthority;
 }
 
 /** Machine-readable startup/socket failures. */
@@ -175,9 +203,30 @@ export class AdminIpcServer {
   private readonly getMonotonicTimeMs: () => number;
 
   private readonly approvalAuditSink: ApprovalAuditSink;
+  /**
+   * RC-05 Task 10 gateway lifecycle sink (rc05 §24).
+   *
+   * The SAME sink instance the remote gateway, the enrollment bootstrap, and the
+   * MCP surface emit through, obtained from the per-chain memo, so an enrollment
+   * request created or cancelled here is recorded in the one existing
+   * `AuditLogger` chain rather than a gateway-only one.
+   */
+  private readonly gatewayAuditSink: GatewayAuditSink;
+  /** RC-05 Task 2 volatile pending-enrollment manager. */
+  private readonly enrollmentManager: EnrollmentManager;
+  /** Server-derived per-operator quota key (SHA-256 of the operator SPKI key). */
+  private readonly operatorId: string;
   private server?: net.Server;
   private socketIdentity?: SocketIdentity;
   private started = false;
+  /**
+   * RC-05 Task 9 device/session administration authority.
+   *
+   * Attached once by the server composition, after the remote gateway exists.
+   * Left undefined in a composition with no authoritative remote trust state,
+   * in which case administration requests fail closed.
+   */
+  private deviceAdministration?: DeviceAdministrationAuthority;
 
   constructor(options: AdminIpcServerOptions) {
     if (process.platform === 'win32') {
@@ -243,6 +292,74 @@ export class AdminIpcServer {
     // transition would be written to the chain twice.
     this.approvalAuditSink = getApprovalAuditSink(auditLogger);
     this.approvalStateManager.registerLifecycleSink(this.approvalAuditSink);
+
+    // RC-05 Task 10: the SAME memoized-per-chain gateway lifecycle sink the
+    // gateway, the bootstrap, and the MCP surface write through, so an
+    // enrollment transition started here lands in the ONE existing chain. It is
+    // never a second logger and never a second queue over the same chain.
+    this.gatewayAuditSink = getGatewayAuditSink(auditLogger);
+
+    // RC-05 Task 2: volatile pending-enrollment lifecycle. Pure domain state,
+    // never persisted, never written to the trust store.
+    this.enrollmentManager = options.enrollmentManager ?? new EnrollmentManager();
+
+    // The per-operator quota key is derived from the VERIFIED operator public
+    // key, never from request parameters. Only the digest is retained, so the
+    // raw operator key never appears in enrollment state, responses, or errors.
+    this.operatorId = deriveOperatorId(publicKey);
+
+    // RC-05 Task 9: composition-supplied, never constructed here. A channel with
+    // no authority refuses administration rather than inventing one.
+    this.deviceAdministration = options.deviceAdministration;
+  }
+
+  /**
+   * The pending-enrollment authority this channel writes to (RC-05 Task 4).
+   *
+   * Returns the exact instance, never a copy. A composing owner uses this to
+   * prove that the local operator channel and the remote bootstrap endpoint
+   * share ONE challenge table: two instances would mean a challenge created
+   * locally could never be observed by a remote completion.
+   */
+  public getEnrollmentManager(): EnrollmentManager {
+    return this.enrollmentManager;
+  }
+
+  /**
+   * Attaches the ONE device/session administration authority (RC-05 Task 9).
+   *
+   * A setter rather than a constructor argument because the authority is backed
+   * by the remote gateway's authoritative trust store, and the gateway is built
+   * after the admin channel. Idempotent for the SAME instance and refuses to
+   * replace a DIFFERENT one: two authorities over two trust stores is exactly
+   * the split-brain the one-store invariant forbids. Re-attaching the same
+   * instance is a no-op so a re-entrant composition cannot fail spuriously.
+   */
+  public attachDeviceAdministration(authority: DeviceAdministrationAuthority): void {
+    if (authority === null || typeof authority !== 'object') {
+      throw new AdminIpcError(
+        'Device administration authority must be an object.',
+        'ADMINISTRATION_AUTHORITY_INVALID',
+      );
+    }
+    if (this.deviceAdministration !== undefined && this.deviceAdministration !== authority) {
+      throw new AdminIpcError(
+        'Device administration authority is already attached to this admin channel.',
+        'ADMINISTRATION_AUTHORITY_CONFLICT',
+      );
+    }
+    this.deviceAdministration = authority;
+  }
+
+  /**
+   * The attached authority, or undefined when this composition has none.
+   *
+   * Exposed for composition-time proof that the local admin channel and the
+   * remote gateway share ONE administration authority; it is not reachable from
+   * any request, and the mutable trust store is not reachable through it.
+   */
+  public getDeviceAdministration(): DeviceAdministrationAuthority | undefined {
+    return this.deviceAdministration;
   }
 
   /** Starts listening. Rejects if the endpoint already exists for any reason. */
@@ -613,19 +730,30 @@ export class AdminIpcServer {
     if (rawParams === null || typeof rawParams !== 'object' || Array.isArray(rawParams)) {
       return null;
     }
-    const params: { requestId?: string; reason?: string } = {};
+    // The parameter shape is closed: any key outside this set is rejected, so a
+    // caller cannot smuggle an operator identity, TTL, attempt counter, or
+    // one-time secret into a signed request. This set is the union across ALL
+    // methods; `dispatch` additionally enforces which keys each method accepts,
+    // so a valid key for one method is still rejected on another.
+    const params: AdminRequestParams = {};
     for (const key of Object.keys(rawParams as Record<string, unknown>)) {
       const value = (rawParams as Record<string, unknown>)[key];
-      if (key === 'requestId') {
-        if (typeof value !== 'string') return null;
-        params.requestId = value;
-      } else if (key === 'reason') {
-        if (typeof value !== 'string') return null;
-        params.reason = value;
-      } else {
+      if (
+        key !== 'requestId' &&
+        key !== 'reason' &&
+        key !== 'clientId' &&
+        key !== 'clientType' &&
+        key !== 'spkiPin' &&
+        key !== 'displayLabel' &&
+        key !== 'enrollmentId' &&
+        key !== 'deviceId' &&
+        key !== 'sessionId'
+      ) {
         // Unexpected params are rejected.
         return null;
       }
+      if (typeof value !== 'string') return null;
+      params[key] = value;
     }
 
     const payload: AdminRequestPayload = {
@@ -652,14 +780,82 @@ export class AdminIpcServer {
     const { method, params } = payload;
 
     if (method === 'approvals.list') {
-      if (params.requestId !== undefined || params.reason !== undefined) {
+      if (
+        params.requestId !== undefined ||
+        params.reason !== undefined ||
+        params.clientId !== undefined ||
+        params.clientType !== undefined ||
+        params.spkiPin !== undefined ||
+        params.displayLabel !== undefined ||
+        params.enrollmentId !== undefined ||
+        params.deviceId !== undefined ||
+        params.sessionId !== undefined
+      ) {
         return errorResponse('INVALID_ADMIN_REQUEST');
       }
       return await this.handleList();
     }
 
+    if (method === 'enrollment.create') {
+      if (
+        params.requestId !== undefined ||
+        params.reason !== undefined ||
+        params.enrollmentId !== undefined ||
+        params.deviceId !== undefined ||
+        params.sessionId !== undefined
+      ) {
+        return errorResponse('INVALID_ADMIN_REQUEST');
+      }
+      if (
+        params.clientId === undefined ||
+        params.clientType === undefined ||
+        params.spkiPin === undefined
+      ) {
+        return errorResponse('INVALID_ADMIN_REQUEST');
+      }
+      return await this.handleEnrollmentCreate({
+        clientId: params.clientId,
+        clientType: params.clientType,
+        spkiPin: params.spkiPin,
+        ...(params.displayLabel === undefined ? {} : { displayLabel: params.displayLabel }),
+      });
+    }
+
+    if (method === 'enrollment.cancel') {
+      if (
+        params.requestId !== undefined ||
+        params.reason !== undefined ||
+        params.clientId !== undefined ||
+        params.clientType !== undefined ||
+        params.spkiPin !== undefined ||
+        params.displayLabel !== undefined ||
+        params.deviceId !== undefined ||
+        params.sessionId !== undefined
+      ) {
+        return errorResponse('INVALID_ADMIN_REQUEST');
+      }
+      if (params.enrollmentId === undefined) {
+        return errorResponse('INVALID_ADMIN_REQUEST');
+      }
+      if (!ENROLLMENT_ID_REGEX.test(params.enrollmentId)) {
+        return errorResponse('INVALID_ADMIN_REQUEST');
+      }
+      return await this.handleEnrollmentCancel(params.enrollmentId);
+    }
+
     if (method === 'approvals.inspect') {
-      if (params.requestId === undefined || params.reason !== undefined) {
+      if (
+        params.requestId === undefined ||
+        params.reason !== undefined ||
+        params.clientId !== undefined ||
+        params.clientType !== undefined ||
+        params.spkiPin !== undefined ||
+        params.displayLabel !== undefined ||
+        params.enrollmentId !== undefined ||
+        params.deviceId !== undefined ||
+        params.sessionId !== undefined ||
+        false
+      ) {
         return errorResponse('INVALID_ADMIN_REQUEST');
       }
       if (!ADMIN_REQUEST_ID_REGEX.test(params.requestId)) {
@@ -669,7 +865,18 @@ export class AdminIpcServer {
     }
 
     if (method === 'approval.approve') {
-      if (params.requestId === undefined || params.reason !== undefined) {
+      if (
+        params.requestId === undefined ||
+        params.reason !== undefined ||
+        params.clientId !== undefined ||
+        params.clientType !== undefined ||
+        params.spkiPin !== undefined ||
+        params.displayLabel !== undefined ||
+        params.enrollmentId !== undefined ||
+        params.deviceId !== undefined ||
+        params.sessionId !== undefined ||
+        false
+      ) {
         return errorResponse('INVALID_ADMIN_REQUEST');
       }
       if (!ADMIN_REQUEST_ID_REGEX.test(params.requestId)) {
@@ -679,7 +886,17 @@ export class AdminIpcServer {
     }
 
     if (method === 'approval.reject') {
-      if (params.requestId === undefined) {
+      if (
+        params.requestId === undefined ||
+        params.clientId !== undefined ||
+        params.clientType !== undefined ||
+        params.spkiPin !== undefined ||
+        params.displayLabel !== undefined ||
+        params.enrollmentId !== undefined ||
+        params.deviceId !== undefined ||
+        params.sessionId !== undefined ||
+        false
+      ) {
         return errorResponse('INVALID_ADMIN_REQUEST');
       }
       if (!ADMIN_REQUEST_ID_REGEX.test(params.requestId)) {
@@ -696,6 +913,101 @@ export class AdminIpcServer {
       return await this.handleReject(params.requestId, params.reason);
     }
 
+    // -------------------------------------------------------------------------
+    // RC-05 Task 9: local device and session administration.
+    //
+    // These eight methods exist ONLY on this authenticated local channel. They
+    // are not MCP tools, not HTTP endpoints, and not WebSocket channels, and no
+    // remote actor can reach them by any route. Each requires the same Ed25519
+    // challenge-response proof as every other admin method, each is strictly
+    // validated here (the CLI's validation is a convenience, never the
+    // authority), and each fails closed with ADMINISTRATION_UNAVAILABLE when no
+    // authoritative trust-store composition is attached.
+    // -------------------------------------------------------------------------
+
+    if (method === 'devices.list') {
+      if (!paramsAreExactly(params, [])) {
+        return errorResponse('INVALID_ADMIN_REQUEST');
+      }
+      return this.handleDevicesList();
+    }
+
+    if (method === 'devices.inspect') {
+      if (!paramsAreExactly(params, ['deviceId'])) {
+        return errorResponse('INVALID_ADMIN_REQUEST');
+      }
+      if (params.deviceId === undefined || !ADMIN_DEVICE_ID_REGEX.test(params.deviceId)) {
+        return errorResponse('INVALID_ADMIN_REQUEST');
+      }
+      return this.handleDeviceInspect(params.deviceId);
+    }
+
+    if (method === 'device.revoke') {
+      if (!paramsAreExactly(params, ['deviceId'])) {
+        return errorResponse('INVALID_ADMIN_REQUEST');
+      }
+      if (params.deviceId === undefined || !ADMIN_DEVICE_ID_REGEX.test(params.deviceId)) {
+        return errorResponse('INVALID_ADMIN_REQUEST');
+      }
+      return await this.handleDeviceRevoke(params.deviceId);
+    }
+
+    if (method === 'device.rename') {
+      if (!paramsAreExactly(params, ['deviceId', 'displayLabel'])) {
+        return errorResponse('INVALID_ADMIN_REQUEST');
+      }
+      if (params.deviceId === undefined || !ADMIN_DEVICE_ID_REGEX.test(params.deviceId)) {
+        return errorResponse('INVALID_ADMIN_REQUEST');
+      }
+      if (!isAcceptableDisplayLabel(params.displayLabel)) {
+        return errorResponse('INVALID_ADMIN_REQUEST');
+      }
+      return this.handleDeviceRename(params.deviceId, params.displayLabel);
+    }
+
+    if (method === 'device.pin.add') {
+      if (!paramsAreExactly(params, ['deviceId', 'spkiPin'])) {
+        return errorResponse('INVALID_ADMIN_REQUEST');
+      }
+      if (params.deviceId === undefined || !ADMIN_DEVICE_ID_REGEX.test(params.deviceId)) {
+        return errorResponse('INVALID_ADMIN_REQUEST');
+      }
+      if (params.spkiPin === undefined || !ADMIN_SPKI_PIN_REGEX.test(params.spkiPin)) {
+        return errorResponse('INVALID_ADMIN_REQUEST');
+      }
+      return this.handleDevicePinAdd(params.deviceId, params.spkiPin);
+    }
+
+    if (method === 'device.pin.remove') {
+      if (!paramsAreExactly(params, ['deviceId', 'spkiPin'])) {
+        return errorResponse('INVALID_ADMIN_REQUEST');
+      }
+      if (params.deviceId === undefined || !ADMIN_DEVICE_ID_REGEX.test(params.deviceId)) {
+        return errorResponse('INVALID_ADMIN_REQUEST');
+      }
+      if (params.spkiPin === undefined || !ADMIN_SPKI_PIN_REGEX.test(params.spkiPin)) {
+        return errorResponse('INVALID_ADMIN_REQUEST');
+      }
+      return this.handleDevicePinRemove(params.deviceId, params.spkiPin);
+    }
+
+    if (method === 'sessions.list') {
+      if (!paramsAreExactly(params, [])) {
+        return errorResponse('INVALID_ADMIN_REQUEST');
+      }
+      return this.handleSessionsList();
+    }
+
+    if (method === 'session.revoke') {
+      if (!paramsAreExactly(params, ['sessionId'])) {
+        return errorResponse('INVALID_ADMIN_REQUEST');
+      }
+      if (params.sessionId === undefined || !ADMIN_SESSION_ID_REGEX.test(params.sessionId)) {
+        return errorResponse('INVALID_ADMIN_REQUEST');
+      }
+      return await this.handleSessionRevoke(params.sessionId);
+    }
+
     return errorResponse('INVALID_ADMIN_REQUEST');
   }
 
@@ -710,6 +1022,20 @@ export class AdminIpcServer {
     // always means the evidence was actually committed.
     try {
       await this.approvalAuditSink.flush();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Commits buffered gateway lifecycle evidence before the operator observes a
+   * result. The gateway and the approval sink share one chain but hold separate
+   * bounded queues, so each is drained by its own owner.
+   */
+  private async flushGatewayAudit(): Promise<boolean> {
+    try {
+      await this.gatewayAuditSink.flush();
       return true;
     } catch {
       return false;
@@ -836,6 +1162,213 @@ export class AdminIpcServer {
     }
   }
 
+  /**
+   * Creates a pending enrollment challenge.
+   *
+   * The one-time secret is generated server-side and returned exactly once in
+   * this successful authenticated response. It is never audited, logged,
+   * persisted, or echoed on any failure path.
+   */
+  private async handleEnrollmentCreate(input: {
+    clientId: string;
+    clientType: string;
+    spkiPin: string;
+    displayLabel?: string;
+  }): Promise<AdminResponse> {
+    try {
+      const created = this.enrollmentManager.create({
+        clientId: input.clientId,
+        clientType: input.clientType,
+        spkiPin: input.spkiPin,
+        ...(input.displayLabel === undefined ? {} : { displayLabel: input.displayLabel }),
+        // Server-derived from the VERIFIED operator public key. A caller cannot
+        // supply or influence the per-operator quota key.
+        operatorId: this.operatorId,
+      });
+
+      // Constructed field by field against the declared closed protocol shape.
+      // A structural spread would also carry PendingEnrollmentView's internal
+      // fields (notably the failed-attempt counter) into the response.
+      const view = created.enrollment;
+
+      // §24 DEVICE_ENROLLMENT_REQUESTED, emitted only once the pending
+      // enrollment actually committed. The ONE-TIME SECRET is deliberately
+      // absent: it is returned exactly once to the operator in the response
+      // below and is never written to the audit chain, not even as a digest —
+      // the record carries the server-issued enrollment identifier, the
+      // operator-supplied client identity, the device's already-public SPKI pin,
+      // and nothing else.
+      this.gatewayAuditSink.emit({
+        eventType: 'DEVICE_ENROLLMENT_REQUESTED',
+        enrollmentId: view.enrollmentId,
+        clientId: view.clientId,
+        clientType: view.clientType,
+        spkiPin: view.spkiPin,
+      });
+
+      // The one-time secret leaves the process in the response below, so the
+      // record of the request that created it is committed FIRST. An operator is
+      // never handed a credential for a transition the audit chain does not
+      // record.
+      if (!(await this.flushGatewayAudit())) {
+        return errorResponse('INTERNAL_ERROR');
+      }
+
+      return {
+        ok: true,
+        result: {
+          enrollment: {
+            enrollmentId: view.enrollmentId,
+            clientId: view.clientId,
+            clientType: view.clientType,
+            spkiPin: view.spkiPin,
+            displayLabel: view.displayLabel,
+            createdAt: view.createdAt,
+            expiresAt: view.expiresAt,
+            remainingSeconds: view.remainingSeconds,
+          },
+          secret: created.secret,
+        },
+      };
+    } catch (err: unknown) {
+      return errorResponse(this.mapEnrollmentError(err));
+    }
+  }
+
+  /**
+   * Cancels a pending enrollment.
+   *
+   * An unknown, expired, already-consumed, or already-cancelled identifier
+   * produces the same bounded NOT_FOUND_OR_NOT_PENDING result as an approval
+   * that is not pending, so cancellation is not an existence oracle.
+   */
+  private async handleEnrollmentCancel(enrollmentId: string): Promise<AdminResponse> {
+    try {
+      const cancelled = this.enrollmentManager.cancel(enrollmentId);
+      if (!cancelled) {
+        return errorResponse('NOT_FOUND_OR_NOT_PENDING');
+      }
+      // §24 DEVICE_ENROLLMENT_REJECTED. An operator cancellation ends a pending
+      // enrollment without enrolling a device, so it is the CANCELLED member of
+      // the frozen bounded reason vocabulary and never a free-text explanation.
+      // Emitted only when the cancellation actually took effect, so a repeated
+      // cancel of an identifier that is already gone records nothing.
+      this.gatewayAuditSink.emit({
+        eventType: 'DEVICE_ENROLLMENT_REJECTED',
+        reason: 'CANCELLED',
+        enrollmentId,
+      });
+      if (!(await this.flushGatewayAudit())) {
+        return errorResponse('INTERNAL_ERROR');
+      }
+      return { ok: true, result: { enrollmentId, state: 'CANCELLED' } };
+    } catch {
+      return errorResponse('INTERNAL_ERROR');
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // RC-05 Task 9 handlers
+  //
+  // Every one of them resolves the attached authority first and refuses with
+  // ADMINISTRATION_UNAVAILABLE when there is none. None of them reads, creates,
+  // or falls back to a trust store of its own, and none of them touches the
+  // trust-store file: the authority owns the ONE authoritative store and the
+  // ONE durable transaction.
+  // -------------------------------------------------------------------------
+
+  /** Lists bounded metadata for every enrolled device. Never discloses pins. */
+  private handleDevicesList(): AdminResponse {
+    const authority = this.deviceAdministration;
+    if (authority === undefined) {
+      return errorResponse('ADMINISTRATION_UNAVAILABLE');
+    }
+    return toAdminResponse(authority.listDevices());
+  }
+
+  /** Reports one device, including the active public SPKI pins it is bound to. */
+  private handleDeviceInspect(deviceId: string): AdminResponse {
+    const authority = this.deviceAdministration;
+    if (authority === undefined) {
+      return errorResponse('ADMINISTRATION_UNAVAILABLE');
+    }
+    return toAdminResponse(authority.inspectDevice(deviceId));
+  }
+
+  /**
+   * Revokes a device and, on a durable commit, every one of its live sessions.
+   *
+   * Nothing is reported as revoked until the trust-store revocation is durable,
+   * and no success is returned until the device's Task-5 sessions and Task-8
+   * transports are already gone.
+   */
+  private async handleDeviceRevoke(deviceId: string): Promise<AdminResponse> {
+    const authority = this.deviceAdministration;
+    if (authority === undefined) {
+      return errorResponse('ADMINISTRATION_UNAVAILABLE');
+    }
+    return toAdminResponse(await authority.revokeDevice(deviceId));
+  }
+
+  /** Replaces non-security display metadata. Changes no identity or binding. */
+  private handleDeviceRename(deviceId: string, displayLabel: string): AdminResponse {
+    const authority = this.deviceAdministration;
+    if (authority === undefined) {
+      return errorResponse('ADMINISTRATION_UNAVAILABLE');
+    }
+    return toAdminResponse(authority.renameDevice(deviceId, displayLabel));
+  }
+
+  /** Adds one rotation-overlap pin, subject to the two-active-pin ceiling. */
+  private handleDevicePinAdd(deviceId: string, spkiPin: string): AdminResponse {
+    const authority = this.deviceAdministration;
+    if (authority === undefined) {
+      return errorResponse('ADMINISTRATION_UNAVAILABLE');
+    }
+    return toAdminResponse(authority.addPin(deviceId, spkiPin));
+  }
+
+  /** Removes one pin. The final remaining pin can never be removed. */
+  private handleDevicePinRemove(deviceId: string, spkiPin: string): AdminResponse {
+    const authority = this.deviceAdministration;
+    if (authority === undefined) {
+      return errorResponse('ADMINISTRATION_UNAVAILABLE');
+    }
+    return toAdminResponse(authority.removePin(deviceId, spkiPin));
+  }
+
+  /** Lists CURRENT LIVE sessions only. Never discloses tokens or digests. */
+  private handleSessionsList(): AdminResponse {
+    const authority = this.deviceAdministration;
+    if (authority === undefined) {
+      return errorResponse('ADMINISTRATION_UNAVAILABLE');
+    }
+    return toAdminResponse(authority.listSessions());
+  }
+
+  /**
+   * Revokes exactly one live session and tears down its Task-8 transport.
+   *
+   * An unknown, expired, or already-revoked identifier is a bounded refusal
+   * that mutates nothing and can never disturb another session.
+   */
+  private async handleSessionRevoke(sessionId: string): Promise<AdminResponse> {
+    const authority = this.deviceAdministration;
+    if (authority === undefined) {
+      return errorResponse('ADMINISTRATION_UNAVAILABLE');
+    }
+    return toAdminResponse(await authority.revokeSession(sessionId));
+  }
+
+  /** Maps an enrollment failure to a bounded admin code. Never leaks detail. */
+  private mapEnrollmentError(err: unknown): AdminErrorCode {
+    if (err instanceof ArcError) {
+      if (err.code === 'RESOURCE_EXHAUSTED') return 'RESOURCE_EXHAUSTED';
+      if (err.code === 'INVALID_REQUEST_SCHEMA') return 'INVALID_ADMIN_REQUEST';
+    }
+    return 'INTERNAL_ERROR';
+  }
+
   /** Maps an approval failure to a bounded admin code. Never leaks detail. */
   private mapApprovalError(err: unknown): AdminErrorCode {
     if (err instanceof ArcError) {
@@ -849,4 +1382,44 @@ export class AdminIpcServer {
 
 function errorResponse(code: AdminErrorCode): AdminResponse {
   return { ok: false, error: { code } };
+}
+
+/**
+ * True when `params` carries ONLY the named keys (RC-05 Task 9).
+ *
+ * The administration methods take a fixed, tiny parameter set, so it is
+ * enumerated POSITIVELY here. Enumerating what is forbidden instead would mean
+ * a parameter added to `AdminRequestParams` later could silently become
+ * acceptable on a method that never intended to accept it.
+ */
+function paramsAreExactly(
+  params: AdminRequestParams,
+  allowed: readonly (keyof AdminRequestParams)[],
+): boolean {
+  return Object.keys(params).every((key) => (allowed as readonly string[]).includes(key));
+}
+
+/**
+ * Validates an operator-supplied display label (RC-05 Task 9 `device.rename`).
+ *
+ * The 64 UTF-8 byte ceiling is the frozen Task-1 trust-store bound. NUL is
+ * rejected here as well so an operator can never introduce a label the trust
+ * store's read path would have to tolerate.
+ */
+function isAcceptableDisplayLabel(label: unknown): label is string {
+  return (
+    typeof label === 'string' &&
+    !label.includes('\u0000') &&
+    Buffer.byteLength(label, 'utf8') <= ADMIN_MAX_DISPLAY_LABEL_BYTES
+  );
+}
+
+/**
+ * Projects one bounded administration outcome onto the admin wire response.
+ *
+ * The authority already returns a bounded `AdminErrorCode`, so nothing an
+ * internal failure carries can reach the operator through this mapping.
+ */
+function toAdminResponse<T extends AdminResult>(outcome: AdministrationOutcome<T>): AdminResponse {
+  return outcome.ok ? { ok: true, result: outcome.result } : errorResponse(outcome.code);
 }

@@ -13,7 +13,7 @@ CesSpace ARC is structured as a modular TypeScript monorepo managed by **pnpm wo
 ```text
 cesspace-arc/
 ├── apps/
-│   ├── mcp-server/         # MCP protocol server (stdio & HTTP SSE transports)
+│   ├── mcp-server/         # MCP protocol server (stdio & Streamable HTTP transports)
 │   └── cli/                # Local CLI for administration, configuration, and inspection
 │
 ├── packages/
@@ -91,7 +91,7 @@ All packages and applications are marked `"private": true` during initial develo
 
 - **Role:** MCP server runtime.
 - **Dependencies:** All `packages/*` via `workspace:*`.
-- **Contents:** Transport listeners (UNIX stdio and HTTPS/SSE), tool registration, request dispatcher, error serialization, and startup lifecycle management.
+- **Contents:** Transport listeners (UNIX stdio and Streamable HTTP over TLS 1.3 with SSE response framing), tool registration, request dispatcher, error serialization, and startup lifecycle management.
 
 ### 2.10. `apps/cli`
 

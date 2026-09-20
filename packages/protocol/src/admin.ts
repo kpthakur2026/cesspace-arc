@@ -24,15 +24,45 @@ import type { KeyObject } from 'node:crypto';
 /** Wire protocol identifier. Binds every signature to this protocol version. */
 export const ADMIN_PROTOCOL_VERSION = 'cesspace-arc-admin-v1';
 
-/** Maximum admin methods are closed; arbitrary method strings are rejected. */
+/**
+ * Maximum admin methods are closed; arbitrary method strings are rejected.
+ *
+ * RC-05 Task 9 adds operator device and session administration. Those methods
+ * are reachable ONLY here: there is no MCP administrative tool, no remote
+ * operator control plane, and no HTTP or WebSocket admin API, so the Ed25519
+ * challenge-response local channel remains the single administrative authority.
+ */
 export type AdminMethod =
-  'approvals.list' | 'approvals.inspect' | 'approval.approve' | 'approval.reject';
+  | 'approvals.list'
+  | 'approvals.inspect'
+  | 'approval.approve'
+  | 'approval.reject'
+  | 'enrollment.create'
+  | 'enrollment.cancel'
+  | 'devices.list'
+  | 'devices.inspect'
+  | 'device.revoke'
+  | 'device.rename'
+  | 'device.pin.add'
+  | 'device.pin.remove'
+  | 'sessions.list'
+  | 'session.revoke';
 
 export const ADMIN_METHODS: readonly AdminMethod[] = [
   'approvals.list',
   'approvals.inspect',
   'approval.approve',
   'approval.reject',
+  'enrollment.create',
+  'enrollment.cancel',
+  'devices.list',
+  'devices.inspect',
+  'device.revoke',
+  'device.rename',
+  'device.pin.add',
+  'device.pin.remove',
+  'sessions.list',
+  'session.revoke',
 ] as const;
 
 /** Challenge lifetime in milliseconds, enforced on a monotonic clock. */
@@ -55,11 +85,26 @@ export const ADMIN_MAX_RESPONSE_FRAME_BYTES = 8 * 1024 * 1024;
 /** Maximum operator-supplied rejection reason, in UTF-8 bytes. */
 export const ADMIN_MAX_REASON_BYTES = 256;
 
+/**
+ * Maximum operator-supplied device display label, in UTF-8 bytes.
+ *
+ * Mirrors the frozen Task-1 trust-store bound (rc05 §8). The server re-validates
+ * against the authoritative domain rule; this constant exists so the CLI can
+ * fail before opening a connection.
+ */
+export const ADMIN_MAX_DISPLAY_LABEL_BYTES = 64;
+
 /** Maximum operator private key source accepted from the inherited FD. */
 export const ADMIN_MAX_PRIVATE_KEY_SOURCE_BYTES = 16 * 1024;
 
 /** Canonical lowercase approval request identifier shape. */
 export const ADMIN_REQUEST_ID_REGEX = /^[0-9a-f]{32}$/;
+/** Canonical ARC device identifier shape (rc05 §8). */
+export const ADMIN_DEVICE_ID_REGEX = /^[0-9a-f]{32}$/;
+/** Server-issued session identifier shape (rc05 §11). */
+export const ADMIN_SESSION_ID_REGEX = /^[0-9a-f]{64}$/;
+/** Canonical SPKI pin: SHA-256 of DER SPKI, 64 lowercase hexadecimal characters. */
+export const ADMIN_SPKI_PIN_REGEX = /^[0-9a-f]{64}$/;
 /** Server-generated challenge identifier shape. */
 export const ADMIN_CHALLENGE_ID_REGEX = /^[0-9a-f]{32}$/;
 /** Server-generated nonce shape. */
@@ -79,10 +124,30 @@ export interface AdminChallenge {
 /**
  * Parameters for an admin request. The shape is closed per method and is
  * validated again after signature verification.
+ *
+ * RC-05 Task 2 adds the enrollment administration inputs. Everything that
+ * identifies ARC-side state or authority — enrollmentId on creation, deviceId,
+ * operator identity, TTL/deadline, attempt counters, and the one-time secret —
+ * is deliberately absent: those are server-derived and a request carrying them
+ * is rejected as an unknown parameter.
  */
 export interface AdminRequestParams {
   requestId?: string;
   reason?: string;
+  /** `enrollment.create`: operator-supplied logical client identity. */
+  clientId?: string;
+  /** `enrollment.create`: operator-supplied client type. */
+  clientType?: string;
+  /** `enrollment.create`: canonical 64-lowercase-hex SPKI pin to enroll. */
+  spkiPin?: string;
+  /** `enrollment.create`: optional non-security display label. */
+  displayLabel?: string;
+  /** `enrollment.cancel`: server-generated enrollment identifier. */
+  enrollmentId?: string;
+  /** `devices.*` / `device.*`: ARC-assigned enrolled device identifier. */
+  deviceId?: string;
+  /** `session.revoke`: server-issued session identifier. */
+  sessionId?: string;
 }
 
 /** Canonical signed admin payload. */
@@ -112,6 +177,18 @@ export type AdminErrorCode =
   | 'APPROVAL_EXPIRED'
   | 'APPROVAL_REJECTED'
   | 'RESOURCE_EXHAUSTED'
+  /**
+   * RC-05 Task 9: no authoritative device/session administration composition is
+   * in effect, or the durable trust store's installed state can no longer be
+   * vouched for.
+   *
+   * Both causes mean the same thing to an operator — the authority this request
+   * would have acted on is not usable right now — and neither discloses which
+   * it was, whether a trust store exists, or where it lives. Device and session
+   * administration NEVER falls back to a second, locally loaded trust store:
+   * an uncomposed authority is a refusal, not an empty view.
+   */
+  | 'ADMINISTRATION_UNAVAILABLE'
   | 'INTERNAL_ERROR';
 
 /** Bounded pending-approval summary. Never contains review material or tokens. */
@@ -177,11 +254,150 @@ export interface AdminApprovalRejectResult {
   state: string;
 }
 
+/**
+ * Bounded operator-safe view of a pending enrollment.
+ *
+ * Never contains the one-time secret, its digest, the operator public key, or
+ * the internal monotonic deadline.
+ */
+export interface AdminEnrollmentSummary {
+  enrollmentId: string;
+  clientId: string;
+  clientType: string;
+  spkiPin: string;
+  displayLabel: string;
+  createdAt: string;
+  expiresAt: string;
+  remainingSeconds: number;
+}
+
+/**
+ * Successful pending-enrollment creation.
+ *
+ * The one-time enrollment secret appears here and ONLY here: on the
+ * authenticated local admin channel, exactly once, to the authenticated
+ * operator. It is never audited, logged, persisted, echoed in an error, or
+ * retained by the IPC server.
+ */
+export interface AdminEnrollmentCreateResult {
+  enrollment: AdminEnrollmentSummary;
+  /** 64 lowercase hexadecimal characters. Disclosed exactly once. */
+  secret: string;
+}
+
+export interface AdminEnrollmentCancelResult {
+  enrollmentId: string;
+  state: string;
+}
+
+// ---------------------------------------------------------------------------
+// RC-05 Task 9: device and session administration
+//
+// Every view here is a SNAPSHOT built field by field from the authoritative
+// record. None carries a raw token, a token digest, a private key, certificate
+// bytes, a bound SPKI pin outside the pin-administration views, a rate-limiter
+// key, an authorization header, or a monotonic internal timestamp.
+// ---------------------------------------------------------------------------
+
+/**
+ * Bounded device view for `devices.list`.
+ *
+ * Deliberately carries the ACTIVE PIN COUNT rather than the pin set, so the
+ * routine listing step does not put every trust anchor on the operator's
+ * terminal. `devices.inspect` is where the exact pins are disclosed, because
+ * that is the step that administers the rotation overlap window.
+ */
+export interface AdminDeviceSummary {
+  deviceId: string;
+  clientId: string;
+  clientType: string;
+  displayLabel: string;
+  enrolledAt: string;
+  revoked: boolean;
+  activePinCount: number;
+}
+
+export interface AdminDevicesListResult {
+  devices: AdminDeviceSummary[];
+}
+
+/**
+ * `devices.inspect` view: the list projection plus the exact active SPKI pins.
+ *
+ * The pins are public values — the SHA-256 of a DER SubjectPublicKeyInfo — and
+ * the authenticated operator needs them verbatim to add or remove the
+ * rotation-overlap pin. Nothing private is added.
+ */
+export interface AdminDeviceInspectResult extends AdminDeviceSummary {
+  /** At most 2 public SPKI pins (the frozen §7 P-7 active-pin ceiling). */
+  pins: string[];
+}
+
+/**
+ * Successful device revocation.
+ *
+ * `sessionsRevoked` is the count of live gateway sessions the revocation closed,
+ * and `transportsClosed` the count of Task-8 transport registry entries torn
+ * down with them. Both are counts, never identities, and both are already
+ * complete when this result is returned.
+ */
+export interface AdminDeviceRevokeResult {
+  deviceId: string;
+  revoked: true;
+  sessionsRevoked: number;
+  transportsClosed: number;
+}
+
+export interface AdminDeviceRenameResult {
+  deviceId: string;
+  displayLabel: string;
+}
+
+/** Successful pin addition or removal. Reports the resulting active pin count. */
+export interface AdminDevicePinMutationResult {
+  deviceId: string;
+  activePinCount: number;
+}
+
+/**
+ * Bounded live-session view for `sessions.list`.
+ *
+ * Structurally the Task-5 `SessionView`: only live sessions exist, so there is
+ * no revoked or expired state to report and no tombstone to leak.
+ */
+export interface AdminSessionSummary {
+  sessionId: string;
+  deviceId: string;
+  clientId: string;
+  clientType: string;
+  issuedAt: string;
+  state: 'ACTIVE';
+}
+
+export interface AdminSessionsListResult {
+  sessions: AdminSessionSummary[];
+}
+
+export interface AdminSessionRevokeResult {
+  sessionId: string;
+  state: 'REVOKED';
+  transportClosed: boolean;
+}
+
 export type AdminResult =
   | AdminApprovalsListResult
   | AdminApprovalsInspectResult
   | AdminApprovalApproveResult
-  | AdminApprovalRejectResult;
+  | AdminApprovalRejectResult
+  | AdminEnrollmentCreateResult
+  | AdminEnrollmentCancelResult
+  | AdminDevicesListResult
+  | AdminDeviceInspectResult
+  | AdminDeviceRevokeResult
+  | AdminDeviceRenameResult
+  | AdminDevicePinMutationResult
+  | AdminSessionsListResult
+  | AdminSessionRevokeResult;
 
 /** Bounded admin response frame. */
 export interface AdminResponse {
@@ -206,18 +422,29 @@ export interface AdminResponse {
 // canonicalJson() for the same value, which keeps the two conventions aligned.
 // ---------------------------------------------------------------------------
 
+/**
+ * Closed parameter key set, in ascending code-unit order.
+ *
+ * The order is what makes the canonical encoding deterministic; adding a key
+ * here in the wrong position would produce a non-canonical byte form for every
+ * request that uses it.
+ */
+const ADMIN_PARAM_KEYS: readonly (keyof AdminRequestParams)[] = [
+  'clientId',
+  'clientType',
+  'deviceId',
+  'displayLabel',
+  'enrollmentId',
+  'reason',
+  'requestId',
+  'sessionId',
+  'spkiPin',
+];
+
 /** Canonically encodes an admin payload to its exact signed byte form. */
 export function encodeAdminPayload(payload: AdminRequestPayload): string {
-  const paramKeys: string[] = [];
-  // Ascending code-unit order: "reason" < "requestId".
-  if (payload.params.reason !== undefined) paramKeys.push('reason');
-  if (payload.params.requestId !== undefined) paramKeys.push('requestId');
-
-  const paramsJson = `{${paramKeys
-    .map(
-      (key) =>
-        `${JSON.stringify(key)}:${JSON.stringify(payload.params[key as keyof AdminRequestParams])}`,
-    )
+  const paramsJson = `{${ADMIN_PARAM_KEYS.filter((key) => payload.params[key] !== undefined)
+    .map((key) => `${JSON.stringify(key)}:${JSON.stringify(payload.params[key])}`)
     .join(',')}}`;
 
   // Ascending code-unit order: challengeId < method < params < protocol.

@@ -1,6 +1,6 @@
 {
   "name": "@cesspace-arc/cli",
-  "version": "0.4.0-rc04",
+  "version": "0.5.0-rc05",
   "description": "Command-line administration and approval interface for CesSpace ARC",
   "license": "Apache-2.0",
   "private": true,

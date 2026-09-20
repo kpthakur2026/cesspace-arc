@@ -15,6 +15,44 @@ export interface HealthResponse {
   policyEngineActive: boolean;
   auditActive: boolean;
   authorizedWorkspacesCount: number;
+  /**
+   * The single active transport mode for this process (§4 L-4). Exactly one
+   * mode runs per process: stdio and remote are mutually exclusive.
+   */
+  transportMode: 'stdio' | 'remote';
+  /** True only while the remote TLS listener is bound and serving. */
+  remoteGatewayActive: boolean;
+  /**
+   * True when the remote gateway is running but cannot admit new sessions.
+   * Absent when the gateway is absent, stdio-only, or healthy.
+   */
+  remoteGatewayDegraded?: boolean;
+  /**
+   * Bounded reason for gateway degradation. Never certificate material, key
+   * material, file paths, pins, or peer addresses (§19).
+   */
+  remoteGatewayDegradedReason?: 'certificate_expired';
+  /**
+   * True only while remote session authentication can admit new requests.
+   *
+   * False in stdio mode — no remote authentication runs there — and false while
+   * the remote gateway is degraded, because an expired server certificate
+   * refuses every new TLS and session admission (§17).
+   */
+  authenticationActive: boolean;
+  /** Enrolled device count from the authoritative trust store. Never a list. */
+  enrolledDevicesCount: number;
+  /**
+   * Live gateway session count, read from the ONE process-local session
+   * authority. Never a second counter, and never a session list.
+   */
+  activeSessionsCount: number;
+  /**
+   * Bounded degradation reason (§16). Same bounded vocabulary as
+   * `remoteGatewayDegradedReason`; never certificate dates, paths, subject or
+   * SAN details, or key material.
+   */
+  degradedReason?: 'certificate_expired';
 }
 
 export interface ListDirectoryRequest {
