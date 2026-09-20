@@ -45,6 +45,7 @@ import {
 } from './tls-material.js';
 import { RemoteConfigError } from './remote-errors.js';
 import { EnrollmentBootstrap, type EnrollmentBootstrapOptions } from './enrollment-bootstrap.js';
+import type { RemoteMcpSurface } from './remote-mcp-surface.js';
 import {
   AdmissionLimiter,
   type AdmissionLimiterOptions,
@@ -282,6 +283,13 @@ export class RemoteGateway {
    * later request without re-reading the file.
    */
   private readonly bootstrap: EnrollmentBootstrap;
+  /**
+   * The composed Streamable HTTP MCP surface, once Task 8 attaches one.
+   *
+   * Held so shutdown can release every remote session. `undefined` means no
+   * transport is composed and `/mcp` remains deny-only.
+   */
+  private mcpSurface?: RemoteMcpSurface;
 
   /** Server key material, held only until the listener consumes it. */
   private privateKeyMaterial?: ReturnType<typeof loadServerPrivateKey>;
@@ -393,6 +401,23 @@ export class RemoteGateway {
       throw err;
     }
     this.privateKeyMaterial = keyMaterial;
+  }
+
+  /**
+   * Attaches the Task-8 Streamable HTTP MCP surface to the `/mcp` route.
+   *
+   * MUST be called before `start()`. The gateway delegates `/mcp` to the surface
+   * only once it is attached, so the composition is complete before the listener
+   * can accept a request and there is no window in which `/mcp` is reachable
+   * without its transport. Attaching after the listener is bound is refused
+   * rather than accepted, so a late attach cannot change reachability at runtime.
+   */
+  public attachMcpSurface(surface: RemoteMcpSurface): void {
+    if (this.started) {
+      throw new Error('The MCP surface must be attached before the gateway starts.');
+    }
+    this.mcpSurface = surface;
+    this.bootstrap.attachMcpSurface(surface);
   }
 
   /** Starts the TLS listener. Resolves once it is bound and accepting. */
@@ -564,6 +589,12 @@ export class RemoteGateway {
     const server = this.server;
     this.server = undefined;
     this.started = false;
+
+    // 0. Release every composed remote MCP session first: each one holds an SDK
+    //    transport, an MCP server, and a gateway session, and none of them may
+    //    outlive the listener. The sessions are volatile by construction, so
+    //    this is the same teardown a process restart performs implicitly.
+    await this.mcpSurface?.closeAll();
 
     // 1. Stop accepting new connections first, so nothing new can be admitted
     //    while the existing state is being torn down.

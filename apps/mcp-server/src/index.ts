@@ -39,6 +39,7 @@ import {
 import type { BoundedRequestLimiter } from './remote-resource-limits.js';
 import { ApprovalAuditSink, getApprovalAuditSink } from './approval-audit.js';
 import { RemoteGateway, type RemoteGatewayStatus } from './remote-gateway.js';
+import { readRemoteRequestContext, RemoteMcpSurface } from './remote-mcp-surface.js';
 import type { RemoteConfig } from './remote-config.js';
 import {
   ARC_APPROVAL_KEY,
@@ -885,6 +886,23 @@ export const ALL_TOOL_DEFINITIONS: Tool[] = withArcApprovalSchemaOnTools([
   ...RC02_TOOL_DEFINITIONS,
   ...RC03_TOOL_DEFINITIONS,
 ]);
+
+/**
+ * Rebuilds one MCP tool result as a fresh object.
+ *
+ * The SDK's `CallToolResult` union is only assignable from an anonymous object
+ * type, because an `interface` does not receive an implicit index signature.
+ * Normalizing here keeps the remote tool path returning exactly the same shape
+ * the shared stdio pipeline returns, with no cast anywhere.
+ */
+function remoteToolResult(result: {
+  isError?: boolean;
+  content: Array<{ type: 'text'; text: string }>;
+}): { isError?: boolean; content: Array<{ type: 'text'; text: string }> } {
+  return result.isError === undefined
+    ? { content: result.content }
+    : { isError: result.isError, content: result.content };
+}
 
 export interface IArcMcpServer {
   start(): Promise<void>;
@@ -2537,6 +2555,17 @@ export class ArcMcpServer implements IArcMcpServer {
             authorizedWorkspacesCount: this.workspaceRegistry.getWorkspaces().length,
             transportMode: this.transportMode,
             remoteGatewayActive: gatewayStatus?.activeAndServing ?? false,
+            // §16/§17: authentication is active only while a remote gateway is
+            // actually admitting authenticated requests. A degraded gateway has
+            // latched its certificate expiry and refuses every new TLS and
+            // session admission, so it reports authentication inactive too.
+            authenticationActive:
+              this.transportMode === 'remote' && (gatewayStatus?.activeAndServing ?? false),
+            // Counts only, from the two existing authorities: the gateway's
+            // authoritative trust store and the ONE process-local session
+            // manager. No device list, no session list, no identifier.
+            enrolledDevicesCount: this.remoteGateway?.getEnrolledDeviceCount() ?? 0,
+            activeSessionsCount: this.sessionManager.getActiveSessionCount(),
             // Only safe, bounded fields cross this boundary: no certificate or
             // key bytes, no file paths, no pins, no peer addresses.
             ...(gatewayStatus === undefined
@@ -2545,7 +2574,10 @@ export class ArcMcpServer implements IArcMcpServer {
                   remoteGatewayDegraded: gatewayStatus.degraded,
                   ...(gatewayStatus.degradedReason === undefined
                     ? {}
-                    : { remoteGatewayDegradedReason: gatewayStatus.degradedReason }),
+                    : {
+                        remoteGatewayDegradedReason: gatewayStatus.degradedReason,
+                        degradedReason: gatewayStatus.degradedReason,
+                      }),
                 }),
           };
           result = health;
@@ -2930,19 +2962,13 @@ export class ArcMcpServer implements IArcMcpServer {
       const gateway = new RemoteGateway(remoteConfig, {
         enrollmentManager: this.enrollmentManager,
       });
-      try {
-        await gateway.start();
-      } catch (err: unknown) {
-        // All-or-nothing: nothing is left bound, and stdio is NOT started as a
-        // fallback.
-        await gateway.stop();
-        throw err;
-      }
-      this.remoteGateway = gateway;
 
       // The remote execution bridge is composed over the gateway's CURRENT
       // authoritative trust store. The resolver is called per request and is
       // never cached, so device revocation takes effect on the next call.
+      //
+      // It is built BEFORE the listener binds, so the ONE remote execution path
+      // exists before any request can reach it.
       this.remoteExecutionBridge = new RemoteExecutionBridge({
         sessionManager: this.sessionManager,
         resolveActiveDeviceIdentity: (spkiPin) => gateway.resolveActiveDeviceIdentity(spkiPin),
@@ -2951,6 +2977,31 @@ export class ArcMcpServer implements IArcMcpServer {
         // rate and concurrency budget table.
         authenticatedLimiter: this.authenticatedRequestLimiter,
       });
+
+      // §3/§5/RC05-NEG-06: the stateful Streamable HTTP surface is constructed
+      // and attached BEFORE the listener binds. Its constructor obtains the
+      // session-ID generator from the ONE Task-5 session authority and throws if
+      // that authority is unusable, so a missing or stateless-capable
+      // configuration fails startup with NO listener bound — there is no
+      // fallback path to a stateless transport, and no window in which `/mcp` is
+      // reachable without its transport.
+      try {
+        gateway.attachMcpSurface(
+          new RemoteMcpSurface({
+            sessionManager: this.sessionManager,
+            bridge: this.remoteExecutionBridge,
+            createSessionServer: () => this.createRemoteSessionServer(),
+            publicHostname: remoteConfig.publicHostname,
+          }),
+        );
+        await gateway.start();
+      } catch (err: unknown) {
+        // All-or-nothing: nothing is left bound, and stdio is NOT started as a
+        // fallback.
+        await gateway.stop();
+        throw err;
+      }
+      this.remoteGateway = gateway;
 
       // The admin channel is a LOCAL IPC channel, so starting it in remote mode
       // adds no network surface: it remains local-only and Ed25519-authenticated,
@@ -3011,6 +3062,112 @@ export class ArcMcpServer implements IArcMcpServer {
    */
   public getRemoteExecutionBridge(): RemoteExecutionBridge | undefined {
     return this.remoteExecutionBridge;
+  }
+
+  /**
+   * Builds the MCP `Server` for ONE remote session (RC-05 Task 8).
+   *
+   * Deliberately assembled from the SAME parts as the stdio server — the same
+   * SDK `Server` shape, the same `ALL_TOOL_DEFINITIONS` catalog, and the same
+   * `CallToolRequestSchema` entry point — so remote cannot expose a tool the
+   * local catalog does not already define, and there is no second tool
+   * dispatcher anywhere.
+   *
+   * The one difference is the destination of a tool call: stdio calls
+   * `dispatchToolCall`, while a remote call must first pass Task-6 session
+   * admission and actor derivation, so it routes into the EXISTING
+   * `RemoteExecutionBridge`, which is the only component that may construct a
+   * trusted remote actor. Neither path calls a subsystem, the policy kernel, the
+   * approval manager, or the filesystem directly — both converge on
+   * `executeAuthenticatedToolCall`.
+   */
+  private createRemoteSessionServer(): Server {
+    const server = new Server(
+      {
+        name: 'cesspace-arc',
+        version: '0.4.0-rc04',
+      },
+      {
+        capabilities: {
+          tools: {},
+        },
+      },
+    );
+
+    server.setRequestHandler(ListToolsRequestSchema, async () => {
+      return {
+        tools: ALL_TOOL_DEFINITIONS,
+      };
+    });
+
+    server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+      const bridge = this.remoteExecutionBridge;
+      const requestContext = readRemoteRequestContext(extra.authInfo);
+      if (bridge === undefined || requestContext === null) {
+        // Fail closed. A remote MCP call whose gateway request context is
+        // missing cannot be attributed to a trusted mTLS identity, so it is
+        // refused with exactly the error an unauthenticated caller receives.
+        // The SPKI pin is NOT taken from the session context as a fallback:
+        // identity must come from the request that is being executed.
+        return this.remoteToolErrorResult(ArcError.unauthenticated());
+      }
+
+      const toolName = request.params.name;
+      const parameters = (request.params.arguments || {}) as Record<string, unknown>;
+
+      try {
+        return remoteToolResult(
+          await bridge.executeRemoteToolCall({
+            trustedSpkiPin: requestContext.spkiPin,
+            presentedSessionId: requestContext.presentedSessionId,
+            authorizationHeader: requestContext.authorizationHeader,
+            hasExistingSessionContext: requestContext.presentedSessionId !== null,
+            toolName,
+            parameters,
+          }),
+        );
+      } catch (err: unknown) {
+        // The bridge throws only bounded ArcErrors, and only BEFORE dispatch.
+        // Anything the shared pipeline itself rejects is already returned from
+        // `executeAuthenticatedToolCall` as a tool result, so it never arrives
+        // here and its semantics are unchanged.
+        return this.remoteToolErrorResult(
+          err instanceof ArcError ? err : ArcError.internalError('Tool execution failed.'),
+        );
+      }
+    });
+
+    return server;
+  }
+
+  /**
+   * Converts a pre-dispatch ArcError into a tool result.
+   *
+   * Uses the same error shape and the same message sanitizer as the shared
+   * stdio pipeline, so a remote caller observes identical error semantics.
+   */
+  private remoteToolErrorResult(arcError: ArcError): {
+    isError: true;
+    content: Array<{ type: 'text'; text: string }>;
+  } {
+    return {
+      isError: true,
+      content: [
+        {
+          type: 'text',
+          text: JSON.stringify(
+            {
+              code: arcError.code,
+              category: arcError.category,
+              message: sanitizeClientErrorMessage(arcError.message),
+              retryable: arcError.retryable,
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+    };
   }
 
   public async flushAudit(): Promise<void> {

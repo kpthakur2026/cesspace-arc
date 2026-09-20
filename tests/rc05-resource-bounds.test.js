@@ -2485,27 +2485,43 @@ describe('RC-05 Task 7: bounds are frozen and the Task-8 boundary is intact', ()
     }
   });
 
-  test('RC05-NEG-55: no SDK transport or stateful /mcp composition exists yet', () => {
+  test('RC05-NEG-55: the SDK transport surface stays confined to the one Task-8 module', () => {
+    // Task 8 intentionally crosses this boundary: exactly ONE remote MCP
+    // transport now exists. The security property is not "no transport anywhere"
+    // but "exactly one transport, in exactly one module, and none of the
+    // forbidden transports anywhere". Containment is therefore asserted two
+    // ways: the surface strings may appear ONLY in `remote-mcp-surface.ts`, and
+    // the client transport, the deprecated SSE transport, and any `eventStore`
+    // (which would add resumability/replay §3 forbids) must appear NOWHERE.
     const srcDir = new URL('../apps/mcp-server/src/', import.meta.url);
     const files = fs.readdirSync(srcDir).filter((name) => name.endsWith('.ts'));
     assert.equal(files.length > 0, true);
+
+    const SURFACE_MODULE = 'remote-mcp-surface.ts';
+    const surfaceOnly = ['StreamableHTTPServerTransport', 'streamableHttp', 'sessionIdGenerator'];
+    const forbiddenEverywhere = [
+      'StreamableHTTPClientTransport',
+      'SSEServerTransport',
+      'eventStore',
+      'Arc-Session-Token',
+      "setHeader('Mcp-Session-Id'",
+      'setHeader("Mcp-Session-Id"',
+    ];
+
+    const composing = [];
     for (const name of files) {
       const source = fs.readFileSync(new URL(name, srcDir), 'utf8');
-      for (const forbidden of [
-        'StreamableHTTPServerTransport',
-        'StreamableHTTPClientTransport',
-        'streamableHttp',
-        'Arc-Session-Token',
-        "setHeader('Mcp-Session-Id'",
-        'setHeader("Mcp-Session-Id"',
-      ]) {
-        assert.equal(
-          source.includes(forbidden),
-          false,
-          `${name} must not compose the Task-8 transport surface (${forbidden})`,
-        );
+      for (const forbidden of forbiddenEverywhere) {
+        assert.equal(source.includes(forbidden), false, `${name} must not contain ${forbidden}`);
+      }
+      if (surfaceOnly.some((marker) => source.includes(marker))) {
+        composing.push(name);
       }
     }
+
+    // ONE module composes a remote transport. A second one would mean a second
+    // listener, a second dispatcher, or a shadow session authority.
+    assert.deepEqual(composing, [SURFACE_MODULE]);
   });
 
   test('RC05-NEG-55: the Layer C refusal discloses no limiter internals', () => {

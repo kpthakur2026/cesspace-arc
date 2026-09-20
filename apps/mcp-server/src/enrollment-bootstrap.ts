@@ -33,6 +33,7 @@ import {
   type TrustedSessionIdentity,
 } from '@cesspace-arc/auth';
 import { RequestBodyError, readBoundedRequestBody } from './remote-request-bounds.js';
+import type { RemoteMcpSurface } from './remote-mcp-surface.js';
 
 /** The only path that can attempt enrollment completion. */
 export const ENROLL_COMPLETE_PATH = '/enroll/complete';
@@ -151,6 +152,16 @@ export class EnrollmentBootstrap {
    * against a trust store whose contents it can no longer vouch for.
    */
   private storageLatched = false;
+  /**
+   * The Task-8 Streamable HTTP MCP surface, attached by the gateway once the
+   * composition exists.
+   *
+   * Absent means `/mcp` stays the deny-only placeholder, which is the correct
+   * behaviour for a gateway constructed without a composed server. Attaching it
+   * is the ONLY thing that can make `/mcp` reachable, and it is never reachable
+   * from configuration, the environment, or a request.
+   */
+  private mcpSurface?: RemoteMcpSurface;
 
   constructor(
     private readonly enrollmentManager: EnrollmentManager,
@@ -201,6 +212,17 @@ export class EnrollmentBootstrap {
   }
 
   /**
+   * Attaches the Task-8 Streamable HTTP MCP surface.
+   *
+   * Called by the gateway between construction and `start()`, so the surface is
+   * always in place before the listener can accept a single request: there is no
+   * window in which `/mcp` is reachable but uncomposed.
+   */
+  public attachMcpSurface(surface: RemoteMcpSurface): void {
+    this.mcpSurface = surface;
+  }
+
+  /**
    * Handles one authenticated HTTP request.
    *
    * `spkiPin` is the Task-3 mTLS identity, already derived from the verified
@@ -226,11 +248,19 @@ export class EnrollmentBootstrap {
     }
 
     if (pathOnly === MCP_PATH) {
-      // Deny-only placeholder. Task 8 owns Streamable HTTP composition; until
-      // then no `/mcp` request may create a transport or session, issue a
-      // token, reach policy, or dispatch a tool. A body carrying enrollment
-      // fields changes nothing: this branch never reads the body.
-      this.send(res, 401, UNAUTHENTICATED_BODY);
+      const surface = this.mcpSurface;
+      if (surface === undefined) {
+        // Deny-only placeholder. With no composed transport attached, no `/mcp`
+        // request may create a transport or session, issue a token, reach
+        // policy, or dispatch a tool. A body carrying enrollment fields changes
+        // nothing: this branch never reads the body.
+        this.send(res, 401, UNAUTHENTICATED_BODY);
+        return;
+      }
+      // The identity is resolved from the CURRENT authoritative trust store on
+      // every request, exactly as the completion path does, so a device revoked
+      // between two MCP requests stops resolving immediately.
+      await surface.handle(req, res, spkiPin, this.resolveActiveDeviceIdentity(spkiPin));
       return;
     }
 

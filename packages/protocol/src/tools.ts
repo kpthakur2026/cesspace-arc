@@ -32,6 +32,27 @@ export interface HealthResponse {
    * material, file paths, pins, or peer addresses (§19).
    */
   remoteGatewayDegradedReason?: 'certificate_expired';
+  /**
+   * True only while remote session authentication can admit new requests.
+   *
+   * False in stdio mode — no remote authentication runs there — and false while
+   * the remote gateway is degraded, because an expired server certificate
+   * refuses every new TLS and session admission (§17).
+   */
+  authenticationActive: boolean;
+  /** Enrolled device count from the authoritative trust store. Never a list. */
+  enrolledDevicesCount: number;
+  /**
+   * Live gateway session count, read from the ONE process-local session
+   * authority. Never a second counter, and never a session list.
+   */
+  activeSessionsCount: number;
+  /**
+   * Bounded degradation reason (§16). Same bounded vocabulary as
+   * `remoteGatewayDegradedReason`; never certificate dates, paths, subject or
+   * SAN details, or key material.
+   */
+  degradedReason?: 'certificate_expired';
 }
 
 export interface ListDirectoryRequest {
