@@ -1454,8 +1454,20 @@ describe('CesSpace ARC — RC-05 Task 6: Remote Actor Pipeline', () => {
         new URL('../apps/mcp-server/src/remote-execution.ts', import.meta.url),
         'utf8',
       );
+      // The bridge depends on exactly three modules: the two shared packages and
+      // the ONE in-memory resource-limits module that carries Layer C and the
+      // per-session concurrency bound (RC-05 Task 7, §21 and §26 C-3). Task 7
+      // puts that enforcement INSIDE the bridge, so the accounting module is a
+      // permitted dependency — and it is separately required to be pure
+      // computation below, which keeps this control's original property whole:
+      // neither the bridge nor the only relative module it imports can perform
+      // I/O, open a transport, or hold a request.
       const specifiers = [...bridge.matchAll(/from\s+'([^']+)'/g)].map((match) => match[1]);
-      assert.deepEqual(specifiers.sort(), ['@cesspace-arc/auth', '@cesspace-arc/protocol']);
+      assert.deepEqual(specifiers.sort(), [
+        './remote-resource-limits.js',
+        '@cesspace-arc/auth',
+        '@cesspace-arc/protocol',
+      ]);
       for (const forbidden of [
         'node:http',
         'node:https',
@@ -1466,6 +1478,43 @@ describe('CesSpace ARC — RC-05 Task 6: Remote Actor Pipeline', () => {
         'listen(',
       ]) {
         assert.equal(bridge.includes(forbidden), false, `the bridge must not use ${forbidden}`);
+      }
+
+      // The bridge's one relative dependency must be pure admission accounting:
+      // normalization and bounded in-memory tables only. It cannot open a
+      // socket, touch a file, arm a timer, or buffer a request, so the
+      // "application-only, no I/O" property holds over the bridge's whole
+      // dependency closure and not just its own source text.
+      const limits = fs.readFileSync(
+        new URL('../apps/mcp-server/src/remote-resource-limits.ts', import.meta.url),
+        'utf8',
+      );
+      const limitsSpecifiers = [...limits.matchAll(/from\s+'([^']+)'/g)].map((match) => match[1]);
+      assert.deepEqual(
+        limitsSpecifiers,
+        ['node:net'],
+        'the limiter module may import node:net only',
+      );
+      for (const forbidden of [
+        'node:http',
+        'node:https',
+        'node:tls',
+        'node:fs',
+        'node:stream',
+        'node:child_process',
+        'createServer',
+        'listen(',
+        'setTimeout',
+        'setInterval',
+        '.destroy(',
+        'readFile',
+        'writeFile',
+      ]) {
+        assert.equal(
+          limits.includes(forbidden),
+          false,
+          `the limiter module must not use ${forbidden}`,
+        );
       }
     });
 

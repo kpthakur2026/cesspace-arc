@@ -15,6 +15,8 @@
  *   trusted SPKI (Task 3 TLS)
  *     → CURRENT DeviceTrustStore resolution   (every request, never cached)
  *     → Task-5 SessionManager admission       (dual-header, monotonic TTLs)
+ *     → Layer C authenticated rate limit      (server-derived device/session)
+ *     → per-session request concurrency       (never queues; §26 C-3)
  *     → exact remote actor derivation         (clientId, clientType, deviceId,
  *                                              sessionId = Mcp-Session-Id)
  *     → remote actor-field spoofing guard     (bounded, cycle-safe)
@@ -24,11 +26,20 @@
  *
  * Ordering is a security property. Authentication is an ADMISSION PREREQUISITE,
  * not a policy decision: nothing below the guard runs unless Task-5 admission
- * returned AUTHENTICATED.
+ * returned AUTHENTICATED, and Layer C cannot run before it either — its key is
+ * derived from the authenticated session result, so there is nothing to key on
+ * until admission has succeeded.
  */
 
 import { ArcError } from '@cesspace-arc/protocol';
 import type { SessionManager, TrustedSessionIdentity } from '@cesspace-arc/auth';
+import {
+  BoundedRequestLimiter,
+  LAYER_C_BURST,
+  LAYER_C_REQUESTS_PER_MINUTE,
+  MAX_LAYER_C_KEYS,
+  MAX_OUTSTANDING_REQUESTS_PER_SESSION,
+} from './remote-resource-limits.js';
 
 /**
  * A fully populated actor: every authorization-relevant field is present.
@@ -90,6 +101,15 @@ export interface RemoteExecutionDeps {
   resolveActiveDeviceIdentity(spkiPin: string): TrustedSessionIdentity | undefined;
   /** The shared pipeline. */
   sink: AuthenticatedToolSink;
+  /**
+   * The ONE process-local Layer C limiter and per-session concurrency state.
+   *
+   * Production composition (`ArcMcpServer.start()`) supplies a single
+   * process-wide instance and resets it on shutdown, so rate and concurrency
+   * state is volatile and never persisted. When omitted, the bridge creates its
+   * own with the frozen production bounds — never a weaker or configurable set.
+   */
+  authenticatedLimiter?: BoundedRequestLimiter;
 }
 
 /** One remote tool call, as the future transport will supply it. */
@@ -242,6 +262,59 @@ export function remoteSessionFailure(): ArcError {
 }
 
 /**
+ * Builds a Layer C limiter with the frozen production bounds (§21.1 Layer C).
+ *
+ * 300 requests/minute with a burst of 60, at most 1024 retained session keys,
+ * and at most {@link MAX_OUTSTANDING_REQUESTS_PER_SESSION} outstanding requests
+ * per key. The `getMonotonicTimeMs` seam exists so a test can drive the clock;
+ * every numeric bound is a module constant and is not parameterized.
+ */
+export function createAuthenticatedRequestLimiter(
+  options: {
+    getMonotonicTimeMs?: () => number;
+  } = {},
+): BoundedRequestLimiter {
+  return new BoundedRequestLimiter({
+    requestsPerMinute: LAYER_C_REQUESTS_PER_MINUTE,
+    burst: LAYER_C_BURST,
+    maxKeys: MAX_LAYER_C_KEYS,
+    maxOutstandingPerKey: MAX_OUTSTANDING_REQUESTS_PER_SESSION,
+    ...(options.getMonotonicTimeMs === undefined
+      ? {}
+      : { getMonotonicTimeMs: options.getMonotonicTimeMs }),
+  });
+}
+
+/**
+ * THE Layer C limiter key.
+ *
+ * Built ONLY from the server-derived `deviceId` and `sessionId` of a successful
+ * Task-5 admission. Neither is client-supplied, and the raw session token is
+ * never used as a key — the token is not even retained in a usable form by the
+ * session manager, and keying on a credential would put it in limiter memory.
+ */
+export function sessionRateLimitKey(session: { deviceId: string; sessionId: string }): string {
+  return `${session.deviceId}:${session.sessionId}`;
+}
+
+/**
+ * The single client-facing rate/concurrency refusal (§21.1 Layer C, §26 C-3).
+ *
+ * One bounded error for every resource bound this layer enforces, so a client
+ * cannot use the response to tell a rate refusal from a concurrency refusal, and
+ * gains no signal about remaining budget. Nothing about the key, the bucket, or
+ * the session is included.
+ */
+export function remoteRateLimitFailure(): ArcError {
+  return new ArcError({
+    code: 'RATE_LIMIT_EXCEEDED',
+    category: 'RESOURCE',
+    message: 'Request rate or concurrency limit exceeded for this session.',
+    retryable: true,
+  });
+}
+
+/**
  * The composition-ready remote execution entry point.
  *
  * Task 8 will call `executeRemoteToolCall` from the SDK transport once a request
@@ -249,7 +322,11 @@ export function remoteSessionFailure(): ArcError {
  * network I/O, and nothing here is reachable from the network in Task 6.
  */
 export class RemoteExecutionBridge {
-  constructor(private readonly deps: RemoteExecutionDeps) {}
+  private readonly authenticatedLimiter: BoundedRequestLimiter;
+
+  constructor(private readonly deps: RemoteExecutionDeps) {
+    this.authenticatedLimiter = deps.authenticatedLimiter ?? createAuthenticatedRequestLimiter();
+  }
 
   /**
    * Authenticates one remote request and, only on success, runs it through the
@@ -281,26 +358,58 @@ export class RemoteExecutionBridge {
       identity,
     });
 
-    // 3. Stop on any admission failure, before schema, policy, or approval.
+    // 3. Stop on any admission failure, before any rate accounting, schema,
+    //    policy, or approval. Layer C is unreachable without authentication.
     if (decision.outcome !== 'AUTHENTICATED') {
       throw this.failureFor(decision.outcome, sessionIdPresented, credentialPresented);
     }
 
-    // 4. Derive the exact actor from the trusted session result.
-    const actor = deriveRemoteActor(decision.session);
+    const session = decision.session;
 
-    // 5. Refuse any attempt to supply actor or transport identity in parameters.
-    //    Checked before the pipeline so no policy evaluation, approval lookup, or
-    //    subsystem call can observe a spoofing attempt.
-    const injection = findActorFieldInjection(input.parameters);
-    if (injection !== null) {
-      throw ArcError.invalidRequestSchema(
-        `Invalid parameters for tool '${input.toolName}': reserved actor or transport identity field is not permitted in remote request parameters.`,
-      );
+    // 4. Layer C: the authenticated session/device rate budget, keyed on the
+    //    server-derived device and session identifiers only (§21.1 Layer C).
+    const budget = this.authenticatedLimiter.consume(sessionRateLimitKey(session));
+    if (!budget.consumed) {
+      // Rate refusals and saturation share ONE client-facing error, so the
+      // refusal is not a probe for whether a key exists or how full a bucket is.
+      throw remoteRateLimitFailure();
     }
 
-    // 6. The ONE shared RC-04 pipeline, with a COMPLETE trusted actor.
-    return this.deps.sink.executeAuthenticatedToolCall(actor, input.toolName, input.parameters);
+    // 5. Per-session concurrency (§26 C-3). A request beyond the bound is
+    //    refused immediately and is NEVER queued, so no unbounded backlog can
+    //    accumulate behind a session.
+    const slot = this.authenticatedLimiter.tryHold(budget.bucket);
+    if (!slot.held) {
+      throw remoteRateLimitFailure();
+    }
+
+    // The slot is released on EVERY exit path below — success, actor-field
+    // refusal, policy denial, approval requirement, approval rejection,
+    // subsystem error, and any thrown internal error — so a failed request can
+    // never leak a concurrency slot.
+    try {
+      // 6. Derive the exact actor from the trusted session result.
+      const actor = deriveRemoteActor(session);
+
+      // 7. Refuse any attempt to supply actor or transport identity in
+      //    parameters. Checked before the pipeline so no policy evaluation,
+      //    approval lookup, or subsystem call can observe a spoofing attempt.
+      const injection = findActorFieldInjection(input.parameters);
+      if (injection !== null) {
+        throw ArcError.invalidRequestSchema(
+          `Invalid parameters for tool '${input.toolName}': reserved actor or transport identity field is not permitted in remote request parameters.`,
+        );
+      }
+
+      // 8. The ONE shared RC-04 pipeline, with a COMPLETE trusted actor.
+      return await this.deps.sink.executeAuthenticatedToolCall(
+        actor,
+        input.toolName,
+        input.parameters,
+      );
+    } finally {
+      slot.release();
+    }
   }
 
   /**

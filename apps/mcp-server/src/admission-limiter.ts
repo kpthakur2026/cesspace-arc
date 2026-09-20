@@ -3,23 +3,35 @@
  *
  * TCP/TLS connection admission, evaluated before and during the TLS handshake so
  * a flood is dropped before it can consume handshake CPU.
- * Authoritative contract: §21.1 Layer A, §21.2 (Layer A row).
+ * Authoritative contract: §21.1 Layer A, §21.2 (Layer A row), §21.3, §26 C-1.
  *
- * Scope boundary: this is Layer A only. Layers B (HTTP) and C (authenticated
- * session) belong to Task 7, as does the full limiter-LRU and IPv6 prefix
- * normalization feature set. This module implements exactly the frozen Layer-A
- * bounds with a bounded peer table, and nothing more.
+ * Task 7 completed the peer table this module was built around: peer keys are
+ * now CANONICAL NETWORK identities rather than raw socket strings, and the
+ * retained-key table is the shared bounded implementation in
+ * `remote-resource-limits.ts` (access-ordered LRU reclamation, fail-closed
+ * saturation). The connection-state lifecycle, the counters, and every frozen
+ * production value are unchanged from the approved Task-3 baseline.
  *
- * The peer table is bounded at {@link MAX_LAYER_A_PEER_KEYS}. At capacity, keys
- * are reclaimed by idle eviction; if none is reclaimable the connection is
- * refused outright rather than allocating, so attacker-driven key churn cannot
- * grow memory.
+ * Scope boundary: this is Layer A only. Layers B (secure HTTP pre-session) and C
+ * (authenticated session) are separate instances of the same bounded table,
+ * owned by the gateway and the remote execution bridge respectively.
  *
  * Rate model: a MONOTONIC TOKEN BUCKET, not a fixed window. The frozen pair
  * "60 attempts / min (burst 20)" is a refill rate of one token per second with a
  * bucket that holds at most 20. A fixed window would admit 60 + 20 = 80
  * immediate attempts, which is not a burst capacity of 20, so it is not used.
+ *
+ * Keying: the key handed to {@link AdmissionLimiter.admit} MUST already be a
+ * canonical peer-network key. The gateway derives it with
+ * `normalizePeerNetwork()`, which unmaps IPv4-mapped IPv6 peers and groups IPv6
+ * peers by `/64` so rotating an interface identifier cannot buy a second bucket.
  */
+
+import {
+  BoundedRequestLimiter,
+  MAX_LAYER_A_KEYS,
+  type RateRefusalReason,
+} from './remote-resource-limits.js';
 
 /** Frozen Layer A rate window, in milliseconds. */
 export const LAYER_A_WINDOW_MS = 60_000;
@@ -43,7 +55,7 @@ export const MAX_LIVE_CONNECTIONS_GLOBAL = 512;
 export const MAX_IN_FLIGHT_HANDSHAKES = 64;
 
 /** Frozen maximum retained peer keys (§21.2 Layer A row). */
-export const MAX_LAYER_A_PEER_KEYS = 4096;
+export const MAX_LAYER_A_PEER_KEYS = MAX_LAYER_A_KEYS;
 
 /** Frozen idle eviction timeout for a peer key, in milliseconds. */
 export const LAYER_A_IDLE_EVICTION_MS = 60_000;
@@ -54,22 +66,12 @@ export type AdmissionRefusalReason =
   | 'PEER_CONNECTION_CAP'
   | 'GLOBAL_CONNECTION_CAP'
   | 'HANDSHAKE_CAP'
-  | 'PEER_TABLE_SATURATED';
+  | 'PEER_TABLE_SATURATED'
+  | 'PEER_KEY_INVALID';
 
 /** Outcome of an admission decision. */
 export type AdmissionDecision =
   { admitted: true; release: () => void } | { admitted: false; reason: AdmissionRefusalReason };
-
-interface PeerState {
-  /** Token-bucket level. Never exceeds the burst capacity. */
-  tokens: number;
-  /** Monotonic millisecond of the last refill, for lazy accrual. */
-  lastRefillMs: number;
-  /** Live connections currently held by this peer. */
-  live: number;
-  /** Last monotonic millisecond this key was touched, for idle eviction. */
-  lastSeenMs: number;
-}
 
 /** Injectable clock and counters for deterministic tests. */
 export interface AdmissionLimiterOptions {
@@ -92,29 +94,27 @@ export interface AdmissionLimiterOptions {
  * atomic with respect to other connections on the event loop.
  */
 export class AdmissionLimiter {
-  private readonly getMonotonicTimeMs: () => number;
-  private readonly refillMs: number;
-  private readonly burst: number;
+  private readonly peers: BoundedRequestLimiter;
   private readonly maxLivePerPeer: number;
   private readonly maxLiveGlobal: number;
   private readonly maxInFlightHandshakes: number;
-  private readonly maxPeerKeys: number;
-  private readonly idleEvictionMs: number;
 
-  private readonly peers = new Map<string, PeerState>();
   private liveGlobal = 0;
   private inFlightHandshakes = 0;
 
   constructor(options: AdmissionLimiterOptions = {}) {
-    this.getMonotonicTimeMs = options.getMonotonicTimeMs ?? (() => performance.now());
-    const attemptsPerMinute = options.attemptsPerMinute ?? LAYER_A_ATTEMPTS_PER_MINUTE;
-    this.refillMs = 60_000 / attemptsPerMinute;
-    this.burst = options.burst ?? LAYER_A_BURST;
     this.maxLivePerPeer = options.maxLivePerPeer ?? MAX_LIVE_CONNECTIONS_PER_PEER;
     this.maxLiveGlobal = options.maxLiveGlobal ?? MAX_LIVE_CONNECTIONS_GLOBAL;
     this.maxInFlightHandshakes = options.maxInFlightHandshakes ?? MAX_IN_FLIGHT_HANDSHAKES;
-    this.maxPeerKeys = options.maxPeerKeys ?? MAX_LAYER_A_PEER_KEYS;
-    this.idleEvictionMs = options.idleEvictionMs ?? LAYER_A_IDLE_EVICTION_MS;
+    this.peers = new BoundedRequestLimiter({
+      requestsPerMinute: options.attemptsPerMinute ?? LAYER_A_ATTEMPTS_PER_MINUTE,
+      burst: options.burst ?? LAYER_A_BURST,
+      maxKeys: options.maxPeerKeys ?? MAX_LAYER_A_PEER_KEYS,
+      idleEvictionMs: options.idleEvictionMs ?? LAYER_A_IDLE_EVICTION_MS,
+      ...(options.getMonotonicTimeMs === undefined
+        ? {}
+        : { getMonotonicTimeMs: options.getMonotonicTimeMs }),
+    });
   }
 
   /** Live connection count across all peers. */
@@ -129,12 +129,23 @@ export class AdmissionLimiter {
 
   /** Retained peer keys. Exposed so bound tests can assert the ceiling holds. */
   public getRetainedPeerKeyCount(): number {
-    return this.peers.size;
+    return this.peers.getRetainedKeyCount();
   }
 
   /** Live connection count for one peer. */
   public getLiveConnectionCountForPeer(peerKey: string): number {
-    return this.peers.get(peerKey)?.live ?? 0;
+    return this.peers.getHolderCount(peerKey);
+  }
+
+  /**
+   * The retained peer keys, in access order (oldest first).
+   *
+   * @internal Test-only observation of the exact keys Layer A bucketed on, used
+   * to prove canonical peer normalization at the transport boundary. Never part
+   * of a response, a log line, or a status object.
+   */
+  public getRetainedPeerKeysForTests(): string[] {
+    return this.peers.getRetainedKeysForTests();
   }
 
   /**
@@ -145,36 +156,13 @@ export class AdmissionLimiter {
    * handshake success then close, socket error, timeout, or shutdown.
    */
   public admit(peerKey: string): AdmissionDecision {
-    const now = this.getMonotonicTimeMs();
-    this.evictIdlePeers(now);
-
-    const existing = this.peers.get(peerKey);
-    if (existing === undefined && this.peers.size >= this.maxPeerKeys) {
-      // Fail closed rather than allocating: an untracked key must not be able to
-      // grow the table without limit.
-      return { admitted: false, reason: 'PEER_TABLE_SATURATED' };
+    // Saturation is decided before anything is allocated, and the attempt is
+    // rate-accounted only once a bucket exists for the peer.
+    const consumed = this.peers.consume(peerKey);
+    if (!consumed.consumed) {
+      return { admitted: false, reason: refusalReasonFor(consumed.reason) };
     }
-
-    const peer = existing ?? this.createPeer(peerKey, now);
-    peer.lastSeenMs = now;
-
-    // Lazily accrue tokens at the frozen rate, capped at the burst capacity so
-    // a long idle period can never bank more than one burst.
-    const elapsedMs = now - peer.lastRefillMs;
-    if (elapsedMs > 0) {
-      peer.tokens = Math.min(this.burst, peer.tokens + elapsedMs / this.refillMs);
-      peer.lastRefillMs = now;
-    }
-
-    // The rate budget governs ATTEMPTS: an attempt is refused here when no
-    // token is available, regardless of what any concurrency bound would say.
-    if (peer.tokens < 1) {
-      return { admitted: false, reason: 'RATE_LIMIT' };
-    }
-
-    // The attempt consumes a token whether or not a concurrency bound then
-    // refuses it, so rate accounting reflects requests actually made.
-    peer.tokens -= 1;
+    const bucket = consumed.bucket;
 
     // Concurrency bounds are evaluated after rate accounting, so their refusal
     // reasons stay precise and the token cost of the attempt is still recorded.
@@ -184,11 +172,15 @@ export class AdmissionLimiter {
     if (this.inFlightHandshakes + 1 > this.maxInFlightHandshakes) {
       return { admitted: false, reason: 'HANDSHAKE_CAP' };
     }
-    if (peer.live + 1 > this.maxLivePerPeer) {
+    if (bucket.holders + 1 > this.maxLivePerPeer) {
       return { admitted: false, reason: 'PEER_CONNECTION_CAP' };
     }
 
-    peer.live += 1;
+    // The live slot is accounted on the retained bucket itself, so the release
+    // closure acts on the SAME entry the per-peer cap is measured against. A
+    // bucket with a live connection is never reclaimable, so the closure can
+    // never outlive its entry and be applied to a replacement key.
+    bucket.holders += 1;
     this.liveGlobal += 1;
     this.inFlightHandshakes += 1;
 
@@ -202,7 +194,7 @@ export class AdmissionLimiter {
         released = true;
         // The handshake counter is released by the caller when the handshake
         // settles, so it is not decremented here.
-        peer.live -= 1;
+        bucket.holders -= 1;
         this.liveGlobal -= 1;
       },
     };
@@ -220,28 +212,13 @@ export class AdmissionLimiter {
 
   /** Drops all state. Used on shutdown. */
   public reset(): void {
-    this.peers.clear();
+    this.peers.reset();
     this.liveGlobal = 0;
     this.inFlightHandshakes = 0;
   }
+}
 
-  private createPeer(peerKey: string, now: number): PeerState {
-    const peer: PeerState = {
-      // A fresh peer starts with a full burst available.
-      tokens: this.burst,
-      lastRefillMs: now,
-      live: 0,
-      lastSeenMs: now,
-    };
-    this.peers.set(peerKey, peer);
-    return peer;
-  }
-
-  private evictIdlePeers(now: number): void {
-    for (const [key, peer] of this.peers) {
-      if (peer.live === 0 && now - peer.lastSeenMs >= this.idleEvictionMs) {
-        this.peers.delete(key);
-      }
-    }
-  }
+/** Maps a shared bucket refusal onto the Layer-A refusal vocabulary. */
+function refusalReasonFor(reason: RateRefusalReason): AdmissionRefusalReason {
+  return reason === 'RATE_LIMIT' ? 'RATE_LIMIT' : 'PEER_TABLE_SATURATED';
 }

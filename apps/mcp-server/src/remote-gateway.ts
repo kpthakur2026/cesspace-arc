@@ -50,6 +50,20 @@ import {
   type AdmissionLimiterOptions,
   type AdmissionRefusalReason,
 } from './admission-limiter.js';
+import {
+  BoundedRequestLimiter,
+  LAYER_B_BURST,
+  LAYER_B_REQUESTS_PER_MINUTE,
+  MAX_LAYER_B_KEYS,
+  normalizePeerNetwork,
+} from './remote-resource-limits.js';
+import {
+  MAX_REQUEST_HEADER_BYTES,
+  MAX_REQUEST_TARGET_BYTES,
+  TOTAL_REQUEST_TIMEOUT_MS,
+  hasContentEncoding,
+  requestTargetBytes,
+} from './remote-request-bounds.js';
 
 /**
  * Bounded, non-secret remote gateway state.
@@ -106,6 +120,30 @@ export interface RemoteGatewayOptions {
   handshakeTimeoutMsForTests?: number;
   /** Layer A limiter overrides. */
   admission?: AdmissionLimiterOptions;
+  /**
+   * @internal Test-only Layer A limiter injection.
+   *
+   * Replaces the internally constructed limiter so a test can observe the exact
+   * peer keys admission bucketed on. Never populated from ArcServerConfig,
+   * RemoteConfig, the environment, or a request.
+   */
+  admissionLimiterForTests?: AdmissionLimiter;
+  /**
+   * @internal Test-only Layer B limiter injection, for a deterministic clock and
+   * for direct observation of pre-session refusals. Never populated from
+   * configuration, the environment, or a request.
+   */
+  layerBLimiterForTests?: BoundedRequestLimiter;
+  /**
+   * @internal Test-only body-read deadline. May only SHORTEN the frozen 10 s.
+   * Never populated from configuration, the environment, or a request.
+   */
+  bodyReadTimeoutMsForTests?: number;
+  /**
+   * @internal Test-only total-request deadline. May only SHORTEN the frozen 60 s.
+   * Never populated from configuration, the environment, or a request.
+   */
+  totalRequestTimeoutMsForTests?: number;
   /**
    * The pending-enrollment authority used by `POST /enroll/complete`.
    *
@@ -172,6 +210,15 @@ function connectionTuple(socket: {
 /** Maximum time to wait for `close()` to settle during shutdown. */
 const SHUTDOWN_GRACE_MS = 2000;
 
+/** Sanitized plaintext Layer B refusal (§21.1 Layer B). No MCP body, no detail. */
+const RATE_LIMITED_BODY = 'Too Many Requests\n';
+
+/** Sanitized refusal for a request target beyond the frozen 2 KiB bound (§20). */
+const REQUEST_TARGET_TOO_LONG_BODY = 'URI Too Long\n';
+
+/** Sanitized refusal for a compressed request, which baseline does not support (§20). */
+const UNSUPPORTED_ENCODING_BODY = 'Payload Too Large\n';
+
 export class RemoteGateway {
   private readonly config: ResolvedRemoteConfig;
   private readonly getWallTime: () => number;
@@ -182,7 +229,23 @@ export class RemoteGateway {
    * internal test seam may resolve it lower.
    */
   public readonly handshakeTimeoutMs: number;
+  /**
+   * Resolved total request deadline in milliseconds.
+   *
+   * Always the frozen {@link TOTAL_REQUEST_TIMEOUT_MS} in production; only the
+   * internal test seam may resolve it lower. Distinct from the 5 s TLS handshake
+   * deadline and the 10 s body-read deadline.
+   */
+  public readonly totalRequestTimeoutMs: number;
   private readonly limiter: AdmissionLimiter;
+  /**
+   * Layer B: the secure HTTP pre-session limiter (§21.1 Layer B).
+   *
+   * Keyed on the NORMALIZED peer network — the same canonical key Layer A uses —
+   * so a peer cannot buy a second pre-session budget by presenting an
+   * IPv4-mapped or re-spelled address.
+   */
+  private readonly layerB: BoundedRequestLimiter;
   private readonly options: RemoteGatewayOptions;
   /**
    * The gateway's enrollment bootstrap surface.
@@ -230,7 +293,23 @@ export class RemoteGateway {
       requestedTimeout < TLS_HANDSHAKE_TIMEOUT_MS
         ? requestedTimeout
         : TLS_HANDSHAKE_TIMEOUT_MS;
-    this.limiter = new AdmissionLimiter(options.admission ?? {});
+    const requestedTotalTimeout = options.totalRequestTimeoutMsForTests;
+    this.totalRequestTimeoutMs =
+      typeof requestedTotalTimeout === 'number' &&
+      Number.isInteger(requestedTotalTimeout) &&
+      requestedTotalTimeout > 0 &&
+      requestedTotalTimeout < TOTAL_REQUEST_TIMEOUT_MS
+        ? requestedTotalTimeout
+        : TOTAL_REQUEST_TIMEOUT_MS;
+    this.limiter =
+      options.admissionLimiterForTests ?? new AdmissionLimiter(options.admission ?? {});
+    this.layerB =
+      options.layerBLimiterForTests ??
+      new BoundedRequestLimiter({
+        requestsPerMinute: LAYER_B_REQUESTS_PER_MINUTE,
+        burst: LAYER_B_BURST,
+        maxKeys: MAX_LAYER_B_KEYS,
+      });
 
     // Everything below runs BEFORE a listener exists. Any rejection propagates
     // out of the constructor, so a failed startup cannot leave a bound socket.
@@ -258,7 +337,14 @@ export class RemoteGateway {
       options.enrollmentManager ?? new EnrollmentManager(),
       trustStore,
       this.config.trustStorePath,
-      options.bootstrap ?? {},
+      {
+        ...(options.bootstrap ?? {}),
+        // The gateway-level seam, when supplied, is the one the transport uses;
+        // both are internal and neither is reachable from configuration.
+        ...(options.bodyReadTimeoutMsForTests === undefined
+          ? {}
+          : { bodyReadTimeoutMsForTests: options.bodyReadTimeoutMsForTests }),
+      },
     );
 
     const keyMaterial = loadServerPrivateKey(this.config.privateKey);
@@ -315,6 +401,14 @@ export class RemoteGateway {
           // §20: a stalled handshake must not hold a slot indefinitely. The
           // test seam may only SHORTEN the frozen value.
           handshakeTimeout: this.handshakeTimeoutMs,
+          // §20: the header block and the request-receipt window are bounded at
+          // the PARSER, so an oversized header block never reaches a handler and
+          // no second copy of the headers is made in order to measure them.
+          // Node answers an over-long header block itself and destroys the
+          // socket, which is exactly the required refusal.
+          maxHeaderSize: MAX_REQUEST_HEADER_BYTES,
+          requestTimeout: TOTAL_REQUEST_TIMEOUT_MS,
+          headersTimeout: TOTAL_REQUEST_TIMEOUT_MS,
         },
         (req: IncomingMessage, res: ServerResponse) => {
           // Reached ONLY after a completed, CA-validated mTLS handshake: with
@@ -461,6 +555,9 @@ export class RemoteGateway {
     // 5. Only now may limiter state be reset: every release closure has already
     //    run, and any that could still fire has nothing to act on.
     this.limiter.reset();
+    // Layer B state is equally volatile: a restart gets a clean pre-session
+    // budget, and nothing about it is ever persisted.
+    this.layerB.reset();
 
     if (server === undefined) {
       // A second stop finds nothing tracked, nothing to destroy, and counters
@@ -500,7 +597,15 @@ export class RemoteGateway {
       return;
     }
 
-    const peerKey = this.peerKeyFor(socket);
+    const peerKey = peerNetworkKeyFor(socket);
+    if (peerKey === null) {
+      // A peer address that is not an address at all cannot become a limiter
+      // key: an attacker-supplied string must never mint a bucket.
+      this.options.onRefused?.('PEER_KEY_INVALID');
+      socket.destroy();
+      return;
+    }
+
     const decision = this.limiter.admit(peerKey);
     if (!decision.admitted) {
       this.options.onRefused?.(decision.reason);
@@ -626,6 +731,18 @@ export class RemoteGateway {
    * The peer identity is read from the admission registry, keyed by the SAME
    * connection tuple the raw and TLS sockets share. It is never recomputed from
    * the request and never accepted from the request (§5 of Task 4).
+   *
+   * Order of bounds, all of which run BEFORE the endpoint router:
+   * 1. the total request deadline (§20, 60 s) is armed at request admission;
+   * 2. Layer B pre-session admission (§21.1), keyed on the normalized peer —
+   *    after successful mTLS and before endpoint routing, enrollment
+   *    verification, session lookup, MCP parsing, policy, or any subsystem;
+   * 3. the request-target bound (§20, 2 KiB);
+   * 4. the compressed-request refusal (§20).
+   *
+   * Every refusal on these paths is a sanitized plaintext response with
+   * `Connection: close`: no MCP JSON-RPC body, no limiter key, no peer address,
+   * no remaining-token count, and no internal bucket state.
    */
   private handleRequest(req: IncomingMessage, res: ServerResponse): void {
     const state = this.connectionStates.get(connectionTuple(req.socket as TLSSocket));
@@ -640,6 +757,49 @@ export class RemoteGateway {
       return;
     }
 
+    // §20: the total request deadline, armed at HTTP request admission and
+    // released when the response settles. A request still being processed at the
+    // deadline is aborted, so no unbounded work is retained.
+    const deadline = setTimeout(() => {
+      req.socket.destroy();
+    }, this.totalRequestTimeoutMs);
+    const clearDeadline = () => {
+      clearTimeout(deadline);
+    };
+    res.once('finish', clearDeadline);
+    res.once('close', clearDeadline);
+
+    const peerKey = peerNetworkKeyFor(req.socket);
+    if (peerKey === null) {
+      // Fail closed: a peer address that is not an address cannot be bucketed,
+      // so the connection is dropped without a response rather than admitted
+      // against an invented key.
+      req.socket.destroy();
+      return;
+    }
+
+    // §21.1 Layer B: secure HTTP pre-session admission.
+    const admitted = this.layerB.consume(peerKey);
+    if (!admitted.consumed) {
+      this.sendSanitized(res, 429, RATE_LIMITED_BODY);
+      return;
+    }
+
+    // §20: the request target is measured on the received representation before
+    // any routing or query parsing happens.
+    if (requestTargetBytes(req.url) > MAX_REQUEST_TARGET_BYTES) {
+      this.sendSanitized(res, 414, REQUEST_TARGET_TOO_LONG_BODY);
+      return;
+    }
+
+    // §20: baseline supports no compressed request. Nothing in ARC decodes
+    // gzip, br, or deflate, so refusing every Content-Encoding removes any
+    // decompression-bomb path before a body is read.
+    if (hasContentEncoding(req)) {
+      this.sendSanitized(res, 413, UNSUPPORTED_ENCODING_BODY);
+      return;
+    }
+
     this.bootstrap.handle(req, res, spkiPin).catch(() => {
       // The controller answers every path it accepts. A rejected promise here
       // means the response could not be written, so the connection is dropped
@@ -648,6 +808,24 @@ export class RemoteGateway {
         res.destroy();
       }
     });
+  }
+
+  /**
+   * Writes one sanitized plaintext refusal and terminates the connection.
+   *
+   * Carries a fixed content type, a fixed length, and a fixed body. Nothing
+   * derived from the peer, the limiter, or the request is echoed.
+   */
+  private sendSanitized(res: ServerResponse, statusCode: number, body: string): void {
+    if (res.headersSent || res.writableEnded) {
+      res.destroy();
+      return;
+    }
+    res.statusCode = statusCode;
+    res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+    res.setHeader('Content-Length', Buffer.byteLength(body, 'utf8'));
+    res.setHeader('Connection', 'close');
+    res.end(body);
   }
 
   /** Enrolled device count held by this gateway's trust store. */
@@ -706,10 +884,21 @@ export class RemoteGateway {
     }
     return false;
   }
+}
 
-  /** Peer key for Layer A accounting: the remote address, else a fixed bucket. */
-  private peerKeyFor(socket: TLSSocket): string {
-    const address = socket.remoteAddress;
-    return typeof address === 'string' && address.length > 0 ? address : 'unknown-peer';
-  }
+/**
+ * THE canonical peer-network key for one socket (§21.3), shared by Layer A and
+ * Layer B.
+ *
+ * Only the socket peer address is authoritative. `X-Forwarded-For`,
+ * `Forwarded`, `X-Real-IP`, `Host`, and every request parameter are ignored by
+ * construction — this helper is given a socket, reads exactly one documented
+ * property from it, and can consult nothing else.
+ *
+ * Returns the normalized key, or null when the address is not an address at
+ * all, which every caller treats as fail-closed refusal. A missing address is
+ * not null: it collapses into the ONE shared bounded bucket.
+ */
+function peerNetworkKeyFor(socket: { remoteAddress?: string }): string | null {
+  return normalizePeerNetwork(socket.remoteAddress);
 }

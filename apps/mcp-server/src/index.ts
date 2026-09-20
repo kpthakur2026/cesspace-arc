@@ -31,7 +31,12 @@ import {
 } from '@cesspace-arc/policy';
 import { EnrollmentManager, SessionManager } from '@cesspace-arc/auth';
 import { AdminIpcError, AdminIpcServer } from './admin-ipc.js';
-import { RemoteExecutionBridge, type CompleteActor } from './remote-execution.js';
+import {
+  RemoteExecutionBridge,
+  createAuthenticatedRequestLimiter,
+  type CompleteActor,
+} from './remote-execution.js';
+import type { BoundedRequestLimiter } from './remote-resource-limits.js';
 import { ApprovalAuditSink, getApprovalAuditSink } from './approval-audit.js';
 import { RemoteGateway, type RemoteGatewayStatus } from './remote-gateway.js';
 import type { RemoteConfig } from './remote-config.js';
@@ -1320,6 +1325,16 @@ export class ArcMcpServer implements IArcMcpServer {
   public readonly sessionManager: SessionManager;
   /** Remote execution bridge. Present only once a remote gateway is bound. */
   private remoteExecutionBridge?: RemoteExecutionBridge;
+  /**
+   * The ONE process-local Layer C limiter and per-session concurrency state
+   * (RC-05 Task 7).
+   *
+   * Volatile and process-local: the frozen 300/min, burst 60, 1024-key ceiling,
+   * and 4-outstanding-request bound are not overridable through ArcServerConfig,
+   * the environment, the CLI, or any network input. It is reset on shutdown, so
+   * a restart gets a clean rate and concurrency state and nothing is persisted.
+   */
+  private readonly authenticatedRequestLimiter: BoundedRequestLimiter;
 
   constructor(
     public readonly workspaceRegistry: WorkspaceRegistry,
@@ -1403,6 +1418,12 @@ export class ArcMcpServer implements IArcMcpServer {
     // frozen TTLs and caps that are not configurable, and shared by every remote
     // consumer through `getRemoteExecutionBridge()`.
     this.sessionManager = sessionManager ?? new SessionManager();
+
+    // RC-05 Task 7: exactly ONE process-local Layer C limiter and per-session
+    // concurrency state. Volatile, with frozen bounds that are not configurable,
+    // shared by every remote consumer through the ONE execution bridge, and
+    // reset on shutdown.
+    this.authenticatedRequestLimiter = createAuthenticatedRequestLimiter();
 
     this.defaultWorkspaceId = config?.defaultWorkspaceId;
     this.processRegistry =
@@ -2926,6 +2947,9 @@ export class ArcMcpServer implements IArcMcpServer {
         sessionManager: this.sessionManager,
         resolveActiveDeviceIdentity: (spkiPin) => gateway.resolveActiveDeviceIdentity(spkiPin),
         sink: this,
+        // The process-wide Layer C limiter, so every remote session shares one
+        // rate and concurrency budget table.
+        authenticatedLimiter: this.authenticatedRequestLimiter,
       });
 
       // The admin channel is a LOCAL IPC channel, so starting it in remote mode
@@ -3004,6 +3028,9 @@ export class ArcMcpServer implements IArcMcpServer {
     // Sessions are volatile and die with the gateway that authenticated them.
     this.remoteExecutionBridge = undefined;
     this.sessionManager.clear();
+    // Layer C rate and concurrency state is equally volatile: a restarted
+    // gateway gets a clean budget, and nothing about it is ever persisted.
+    this.authenticatedRequestLimiter.reset();
     if (this.adminIpcServer) {
       await this.adminIpcServer.stop();
     }

@@ -32,6 +32,7 @@ import {
   type PendingEnrollmentView,
   type TrustedSessionIdentity,
 } from '@cesspace-arc/auth';
+import { RequestBodyError, readBoundedRequestBody } from './remote-request-bounds.js';
 
 /** The only path that can attempt enrollment completion. */
 export const ENROLL_COMPLETE_PATH = '/enroll/complete';
@@ -42,9 +43,10 @@ export const MCP_PATH = '/mcp';
 /**
  * Maximum raw request body for the bootstrap endpoint, in bytes (Task 4 §6).
  *
- * Deliberately NOT the later Task-7 global 4 MiB MCP bound: bootstrap carries
- * one 64-character secret, so 4 KiB is already generous. Enforced while reading
- * the raw body, before any JSON parsing.
+ * Deliberately NOT the generic Task-7 4 MiB remote body ceiling: bootstrap
+ * carries one 64-character secret, so 4 KiB is already generous. It is passed to
+ * the SHARED bounded reader as that endpoint's internal bound, so the generic
+ * 4 MiB mechanism exists and is tested without loosening this endpoint.
  */
 export const MAX_ENROLL_BODY_BYTES = 4096;
 
@@ -105,6 +107,11 @@ export interface EnrollmentBootstrapOptions {
    * configuration, environment, or a request.
    */
   trustStoreStorageForTests?: Partial<TrustStoreStorage>;
+  /**
+   * @internal Test-only body-read deadline. May only SHORTEN the frozen 10 s.
+   * Never populated from configuration, environment, or a request.
+   */
+  bodyReadTimeoutMsForTests?: number;
 }
 
 /**
@@ -134,6 +141,8 @@ function trustStateFingerprint(store: DeviceTrustStore): string {
 /** Controller driving one gateway's bootstrap HTTP surface. */
 export class EnrollmentBootstrap {
   private readonly storage: TrustStoreStorage;
+  /** @internal Test-only body-read deadline. Only ever SHORTER than the frozen 10 s. */
+  private readonly bodyReadTimeoutMsForTests?: number;
   /**
    * Terminal latch for an uncertain durable authentication root.
    *
@@ -157,6 +166,7 @@ export class EnrollmentBootstrap {
         options.trustStoreStorageForTests?.load ??
         ((filePath) => DeviceTrustStore.loadFromFile(filePath)),
     };
+    this.bodyReadTimeoutMsForTests = options.bodyReadTimeoutMsForTests;
   }
 
   /** Enrolled device count, for bounded reporting. Never a device list. */
@@ -244,13 +254,27 @@ export class EnrollmentBootstrap {
 
     let body: string;
     try {
-      body = await readBoundedBody(req, MAX_ENROLL_BODY_BYTES);
+      body = await readBoundedRequestBody(req, {
+        maxBytes: MAX_ENROLL_BODY_BYTES,
+        ...(this.bodyReadTimeoutMsForTests === undefined
+          ? {}
+          : { bodyReadTimeoutMsForTests: this.bodyReadTimeoutMsForTests }),
+      });
     } catch (err: unknown) {
-      if (err instanceof BodyTooLargeError) {
-        // Oversized bootstrap requests are refused before the enrollment
-        // manager is reached, so no attempt is counted and no state changes.
-        this.send(res, 413, PAYLOAD_TOO_LARGE_BODY);
-        return;
+      if (err instanceof RequestBodyError) {
+        if (err.kind === 'PAYLOAD_TOO_LARGE' || err.kind === 'UNSUPPORTED_CONTENT_ENCODING') {
+          // Oversized or compressed bootstrap requests are refused before the
+          // enrollment manager is reached, so no attempt is counted and no
+          // state changes. A compressed request is refused under the same
+          // bounded payload response, whatever its decoded size would be.
+          this.send(res, 413, PAYLOAD_TOO_LARGE_BODY);
+          return;
+        }
+        if (err.kind === 'READ_TIMEOUT') {
+          // The reader already aborted the request and destroyed the socket:
+          // there is no complete request and no connection left to answer on.
+          return;
+        }
       }
       this.failClosed(res);
       return;
@@ -418,78 +442,14 @@ export class EnrollmentBootstrap {
   }
 }
 
-/** @internal Raised internally when the bootstrap body exceeds its bound. */
-class BodyTooLargeError extends Error {
-  constructor() {
-    super('Bootstrap request body exceeds the maximum size.');
-    this.name = 'BodyTooLargeError';
-  }
-}
-
 /**
- * Reads the raw body with a hard byte ceiling enforced DURING the read.
- *
- * A declared Content-Length above the bound is refused immediately, and a
- * chunked body is aborted as soon as the cumulative size exceeds it, so an
- * oversized request can never be fully buffered or parsed.
+ * The bounded body reader now lives in `remote-request-bounds.ts` as
+ * `readBoundedRequestBody`, shared with every future remote body-reading
+ * endpoint. Enrollment calls it with its own internal 4096-byte bound
+ * ({@link MAX_ENROLL_BODY_BYTES}), which keeps this endpoint's stricter Task-4
+ * ceiling exactly as it was while the generic 4 MiB mechanism is implemented and
+ * tested once.
  */
-export function readBoundedBody(req: IncomingMessage, maxBytes: number): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const declared = req.headers['content-length'];
-    if (typeof declared === 'string' && declared.length > 0) {
-      const declaredBytes = Number.parseInt(declared, 10);
-      if (Number.isFinite(declaredBytes) && declaredBytes > maxBytes) {
-        reject(new BodyTooLargeError());
-        return;
-      }
-    }
-
-    const chunks: Buffer[] = [];
-    let total = 0;
-    let settled = false;
-
-    const cleanup = () => {
-      req.removeListener('data', onData);
-      req.removeListener('end', onEnd);
-      req.removeListener('error', onError);
-    };
-    const onData = (chunk: Buffer) => {
-      if (settled) {
-        return;
-      }
-      total += chunk.length;
-      if (total > maxBytes) {
-        settled = true;
-        cleanup();
-        reject(new BodyTooLargeError());
-        return;
-      }
-      chunks.push(chunk);
-    };
-    const onEnd = () => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      cleanup();
-      resolve(Buffer.concat(chunks).toString('utf8'));
-    };
-    const onError = () => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      cleanup();
-      // The underlying cause is deliberately discarded: a stream error can
-      // carry peer-controlled text, and the caller only needs "no usable body".
-      reject(new Error('Request stream failed.'));
-    };
-
-    req.on('data', onData);
-    req.on('end', onEnd);
-    req.on('error', onError);
-  });
-}
 
 /**
  * Extracts the one-time secret from the CLOSED bootstrap schema.
