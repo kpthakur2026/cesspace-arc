@@ -1,0 +1,780 @@
+/**
+ * CesSpace ARC — RC-06 Task 1: Persistent Append Storage, Protocol, Metadata & Lock
+ *
+ * Test suite verifying:
+ * - Fresh store initialization and directory security
+ * - AuditStoreMetadataV1 validation and persistence
+ * - Single-writer process lock (audit.lock)
+ * - Canonical V1 JSON representation and non-circular hash preimage
+ * - PersistentAuditStorage append engine
+ * - All frozen Task-1 negative security controls RC06-NEG-01..29
+ */
+
+import { test, describe, before, after } from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+
+import { MAX_RECORD_BYTES } from '../packages/protocol/dist/index.js';
+
+import {
+  PersistentAuditStorage,
+  canonicalJsonV1,
+  computeRecordHashV1,
+  serializeRecordV1,
+  parseAndValidateRecordLineV1,
+  validateAuditDirectory,
+  validateFileDescriptorAuthority,
+  validatePlatformCapabilities,
+  acquireWriterLock,
+  createStoreMetadataFile,
+  loadStoreMetadataFile,
+  validateStoreMetadataConsistency,
+  ACTIVE_SEGMENT_FILENAME,
+  METADATA_FILENAME,
+} from '../packages/audit/dist/index.js';
+
+function createSampleRecordCandidate() {
+  return {
+    eventId: 'f47ac10b-58cc-4372-a567-0e02b2c3d479',
+    timestamp: '2026-09-20T18:00:00.000Z',
+    actor: {
+      clientId: 'test-client',
+      clientType: 'admin',
+      deviceId: 'a'.repeat(32),
+      sessionId: 'b'.repeat(64),
+    },
+    target: {
+      workspaceId: 'ws-test',
+      workspacePath: '',
+      workspaceRootHash: 'c'.repeat(64),
+    },
+    invocation: {
+      toolName: 'read_file',
+      parametersRedacted: { path: 'test.txt' },
+      payloadHash: 'd'.repeat(64),
+    },
+    policy: {
+      decision: 'ALLOW',
+      ruleId: 'rule-test-01',
+      evaluationDurationMs: 1.5,
+    },
+    execution: {
+      status: 'SUCCESS',
+      startTime: '2026-09-20T18:00:00.000Z',
+      endTime: '2026-09-20T18:00:00.010Z',
+      durationMs: 10,
+    },
+  };
+}
+
+describe('CesSpace ARC — RC-06 Task 1: Persistent Append Storage Foundation', () => {
+  let tempBaseDir;
+
+  before(() => {
+    tempBaseDir = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-rc06-task1-'));
+  });
+
+  after(() => {
+    try {
+      fs.rmSync(tempBaseDir, { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+  });
+
+  describe('Positive Flows: Store Initialization, Locking & V1 Append', () => {
+    test('Fresh store initialization creates directory, lock, metadata, and active segment', async () => {
+      const auditDir = path.join(tempBaseDir, 'store-init');
+      const storage = new PersistentAuditStorage({
+        directory: auditDir,
+        createIfMissing: true,
+        metadata: {
+          checkpointPublicKeyFingerprint: '1'.repeat(64),
+          anchorMode: 'DISABLED',
+        },
+      });
+
+      storage.initialize();
+
+      const dirStats = fs.statSync(auditDir);
+      assert.equal(dirStats.mode & 0o777, 0o700, 'audit directory must be 0700');
+
+      const metaPath = path.join(auditDir, METADATA_FILENAME);
+      assert.ok(fs.existsSync(metaPath), 'audit-store.json must exist');
+      const metaStats = fs.statSync(metaPath);
+      assert.equal(metaStats.mode & 0o777, 0o600, 'audit-store.json must be 0600');
+
+      const metadata = storage.getMetadata();
+      assert.ok(metadata !== null, 'metadata must be loaded');
+      assert.equal(metadata.version, 1);
+      assert.equal(metadata.anchorMode, 'DISABLED');
+      assert.equal(metadata.checkpointPublicKeyFingerprint, '1'.repeat(64));
+      assert.match(
+        metadata.storeId,
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+      );
+
+      const activePath = path.join(auditDir, ACTIVE_SEGMENT_FILENAME);
+      assert.ok(fs.existsSync(activePath), 'active segment must exist');
+      const activeStats = fs.statSync(activePath);
+      assert.equal(activeStats.mode & 0o777, 0o600, 'active segment must be 0600');
+
+      assert.equal(storage.getCurrentSequence(), 1);
+      assert.equal(storage.getLastRecordHash(), '0'.repeat(64));
+
+      storage.close();
+    });
+
+    test('Canonical V1 appends advance sequence and previousRecordHash strictly', async () => {
+      const auditDir = path.join(tempBaseDir, 'store-appends');
+      const storage = new PersistentAuditStorage({
+        directory: auditDir,
+        createIfMissing: true,
+        metadata: {
+          checkpointPublicKeyFingerprint: '2'.repeat(64),
+          anchorMode: 'ENABLED',
+          anchorReceiptPublicKeyFingerprint: '3'.repeat(64),
+        },
+      });
+
+      storage.initialize();
+
+      const r1 = await storage.append(createSampleRecordCandidate());
+      assert.equal(r1.schemaVersion, 1);
+      assert.equal(r1.sequenceNumber, 1);
+      assert.equal(r1.integrity.previousRecordHash, '0'.repeat(64));
+      assert.match(r1.integrity.recordHash, /^[0-9a-f]{64}$/);
+
+      const r2 = await storage.append(createSampleRecordCandidate());
+      assert.equal(r2.schemaVersion, 1);
+      assert.equal(r2.sequenceNumber, 2);
+      assert.equal(r2.integrity.previousRecordHash, r1.integrity.recordHash);
+      assert.match(r2.integrity.recordHash, /^[0-9a-f]{64}$/);
+
+      assert.equal(storage.getCurrentSequence(), 3);
+      assert.equal(storage.getLastRecordHash(), r2.integrity.recordHash);
+
+      const lines = fs
+        .readFileSync(path.join(auditDir, ACTIVE_SEGMENT_FILENAME), 'utf8')
+        .split('\n');
+      assert.equal(lines.length, 3); // 2 lines + trailing newline
+      assert.equal(lines[2], '');
+
+      const parsed1 = parseAndValidateRecordLineV1(lines[0] + '\n');
+      assert.equal(parsed1.record.sequenceNumber, 1);
+      assert.equal(parsed1.record.integrity.recordHash, r1.integrity.recordHash);
+
+      const parsed2 = parseAndValidateRecordLineV1(lines[1] + '\n');
+      assert.equal(parsed2.record.sequenceNumber, 2);
+      assert.equal(parsed2.record.integrity.recordHash, r2.integrity.recordHash);
+
+      storage.close();
+    });
+
+    test('Non-circular record hash preimage reconstructs and verifies', () => {
+      const candidate = {
+        ...createSampleRecordCandidate(),
+        schemaVersion: 1,
+        sequenceNumber: 1,
+        integrity: {
+          previousRecordHash: '0'.repeat(64),
+          recordHash: '',
+        },
+      };
+
+      const hash = computeRecordHashV1(candidate);
+      candidate.integrity.recordHash = hash;
+
+      const line = serializeRecordV1(candidate);
+      const parsed = parseAndValidateRecordLineV1(line);
+      assert.equal(parsed.computedHash, hash);
+
+      const lineWithoutNewline = line.slice(0, -1);
+      const directLineHash = createHash('sha256').update(lineWithoutNewline, 'utf8').digest('hex');
+      assert.notEqual(
+        directLineHash,
+        hash,
+        'direct hash of stored line must differ from recordHash',
+      );
+    });
+
+    test('Durability and cursor safety on simulated write failure and short write', async () => {
+      const auditDir = path.join(tempBaseDir, 'store-failure');
+
+      const storageFail = new PersistentAuditStorage({
+        directory: auditDir,
+        createIfMissing: true,
+        metadata: {
+          checkpointPublicKeyFingerprint: '4'.repeat(64),
+        },
+        simulateWriteFailure: true,
+      });
+      storageFail.initialize();
+
+      await assert.rejects(async () => {
+        await storageFail.append(createSampleRecordCandidate());
+      }, /SIMULATED_WRITE_FAILURE/);
+
+      assert.equal(storageFail.getCurrentSequence(), 1, 'cursor must not advance on failure');
+      assert.equal(storageFail.getLastRecordHash(), '0'.repeat(64));
+      storageFail.close();
+
+      const auditDirShort = path.join(tempBaseDir, 'store-short-write');
+      const storageShort = new PersistentAuditStorage({
+        directory: auditDirShort,
+        createIfMissing: true,
+        metadata: {
+          checkpointPublicKeyFingerprint: '4'.repeat(64),
+        },
+        simulateShortWrite: true,
+      });
+      storageShort.initialize();
+
+      await assert.rejects(async () => {
+        await storageShort.append(createSampleRecordCandidate());
+      }, /SHORT_WRITE/);
+
+      assert.equal(storageShort.getCurrentSequence(), 1, 'cursor must not advance on short write');
+      storageShort.close();
+    });
+
+    test('Exclusive writer lock lifecycle and reacquisition', () => {
+      const auditDir = path.join(tempBaseDir, 'store-lock-lifecycle');
+      fs.mkdirSync(auditDir, { mode: 0o700, recursive: true });
+
+      const lock1 = acquireWriterLock({ auditDir });
+      assert.ok(fs.existsSync(lock1.lockPath));
+
+      assert.throws(
+        () => acquireWriterLock({ auditDir }),
+        (err) => err.code === 'AUDIT_STORE_LOCKED',
+      );
+
+      lock1.release();
+      assert.ok(!fs.existsSync(lock1.lockPath));
+
+      const lock2 = acquireWriterLock({ auditDir });
+      assert.ok(fs.existsSync(lock2.lockPath));
+      lock2.release();
+    });
+  });
+
+  describe('Negative Controls: RC06-NEG-01..29', () => {
+    test('RC06-NEG-01: Audit directory is a symlink. Startup rejected.', () => {
+      const targetDir = path.join(tempBaseDir, 'neg-01-target');
+      fs.mkdirSync(targetDir, { mode: 0o700, recursive: true });
+      const symlinkDir = path.join(tempBaseDir, 'neg-01-symlink');
+      fs.symlinkSync(targetDir, symlinkDir, 'dir');
+
+      assert.throws(
+        () => validateAuditDirectory(symlinkDir),
+        (err) => err.code === 'SYMLINK_DETECTED' || err.code === 'INVALID_AUDIT_PATH',
+      );
+    });
+
+    test('RC06-NEG-02: Active audit segment file is a symlink. Write rejected.', () => {
+      const auditDir = path.join(tempBaseDir, 'neg-02-store');
+      fs.mkdirSync(auditDir, { mode: 0o700, recursive: true });
+      const targetFile = path.join(tempBaseDir, 'neg-02-target.jsonl');
+      fs.writeFileSync(targetFile, '', { mode: 0o600 });
+      const symlinkSegment = path.join(auditDir, ACTIVE_SEGMENT_FILENAME);
+      fs.symlinkSync(targetFile, symlinkSegment);
+
+      const storage = new PersistentAuditStorage({
+        directory: auditDir,
+        metadata: { checkpointPublicKeyFingerprint: 'a'.repeat(64) },
+      });
+
+      assert.throws(
+        () => storage.initialize(),
+        (err) => err.code === 'SYMLINK_DETECTED',
+      );
+    });
+
+    test('RC06-NEG-03: Audit directory permissions wider than 0700 (e.g. 0755). Startup rejected.', () => {
+      const auditDir = path.join(tempBaseDir, 'neg-03-store');
+      fs.mkdirSync(auditDir, { mode: 0o755, recursive: true });
+      fs.chmodSync(auditDir, 0o755);
+
+      assert.throws(
+        () => validateAuditDirectory(auditDir),
+        (err) => err.code === 'INSECURE_PERMISSIONS',
+      );
+    });
+
+    test('RC06-NEG-04: Audit segment file permissions wider than 0600 (e.g. 0644). Startup rejected.', () => {
+      const auditDir = path.join(tempBaseDir, 'neg-04-store');
+      fs.mkdirSync(auditDir, { mode: 0o700, recursive: true });
+      const segmentFile = path.join(auditDir, ACTIVE_SEGMENT_FILENAME);
+      fs.writeFileSync(segmentFile, '', { mode: 0o644 });
+      fs.chmodSync(segmentFile, 0o644);
+
+      const storage = new PersistentAuditStorage({
+        directory: auditDir,
+        metadata: { checkpointPublicKeyFingerprint: 'a'.repeat(64) },
+      });
+
+      assert.throws(
+        () => storage.initialize(),
+        (err) => err.code === 'INSECURE_PERMISSIONS',
+      );
+    });
+
+    test('RC06-NEG-05: Audit directory owned by different UID. Startup rejected with OWNERSHIP_MISMATCH.', () => {
+      const auditDir = path.join(tempBaseDir, 'neg-05-store');
+      fs.mkdirSync(auditDir, { mode: 0o700, recursive: true });
+
+      assert.throws(
+        () => validateAuditDirectory(auditDir, { expectedUid: process.getuid() + 9999 }),
+        (err) => err.code === 'OWNERSHIP_MISMATCH',
+      );
+    });
+
+    test('RC06-NEG-06: Audit segment owned by different UID. Write rejected with OWNERSHIP_MISMATCH.', () => {
+      const filePath = path.join(tempBaseDir, 'neg-06-file.jsonl');
+      fs.writeFileSync(filePath, '', { mode: 0o600 });
+      const fd = fs.openSync(filePath, fs.constants.O_RDWR);
+
+      try {
+        assert.throws(
+          () => validateFileDescriptorAuthority(fd, 0o600, process.getuid() + 9999),
+          (err) => err.code === 'OWNERSHIP_MISMATCH',
+        );
+      } finally {
+        fs.closeSync(fd);
+      }
+    });
+
+    test('RC06-NEG-07: Target audit path is a non-regular file (FIFO, device). Write rejected.', () => {
+      const fifoPath = path.join(tempBaseDir, 'neg-07-fifo');
+      try {
+        execFileSync('mkfifo', [fifoPath]);
+      } catch {
+        // ignore
+      }
+
+      if (fs.existsSync(fifoPath)) {
+        const fd = fs.openSync(fifoPath, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
+        try {
+          assert.throws(
+            () => validateFileDescriptorAuthority(fd, 0o600),
+            (err) => err.code === 'NOT_REGULAR_FILE',
+          );
+        } finally {
+          fs.closeSync(fd);
+        }
+      } else {
+        const devFd = fs.openSync('/dev/null', fs.constants.O_RDONLY);
+        try {
+          assert.throws(
+            () => validateFileDescriptorAuthority(devFd, 0o600),
+            (err) => err.code === 'NOT_REGULAR_FILE',
+          );
+        } finally {
+          fs.closeSync(devFd);
+        }
+      }
+    });
+
+    test('RC06-NEG-08: Target audit path attempts directory traversal (../). Path rejected.', () => {
+      const traversalPath = path.join(tempBaseDir, 'sub', '..', 'neg-08-traversal');
+      assert.throws(
+        () => validateAuditDirectory(traversalPath),
+        (err) => err.code === 'INVALID_AUDIT_PATH',
+      );
+    });
+
+    test('RC06-NEG-09: Active audit segment file has hard-link count > 1 (nlink != 1). Write rejected.', () => {
+      const filePath = path.join(tempBaseDir, 'neg-09-file.jsonl');
+      const linkPath = path.join(tempBaseDir, 'neg-09-link.jsonl');
+      fs.writeFileSync(filePath, '', { mode: 0o600 });
+      fs.linkSync(filePath, linkPath);
+
+      const fd = fs.openSync(filePath, fs.constants.O_RDWR);
+      try {
+        assert.throws(
+          () => validateFileDescriptorAuthority(fd, 0o600),
+          (err) => err.code === 'HARD_LINK_DETECTED',
+        );
+      } finally {
+        fs.closeSync(fd);
+      }
+    });
+
+    test('RC06-NEG-10: O_NOFOLLOW / fstat descriptor check detects symlink substitution during open. Rejected.', () => {
+      const targetFile = path.join(tempBaseDir, 'neg-10-target');
+      fs.writeFileSync(targetFile, 'data', { mode: 0o600 });
+      const symlinkFile = path.join(tempBaseDir, 'neg-10-symlink');
+      fs.symlinkSync(targetFile, symlinkFile);
+
+      assert.throws(
+        () => fs.openSync(symlinkFile, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW),
+        /ELOOP/,
+      );
+    });
+
+    test('RC06-NEG-11: Unsupported platform lacking O_NOFOLLOW or required POSIX primitives fails production startup.', () => {
+      assert.throws(
+        () => validatePlatformCapabilities({ hasONoFollow: false }),
+        (err) => err.code === 'AUDIT_PLATFORM_UNSUPPORTED',
+      );
+      assert.throws(
+        () => validatePlatformCapabilities({ isPosixPlatform: false }),
+        (err) => err.code === 'AUDIT_PLATFORM_UNSUPPORTED',
+      );
+      assert.throws(
+        () => validatePlatformCapabilities({ hasGetUid: false }),
+        (err) => err.code === 'AUDIT_PLATFORM_UNSUPPORTED',
+      );
+    });
+
+    test('RC06-NEG-12: Second ARC process attempts lock on existing audit.lock (fails with AUDIT_STORE_LOCKED).', () => {
+      const auditDir = path.join(tempBaseDir, 'neg-12-store');
+      fs.mkdirSync(auditDir, { mode: 0o700, recursive: true });
+
+      const lock1 = acquireWriterLock({ auditDir });
+      try {
+        assert.throws(
+          () => acquireWriterLock({ auditDir }),
+          (err) => err.code === 'AUDIT_STORE_LOCKED',
+        );
+      } finally {
+        lock1.release();
+      }
+    });
+
+    test('RC06-NEG-13: Stale lock takeover attempted without operator intervention. Automatic takeover rejected.', () => {
+      const auditDir = path.join(tempBaseDir, 'neg-13-store');
+      fs.mkdirSync(auditDir, { mode: 0o700, recursive: true });
+      const staleLockPath = path.join(auditDir, 'audit.lock');
+      fs.writeFileSync(
+        staleLockPath,
+        JSON.stringify({ pid: 999999, startedAt: '2020-01-01T00:00:00.000Z' }) + '\n',
+        { mode: 0o600 },
+      );
+
+      assert.throws(
+        () => acquireWriterLock({ auditDir }),
+        (err) => err.code === 'AUDIT_STORE_LOCKED',
+      );
+      assert.ok(fs.existsSync(staleLockPath), 'stale lock file must not be deleted');
+    });
+
+    test('RC06-NEG-14: Audit lock file is a symlink or hard link. Startup fails immediately.', () => {
+      const auditDir = path.join(tempBaseDir, 'neg-14-store');
+      fs.mkdirSync(auditDir, { mode: 0o700, recursive: true });
+      const dummyFile = path.join(tempBaseDir, 'neg-14-dummy');
+      fs.writeFileSync(dummyFile, 'dummy', { mode: 0o600 });
+      const lockSymlink = path.join(auditDir, 'audit.lock');
+      fs.symlinkSync(dummyFile, lockSymlink);
+
+      assert.throws(
+        () => acquireWriterLock({ auditDir }),
+        (err) => err.code === 'AUDIT_LOCK_INSECURE' || err.code === 'SYMLINK_DETECTED',
+      );
+    });
+
+    test('RC06-NEG-15: Configured audit directory path contains unexpanded literal ~. Startup fails; shell expansion prohibited.', () => {
+      assert.throws(
+        () => validateAuditDirectory('~/.cesspace-arc/audit'),
+        (err) => err.code === 'INVALID_AUDIT_PATH',
+      );
+    });
+
+    test('RC06-NEG-16: audit-store.json missing on non-empty audit store. Startup fails closed.', () => {
+      const auditDir = path.join(tempBaseDir, 'neg-16-store');
+      fs.mkdirSync(auditDir, { mode: 0o700, recursive: true });
+      const activeFile = path.join(auditDir, ACTIVE_SEGMENT_FILENAME);
+      fs.writeFileSync(activeFile, 'some-prior-record\n', { mode: 0o600 });
+
+      const storage = new PersistentAuditStorage({
+        directory: auditDir,
+        metadata: { checkpointPublicKeyFingerprint: 'a'.repeat(64) },
+      });
+
+      assert.throws(
+        () => storage.initialize(),
+        (err) => err.code === 'METADATA_MISSING',
+      );
+    });
+
+    test('RC06-NEG-17: Tampered or malformed audit-store.json metadata. Startup fails closed.', () => {
+      const auditDir = path.join(tempBaseDir, 'neg-17-store');
+      fs.mkdirSync(auditDir, { mode: 0o700, recursive: true });
+      const metaFile = path.join(auditDir, METADATA_FILENAME);
+
+      fs.writeFileSync(metaFile, '{ not valid json\n', { mode: 0o600 });
+      assert.throws(
+        () => loadStoreMetadataFile(auditDir),
+        (err) => err.code === 'INVALID_METADATA',
+      );
+
+      fs.writeFileSync(metaFile, JSON.stringify({ version: 2 }) + '\n', { mode: 0o600 });
+      assert.throws(
+        () => loadStoreMetadataFile(auditDir),
+        (err) => err.code === 'UNSUPPORTED_METADATA_VERSION',
+      );
+
+      fs.writeFileSync(
+        metaFile,
+        JSON.stringify({
+          version: 1,
+          storeId: 'f47ac10b-58cc-4372-a567-0e02b2c3d479',
+          createdAt: '2026-09-20T18:00:00Z',
+          checkpointPublicKeyFingerprint: 'a'.repeat(64),
+          anchorMode: 'DISABLED',
+          unknownField: 'forbidden',
+        }) + '\n',
+        { mode: 0o600 },
+      );
+      assert.throws(
+        () => loadStoreMetadataFile(auditDir),
+        (err) => err.code === 'INVALID_METADATA',
+      );
+    });
+
+    test('RC06-NEG-18: Configured checkpoint public key fingerprint does not match audit-store.json. Startup fails closed.', () => {
+      const auditDir = path.join(tempBaseDir, 'neg-18-store');
+      fs.mkdirSync(auditDir, { mode: 0o700, recursive: true });
+
+      createStoreMetadataFile(auditDir, {
+        version: 1,
+        storeId: 'f47ac10b-58cc-4372-a567-0e02b2c3d479',
+        createdAt: '2026-09-20T18:00:00Z',
+        checkpointPublicKeyFingerprint: 'a'.repeat(64),
+        anchorMode: 'DISABLED',
+      });
+
+      const loaded = loadStoreMetadataFile(auditDir);
+      assert.throws(
+        () =>
+          validateStoreMetadataConsistency(loaded, {
+            checkpointPublicKeyFingerprint: 'b'.repeat(64),
+          }),
+        (err) => err.code === 'FINGERPRINT_MISMATCH',
+      );
+    });
+
+    test('RC06-NEG-19: Configured anchor receipt public key fingerprint does not match audit-store.json when anchor mode is enabled. Startup fails closed.', () => {
+      const auditDir = path.join(tempBaseDir, 'neg-19-store');
+      fs.mkdirSync(auditDir, { mode: 0o700, recursive: true });
+
+      createStoreMetadataFile(auditDir, {
+        version: 1,
+        storeId: 'f47ac10b-58cc-4372-a567-0e02b2c3d479',
+        createdAt: '2026-09-20T18:00:00Z',
+        checkpointPublicKeyFingerprint: 'a'.repeat(64),
+        anchorMode: 'ENABLED',
+        anchorReceiptPublicKeyFingerprint: 'b'.repeat(64),
+      });
+
+      const loaded = loadStoreMetadataFile(auditDir);
+      assert.throws(
+        () =>
+          validateStoreMetadataConsistency(loaded, {
+            checkpointPublicKeyFingerprint: 'a'.repeat(64),
+            anchorMode: 'ENABLED',
+            anchorReceiptPublicKeyFingerprint: 'c'.repeat(64),
+          }),
+        (err) => err.code === 'FINGERPRINT_MISMATCH',
+      );
+    });
+
+    test('RC06-NEG-20: Attempting to change checkpoint signer or anchor trust settings on existing non-empty store. Rejected.', () => {
+      const auditDir = path.join(tempBaseDir, 'neg-20-store');
+      fs.mkdirSync(auditDir, { mode: 0o700, recursive: true });
+
+      createStoreMetadataFile(auditDir, {
+        version: 1,
+        storeId: 'f47ac10b-58cc-4372-a567-0e02b2c3d479',
+        createdAt: '2026-09-20T18:00:00Z',
+        checkpointPublicKeyFingerprint: 'a'.repeat(64),
+        anchorMode: 'DISABLED',
+      });
+
+      const loaded = loadStoreMetadataFile(auditDir);
+      assert.throws(
+        () =>
+          validateStoreMetadataConsistency(loaded, {
+            checkpointPublicKeyFingerprint: 'a'.repeat(64),
+            anchorMode: 'ENABLED',
+          }),
+        (err) => err.code === 'STORE_RECONFIGURATION_FORBIDDEN',
+      );
+    });
+
+    test('RC06-NEG-21: Record line missing terminating newline character (\\n). Line rejected as malformed.', () => {
+      const candidate = {
+        ...createSampleRecordCandidate(),
+        schemaVersion: 1,
+        sequenceNumber: 1,
+        integrity: { previousRecordHash: '0'.repeat(64), recordHash: '' },
+      };
+      candidate.integrity.recordHash = computeRecordHashV1(candidate);
+      const lineWithoutNl = serializeRecordV1(candidate).slice(0, -1);
+
+      assert.throws(
+        () => parseAndValidateRecordLineV1(lineWithoutNl),
+        (err) => err.code === 'INVALID_LINE',
+      );
+    });
+
+    test('RC06-NEG-22: Record line containing carriage return character (\\r). Line rejected as malformed.', () => {
+      const candidate = {
+        ...createSampleRecordCandidate(),
+        schemaVersion: 1,
+        sequenceNumber: 1,
+        integrity: { previousRecordHash: '0'.repeat(64), recordHash: '' },
+      };
+      candidate.integrity.recordHash = computeRecordHashV1(candidate);
+      const lineWithCr = serializeRecordV1(candidate).slice(0, -1) + '\r\n';
+
+      assert.throws(
+        () => parseAndValidateRecordLineV1(lineWithCr),
+        (err) => err.code === 'INVALID_LINE',
+      );
+    });
+
+    test('RC06-NEG-23: Record containing raw undefined or NaN/Infinity values. Canonicalization fails.', () => {
+      assert.throws(
+        () => canonicalJsonV1(undefined),
+        (err) => err.code === 'CANONICAL_JSON_UNDEFINED',
+      );
+      assert.throws(
+        () => canonicalJsonV1([undefined]),
+        (err) => err.code === 'CANONICAL_JSON_UNDEFINED',
+      );
+      assert.throws(
+        () => canonicalJsonV1({ num: NaN }),
+        (err) => err.code === 'CANONICAL_JSON_INVALID_NUMBER',
+      );
+      assert.throws(
+        () => canonicalJsonV1({ num: Infinity }),
+        (err) => err.code === 'CANONICAL_JSON_INVALID_NUMBER',
+      );
+      assert.throws(
+        () => canonicalJsonV1({ num: -Infinity }),
+        (err) => err.code === 'CANONICAL_JSON_INVALID_NUMBER',
+      );
+    });
+
+    test('RC06-NEG-24: Record containing unescaped control characters (< 0x20 or NUL). Line rejected.', () => {
+      const badLine = '{"eventId":"\x01"}\n';
+      assert.throws(
+        () => parseAndValidateRecordLineV1(badLine),
+        (err) => err.code === 'INVALID_LINE',
+      );
+    });
+
+    test('RC06-NEG-25: Record with unsupported schemaVersion (e.g. 2 or 0). Verifier rejects with UNSUPPORTED_SCHEMA_VERSION.', () => {
+      const badRecord = {
+        ...createSampleRecordCandidate(),
+        schemaVersion: 2,
+        sequenceNumber: 1,
+        integrity: { previousRecordHash: '0'.repeat(64), recordHash: 'a'.repeat(64) },
+      };
+      const line = JSON.stringify(badRecord) + '\n';
+      assert.throws(
+        () => parseAndValidateRecordLineV1(line),
+        (err) => err.code === 'UNSUPPORTED_SCHEMA_VERSION',
+      );
+    });
+
+    test('RC06-NEG-26: Record missing mandatory top-level schemaVersion: 1 field. Verification fails.', () => {
+      const badRecord = {
+        ...createSampleRecordCandidate(),
+        sequenceNumber: 1,
+        integrity: { previousRecordHash: '0'.repeat(64), recordHash: 'a'.repeat(64) },
+      };
+      const line = JSON.stringify(badRecord) + '\n';
+      assert.throws(
+        () => parseAndValidateRecordLineV1(line),
+        (err) => err.code === 'MISSING_SCHEMA_VERSION',
+      );
+    });
+
+    test('RC06-NEG-27: Record containing unknown top-level field outside V1 schema. Verification fails.', () => {
+      const badRecord = {
+        ...createSampleRecordCandidate(),
+        schemaVersion: 1,
+        sequenceNumber: 1,
+        unknownField: 'bad-metadata',
+        integrity: { previousRecordHash: '0'.repeat(64), recordHash: 'a'.repeat(64) },
+      };
+      const line = JSON.stringify(badRecord) + '\n';
+      assert.throws(
+        () => parseAndValidateRecordLineV1(line),
+        (err) => err.code === 'UNKNOWN_FIELD',
+      );
+    });
+
+    test('RC06-NEG-28: Single record exceeding MAX_RECORD_BYTES (64 KiB). Append rejected with RECORD_TOO_LARGE.', async () => {
+      const auditDir = path.join(tempBaseDir, 'neg-28-store');
+      const storage = new PersistentAuditStorage({
+        directory: auditDir,
+        createIfMissing: true,
+        metadata: { checkpointPublicKeyFingerprint: 'a'.repeat(64) },
+      });
+      storage.initialize();
+
+      const oversizedCandidate = {
+        ...createSampleRecordCandidate(),
+        invocation: {
+          toolName: 'read_file',
+          parametersRedacted: {
+            hugeData: 'x'.repeat(MAX_RECORD_BYTES + 100),
+          },
+          payloadHash: 'd'.repeat(64),
+        },
+      };
+
+      await assert.rejects(
+        async () => {
+          await storage.append(oversizedCandidate);
+        },
+        (err) => err.code === 'RECORD_TOO_LARGE',
+      );
+
+      assert.equal(storage.getCurrentSequence(), 1, 'cursor must not advance on oversized record');
+      storage.close();
+    });
+
+    test('RC06-NEG-29: Direct hash of stored line bytes asserted as recordHash. Rejected; verifier enforces hash preimage omission of integrity.recordHash.', () => {
+      const candidate = {
+        ...createSampleRecordCandidate(),
+        schemaVersion: 1,
+        sequenceNumber: 1,
+        integrity: { previousRecordHash: '0'.repeat(64), recordHash: '' },
+      };
+
+      const selfReferentialCandidate = {
+        ...candidate,
+        integrity: {
+          previousRecordHash: '0'.repeat(64),
+          recordHash: '0'.repeat(64),
+        },
+      };
+      const directLine = serializeRecordV1(selfReferentialCandidate);
+      const textWithoutNl = directLine.slice(0, -1);
+      const directHash = createHash('sha256').update(textWithoutNl, 'utf8').digest('hex');
+
+      const falseRecord = {
+        ...candidate,
+        integrity: {
+          previousRecordHash: '0'.repeat(64),
+          recordHash: directHash,
+        },
+      };
+
+      const falseLine = serializeRecordV1(falseRecord);
+      assert.throws(
+        () => parseAndValidateRecordLineV1(falseLine),
+        (err) => err.code === 'HASH_MISMATCH',
+      );
+    });
+  });
+});

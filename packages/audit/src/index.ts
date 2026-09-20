@@ -513,3 +513,7 @@ export class AuditLogger implements IAuditLogger {
 }
 
 export type { AuditRecord };
+
+export * from './storage.js';
+export * from './metadata.js';
+export * from './lock.js';
