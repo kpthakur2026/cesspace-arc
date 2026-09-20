@@ -24,10 +24,12 @@
  */
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { ArcError } from '@cesspace-arc/protocol';
 import {
   DeviceTrustStore,
   resolveActiveDeviceIdentity,
   type DeviceTrustStoreData,
+  type EnrolledDeviceRecord,
   type EnrollmentManager,
   type PendingEnrollmentView,
   type TrustedSessionIdentity,
@@ -99,6 +101,25 @@ export interface TrustStoreStorage {
   save(store: DeviceTrustStore, filePath: string): void;
   load(filePath: string): DeviceTrustStore;
 }
+
+/**
+ * Outcome of one authoritative trust-store mutation (RC-05 Task 9).
+ *
+ * Three outcomes, never two: a domain refusal and a durable-storage failure are
+ * DIFFERENT facts and the operator-visible result must not conflate them. Only
+ * `COMMITTED` means the authoritative in-memory state and the destination file
+ * were both changed, and only `COMMITTED` permits a caller to report success.
+ */
+export type TrustStoreMutationOutcome =
+  | { outcome: 'COMMITTED' }
+  /** The mutation was refused by the domain before anything was persisted. */
+  | { outcome: 'REJECTED'; error: ArcError }
+  /**
+   * The mutation could not be proven durable. `latched` reports whether the
+   * fail-closed storage latch is now set, which means the installed state could
+   * not be proven restored and the gateway will refuse every later mutation.
+   */
+  | { outcome: 'STORAGE_FAILED'; latched: boolean };
 
 /** @internal Internal seams for the bootstrap controller. */
 export interface EnrollmentBootstrapOptions {
@@ -235,6 +256,99 @@ export class EnrollmentBootstrap {
    */
   public attachMcpSurface(surface: RemoteMcpSurface): void {
     this.mcpSurface = surface;
+  }
+
+  /**
+   * Immutable snapshot of the authoritative device records (RC-05 Task 9).
+   *
+   * Every record is rebuilt field by field into a fresh FROZEN object with a
+   * frozen pin array, so an administrative reader receives a snapshot rather
+   * than the mutable record the trust store itself holds: mutating what it was
+   * handed cannot alter trust state, and it cannot retain a live reference into
+   * the store's internal map.
+   *
+   * This is the same authoritative state every remote admission decision reads.
+   * There is no second store, no shadow table, and no re-read of the file.
+   */
+  public snapshotDeviceRecords(): readonly EnrolledDeviceRecord[] {
+    return Object.freeze(
+      this.authoritativeTrustStore.getDevices().map((device) =>
+        Object.freeze({
+          deviceId: device.deviceId,
+          clientId: device.clientId,
+          clientType: device.clientType,
+          pins: Object.freeze([...device.pins]),
+          enrolledAt: device.enrolledAt,
+          displayLabel: device.displayLabel,
+          revoked: device.revoked,
+        }),
+      ),
+    );
+  }
+
+  /**
+   * Applies ONE durable trust-store mutation through the SAME transaction model
+   * the enrollment completion path already uses (RC-05 Task 9, §8):
+   *
+   *   current authoritative snapshot -> isolated candidate -> apply the mutation
+   *   to the candidate -> persist the candidate atomically -> make the candidate
+   *   authoritative -> report success.
+   *
+   * The live authoritative store is NEVER mutated first and persisted later, so
+   * a filesystem write failure can never produce an operator-visible success
+   * while memory and disk disagree. A reported failure is reconciled through
+   * {@link restorePreTransactionState}, which proves — by reloading and
+   * re-comparing VALIDATED state — whether the prior state is actually back, and
+   * sets the fail-closed latch when it is not.
+   *
+   * When durable storage is already latched, or is latched by this call, every
+   * later mutation is refused: the gateway does not keep administering an
+   * authentication root whose installed state cannot be proven.
+   *
+   * Fully synchronous, so no remote request can interleave between the decision
+   * and the commit.
+   */
+  public applyTrustStoreMutation(
+    mutate: (candidate: DeviceTrustStore) => void,
+  ): TrustStoreMutationOutcome {
+    // Fail closed BEFORE any work. An authentication root whose installed state
+    // is unproven is not one the gateway will keep mutating.
+    if (this.storageLatched) {
+      return { outcome: 'STORAGE_FAILED', latched: true };
+    }
+
+    const before = this.authoritativeTrustStore.toData();
+    const candidate = DeviceTrustStore.fromData(before);
+
+    try {
+      mutate(candidate);
+    } catch (err: unknown) {
+      // A domain refusal is decided against the CANDIDATE, before anything has
+      // been written, so the destination file and the authoritative store are
+      // both exactly as they were.
+      return {
+        outcome: 'REJECTED',
+        error:
+          err instanceof ArcError
+            ? err
+            : ArcError.internalError('Device trust mutation was rejected.'),
+      };
+    }
+
+    try {
+      this.storage.save(candidate, this.trustStorePath);
+    } catch {
+      // See activateDevice: a reported save failure does not mean the
+      // destination is unchanged, because Task-1 persistence renames over the
+      // destination before fsyncing the parent directory. Reconcile and prove.
+      this.restorePreTransactionState(before);
+      return { outcome: 'STORAGE_FAILED', latched: this.storageLatched };
+    }
+
+    // Only now does the new state become authoritative, and only now may a
+    // caller report success.
+    this.authoritativeTrustStore = candidate;
+    return { outcome: 'COMMITTED' };
   }
 
   /**

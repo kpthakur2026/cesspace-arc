@@ -52,6 +52,7 @@ import {
 } from './enrollment-bootstrap.js';
 import { checkRequestAuthority, writeAuthorityRefusal } from './remote-request-authority.js';
 import type { RemoteMcpSurface } from './remote-mcp-surface.js';
+import type { DeviceTrustAuthority } from './device-administration.js';
 import {
   AdmissionLimiter,
   type AdmissionLimiterOptions,
@@ -424,6 +425,21 @@ export class RemoteGateway {
     }
     this.mcpSurface = surface;
     this.bootstrap.attachMcpSurface(surface);
+  }
+
+  /**
+   * The device trust authority for RC-05 Task 9 local operator administration.
+   *
+   * Returns a NARROWED capability over the gateway's own `EnrollmentBootstrap`:
+   * the durable-transaction primitive and the frozen device-record snapshot.
+   * The raw mutable `DeviceTrustStore` is NOT exposed and neither is anything
+   * that could re-attach a transport, so the composed administration facade can
+   * only ever act on the SAME authoritative trust state every remote admission
+   * decision reads. Storage-latch state is reported through the mutation
+   * outcome rather than as a separate accessor.
+   */
+  public getDeviceTrustAuthority(): DeviceTrustAuthority {
+    return this.bootstrap;
   }
 
   /** Starts the TLS listener. Resolves once it is bound and accepting. */

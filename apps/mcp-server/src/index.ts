@@ -41,6 +41,7 @@ import type { BoundedRequestLimiter } from './remote-resource-limits.js';
 import { ApprovalAuditSink, getApprovalAuditSink } from './approval-audit.js';
 import { RemoteGateway, type RemoteGatewayStatus } from './remote-gateway.js';
 import { readRemoteRequestContext, RemoteMcpSurface } from './remote-mcp-surface.js';
+import { GatewayDeviceAdministration } from './device-administration.js';
 import type { RemoteConfig } from './remote-config.js';
 import {
   ARC_APPROVAL_KEY,
@@ -2996,14 +2997,35 @@ export class ArcMcpServer implements IArcMcpServer {
       // fallback path to a stateless transport, and no window in which `/mcp` is
       // reachable without its transport.
       try {
-        gateway.attachMcpSurface(
-          new RemoteMcpSurface({
-            sessionManager: this.sessionManager,
-            admission,
-            createSessionServer: () => this.createRemoteSessionServer(),
-            publicHostname: remoteConfig.publicHostname,
-          }),
-        );
+        const surface = new RemoteMcpSurface({
+          sessionManager: this.sessionManager,
+          admission,
+          createSessionServer: () => this.createRemoteSessionServer(),
+          publicHostname: remoteConfig.publicHostname,
+        });
+        gateway.attachMcpSurface(surface);
+
+        // RC-05 Task 9: the ONE local device/session administration authority,
+        // composed over the gateway's CURRENT authoritative trust state and the
+        // Task-8 transport registry that remote requests are actually served
+        // from. It is attached before the listener binds, so there is no window
+        // in which the local operator channel answers administration requests
+        // from anything other than the running trust root.
+        //
+        // The authority is attached ONLY here, in the remote composition. A
+        // process with no authoritative remote trust state therefore has no
+        // administration authority at all, and every administration method
+        // fails closed rather than loading a second device store.
+        if (this.adminIpcServer) {
+          this.adminIpcServer.attachDeviceAdministration(
+            new GatewayDeviceAdministration(
+              gateway.getDeviceTrustAuthority(),
+              this.sessionManager,
+              () => surface,
+            ),
+          );
+        }
+
         await gateway.start();
       } catch (err: unknown) {
         // All-or-nothing: nothing is left bound, and stdio is NOT started as a

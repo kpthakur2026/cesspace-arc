@@ -900,6 +900,36 @@ export class DeviceTrustStore {
   }
 
   /**
+   * Replace a device's non-security display label (RC-05 Task 9).
+   *
+   * The display label is NOT an identity, an authorization input, or a policy
+   * input: this touches exactly one field of one record and leaves deviceId,
+   * clientId, clientType, the pin set, enrolledAt, and the revoked flag
+   * untouched. Renaming therefore cannot rebind a device, add or remove trust,
+   * or disturb a live session.
+   *
+   * Validation reuses the SAME authoritative rule the persisted schema applies
+   * ({@link validateDisplayLabel}, 64 UTF-8 bytes), plus a NUL rejection that
+   * the read path tolerates for backward compatibility but that an operator
+   * must never be able to introduce.
+   */
+  public renameDevice(deviceId: string, displayLabel: string): void {
+    const dev = this.devices.get(deviceId);
+    if (!dev) {
+      throw ArcError.deviceNotEnrolled(`Device '${deviceId}' is not enrolled in trust store.`);
+    }
+    if (displayLabel.includes('\u0000')) {
+      throw ArcError.invalidRequestSchema('displayLabel must not contain NUL characters.');
+    }
+    const label = validateDisplayLabel(displayLabel);
+
+    this.devices.set(deviceId, {
+      ...dev,
+      displayLabel: label,
+    });
+  }
+
+  /**
    * Revoke an enrolled device.
    * Marks the device record as revoked; revocation is immediate and survives restart when persisted.
    */

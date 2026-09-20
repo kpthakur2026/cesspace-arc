@@ -336,6 +336,61 @@ export class RemoteMcpSurface {
   }
 
   /**
+   * Administrative teardown for ONE session (RC-05 Task 9, §10).
+   *
+   * Revokes the Task-5 session through the existing primitive and then removes
+   * the matching Task-8 transport registry entry, closing its SDK server and
+   * transport immediately rather than waiting for the client's next request or
+   * for a later reconciliation sweep. Returns whether the authority actually
+   * held a live session, so an unknown, expired, or already-revoked identifier
+   * is reported truthfully without touching any other session.
+   *
+   * `discard` is a no-op when no registry entry exists, so this can never
+   * dispose of another session's transport, and the SDK's `transport.close()`
+   * does not raise `onsessionclosed` — the entry is already gone by then.
+   */
+  public async revokeSessionForAdmin(
+    sessionId: string,
+  ): Promise<{ revoked: boolean; transportClosed: boolean }> {
+    const revoked = this.deps.sessionManager.revokeSession(sessionId);
+    // Observed BEFORE the discard, which is what makes the answer truthful
+    // about whether a transport actually existed for this session.
+    const transportClosed = this.sessions.has(sessionId);
+    await this.discard(sessionId);
+    return { revoked, transportClosed };
+  }
+
+  /**
+   * Administrative teardown for EVERY live session bound to a device
+   * (RC-05 Task 9, §9 steps 7-8).
+   *
+   * Device revocation is immediate: revoking the Task-5 session authority alone
+   * is not enough while the Task-8 registry still holds the corresponding SDK
+   * sessions and streams, so those entries are torn down here, in the same call,
+   * BEFORE the operator is told the revocation succeeded.
+   *
+   * The registry is reconciled against the authority rather than filtered by
+   * device: an entry whose session the authority no longer has is an orphan of
+   * exactly the revocation just performed (or of an expiry this call's purge
+   * observed), and every remaining entry — including a live session belonging to
+   * another device — is left exactly as it was.
+   */
+  public async revokeDeviceSessionsForAdmin(
+    deviceId: string,
+  ): Promise<{ sessionsRevoked: number; transportsClosed: number }> {
+    const sessionsRevoked = this.deps.sessionManager.revokeSessionsForDevice(deviceId);
+
+    let transportsClosed = 0;
+    for (const sessionId of [...this.sessions.keys()]) {
+      if (!this.deps.sessionManager.hasSession(sessionId)) {
+        transportsClosed += 1;
+        await this.discard(sessionId);
+      }
+    }
+    return { sessionsRevoked, transportsClosed };
+  }
+
+  /**
    * Handles one `/mcp` request that has already passed every earlier ingress
    * control. `spkiPin` is the Task-3 mTLS identity; `identity` is the CURRENT
    * enrolled device behind it, or undefined when there is none.

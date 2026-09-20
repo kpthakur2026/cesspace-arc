@@ -317,8 +317,13 @@ describe('CesSpace ARC — RC-05 Task 2: Enrollment Admin IPC', () => {
 
     test('RC05-NEG-33h: caller-supplied server-derived fields cannot reach the server', async () => {
       const base = { clientId: 'x', clientType: 'claude-code', spkiPin: pin('derived') };
+      // RC-05 Task 9 added `deviceId` and `sessionId` to the closed parameter
+      // key set, because the device/session administration methods need them.
+      // They are therefore covered by the per-method refusal assertions below
+      // rather than by this list, exactly as `enrollmentId` already was. The
+      // property this case protects is unchanged: a caller-supplied value that
+      // is NOT part of the signed contract cannot reach the server at all.
       const notInClosedSet = [
-        'deviceId',
         'operatorId',
         'secret',
         'ttl',
@@ -340,20 +345,27 @@ describe('CesSpace ARC — RC-05 Task 2: Enrollment Admin IPC', () => {
         assert.ok(!encoded.includes(key), `${key} must not appear in the canonical payload`);
       }
 
-      // `enrollmentId` IS part of the closed parameter set, because
-      // `enrollment.cancel` needs it. On `enrollment.create` it is therefore
-      // transmitted and then explicitly refused by the method's own schema.
-      const withEnrollmentId = await adminRequest(
-        endpoint,
-        operator.privateKey,
-        'enrollment.create',
-        { ...base, enrollmentId: 'a'.repeat(32) },
-      );
-      assert.equal(withEnrollmentId.ok, false);
-      assert.equal(withEnrollmentId.error.code, 'INVALID_ADMIN_REQUEST');
+      // `enrollmentId`, `deviceId`, and `sessionId` ARE part of the closed
+      // parameter set, because other methods need them. On `enrollment.create`
+      // they are therefore transmitted and then explicitly refused by the
+      // method's own schema.
+      const smuggled = [
+        { enrollmentId: 'a'.repeat(32) },
+        { deviceId: 'b'.repeat(32) },
+        { sessionId: 'c'.repeat(64) },
+      ];
+      for (const extra of smuggled) {
+        const withExtra = await adminRequest(endpoint, operator.privateKey, 'enrollment.create', {
+          ...base,
+          ...extra,
+        });
+        assert.equal(withExtra.ok, false, JSON.stringify(extra));
+        assert.equal(withExtra.error.code, 'INVALID_ADMIN_REQUEST');
+      }
 
       // A hand-crafted payload that DOES carry one is rejected after the
-      // signature verifies: it is not canonical, so it never reaches dispatch.
+      // signature verifies: the method's own parameter schema refuses it, so it
+      // never reaches the enrollment domain.
       const before = enrollmentManager.list().length;
       const socket = net.createConnection(endpoint);
       await once(socket, 'connect');
