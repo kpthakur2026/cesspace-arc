@@ -18,11 +18,21 @@
  * further; it re-implements none of them.
  *
  * Design rules:
+ * - ONE admission per authenticated request. Identity and session credentials are
+ *   authenticated, the Layer C rate token is spent, and a §26 C-3 concurrency
+ *   slot is taken by `RemoteRequestAdmission` for EVERY authenticated MCP
+ *   request — `initialize` aside, that is POST, GET SSE, DELETE, `tools/list`,
+ *   `ping`, and `tools/call` alike. No request kind can bypass Layer C.
+ * - The granted admission is held until the HTTP exchange SETTLES, so a
+ *   long-lived GET SSE stream keeps its slot for the life of the stream and
+ *   releases it exactly once on completion, error, socket close, or shutdown.
  * - ONE session authority. The session ID generator is Task-5's
  *   `SessionManager.createSessionIdGenerator()`, so every `Mcp-Session-Id` is a
  *   reserved server-issued identifier and there is no second authority.
  * - ONE registry, bounded by the frozen global session capacity, keyed by the
- *   server-issued `Mcp-Session-Id`. There is no shadow session ID.
+ *   server-issued `Mcp-Session-Id`. There is no shadow session ID, and the
+ *   registry is reconciled against the session authority before its occupancy is
+ *   ever used as a capacity decision, so a dead entry cannot pin capacity.
  * - Identity is the gateway-derived SPKI pin and the ACTIVE enrolled device
  *   behind it. No JSON field, tool parameter, `Host`, `Origin`, `X-Forwarded-*`,
  *   or client-supplied session identifier is ever an identity input.
@@ -43,25 +53,27 @@ import {
   type SessionManager,
   type TrustedSessionIdentity,
 } from '@cesspace-arc/auth';
-import type { RemoteExecutionBridge } from './remote-execution.js';
+import {
+  isAdmittedRemoteRequest,
+  remoteRateLimitResponseBody,
+  type AdmittedRemoteRequest,
+  type RemoteRequestAdmission,
+} from './remote-execution.js';
+import { checkRequestAuthority, writeAuthorityRefusal } from './remote-request-authority.js';
 import {
   MAX_REMOTE_BODY_BYTES,
   RequestBodyError,
   readBoundedRequestBody,
 } from './remote-request-bounds.js';
 
-/** §10: the request did not present the configured public hostname. */
-export const HOST_REFUSED_BODY = JSON.stringify({ error: 'Forbidden' });
-
-/**
- * §11: every request carrying an `Origin` header is refused by default.
- *
- * Baseline has no browser origin trust model at all, so the `Origin` value is
- * never parsed, never compared against a list, and never reflected. The body is
- * byte-identical to the Host refusal, so a caller cannot use the response to
- * tell "browser origin" from "wrong host".
- */
-export const ORIGIN_REFUSED_BODY = HOST_REFUSED_BODY;
+// The Host (§10) and Origin (§11) refusals and their normalization are owned by
+// the ONE shared authority module, so `/mcp` and `/enroll/complete` cannot
+// drift. Re-exported here because this module is the documented `/mcp` contract.
+export {
+  HOST_REFUSED_BODY,
+  ORIGIN_REFUSED_BODY,
+  normalizeHostHeader,
+} from './remote-request-authority.js';
 
 /** §7 pre-session refusal. Byte-identical to the Task-4 deny-only placeholder. */
 export const UNAUTHENTICATED_BODY = JSON.stringify({
@@ -105,6 +117,16 @@ export interface RemoteRequestContext {
   presentedSessionId: string | null;
   /** The `Authorization` header this request presented, verbatim, or null. */
   authorizationHeader: string | null;
+  /**
+   * The admission THIS request was granted.
+   *
+   * Carried so the tool handler executes against the very admission the request
+   * already paid for — ONE Layer C rate token and ONE outstanding slot — instead
+   * of authenticating and charging a second time. It is the server-minted lease
+   * for this request, never a value derived from it, and the handler refuses to
+   * proceed without one.
+   */
+  admission: AdmittedRemoteRequest;
 }
 
 /**
@@ -130,7 +152,16 @@ export type RemoteSessionServerFactory = (context: RemoteSessionServerContext) =
 
 export interface RemoteMcpSurfaceDeps {
   sessionManager: SessionManager;
-  bridge: RemoteExecutionBridge;
+  /**
+   * THE ONE authenticated remote-request admission authority.
+   *
+   * Every authenticated MCP request — POST, GET SSE, DELETE, `tools/list`,
+   * `ping`, and `tools/call` alike — passes through it, so Layer C (§21.1) and
+   * the §26 C-3 concurrency bound are per-REQUEST controls that no request kind
+   * can bypass. It is the SAME instance the execution bridge executes against,
+   * so a `tools/call` is never authenticated or charged twice.
+   */
+  admission: RemoteRequestAdmission;
   createSessionServer: RemoteSessionServerFactory;
   /** The configured public hostname. The single accepted `Host` value (§10). */
   publicHostname: string;
@@ -141,67 +172,6 @@ interface RemoteSessionEntry {
   sessionId: string;
   transport: StreamableHTTPServerTransport;
   server: Server;
-}
-
-/**
- * True when a value holds any C0 control character or DEL.
- *
- * Written as an explicit code-point scan rather than a control-character
- * regular expression, so the check is plainly readable and needs no lint
- * suppression.
- */
-function hasControlCharacters(value: string): boolean {
-  for (const char of value) {
-    const code = char.codePointAt(0) ?? 0;
-    if (code < 0x20 || code === 0x7f) {
-      return true;
-    }
-  }
-  return false;
-}
-
-/**
- * Normalizes a `Host` header to a bare lowercase hostname, or null when the
- * value cannot be a single well-formed host.
- *
- * A port is allowed and ignored: the listener's port is not a security boundary,
- * and testing and production bind different ones. An IPv6 literal keeps its
- * brackets stripped. Whitespace, control characters, and comma-separated
- * multiple values are refused outright rather than parsed, so a malformed or
- * smuggled `Host` fails closed instead of being reinterpreted.
- */
-export function normalizeHostHeader(raw: unknown): string | null {
-  if (typeof raw !== 'string') {
-    return null;
-  }
-  const value = raw.trim();
-  if (
-    value.length === 0 ||
-    /\s/.test(value) ||
-    hasControlCharacters(value) ||
-    value.includes(',')
-  ) {
-    return null;
-  }
-  if (value.startsWith('[')) {
-    const end = value.indexOf(']');
-    if (end === -1) {
-      return null;
-    }
-    const rest = value.slice(end + 1);
-    if (rest.length > 0 && !/^:\d+$/.test(rest)) {
-      return null;
-    }
-    return value.slice(1, end).toLowerCase();
-  }
-  const colon = value.indexOf(':');
-  if (colon === -1) {
-    return value.toLowerCase();
-  }
-  if (!/^\d+$/.test(value.slice(colon + 1))) {
-    return null;
-  }
-  return value.slice(0, colon).toLowerCase();
 }
 
 /**
@@ -235,8 +205,13 @@ function readSingleHeader(req: IncomingMessage, name: string): string | null {
  *
  * The SDK copies `req.auth` to `options.authInfo` and hands it to the request
  * handler as `extra.authInfo`, so the context is request-scoped by construction
- * and cannot be confused between two concurrent calls on one session. A missing
- * or malformed context returns null and the caller must fail closed.
+ * and cannot be confused between two concurrent calls on one session.
+ *
+ * Returns null — and the caller MUST fail closed — for a missing or malformed
+ * context, and equally for an `admission` this process did not mint: executing a
+ * tool call without a server-issued admission would mean executing a call that
+ * was never authenticated or charged, so the absence of one is a refusal rather
+ * than a reason to admit the call a second time.
  */
 export function readRemoteRequestContext(
   authInfo: AuthInfo | undefined,
@@ -245,13 +220,24 @@ export function readRemoteRequestContext(
   if (extra === undefined || extra === null) {
     return null;
   }
-  const { spkiPin, presentedSessionId, authorizationHeader } = extra as Record<string, unknown>;
+  const { spkiPin, presentedSessionId, authorizationHeader, admission } = extra as Record<
+    string,
+    unknown
+  >;
   if (typeof spkiPin !== 'string' || spkiPin.length === 0) {
+    return null;
+  }
+  if (!isAdmittedRemoteRequest(admission)) {
     return null;
   }
   const sessionId = typeof presentedSessionId === 'string' ? presentedSessionId : null;
   const authorization = typeof authorizationHeader === 'string' ? authorizationHeader : null;
-  return { spkiPin, presentedSessionId: sessionId, authorizationHeader: authorization };
+  return {
+    spkiPin,
+    presentedSessionId: sessionId,
+    authorizationHeader: authorization,
+    admission,
+  };
 }
 
 export class RemoteMcpSurface {
@@ -268,6 +254,17 @@ export class RemoteMcpSurface {
    * observed on a later request, shutdown, and transport close.
    */
   private readonly sessions = new Map<string, RemoteSessionEntry>();
+  /**
+   * Admissions whose HTTP request is still outstanding.
+   *
+   * A request holds its Layer C slot from admission until its response settles —
+   * for a long-lived GET SSE stream, that is the whole life of the stream. This
+   * set exists so shutdown can release those slots deterministically instead of
+   * waiting for a socket close that a hard stop may never deliver. It is bounded
+   * by the §26 C-3 concurrency bound times the session capacity, and an entry is
+   * removed by the same idempotent release the response listeners call.
+   */
+  private readonly liveAdmissions = new Set<AdmittedRemoteRequest>();
   private closed = false;
 
   constructor(deps: RemoteMcpSurfaceDeps) {
@@ -304,22 +301,15 @@ export class RemoteMcpSurface {
       return;
     }
 
-    // §10 Host validation — BEFORE any MCP parsing or session work. The check
-    // reads only the `Host` header Node's parser produced; `X-Forwarded-Host`
-    // and every other forwarding header is never consulted, because ARC has no
-    // reverse-proxy trust model and a forwarded address must not be able to
-    // substitute for the real one.
-    if (normalizeHostHeader(req.headers.host) !== this.deps.publicHostname.toLowerCase()) {
-      this.send(res, 403, HOST_REFUSED_BODY);
-      return;
-    }
-
-    // §11 Origin default-deny — also before MCP parsing and session work. The
-    // value is not parsed, not compared, and never echoed: ARC emits no
-    // `Access-Control-Allow-Origin` on any response, so no browser origin is
-    // ever granted access and no preflight can be satisfied.
-    if (req.headers.origin !== undefined) {
-      this.send(res, 403, ORIGIN_REFUSED_BODY);
+    // §10 Host and §11 Origin — the SAME shared authority check the gateway
+    // applies to every configured remote endpoint, applied here as well so a
+    // surface reached by any other composition cannot become a bypass and the
+    // two endpoints cannot drift. It reads only the `Host` header Node's parser
+    // produced; `X-Forwarded-Host` and every other forwarding header is never
+    // consulted, because ARC has no reverse-proxy trust model.
+    const refusal = checkRequestAuthority(req.headers, this.deps.publicHostname);
+    if (refusal !== null) {
+      writeAuthorityRefusal(res, refusal);
       return;
     }
 
@@ -387,12 +377,17 @@ export class RemoteMcpSurface {
     const kind =
       parsedBody !== undefined && isInitializeRequest(parsedBody) ? 'initialize' : 'ordinary';
 
-    const decision = this.deps.sessionManager.admitRequest({
-      kind,
-      hasExistingSessionContext: existing !== undefined,
+    // ONE admission per request: identity/session authentication, the Layer C
+    // rate token, and the §26 C-3 concurrency slot, for EVERY authenticated MCP
+    // request — `tools/list`, `ping`, and `tools/call` alike. A client cannot
+    // reach the transport without passing all three.
+    const decision = this.deps.admission.admit({
+      trustedSpkiPin: spkiPin,
+      identity,
       presentedSessionId,
       authorizationHeader,
-      identity,
+      hasExistingSessionContext: existing !== undefined,
+      kind,
     });
 
     if (decision.outcome === 'BOOTSTRAP_TOKENLESS') {
@@ -400,22 +395,30 @@ export class RemoteMcpSurface {
       return;
     }
 
-    if (decision.outcome !== 'AUTHENTICATED') {
-      this.send(
-        res,
-        401,
-        decision.outcome === 'INVALID_SESSION_TOKEN'
-          ? INVALID_SESSION_TOKEN_BODY
-          : UNAUTHENTICATED_BODY,
-      );
+    if (decision.outcome === 'RATE_LIMITED') {
+      // §21.1 Layer C / §26 C-3: one sanitized refusal for both the rate and the
+      // concurrency bound, with the frozen `RATE_LIMIT_EXCEEDED` code.
+      this.send(res, 429, remoteRateLimitResponseBody());
       return;
     }
+
+    if (decision.outcome !== 'ADMITTED') {
+      await this.reapPresentedSession(presentedSessionId);
+      const invalidSession = decision.outcome === 'INVALID_SESSION_TOKEN';
+      this.send(res, 401, invalidSession ? INVALID_SESSION_TOKEN_BODY : UNAUTHENTICATED_BODY);
+      return;
+    }
+
+    const sessionId = decision.admission.session.sessionId;
 
     // Authenticated. The registry must agree with the session authority; if it
     // somehow does not, this fails closed as a generic session failure rather
     // than serving a request whose transport binding cannot be proven.
-    const entry = this.sessions.get(decision.session.sessionId);
+    const entry = this.sessions.get(sessionId);
     if (entry === undefined) {
+      // Nothing can serve this request, so the admission it holds is released
+      // immediately rather than held for a response that will never use it.
+      decision.admission.release();
       this.send(res, 401, INVALID_SESSION_TOKEN_BODY);
       return;
     }
@@ -424,9 +427,10 @@ export class RemoteMcpSurface {
       res,
       entry,
       req,
+      decision.admission,
       {
         spkiPin,
-        presentedSessionId: decision.session.sessionId,
+        presentedSessionId: sessionId,
         authorizationHeader,
       },
       parsedBody,
@@ -448,28 +452,39 @@ export class RemoteMcpSurface {
     const presentedSessionId = readSingleHeader(req, 'mcp-session-id');
     const authorizationHeader = readSingleHeader(req, 'authorization');
 
-    const decision = this.deps.sessionManager.admitRequest({
-      kind: 'ordinary',
-      hasExistingSessionContext:
-        presentedSessionId !== null && this.sessions.has(presentedSessionId),
+    // The same ONE admission as POST. A GET SSE stream therefore consumes the
+    // same Layer C budget and holds one of the same four §26 C-3 slots for as
+    // long as the stream is open; a DELETE settles like any other request.
+    const decision = this.deps.admission.admit({
+      trustedSpkiPin: spkiPin,
+      identity,
       presentedSessionId,
       authorizationHeader,
-      identity,
+      hasExistingSessionContext:
+        presentedSessionId !== null && this.sessions.has(presentedSessionId),
+      kind: 'ordinary',
     });
 
-    if (decision.outcome !== 'AUTHENTICATED') {
+    if (decision.outcome === 'RATE_LIMITED') {
+      this.send(res, 429, remoteRateLimitResponseBody());
+      return;
+    }
+
+    if (decision.outcome !== 'ADMITTED') {
       // §12: no unauthenticated stream may be opened, and §13: no session may be
       // terminated on unproven credentials. Distinguishing pre-session from
       // post-session here would disclose whether a session ID exists, so the
       // pre-session case stays uniformly `UNAUTHENTICATED` and only a request
       // that actually presented a session context gets the session failure.
-      const preSession = decision.outcome !== 'INVALID_SESSION_TOKEN';
-      this.send(res, 401, preSession ? UNAUTHENTICATED_BODY : INVALID_SESSION_TOKEN_BODY);
+      await this.reapPresentedSession(presentedSessionId);
+      const invalidSession = decision.outcome === 'INVALID_SESSION_TOKEN';
+      this.send(res, 401, invalidSession ? INVALID_SESSION_TOKEN_BODY : UNAUTHENTICATED_BODY);
       return;
     }
 
-    const entry = this.sessions.get(decision.session.sessionId);
+    const entry = this.sessions.get(decision.admission.session.sessionId);
     if (entry === undefined) {
+      decision.admission.release();
       this.send(res, 401, INVALID_SESSION_TOKEN_BODY);
       return;
     }
@@ -478,9 +493,10 @@ export class RemoteMcpSurface {
       res,
       entry,
       req,
+      decision.admission,
       {
         spkiPin,
-        presentedSessionId: decision.session.sessionId,
+        presentedSessionId: decision.admission.session.sessionId,
         authorizationHeader,
       },
       undefined,
@@ -493,24 +509,39 @@ export class RemoteMcpSurface {
    *
    * The transport is the ONLY thing that speaks MCP here. It parses the request,
    * validates the session, and calls back into the per-session `Server`, whose
-   * tool handler routes into the existing `RemoteExecutionBridge`.
+   * tool handler routes into the existing `RemoteExecutionBridge` with the
+   * admission handed to it here.
+   *
+   * The admission is held until the HTTP exchange SETTLES, not until
+   * `handleRequest` returns: a GET SSE stream keeps its slot for the whole life
+   * of the stream, and a POST keeps its slot until its response is complete.
+   * `finish` and `close` are BOTH armed and the release is idempotent, so exactly
+   * one slot is freed whichever fires and every path — normal completion,
+   * protocol error, stream close, DELETE completion, response error, socket
+   * close, and `closeAll()` on shutdown — releases it.
    */
   private async dispatch(
     res: ServerResponse,
     entry: RemoteSessionEntry,
     req: IncomingMessage,
-    context: RemoteRequestContext,
+    admission: AdmittedRemoteRequest,
+    context: Omit<RemoteRequestContext, 'admission'>,
     parsedBody: unknown,
     method: 'POST' | 'GET' | 'DELETE' = 'POST',
   ): Promise<void> {
     const sessionId = entry.transport.sessionId;
     if (sessionId !== undefined && !this.deps.sessionManager.hasSession(sessionId)) {
-      // Expiry or revocation observed on a live transport: drop the binding
-      // immediately so the registry cannot outlive the session it names.
+      // The authoritative session authority no longer holds this session, so the
+      // binding is dropped immediately rather than outliving the session it
+      // names. The admission was granted on that same authoritative answer, so
+      // it is released here rather than held for a response that will not run.
+      admission.release();
       await this.discard(sessionId);
       this.send(res, 401, INVALID_SESSION_TOKEN_BODY);
       return;
     }
+
+    this.holdAdmission(res, admission);
 
     // The SDK copies this to `options.authInfo` and the request handler receives
     // it as `extra.authInfo`, so the context is scoped to THIS request.
@@ -522,6 +553,7 @@ export class RemoteMcpSurface {
         spkiPin: context.spkiPin,
         presentedSessionId: context.presentedSessionId,
         authorizationHeader: context.authorizationHeader,
+        admission,
       },
     };
 
@@ -534,7 +566,8 @@ export class RemoteMcpSurface {
     } catch {
       // The transport reports its own protocol errors through the response. A
       // throw here means the exchange could not be completed at all, so the
-      // binding is torn down rather than left half-alive.
+      // binding is torn down rather than left half-alive. The admission itself is
+      // released by the listeners armed above, which `res.destroy()` also fires.
       if (method === 'DELETE' && sessionId !== undefined) {
         await this.discard(sessionId);
       }
@@ -542,6 +575,24 @@ export class RemoteMcpSurface {
         res.destroy();
       }
     }
+  }
+
+  /**
+   * Holds one admission until its HTTP response settles.
+   *
+   * A `finish` (the response completed) and a `close` (the exchange ended,
+   * including an aborted or destroyed socket) are both armed because either can
+   * be the only signal on a given path; the release is idempotent, so exactly one
+   * slot is freed. `closeAll()` drains the same set on shutdown.
+   */
+  private holdAdmission(res: ServerResponse, admission: AdmittedRemoteRequest): void {
+    this.liveAdmissions.add(admission);
+    const release = () => {
+      this.liveAdmissions.delete(admission);
+      admission.release();
+    };
+    res.once('finish', release);
+    res.once('close', release);
   }
 
   /**
@@ -561,6 +612,15 @@ export class RemoteMcpSurface {
     identity: TrustedSessionIdentity,
     parsedBody: unknown,
   ): Promise<void> {
+    // BEFORE registry occupancy is used as a capacity decision, the registry is
+    // reconciled against the authoritative session manager. An entry whose
+    // session has expired or been revoked is not normally presented again — the
+    // authority removes an expired session before this surface sees the request —
+    // so without this sweep a dead entry would consume the global session
+    // capacity for the life of the process and could eventually stop every new
+    // session from being created.
+    await this.reapOrphanedSessions();
+
     if (this.sessions.size >= MAX_ACTIVE_SESSIONS_GLOBAL) {
       this.send(res, 401, UNAUTHENTICATED_BODY);
       return;
@@ -650,6 +710,45 @@ export class RemoteMcpSurface {
   }
 
   /**
+   * Reclaims ONE presented registry entry the authoritative session manager no
+   * longer has.
+   *
+   * The question is asked OF the session manager — `hasSession` is its own
+   * answer about whether the session still exists and is live — and never
+   * inferred from the fact that authentication failed. A wrong token presented
+   * for a STILL-ACTIVE session is also an authentication failure, and reaping on
+   * that basis would let any caller destroy a legitimate session by presenting a
+   * bad credential. Only "the authority says this session is gone" reclaims an
+   * entry, and the entry's SDK server and transport are closed with it.
+   */
+  private async reapPresentedSession(presentedSessionId: string | null): Promise<void> {
+    if (presentedSessionId === null || !this.sessions.has(presentedSessionId)) {
+      return;
+    }
+    if (this.deps.sessionManager.hasSession(presentedSessionId)) {
+      return;
+    }
+    await this.discard(presentedSessionId);
+  }
+
+  /**
+   * Reconciles the WHOLE registry against the authoritative session manager.
+   *
+   * The registry is capped at the same frozen global session capacity, so this
+   * sweep is bounded by 1024 `hasSession` calls. It arms no timer, retains no
+   * history, and keeps no tombstones: it is a reconciliation, not a bookkeeping
+   * structure, and it is the only thing that lets capacity pinned by an expired
+   * session become reusable again without a process restart.
+   */
+  private async reapOrphanedSessions(): Promise<void> {
+    for (const sessionId of [...this.sessions.keys()]) {
+      if (!this.deps.sessionManager.hasSession(sessionId)) {
+        await this.discard(sessionId);
+      }
+    }
+  }
+
+  /**
    * §13: the DELETE path. Revokes the gateway session bound to exactly this
    * `Mcp-Session-Id` through the existing Task-5 primitive, then releases the
    * server. No other session is touched, and the transport is left to the SDK,
@@ -668,9 +767,18 @@ export class RemoteMcpSurface {
   /**
    * Releases every remote session. Used by gateway shutdown and server stop, so
    * a stopped process holds no live transport.
+   *
+   * Every admission still held by an outstanding HTTP exchange is released here
+   * as well: a hard stop may end a long-lived GET SSE stream without ever
+   * delivering its response listeners, and a slot that outlived its session
+   * would be a permanent leak in the ONE process-wide Layer C table.
    */
   public async closeAll(): Promise<void> {
     this.closed = true;
+    for (const admission of [...this.liveAdmissions]) {
+      this.liveAdmissions.delete(admission);
+      admission.release();
+    }
     const entries = [...this.sessions.values()];
     this.sessions.clear();
     for (const entry of entries) {

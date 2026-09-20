@@ -44,7 +44,13 @@ import {
   type ServerCertificateFacts,
 } from './tls-material.js';
 import { RemoteConfigError } from './remote-errors.js';
-import { EnrollmentBootstrap, type EnrollmentBootstrapOptions } from './enrollment-bootstrap.js';
+import {
+  ENROLL_COMPLETE_PATH,
+  EnrollmentBootstrap,
+  MCP_PATH,
+  type EnrollmentBootstrapOptions,
+} from './enrollment-bootstrap.js';
+import { checkRequestAuthority, writeAuthorityRefusal } from './remote-request-authority.js';
 import type { RemoteMcpSurface } from './remote-mcp-surface.js';
 import {
   AdmissionLimiter,
@@ -818,11 +824,13 @@ export class RemoteGateway {
    *    after successful mTLS and before endpoint routing, enrollment
    *    verification, session lookup, MCP parsing, policy, or any subsystem;
    * 3. the request-target bound (§20, 2 KiB);
-   * 4. the compressed-request refusal (§20).
+   * 4. the compressed-request refusal (§20);
+   * 5. the Host (§10) and Origin (§11) authority check, for every configured
+   *    remote endpoint.
    *
-   * Every refusal on these paths is a sanitized plaintext response with
-   * `Connection: close`: no MCP JSON-RPC body, no limiter key, no peer address,
-   * no remaining-token count, and no internal bucket state.
+   * Every refusal on these paths is a sanitized response with `Connection:
+   * close`: no MCP JSON-RPC body, no limiter key, no peer address, no
+   * remaining-token count, and no internal bucket state.
    */
   private handleRequest(req: IncomingMessage, res: ServerResponse): void {
     const state = this.connectionStates.get(connectionTuple(req.socket as TLSSocket));
@@ -878,6 +886,30 @@ export class RemoteGateway {
     if (hasContentEncoding(req)) {
       this.sendSanitized(res, 413, UNSUPPORTED_ENCODING_BODY);
       return;
+    }
+
+    // §10/§11: the Host and Origin authority check runs HERE, at the gateway
+    // boundary, for every CONFIGURED remote endpoint and before any
+    // endpoint-specific processing. Neither endpoint owns a private variant, so
+    // `/mcp` and `/enroll/complete` cannot drift: a request carrying `Origin` is
+    // refused by default, a wrong or malformed `Host` fails closed, and
+    // `X-Forwarded-Host` and every other forwarding header grants nothing.
+    //
+    // For `/enroll/complete` this lands BEFORE the body is read, before any
+    // enrollment proof is verified, and before any challenge, failed-attempt
+    // counter, or trust-store state can be touched — so neither endpoint is an
+    // oracle for host or origin.
+    //
+    // Only the two configured paths are checked. An unknown path still falls
+    // through to the router's uniform 404, so moving this validation earlier does
+    // not turn every unknown-path probe into a Host/Origin oracle.
+    const pathOnly = (req.url ?? '').split('?')[0];
+    if (pathOnly === MCP_PATH || pathOnly === ENROLL_COMPLETE_PATH) {
+      const refusal = checkRequestAuthority(req.headers, this.config.publicHostname);
+      if (refusal !== null) {
+        writeAuthorityRefusal(res, refusal);
+        return;
+      }
     }
 
     this.bootstrap.handle(req, res, spkiPin).catch(() => {

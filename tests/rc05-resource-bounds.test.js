@@ -273,7 +273,16 @@ function httpsRequest(port, options = {}) {
         // is about bounds rather than certificate validation.
         rejectUnauthorized: false,
         ...(client ?? {}),
-        headers,
+        // §10 makes the configured remote endpoints Host-checked at the gateway
+        // boundary, so a request that is meant to REACH an endpoint must present
+        // the configured public hostname. Node would otherwise send
+        // `Host: 127.0.0.1:<port>`, which is not the configured authority and is
+        // refused with 403 before any endpoint-specific processing. This suite is
+        // about the bounds in front of and behind that check, so the default here
+        // is the public hostname and an explicit `Host` in `headers` still wins.
+        // Presenting a correct Host weakens no bound: the same bytes must pass
+        // every other control.
+        headers: { Host: publicHostname, ...headers },
       },
       (res) => {
         let data = '';
@@ -1870,7 +1879,10 @@ describe('RC-05 Task 7: §20 bounds enforced at the gateway', () => {
     );
     try {
       const requestLine = 'POST /enroll/complete HTTP/1.1\r\n';
-      const hostLine = `Host: 127.0.0.1:${port}\r\n`;
+      // The configured public hostname, so the case reaches the handler rather
+      // than being refused by the §10 authority check; the head is still padded
+      // to exactly the frozen bound, computed from this line's own length.
+      const hostLine = `Host: ${publicHostname}\r\n`;
       const padPrefix = 'X-Pad: ';
       const overhead = Buffer.byteLength(`${requestLine}${hostLine}${padPrefix}\r\n\r\n`);
 
@@ -2015,7 +2027,7 @@ describe('RC-05 Task 7: §20 bounds enforced at the gateway', () => {
             ca: [fs.readFileSync(pki.trustedCaCertPath)],
             rejectUnauthorized: false,
             ...clientMaterial(),
-            headers: { 'content-length': '64' },
+            headers: { Host: publicHostname, 'content-length': '64' },
           },
           () => resolve({ answered: true }),
         );
@@ -2056,7 +2068,10 @@ describe('RC-05 Task 7: §20 bounds enforced at the gateway', () => {
       });
       await new Promise((resolve) => socket.once('secureConnect', resolve));
       socket.write(
-        'POST /enroll/complete HTTP/1.1\r\nHost: x\r\nContent-Length: 4096\r\n\r\npartial',
+        // A correct Host, so the request is admitted and its body reader arms:
+        // this case is about the read deadline's lifecycle, not the authority
+        // check, which would otherwise refuse the request before any read began.
+        `POST /enroll/complete HTTP/1.1\r\nHost: ${publicHostname}\r\nContent-Length: 4096\r\n\r\npartial`,
       );
       assert.equal(
         await waitFor(() => getActiveBodyReadDeadlineCountForTests() >= 1, 1500),

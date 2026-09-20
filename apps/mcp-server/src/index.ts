@@ -33,6 +33,7 @@ import { EnrollmentManager, SessionManager } from '@cesspace-arc/auth';
 import { AdminIpcError, AdminIpcServer } from './admin-ipc.js';
 import {
   RemoteExecutionBridge,
+  RemoteRequestAdmission,
   createAuthenticatedRequestLimiter,
   type CompleteActor,
 } from './remote-execution.js';
@@ -2963,6 +2964,16 @@ export class ArcMcpServer implements IArcMcpServer {
         enrollmentManager: this.enrollmentManager,
       });
 
+      // ONE admission authority per process, over the ONE process-wide Layer C
+      // limiter. The transport admits every authenticated MCP request with it —
+      // POST, GET SSE, DELETE, `tools/list`, `ping`, and `tools/call` alike — and
+      // the execution bridge executes against the SAME instance, so a `tools/call`
+      // is neither authenticated nor rate-charged a second time.
+      const admission = new RemoteRequestAdmission({
+        sessionManager: this.sessionManager,
+        authenticatedLimiter: this.authenticatedRequestLimiter,
+      });
+
       // The remote execution bridge is composed over the gateway's CURRENT
       // authoritative trust store. The resolver is called per request and is
       // never cached, so device revocation takes effect on the next call.
@@ -2973,9 +2984,8 @@ export class ArcMcpServer implements IArcMcpServer {
         sessionManager: this.sessionManager,
         resolveActiveDeviceIdentity: (spkiPin) => gateway.resolveActiveDeviceIdentity(spkiPin),
         sink: this,
-        // The process-wide Layer C limiter, so every remote session shares one
-        // rate and concurrency budget table.
         authenticatedLimiter: this.authenticatedRequestLimiter,
+        admission,
       });
 
       // §3/§5/RC05-NEG-06: the stateful Streamable HTTP surface is constructed
@@ -2989,7 +2999,7 @@ export class ArcMcpServer implements IArcMcpServer {
         gateway.attachMcpSurface(
           new RemoteMcpSurface({
             sessionManager: this.sessionManager,
-            bridge: this.remoteExecutionBridge,
+            admission,
             createSessionServer: () => this.createRemoteSessionServer(),
             publicHostname: remoteConfig.publicHostname,
           }),
@@ -3074,10 +3084,12 @@ export class ArcMcpServer implements IArcMcpServer {
    * dispatcher anywhere.
    *
    * The one difference is the destination of a tool call: stdio calls
-   * `dispatchToolCall`, while a remote call must first pass Task-6 session
-   * admission and actor derivation, so it routes into the EXISTING
+   * `dispatchToolCall`, while a remote call routes into the EXISTING
    * `RemoteExecutionBridge`, which is the only component that may construct a
-   * trusted remote actor. Neither path calls a subsystem, the policy kernel, the
+   * trusted remote actor. The admission the transport already granted for this
+   * HTTP request travels with it as `extra.authInfo.admission`, so the bridge
+   * authenticates nothing a second time and charges no second rate token or
+   * concurrency slot. Neither path calls a subsystem, the policy kernel, the
    * approval manager, or the filesystem directly — both converge on
    * `executeAuthenticatedToolCall`.
    */
@@ -3122,6 +3134,10 @@ export class ArcMcpServer implements IArcMcpServer {
             presentedSessionId: requestContext.presentedSessionId,
             authorizationHeader: requestContext.authorizationHeader,
             hasExistingSessionContext: requestContext.presentedSessionId !== null,
+            // The admission THIS HTTP request already paid for: the tool call
+            // executes against it, so ONE Layer C rate token and ONE §26 C-3
+            // slot cover the whole request rather than being charged twice.
+            admission: requestContext.admission,
             toolName,
             parameters,
           }),

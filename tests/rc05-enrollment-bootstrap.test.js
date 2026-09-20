@@ -219,7 +219,13 @@ function httpsRequest(port, options = {}) {
     declareContentLength = false,
   } = options;
 
-  const requestHeaders = { ...headers };
+  // §10/§11: the configured remote endpoints carry a Host authority check at the
+  // gateway boundary, so every request must name the configured public hostname.
+  // Node would otherwise send `Host: 127.0.0.1:<port>`, which is not the
+  // configured authority and is refused before the endpoint runs. Presenting the
+  // correct Host weakens no case: the same bytes must still pass every other
+  // control, and no case here varies the Host.
+  const requestHeaders = { Host: publicHostname, ...headers };
   if (declareContentLength) {
     assert.equal(chunked, false, 'a request cannot both declare a length and stream');
     assert.equal(typeof body, 'string', 'a declared length requires a concrete body');

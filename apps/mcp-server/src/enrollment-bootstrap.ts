@@ -180,9 +180,24 @@ export class EnrollmentBootstrap {
     this.bodyReadTimeoutMsForTests = options.bodyReadTimeoutMsForTests;
   }
 
-  /** Enrolled device count, for bounded reporting. Never a device list. */
+  /**
+   * Count of NON-REVOKED enrolled devices, for bounded reporting (§19).
+   *
+   * The health field is "enrolled devices", and a revoked device is no longer an
+   * enrolled device: it can neither resolve to an identity nor authenticate, so
+   * counting it would overstate the trust root the gateway is actually serving.
+   * The count is derived from the authoritative trust-store records, which carry
+   * the revoked flag — the same records every admission decision reads — and only
+   * the COUNT leaves this method: no record, pin, client, or label is exposed.
+   */
   public getEnrolledDeviceCount(): number {
-    return this.authoritativeTrustStore.getDeviceCount();
+    let active = 0;
+    for (const device of this.authoritativeTrustStore.getDevices()) {
+      if (!device.revoked) {
+        active += 1;
+      }
+    }
+    return active;
   }
 
   /**
