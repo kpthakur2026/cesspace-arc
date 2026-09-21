@@ -47,6 +47,7 @@ import {
 import { FilesystemSubsystem } from '../packages/filesystem/dist/index.js';
 import { GitSubsystem } from '../packages/git/dist/index.js';
 import { createTestPki, hasOpenssl } from './helpers/rc05-test-pki.mjs';
+import { createAuditConfig } from './helpers/rc06-audit-runtime.mjs';
 
 // ---------------------------------------------------------------------------
 // Test Fixtures
@@ -142,6 +143,9 @@ async function startRemoteServer({
       transport: 'remote',
       authorizedRoots: [{ id: 'ws', path: workspaceDir }],
       defaultWorkspaceId: 'ws',
+      // RC-06 Task 6: `start()` binds no transport until the durable audit
+      // runtime has reached startup step 12.
+      audit: createAuditConfig(tempRoot, `gateway-audit-${tag}`),
       remote: {
         bindHost: '127.0.0.1',
         port,

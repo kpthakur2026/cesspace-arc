@@ -1118,6 +1118,33 @@ export interface Tier2CheckpointEngineConfig {
   publicKeyPath: string;
   /** Authenticated agent workspace paths the signing key must lie outside of. */
   workspacePaths?: readonly string[];
+  /**
+   * The production durable-completion handoff (Task 6 §22.1, §25).
+   *
+   * Invoked with each checkpoint at the moment it is durable — after the append
+   * and its `fdatasync` have both succeeded and after every cursor has advanced
+   * — and `await`ed before this engine returns. Two consequences follow, and
+   * both are load-bearing:
+   *
+   *  - an observer can only ever be offered a checkpoint that is already on
+   *    disk, so a composition that anchors from here gets the ordering
+   *    "checkpoint durable, then spool, then network" without having to
+   *    reconstruct it; and
+   *  - because the call happens INSIDE the engine's serialized section, no
+   *    second checkpoint can be emitted until the handoff has resolved. A
+   *    composition therefore cannot accumulate two durable checkpoints it has
+   *    not yet seen and then anchor them one at a time from a stale boundary.
+   *
+   * The hook both interval cadence and rotation sealing flow through, so a
+   * rotation-triggered checkpoint and an interval checkpoint are handed over by
+   * the same code path at the same point in their durability.
+   *
+   * A throw from this callback propagates to the caller of the append that
+   * triggered it. That is deliberate: a checkpoint that could not be handed
+   * onward is an audit integrity failure, and the caller must stop rather than
+   * proceed. The checkpoint itself is durable either way.
+   */
+  onDurableCheckpoint?: (checkpoint: AuditCheckpointV1) => void | Promise<void>;
 }
 
 /** Bounded, read-only view of the engine's checkpoint cursor. */
@@ -1761,11 +1788,17 @@ export class Tier2CheckpointEngine implements RotationCheckpointSealer {
     this.lastCheckpointHash = checkpointHash;
     this.lastCheckpointTerminalRecordHash = terminalRecordHash;
 
-    // The durable-completion handoff (Task 5 §37). It runs after the append and
-    // its `fdatasync` have both succeeded and after every cursor has advanced,
-    // so an observer can only ever be offered a checkpoint that is already on
-    // disk. A composition that anchors from here therefore gets the ordering
-    // §14.4 mandates for free: checkpoint durable, then spool, then network.
+    // The durable-completion handoff (Task 5 §37, Task 6 §25). It runs after the
+    // append and its `fdatasync` have both succeeded and after every cursor has
+    // advanced, so an observer can only ever be offered a checkpoint that is
+    // already on disk. A composition that anchors from here therefore gets the
+    // ordering §14.4 mandates for free: checkpoint durable, then spool, then
+    // network. Because this is inside the engine's serialized section, the
+    // await also guarantees no SECOND checkpoint becomes durable until the
+    // handoff of this one has finished.
+    if (this.config.onDurableCheckpoint !== undefined) {
+      await this.config.onDurableCheckpoint(checkpoint);
+    }
     if (this.hooks.onCheckpointEmitted !== undefined) {
       await this.hooks.onCheckpointEmitted(checkpoint);
     }

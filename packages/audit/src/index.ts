@@ -667,3 +667,20 @@ export {
   parseRotatedSegmentFilename,
   isValidRotatedSegmentFilename,
 } from './rotation-filename.js';
+
+/* -------------------------------------------------------------------------- *
+ * RC-06 Task 6 — the production audit runtime composition.
+ *
+ * The ONLY production surface Task 6 adds. Everything else Task 6 composes is
+ * already exported by the Task that owns it, and the deterministic seams live in
+ * `./internal/runtime-testing.js`, which is deliberately absent from the
+ * package's `exports` map so no consumer can import them by subpath.
+ * -------------------------------------------------------------------------- */
+export {
+  AUDIT_STARTUP_STAGE_ORDER,
+  openAuditRuntime,
+  type AuditConfig,
+  type AuditHealthMetadata,
+  type AuditRuntime,
+  type AuditStartupStage,
+} from './startup.js';

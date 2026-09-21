@@ -53,6 +53,35 @@ export interface HealthResponse {
    * SAN details, or key material.
    */
   degradedReason?: 'certificate_expired';
+  /**
+   * Bounded RC-06 durable-audit runtime state (rc06 §22.2).
+   *
+   * Present only once the production audit runtime has reached startup step 12;
+   * absent on a server composed without one. It carries STATE and COUNTS only —
+   * never the audit directory, a key path, a public key body, an anchor
+   * endpoint, a receipt body, or a spool filename or hash.
+   */
+  audit?: AuditHealthMetadata;
+}
+
+/**
+ * The closed, non-sensitive audit health block (rc06 §22.2).
+ *
+ * Deliberately redeclared here rather than imported from
+ * `@cesspace-arc/audit`: the protocol package is the shared vocabulary every
+ * consumer already depends on, and it must not gain a dependency on the audit
+ * implementation to describe one response field. The two declarations are kept
+ * identical, and the audit runtime's own type is structurally assignable to
+ * this one.
+ */
+export interface AuditHealthMetadata {
+  persistence: 'ACTIVE' | 'DEGRADED' | 'FAILED';
+  integrity: 'VERIFIED' | 'FAILED';
+  sequence: number;
+  lastCheckpointSequence: number | null;
+  unanchoredCheckpoints: number;
+  anchorState: 'DISABLED' | 'HEALTHY' | 'DEGRADED' | 'FULL';
+  indeterminateRecoveries: number;
 }
 
 export interface ListDirectoryRequest {

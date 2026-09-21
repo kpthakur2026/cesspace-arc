@@ -1533,6 +1533,7 @@ describe('CesSpace ARC — RC-05 Task 6: Remote Actor Pipeline', () => {
       fs.chmodSync(storePath, 0o600);
 
       const { createTestPki, hasOpenssl } = await import('./helpers/rc05-test-pki.mjs');
+      const { createAuditConfig } = await import('./helpers/rc06-audit-runtime.mjs');
       assert.equal(hasOpenssl(), true, 'the TLS helper requires openssl');
       const pki = createTestPki(path.join(tempRoot, `pki-actor-${Date.now()}`));
       const port = await new Promise((resolve, reject) => {
@@ -1548,6 +1549,9 @@ describe('CesSpace ARC — RC-05 Task 6: Remote Actor Pipeline', () => {
         transport: 'remote',
         authorizedRoots: [{ id: 'ws', path: workspaceDir }],
         defaultWorkspaceId: 'ws',
+        // RC-06 Task 6: `start()` binds no transport until the durable audit
+        // runtime has reached startup step 12.
+        audit: createAuditConfig(tempRoot, 'actor-pipeline-composed'),
         remote: {
           bindHost: '127.0.0.1',
           port,

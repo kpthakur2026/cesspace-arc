@@ -496,6 +496,240 @@ export function verifyActiveStream(
   }
 }
 
+/**
+ * Isolates a permitted torn active tail to a sidecar, truncates the active
+ * segment back to its last verified record, and fsyncs both.
+ *
+ * Extracted so Task-2 restart recovery and the Task-6 production startup engine
+ * repair a torn tail through EXACTLY ONE implementation. There is no second
+ * truncation path, no second sidecar naming family, no second collision rule and
+ * no second durability ordering: the sidecar is created exclusively and made
+ * durable, the directory is fsynced, the descriptor identity and expected length
+ * are re-proved immediately before `ftruncate`, and the truncated descriptor is
+ * fdatasynced before the function returns.
+ *
+ * The caller supplies the post-repair verification authority, because "the
+ * active segment re-verified from the beginning" means different things to the
+ * two callers: Task-2 recovery re-verifies the active segment alone against its
+ * trusted boundary, while the Task-6 full-history engine re-verifies the whole
+ * retained primary history, which is the only correct re-verification for a
+ * store that has rotated archives. The bytes on disk are touched by one
+ * implementation either way.
+ *
+ * @internal
+ */
+export async function repairTornActiveTailInternal(
+  auditDir: string,
+  expectedUid: number,
+  classification: {
+    lastVerifiedByteOffset: number;
+    tornBytes: Buffer;
+    activeIdentity: { dev: number; ino: number };
+  },
+  verifyAfterRepair: () => Promise<void>,
+  testHooks?: RecoveryTestHooks,
+): Promise<string> {
+  const activePath = path.join(auditDir, ACTIVE_SEGMENT_FILENAME);
+
+  try {
+    const now = new Date();
+    const isoTime = testHooks?.sidecarTimestamp ?? now.toISOString().replace(/:/g, '-');
+    let sidecarFilename = `${ACTIVE_SEGMENT_FILENAME}.torn.${isoTime}`;
+    let sidecarCandidate = path.join(auditDir, sidecarFilename);
+
+    let sidecarFd: number | null = null;
+    let counter = 0;
+    while (sidecarFd === null) {
+      try {
+        if (testHooks?.failSidecarCreation) {
+          throw createCodedError(
+            'SIMULATED_SIDECAR_CREATION_FAILURE',
+            'Simulated sidecar creation failure',
+          );
+        }
+        sidecarFd = fs.openSync(
+          sidecarCandidate,
+          fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW,
+          0o600,
+        );
+      } catch (err: unknown) {
+        const code = (err as { code?: string })?.code;
+        if (code === 'EEXIST') {
+          counter++;
+          if (counter > 10) {
+            throw createCodedError(
+              'AUDIT_RECOVERY_FAILED',
+              `Unable to find collision-free torn sidecar filename after ${counter} attempts`,
+              { cause: err },
+            );
+          }
+          sidecarFilename = `${ACTIVE_SEGMENT_FILENAME}.torn.${isoTime}.${counter}`;
+          sidecarCandidate = path.join(auditDir, sidecarFilename);
+          continue;
+        }
+        throw createCodedError(
+          'AUDIT_RECOVERY_FAILED',
+          `Failed to create torn sidecar file: ${(err as Error)?.message}`,
+          { cause: err },
+        );
+      }
+    }
+
+    const sidecarPath = sidecarCandidate;
+
+    try {
+      const sidecarStats = validateFileDescriptorAuthority(sidecarFd, 0o600, expectedUid);
+      if (!sidecarStats.isFile() || sidecarStats.nlink !== 1) {
+        throw createCodedError(
+          'AUDIT_RECOVERY_FAILED',
+          'Insecure sidecar file descriptor authority',
+        );
+      }
+
+      if (testHooks?.failSidecarWrite) {
+        throw createCodedError(
+          'SIMULATED_SIDECAR_WRITE_FAILURE',
+          'Simulated sidecar write failure',
+        );
+      }
+
+      let written = 0;
+      const tornBytes = classification.tornBytes;
+      while (written < tornBytes.length) {
+        const n = fs.writeSync(sidecarFd, tornBytes, written, tornBytes.length - written, null);
+        if (n <= 0) {
+          throw createCodedError(
+            'AUDIT_RECOVERY_FAILED',
+            'Short write writing torn bytes to sidecar',
+          );
+        }
+        written += n;
+      }
+
+      if (testHooks?.failSidecarSync) {
+        throw createCodedError('SIMULATED_SIDECAR_SYNC_FAILURE', 'Simulated sidecar sync failure');
+      }
+
+      fs.fsyncSync(sidecarFd);
+    } finally {
+      fs.closeSync(sidecarFd);
+    }
+
+    const dirFd = fs.openSync(auditDir, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY);
+    try {
+      fs.fsyncSync(dirFd);
+    } finally {
+      fs.closeSync(dirFd);
+    }
+
+    if (testHooks?.beforeTruncate) {
+      testHooks.beforeTruncate();
+    }
+
+    const truncFd = fs.openSync(activePath, fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW);
+    try {
+      const truncStats = validateFileDescriptorAuthority(truncFd, 0o600, expectedUid);
+      if (
+        truncStats.dev !== classification.activeIdentity.dev ||
+        truncStats.ino !== classification.activeIdentity.ino
+      ) {
+        throw createCodedError(
+          'AUDIT_RECOVERY_FAILED',
+          'Active file identity changed between classification and truncation',
+        );
+      }
+
+      const classifiedFileSize =
+        classification.lastVerifiedByteOffset + classification.tornBytes.length;
+      if (truncStats.size !== classifiedFileSize) {
+        throw createCodedError(
+          'AUDIT_RECOVERY_FAILED',
+          `Active file size changed unexpectedly before truncation (expected: ${classifiedFileSize}, actual: ${truncStats.size})`,
+        );
+      }
+
+      if (testHooks?.failTruncation) {
+        throw createCodedError('SIMULATED_TRUNCATION_FAILURE', 'Simulated truncation failure');
+      }
+
+      fs.ftruncateSync(truncFd, classification.lastVerifiedByteOffset);
+      fs.fdatasyncSync(truncFd);
+    } finally {
+      fs.closeSync(truncFd);
+    }
+
+    // The repaired segment must verify from the beginning before anything else
+    // proceeds. A repair that does not produce verifiable bytes is not a repair.
+    await verifyAfterRepair();
+
+    return sidecarPath;
+  } catch (err: unknown) {
+    const code = (err as CodedError)?.code;
+    if (
+      code === 'AUDIT_CORRUPTION_DETECTED' ||
+      code === 'AUDIT_LIFECYCLE_CORRUPTION' ||
+      code === 'AUDIT_RECOVERY_FAILED'
+    ) {
+      throw err;
+    }
+    throw createCodedError(
+      'AUDIT_RECOVERY_FAILED',
+      `Torn tail recovery failed: ${(err as Error)?.message}`,
+      { cause: err },
+    );
+  }
+}
+
+/**
+ * Builds the canonical `RECOVERY_INDETERMINATE` record for one dangling
+ * operation (§7.3.5, §7.3.6, §7.3.7).
+ *
+ * Extracted so the Task-2 restart path and the Task-6 production full-history
+ * startup engine append byte-identical recovery evidence. The construction is
+ * closed: the canonical SYSTEM actor, the fixed `execution` block, the fixed
+ * `error` block, and the copied `target`/`invocation`/`policy`/`approval`
+ * context are all defined here and nowhere else. No caller can supply an actor,
+ * an execution status, an error message, or a `gateway` block for a recovery
+ * record.
+ *
+ * @internal
+ */
+export function buildRecoveryIndeterminateRecord(
+  danglingOp: DanglingOperation,
+  recoveryTimestamp: string,
+): Omit<PersistentAuditRecordV1, 'sequenceNumber' | 'integrity' | 'schemaVersion'> {
+  return {
+    eventId: randomUUID(),
+    timestamp: recoveryTimestamp,
+    actor: {
+      clientId: 'system',
+      clientType: 'SYSTEM',
+      deviceId: '',
+      sessionId: '',
+    },
+    lifecycle: {
+      operationId: danglingOp.operationId,
+      phase: 'RECOVERY_INDETERMINATE',
+    },
+    execution: {
+      status: 'ERROR',
+      startTime: recoveryTimestamp,
+      endTime: recoveryTimestamp,
+      durationMs: 0,
+    },
+    error: {
+      code: 'AUDIT_OUTCOME_INDETERMINATE',
+      message: 'Prior operation outcome is indeterminate after crash recovery.',
+    },
+    target: danglingOp.target as AuditRecord['target'],
+    invocation: danglingOp.invocation as AuditRecord['invocation'],
+    policy: danglingOp.policy as AuditRecord['policy'],
+    ...(danglingOp.approval !== undefined
+      ? { approval: danglingOp.approval as AuditRecord['approval'] }
+      : {}),
+  };
+}
+
 export interface AuditRecoveryResult {
   storage: PersistentAuditStorage;
   recoveredTornTail: boolean;
@@ -619,173 +853,40 @@ export async function executeAuditRecoveryInternal(
       }
     }
 
-    let verifyResult = verifyActiveStream(activePath, expectedUid, {
+    const verifyResult = verifyActiveStream(activePath, expectedUid, {
       trustedBoundary,
     });
 
     let recoveredTornTail = false;
     let tornSidecarPath: string | undefined = undefined;
+    let verifiedStream!: VerifiedStreamResult;
 
     if (verifyResult.status === 'RECOVERABLE_TORN_ACTIVE_TAIL') {
       recoveredTornTail = true;
-      try {
-        const now = new Date();
-        const isoTime = testHooks?.sidecarTimestamp ?? now.toISOString().replace(/:/g, '-');
-        let sidecarFilename = `${ACTIVE_SEGMENT_FILENAME}.torn.${isoTime}`;
-        let sidecarCandidate = path.join(auditDir, sidecarFilename);
-
-        let sidecarFd: number | null = null;
-        let counter = 0;
-        while (sidecarFd === null) {
-          try {
-            if (testHooks?.failSidecarCreation) {
-              throw createCodedError(
-                'SIMULATED_SIDECAR_CREATION_FAILURE',
-                'Simulated sidecar creation failure',
-              );
-            }
-            sidecarFd = fs.openSync(
-              sidecarCandidate,
-              fsConstants.O_CREAT |
-                fsConstants.O_EXCL |
-                fsConstants.O_WRONLY |
-                fsConstants.O_NOFOLLOW,
-              0o600,
-            );
-          } catch (err: unknown) {
-            const code = (err as { code?: string })?.code;
-            if (code === 'EEXIST') {
-              counter++;
-              if (counter > 10) {
-                throw createCodedError(
-                  'AUDIT_RECOVERY_FAILED',
-                  `Unable to find collision-free torn sidecar filename after ${counter} attempts`,
-                  { cause: err },
-                );
-              }
-              sidecarFilename = `${ACTIVE_SEGMENT_FILENAME}.torn.${isoTime}.${counter}`;
-              sidecarCandidate = path.join(auditDir, sidecarFilename);
-              continue;
-            }
+      tornSidecarPath = await repairTornActiveTailInternal(
+        auditDir,
+        expectedUid,
+        {
+          lastVerifiedByteOffset: verifyResult.lastVerifiedByteOffset,
+          tornBytes: verifyResult.tornBytes,
+          activeIdentity: verifyResult.activeIdentity,
+        },
+        async () => {
+          const reverifyResult = verifyActiveStream(activePath, expectedUid, {
+            trustedBoundary,
+          });
+          if (reverifyResult.status !== 'VERIFIED') {
             throw createCodedError(
               'AUDIT_RECOVERY_FAILED',
-              `Failed to create torn sidecar file: ${(err as Error)?.message}`,
-              { cause: err },
+              'Re-verification of active segment failed after torn tail truncation',
             );
           }
-        }
-
-        tornSidecarPath = sidecarCandidate;
-
-        try {
-          const sidecarStats = validateFileDescriptorAuthority(sidecarFd, 0o600, expectedUid);
-          if (!sidecarStats.isFile() || sidecarStats.nlink !== 1) {
-            throw createCodedError(
-              'AUDIT_RECOVERY_FAILED',
-              'Insecure sidecar file descriptor authority',
-            );
-          }
-
-          if (testHooks?.failSidecarWrite) {
-            throw createCodedError(
-              'SIMULATED_SIDECAR_WRITE_FAILURE',
-              'Simulated sidecar write failure',
-            );
-          }
-
-          let written = 0;
-          const tornBytes = verifyResult.tornBytes;
-          while (written < tornBytes.length) {
-            const n = fs.writeSync(sidecarFd, tornBytes, written, tornBytes.length - written, null);
-            if (n <= 0) {
-              throw createCodedError(
-                'AUDIT_RECOVERY_FAILED',
-                'Short write writing torn bytes to sidecar',
-              );
-            }
-            written += n;
-          }
-
-          if (testHooks?.failSidecarSync) {
-            throw createCodedError(
-              'SIMULATED_SIDECAR_SYNC_FAILURE',
-              'Simulated sidecar sync failure',
-            );
-          }
-
-          fs.fsyncSync(sidecarFd);
-        } finally {
-          fs.closeSync(sidecarFd);
-        }
-
-        const dirFd = fs.openSync(auditDir, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY);
-        try {
-          fs.fsyncSync(dirFd);
-        } finally {
-          fs.closeSync(dirFd);
-        }
-
-        if (testHooks?.beforeTruncate) {
-          testHooks.beforeTruncate();
-        }
-
-        const truncFd = fs.openSync(activePath, fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW);
-        try {
-          const truncStats = validateFileDescriptorAuthority(truncFd, 0o600, expectedUid);
-          if (
-            truncStats.dev !== verifyResult.activeIdentity.dev ||
-            truncStats.ino !== verifyResult.activeIdentity.ino
-          ) {
-            throw createCodedError(
-              'AUDIT_RECOVERY_FAILED',
-              'Active file identity changed between classification and truncation',
-            );
-          }
-
-          const classifiedFileSize =
-            verifyResult.lastVerifiedByteOffset + verifyResult.tornBytes.length;
-          if (truncStats.size !== classifiedFileSize) {
-            throw createCodedError(
-              'AUDIT_RECOVERY_FAILED',
-              `Active file size changed unexpectedly before truncation (expected: ${classifiedFileSize}, actual: ${truncStats.size})`,
-            );
-          }
-
-          if (testHooks?.failTruncation) {
-            throw createCodedError('SIMULATED_TRUNCATION_FAILURE', 'Simulated truncation failure');
-          }
-
-          fs.ftruncateSync(truncFd, verifyResult.lastVerifiedByteOffset);
-          fs.fdatasyncSync(truncFd);
-        } finally {
-          fs.closeSync(truncFd);
-        }
-
-        const reverifyResult = verifyActiveStream(activePath, expectedUid, {
-          trustedBoundary,
-        });
-        if (reverifyResult.status !== 'VERIFIED') {
-          throw createCodedError(
-            'AUDIT_RECOVERY_FAILED',
-            'Re-verification of active segment failed after torn tail truncation',
-          );
-        }
-        verifyResult = reverifyResult;
-      } catch (err: unknown) {
-        const code = (err as CodedError)?.code;
-        if (
-          code === 'AUDIT_CORRUPTION_DETECTED' ||
-          code === 'AUDIT_LIFECYCLE_CORRUPTION' ||
-          code === 'AUDIT_RECOVERY_FAILED'
-        ) {
-          throw err;
-        }
-        throw createCodedError(
-          'AUDIT_RECOVERY_FAILED',
-          `Torn tail recovery failed: ${(err as Error)?.message}`,
-          { cause: err },
-        );
-      }
+          verifiedStream = reverifyResult;
+        },
+        testHooks,
+      );
+    } else {
+      verifiedStream = verifyResult;
     }
 
     if (testHooks?.beforeFinalAppendOpen) {
@@ -808,15 +909,15 @@ export async function executeAuditRecoveryInternal(
 
     const appendStats = validateFileDescriptorAuthority(activeFd, 0o600, expectedUid);
     if (
-      appendStats.dev !== verifyResult.activeIdentity.dev ||
-      appendStats.ino !== verifyResult.activeIdentity.ino
+      appendStats.dev !== verifiedStream.activeIdentity.dev ||
+      appendStats.ino !== verifiedStream.activeIdentity.ino
     ) {
       throw createCodedError(
         'AUDIT_RECOVERY_FAILED',
         'Active file replacement detected before activating storage',
       );
     }
-    if (appendStats.size !== verifyResult.verifiedByteLength) {
+    if (appendStats.size !== verifiedStream.verifiedByteLength) {
       throw createCodedError(
         'AUDIT_RECOVERY_FAILED',
         'Active file length mismatch between verification and activation',
@@ -830,52 +931,20 @@ export async function executeAuditRecoveryInternal(
         lock,
         metadata,
         activeFd,
-        terminalSequence: verifyResult.terminalSequence,
-        terminalRecordHash: verifyResult.terminalRecordHash,
+        terminalSequence: verifiedStream.terminalSequence,
+        terminalRecordHash: verifiedStream.terminalRecordHash,
         verifiedActiveIdentity: { dev: appendStats.dev, ino: appendStats.ino },
       },
       testHooks?.storageTestFaults ? { testFaults: testHooks.storageTestFaults } : undefined,
     );
 
     let indeterminateRecoveries = 0;
-    const danglingOps = verifyResult.danglingOperations;
+    const danglingOps = verifiedStream.danglingOperations;
     let opIndex = 0;
 
     for (const danglingOp of danglingOps) {
       const recoveryTimestamp = new Date().toISOString();
-      const recoveryCandidate: Omit<
-        PersistentAuditRecordV1,
-        'sequenceNumber' | 'integrity' | 'schemaVersion'
-      > = {
-        eventId: randomUUID(),
-        timestamp: recoveryTimestamp,
-        actor: {
-          clientId: 'system',
-          clientType: 'SYSTEM',
-          deviceId: '',
-          sessionId: '',
-        },
-        lifecycle: {
-          operationId: danglingOp.operationId,
-          phase: 'RECOVERY_INDETERMINATE',
-        },
-        execution: {
-          status: 'ERROR',
-          startTime: recoveryTimestamp,
-          endTime: recoveryTimestamp,
-          durationMs: 0,
-        },
-        error: {
-          code: 'AUDIT_OUTCOME_INDETERMINATE',
-          message: 'Prior operation outcome is indeterminate after crash recovery.',
-        },
-        target: danglingOp.target as AuditRecord['target'],
-        invocation: danglingOp.invocation as AuditRecord['invocation'],
-        policy: danglingOp.policy as AuditRecord['policy'],
-        ...(danglingOp.approval !== undefined
-          ? { approval: danglingOp.approval as AuditRecord['approval'] }
-          : {}),
-      };
+      const recoveryCandidate = buildRecoveryIndeterminateRecord(danglingOp, recoveryTimestamp);
 
       try {
         if (

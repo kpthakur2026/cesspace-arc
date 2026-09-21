@@ -40,6 +40,7 @@ import {
   oversizedCaFile,
   symlinkTo,
 } from './helpers/rc05-test-pki.mjs';
+import { createAuditConfig } from './helpers/rc06-audit-runtime.mjs';
 
 let tempRoot;
 let pki;
@@ -1570,6 +1571,9 @@ describe('CesSpace ARC — RC-05 Task 3: TLS/mTLS Admission Layer', () => {
       const server = createArcMcpServer({
         transport: 'remote',
         authorizedRoots: [],
+        // RC-06 Task 6: `start()` binds no transport until the durable audit
+        // runtime has reached startup step 12.
+        audit: createAuditConfig(tempRoot, 'enr-175'),
         remote: {
           port: remotePort,
           publicHostname,
@@ -2058,6 +2062,7 @@ trailing-not-pem
       const server = createArcMcpServer({
         transport: 'remote',
         authorizedRoots: [],
+        audit: createAuditConfig(tempRoot, 'enr-185'),
         remote: {
           port: remotePort,
           publicHostname,
@@ -2100,6 +2105,9 @@ trailing-not-pem
         {
           transport: 'stdio',
           authorizedRoots: [],
+          // RC-06 Task 6: `start()` binds no transport until the durable audit
+          // runtime has reached startup step 12.
+          audit: createAuditConfig(tempRoot, 'enr-130b'),
           // Supplying a remote configuration alongside stdio must NOT activate
           // it: the mode is exclusive, not additive.
           remote: {
@@ -2136,6 +2144,7 @@ trailing-not-pem
       const server = createArcMcpServer({
         transport: 'remote',
         authorizedRoots: [],
+        audit: createAuditConfig(tempRoot, 'enr-131'),
         remote: {
           port: remotePort,
           publicHostname,
@@ -2175,6 +2184,7 @@ trailing-not-pem
       const server = createArcMcpServer({
         transport: 'remote',
         authorizedRoots: [],
+        audit: createAuditConfig(tempRoot, 'enr-132'),
         remote: {
           port: remotePort,
           publicHostname,
@@ -2213,6 +2223,7 @@ trailing-not-pem
       const server = createArcMcpServer({
         transport: 'remote',
         authorizedRoots: [],
+        audit: createAuditConfig(tempRoot, 'enr-remote-trust-root'),
         remote: {
           port: remotePort,
           publicHostname,
