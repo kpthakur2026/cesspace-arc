@@ -22,6 +22,7 @@ import {
 } from './storage.js';
 import { RECOVERY_HANDOFF_TOKEN } from './internal/recovery-capability.js';
 import type { RecoveryTestHooks } from './internal/recovery-testing.js';
+import { MAX_TORN_TAIL_BYTES, classifyTrailingBytes } from './internal/torn-tail.js';
 import { acquireWriterLock } from './lock.js';
 import {
   METADATA_FILENAME,
@@ -31,7 +32,11 @@ import {
   validateStoreMetadataConsistency,
 } from './metadata.js';
 
-export const MAX_TORN_TAIL_BYTES = 65536;
+/**
+ * Re-exported so the frozen constant keeps its existing public home while its
+ * definition, and the torn-tail rule built on it, live in one shared place.
+ */
+export { MAX_TORN_TAIL_BYTES } from './internal/torn-tail.js';
 
 export interface TrustedPrimaryChainBoundary {
   sequenceNumber: number;
@@ -312,10 +317,13 @@ export function verifyActiveStream(
             );
           }
 
-          if (lineBytes.length > MAX_TORN_TAIL_BYTES) {
+          const tailClassification = classifyTrailingBytes(lineBytes, { allowTornTail: true });
+          if (!tailClassification.recoverable) {
             throw createCodedError(
               'AUDIT_CORRUPTION_DETECTED',
-              `Torn tail exceeds MAX_TORN_TAIL_BYTES (${MAX_TORN_TAIL_BYTES})`,
+              tailClassification.rejection === 'TORN_TAIL_TOO_LARGE'
+                ? `Torn tail exceeds MAX_TORN_TAIL_BYTES (${MAX_TORN_TAIL_BYTES})`
+                : 'Malformed JSON line in active audit segment before EOF',
             );
           }
 
@@ -329,7 +337,7 @@ export function verifyActiveStream(
           return {
             status: 'RECOVERABLE_TORN_ACTIVE_TAIL',
             lastVerifiedByteOffset,
-            tornBytes: Buffer.from(lineBytes),
+            tornBytes: tailClassification.tornBytes,
             terminalSequence,
             terminalRecordHash,
             nextSequence,
@@ -438,7 +446,12 @@ export function verifyActiveStream(
           };
         }
 
-        if (accumulated.length > MAX_TORN_TAIL_BYTES) {
+        // An unterminated final fragment is a torn-tail candidate purely on the
+        // shared rule. It is deliberately NOT required to be undecodable: a
+        // complete record that merely lost its newline is just as much a crash
+        // artifact as a half-written one.
+        const tailClassification = classifyTrailingBytes(accumulated, { allowTornTail: true });
+        if (!tailClassification.recoverable) {
           throw createCodedError(
             'AUDIT_CORRUPTION_DETECTED',
             `Unterminated torn tail exceeds MAX_TORN_TAIL_BYTES (${MAX_TORN_TAIL_BYTES})`,
@@ -455,7 +468,7 @@ export function verifyActiveStream(
         return {
           status: 'RECOVERABLE_TORN_ACTIVE_TAIL',
           lastVerifiedByteOffset,
-          tornBytes: Buffer.from(accumulated),
+          tornBytes: tailClassification.tornBytes,
           terminalSequence,
           terminalRecordHash,
           nextSequence,

@@ -19,6 +19,22 @@
  */
 export const ROTATION_CAPABILITY_TOKEN = Symbol('ROTATION_CAPABILITY_TOKEN');
 
+/**
+ * Device/inode/size identity of a durable artifact.
+ *
+ * The pair `(dev, ino)` names the inode; `size` pins the exact byte length that
+ * was observed. Together they are what lets a later step prove that a pathname
+ * still resolves to the artifact an earlier step validated, instead of trusting
+ * that the name has not been swapped underneath it (rc06 §14, §29).
+ *
+ * @internal
+ */
+export interface FileIdentity {
+  dev: number;
+  ino: number;
+  size: number;
+}
+
 /** The descriptor-level authority the rotation coordinator needs. @internal */
 export interface RotationStorageCapability {
   /** Absolute audit store directory. */
@@ -65,8 +81,19 @@ export interface RotationStorageCapability {
    *
    * It is called only AFTER the sealing authority has succeeded, so a segment
    * can never become a finalized rotated segment before it is sealed.
+   *
+   * `expectedIdentity` is the dev/ino/size the caller read from the
+   * authoritative active descriptor before committing to this rotation. The
+   * implementation re-proves the descriptor against it and then re-proves the
+   * active pathname against it, so a segment replaced, grown or shrunk between
+   * the two observations is refused rather than archived. That same identity is
+   * carried forward by the caller so compression and deletion can each re-prove
+   * the pathname again.
    */
-  rotateActiveSegmentPhysical(archiveName: string): {
+  rotateActiveSegmentPhysical(
+    archiveName: string,
+    expectedIdentity: FileIdentity,
+  ): {
     archivedPath: string;
     newActiveFd: number;
   };
@@ -86,6 +113,12 @@ export interface RotationTestHooks {
   failCompressionSync?: boolean;
   /** Simulates a `stat` disagreement between the two representations. */
   failPostCompressionVerification?: boolean;
+  /**
+   * Invoked immediately before the plain source is unlinked, after the
+   * compressed artifact has been verified. Lets a test replace the source
+   * pathname to prove removal is identity-checked rather than name-checked.
+   */
+  beforeSourceRemoval?: () => void;
   /** Simulates a source-removal (`unlink`) failure. */
   failSourceRemoval?: boolean;
   /**

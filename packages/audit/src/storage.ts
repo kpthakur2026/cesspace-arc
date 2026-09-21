@@ -24,6 +24,7 @@ import {
   validateStoreMetadataConsistency,
 } from './metadata.js';
 import { acquireWriterLock, type AuditLockAcquisition } from './lock.js';
+import { createCodedError, type CodedError } from './internal/errors.js';
 
 export const DEFAULT_AUDIT_DIR = path.join(os.homedir(), '.cesspace-arc', 'audit');
 export const ACTIVE_SEGMENT_FILENAME = 'audit-active.jsonl';
@@ -108,19 +109,12 @@ export const GATEWAY_ALLOWED_KEYS = new Set([
 ]);
 export const INTEGRITY_ALLOWED_KEYS = new Set(['previousRecordHash', 'recordHash']);
 
-export interface CodedError extends Error {
-  code?: string;
-}
-
-export function createCodedError(
-  code: string,
-  message: string,
-  options?: { cause?: unknown },
-): CodedError {
-  const err = new Error(`${code}: ${message}`, options) as CodedError;
-  err.code = code;
-  return err;
-}
+/**
+ * Re-exported so the error primitive keeps its public home on this module while
+ * its definition lives in the leaf module every layer can import without a
+ * cycle. See `internal/errors.ts`.
+ */
+export { createCodedError, type CodedError };
 
 export function getProcessUid(): number {
   return typeof process.getuid === 'function' ? process.getuid() : -1;
@@ -973,9 +967,11 @@ import {
 } from './internal/storage-capability.js';
 import {
   ROTATION_CAPABILITY_TOKEN,
+  type FileIdentity,
   type RotationStorageCapability,
 } from './internal/rotation-capability.js';
 import { isValidRotatedSegmentFilename } from './rotation-filename.js';
+import { assertPathIdentity } from './internal/file-identity.js';
 
 export class PersistentAuditStorage {
   /** @internal Package-private recovery bootstrap */
@@ -1363,8 +1359,8 @@ export class PersistentAuditStorage {
         this.state = 'FAILED';
       },
 
-      rotateActiveSegmentPhysical: (archiveName: string) =>
-        this.rotateActiveSegmentPhysical(archiveName),
+      rotateActiveSegmentPhysical: (archiveName: string, expectedIdentity: FileIdentity) =>
+        this.rotateActiveSegmentPhysical(archiveName, expectedIdentity),
     };
   }
 
@@ -1392,9 +1388,21 @@ export class PersistentAuditStorage {
    * artifact while both names exist, and the source name is removed before this
    * method returns.
    *
+   * Pathname identity is proven twice around the installation. The authoritative
+   * descriptor is what defines the segment: `(dev, ino, size)` is captured from
+   * it, the pathname is re-proved against that identity before `link()`, and the
+   * installed archive name is re-proved against it after. A pathname that was
+   * replaced between the descriptor being finalized and the archive being
+   * installed is therefore rejected instead of being archived under a canonical
+   * name, and a same-inode size change fails as well. There is no repair path
+   * and no truncation: the rotation simply fails closed.
+   *
    * `currentSequence` and `lastRecordHash` are intentionally left untouched.
    */
-  private rotateActiveSegmentPhysical(archiveName: string): {
+  private rotateActiveSegmentPhysical(
+    archiveName: string,
+    expectedIdentity: FileIdentity,
+  ): {
     archivedPath: string;
     newActiveFd: number;
   } {
@@ -1413,13 +1421,66 @@ export class PersistentAuditStorage {
     const previousFd = this.activeFd;
     this.activeFd = null;
 
+    // Authoritative identity of the segment being finalized. Taken from the
+    // descriptor, never from the path.
+    const finalizedStats = validateFileDescriptorAuthority(previousFd, 0o600, this.expectedUid);
+    if (finalizedStats.size === 0) {
+      this.state = 'FAILED';
+      throw createCodedError(
+        'AUDIT_ROTATION_EMPTY_SEGMENT',
+        'refusing to finalize an active segment with no durable bytes',
+      );
+    }
+
+    // The caller captured this identity from the descriptor before the rotation
+    // was committed to. Re-proving the descriptor against it here closes the gap
+    // between that capture and the pathname operations below: a segment grown or
+    // shrunk in place in the meantime no longer matches, even though its
+    // device and inode still do.
+    const identity: FileIdentity = {
+      dev: finalizedStats.dev,
+      ino: finalizedStats.ino,
+      size: finalizedStats.size,
+    };
+    if (
+      identity.dev !== expectedIdentity.dev ||
+      identity.ino !== expectedIdentity.ino ||
+      identity.size !== expectedIdentity.size
+    ) {
+      this.state = 'FAILED';
+      throw createCodedError(
+        'AUDIT_ROTATION_FAILED',
+        'active segment changed after it was validated for rotation',
+      );
+    }
+
     try {
       fs.fdatasyncSync(previousFd);
       fs.closeSync(previousFd);
 
+      // Re-prove the pathname against the descriptor identity. `lstat` is used
+      // so a symlink swapped in at the active name is seen as a symlink rather
+      // than followed to its target.
+      assertPathIdentity(this.activePath, identity, 'active segment');
+
       // No-overwrite installation. `EEXIST` propagates and aborts rotation with
       // the source segment still intact and still named as the active segment.
       fs.linkSync(this.activePath, archivedPath);
+
+      // The archive name must now name the very inode that was finalized; a
+      // link that landed on something else is not a rotated segment.
+      const archivedStats = fs.lstatSync(archivedPath);
+      if (
+        archivedStats.dev !== identity.dev ||
+        archivedStats.ino !== identity.ino ||
+        archivedStats.size !== identity.size
+      ) {
+        throw createCodedError(
+          'AUDIT_ROTATION_FAILED',
+          'installed archive name does not refer to the finalized active segment',
+        );
+      }
+
       fs.unlinkSync(this.activePath);
     } catch (err) {
       this.state = 'FAILED';

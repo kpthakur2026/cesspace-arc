@@ -22,6 +22,7 @@
 
 import fs, { constants as fsConstants } from 'node:fs';
 import path from 'node:path';
+import { Transform } from 'node:stream';
 import { createHash, randomUUID } from 'node:crypto';
 import { pipeline } from 'node:stream/promises';
 import { createGzip, createGunzip } from 'node:zlib';
@@ -31,20 +32,23 @@ import {
   createCodedError,
   parseAndValidateRecordLineV1,
   validateFileDescriptorAuthority,
+  type CodedError,
   type PersistentAuditStorage,
   type StorageState,
 } from './storage.js';
 import { LOCK_FILENAME } from './lock.js';
 import { METADATA_FILENAME } from './metadata.js';
 import {
-  MAX_TORN_TAIL_BYTES,
   extractDanglingOperations,
   updateLifecycle,
   type DanglingOperation,
   type LifecycleTrackingEntry,
 } from './recovery.js';
+import { MAX_TORN_TAIL_BYTES, classifyTrailingBytes } from './internal/torn-tail.js';
+import { assertPathIdentity } from './internal/file-identity.js';
 import {
   ROTATION_CAPABILITY_TOKEN,
+  type FileIdentity,
   type RotationStorageCapability,
   type RotationTestHooks,
 } from './internal/rotation-capability.js';
@@ -159,6 +163,172 @@ export interface ArchiveInventoryEntry {
   parsed: ParsedRotatedSegmentFilename;
   /** Physical on-disk size in bytes. */
   physicalByteLength: number;
+}
+
+/**
+ * One physical representation of a logical rotated segment.
+ *
+ * A logical segment may be represented on disk by an uncompressed `.jsonl`, a
+ * compressed `.jsonl.gz`, or — during the crash window between installing the
+ * compressed artifact and removing its source — by both at once.
+ */
+export interface PhysicalArchiveRepresentation {
+  /** Filename exactly as it appears on disk. */
+  filename: string;
+  /** Absolute path. */
+  filePath: string;
+  /** True for `.jsonl.gz`. */
+  compressed: boolean;
+  /** Operational timestamp component; never an ordering or identity key. */
+  rotationTimestamp: string;
+  /** Physical on-disk size in bytes. */
+  physicalByteLength: number;
+}
+
+/**
+ * One retained rotated segment, grouped by its authoritative sequence range.
+ *
+ * This is the unit that the archive ceiling counts and that history
+ * verification walks. Grouping by `(sequenceStart, sequenceEnd)` is what keeps a
+ * legitimate compression crash — where both the plain and the compressed
+ * representation of one range are on disk — from being mistaken for two
+ * archives, or for a range conflict.
+ */
+export interface LogicalArchiveEntry {
+  /** First global sequence number in the range (inclusive). */
+  sequenceStart: number;
+  /** Last global sequence number in the range (inclusive). */
+  sequenceEnd: number;
+  /** The uncompressed representation, when present. */
+  plain?: PhysicalArchiveRepresentation;
+  /** The compressed representation, when present. */
+  gzip?: PhysicalArchiveRepresentation;
+  /** Sum of the physical sizes of every present representation. */
+  physicalByteLength: number;
+  /** Diagnostic label: the plain name when present, otherwise the gzip name. */
+  label: string;
+}
+
+function toPhysicalRepresentation(
+  entry: StoreEntry & { parsed: ParsedRotatedSegmentFilename },
+): PhysicalArchiveRepresentation {
+  return {
+    filename: entry.filename,
+    filePath: entry.filePath,
+    compressed: entry.parsed.compressed,
+    rotationTimestamp: entry.parsed.rotationTimestamp,
+    physicalByteLength: entry.physicalByteLength,
+  };
+}
+
+/**
+ * Groups the physical rotated entries currently on disk by sequence range.
+ *
+ * Fail-closed rules, applied before any content is read:
+ *
+ *  - At most one plain and at most one compressed representation per range.
+ *    Two `.jsonl` files, or two `.jsonl.gz` files, for the same range are
+ *    ambiguous and rejected.
+ *  - When both representations exist they must share the rotation timestamp.
+ *    Rotation names both halves of a compression transition from one instant,
+ *    so a range whose two representations carry different timestamps is not a
+ *    canonical compression pair. Timestamp freshness is never used to pick a
+ *    winner; a mismatch is a conflict.
+ *  - Ranges must be strictly increasing and must not overlap or nest.
+ *
+ * Returns ranges in ascending order.
+ */
+function groupArchiveEntriesByRange(auditDir: string, expectedUid: number): LogicalArchiveEntry[] {
+  const rotated = enumerateAuditStoreEntries(auditDir, expectedUid).filter(
+    (entry): entry is StoreEntry & { parsed: ParsedRotatedSegmentFilename } =>
+      entry.kind === 'ROTATED' && entry.parsed !== null,
+  );
+
+  interface RangeGroup {
+    sequenceStart: number;
+    sequenceEnd: number;
+    plain?: PhysicalArchiveRepresentation;
+    gzip?: PhysicalArchiveRepresentation;
+  }
+
+  const groups = new Map<string, RangeGroup>();
+
+  for (const entry of rotated) {
+    const { sequenceStart, sequenceEnd, compressed } = entry.parsed;
+    const key = `${sequenceStart}-${sequenceEnd}`;
+
+    let group = groups.get(key);
+    if (group === undefined) {
+      group = { sequenceStart, sequenceEnd };
+      groups.set(key, group);
+    }
+
+    if (compressed) {
+      if (group.gzip !== undefined) {
+        throw createCodedError(
+          'AUDIT_SEGMENT_RANGE_CONFLICT',
+          `two compressed representations for sequence range ${key}: ${group.gzip.filename} and ${entry.filename}`,
+        );
+      }
+      group.gzip = toPhysicalRepresentation(entry);
+    } else {
+      if (group.plain !== undefined) {
+        throw createCodedError(
+          'AUDIT_SEGMENT_RANGE_CONFLICT',
+          `two uncompressed representations for sequence range ${key}: ${group.plain.filename} and ${entry.filename}`,
+        );
+      }
+      group.plain = toPhysicalRepresentation(entry);
+    }
+  }
+
+  const logical: LogicalArchiveEntry[] = [];
+
+  for (const group of groups.values()) {
+    const { plain, gzip } = group;
+
+    if (plain !== undefined && gzip !== undefined) {
+      if (plain.rotationTimestamp !== gzip.rotationTimestamp) {
+        throw createCodedError(
+          'AUDIT_SEGMENT_RANGE_CONFLICT',
+          `sequence range ${group.sequenceStart}-${group.sequenceEnd} has competing timestamps ` +
+            `(${plain.filename} and ${gzip.filename}); only a canonical compression pair may coexist`,
+        );
+      }
+    }
+
+    const representations = [plain, gzip].filter(
+      (rep): rep is PhysicalArchiveRepresentation => rep !== undefined,
+    );
+
+    logical.push({
+      sequenceStart: group.sequenceStart,
+      sequenceEnd: group.sequenceEnd,
+      ...(plain !== undefined ? { plain } : {}),
+      ...(gzip !== undefined ? { gzip } : {}),
+      physicalByteLength: representations.reduce((total, rep) => total + rep.physicalByteLength, 0),
+      label: (plain ?? gzip)?.filename as string,
+    });
+  }
+
+  // Ordering is by the authoritative sequence range, never by the timestamp.
+  logical.sort((a, b) => {
+    if (a.sequenceStart !== b.sequenceStart) return a.sequenceStart - b.sequenceStart;
+    return a.sequenceEnd - b.sequenceEnd;
+  });
+
+  for (let i = 1; i < logical.length; i++) {
+    const previous = logical[i - 1];
+    const current = logical[i];
+    if (current.sequenceStart <= previous.sequenceEnd) {
+      throw createCodedError(
+        'AUDIT_SEGMENT_RANGE_CONFLICT',
+        `rotated segments overlap or duplicate: ${previous.label} and ${current.label}`,
+      );
+    }
+  }
+
+  return logical;
 }
 
 /** Why a rotation was performed. */
@@ -311,6 +481,51 @@ export function listArchiveInventory(
   }));
 }
 
+/**
+ * Lists retained rotated segments grouped by logical sequence range.
+ *
+ * This is the inventory every capacity decision is made from. It is bounded by
+ * {@link MAX_ARCHIVE_SEGMENTS} logical ranges, each holding at most two physical
+ * representations, and it never retains record content.
+ */
+export function listLogicalArchiveInventory(
+  auditDir: string,
+  expectedUid: number,
+): LogicalArchiveEntry[] {
+  return groupArchiveEntriesByRange(auditDir, expectedUid);
+}
+
+/** The number of retained logical archive ranges. */
+export function countLogicalArchives(auditDir: string, expectedUid: number): number {
+  return groupArchiveEntriesByRange(auditDir, expectedUid).length;
+}
+
+/**
+ * Fail-closed archive-ceiling preflight.
+ *
+ * {@link MAX_ARCHIVE_SEGMENTS} bounds the number of retained *logical* archive
+ * ranges. A crash pair — one range present as both `.jsonl` and `.jsonl.gz` — is
+ * one archive, so the ceiling is reached by ranges, never by pathnames.
+ *
+ * Reaching the ceiling makes the store exhausted for every privileged-storage
+ * progression: neither another record nor another rotation may proceed, and
+ * nothing is ever reclaimed to make room. The check runs before a record is
+ * written and before a boundary is sealed, so an exhausted store consumes no
+ * checkpoint.
+ */
+export function assertArchiveCapacityAvailable(auditDir: string, expectedUid: number): number {
+  const retained = countLogicalArchives(auditDir, expectedUid);
+
+  if (retained >= MAX_ARCHIVE_SEGMENTS) {
+    throw createCodedError(
+      'AUDIT_STORAGE_EXHAUSTED',
+      `archive segment limit reached: ${retained} retained logical archives, limit ${MAX_ARCHIVE_SEGMENTS}`,
+    );
+  }
+
+  return retained;
+}
+
 /* -------------------------------------------------------------------------- *
  * Storage budget (rc06 §11, §50, §51)
  * -------------------------------------------------------------------------- */
@@ -334,9 +549,16 @@ export function scanAuditStorePhysicalBytes(auditDir: string, expectedUid: numbe
  * Fail-closed capacity preflight.
  *
  * Throws `AUDIT_STORAGE_EXHAUSTED` when the store's physical bytes plus the
- * bytes about to be written would exceed the total budget. It never deletes,
- * truncates, compresses-away or otherwise reclaims anything: the operator
- * remediates out of band (rc06 §11).
+ * bytes about to be written would reach the total budget. Reaching the ceiling
+ * is exhausted, not merely exceeding it: the frozen budget is a hard ceiling on
+ * durable disk evidence, so a successful operation may never leave the store
+ * sitting exactly at it (rc06 §11, §51). The comparison is therefore `>=`, and
+ * it is the same comparison on every path — append, rotation, compression and
+ * scratch creation all route through here or through the streaming guard built
+ * on the same rule.
+ *
+ * It never deletes, truncates, compresses-away or otherwise reclaims anything:
+ * the operator remediates out of band.
  */
 export function assertAuditStorageCapacity(
   auditDir: string,
@@ -346,7 +568,7 @@ export function assertAuditStorageCapacity(
   const projected = Math.max(0, Math.trunc(additionalBytes));
   const used = scanAuditStorePhysicalBytes(auditDir, expectedUid);
 
-  if (used + projected > TOTAL_AUDIT_BUDGET_BYTES) {
+  if (used + projected >= TOTAL_AUDIT_BUDGET_BYTES) {
     throw createCodedError(
       'AUDIT_STORAGE_EXHAUSTED',
       `audit storage budget exhausted: ${used} bytes retained, ${projected} bytes requested, ${TOTAL_AUDIT_BUDGET_BYTES} byte budget`,
@@ -382,13 +604,26 @@ export interface SegmentDigest {
   previousRecordHash: string;
   /** Decompressed torn-tail bytes, for the active segment only. */
   tornBytes: Buffer | null;
+  /** Timestamp of the first verified record, in ms, or null when empty. */
+  openedAtMs: number | null;
+  /** True when this segment carried the requested trusted boundary record. */
+  trustedBoundaryMatched: boolean;
   /** Identity of the verified descriptor. */
   identity: { dev: number; ino: number };
 }
 
 interface ScanOptions {
-  /** Expected sequence of the first record in this segment. */
-  expectedFirstSequence: number;
+  /**
+   * Expected sequence of the first record in this segment.
+   *
+   * `null` means the caller does not know where the segment starts. Only the
+   * bounded active-segment bootstrap scan passes `null`, because it reads a
+   * segment whose origin is not known a priori; the sequence it then reports is
+   * cross-checked against the storage cursors before it is trusted. Every other
+   * caller knows the boundary and passes a number, which keeps the discontinuity
+   * check armed for all of them.
+   */
+  expectedFirstSequence: number | null;
   /**
    * Expected `previousRecordHash` of the first record in this segment.
    *
@@ -408,6 +643,15 @@ interface ScanOptions {
   lifecycleMap: Map<string, LifecycleTrackingEntry>;
   /** Rolling most-recent-records cache, shared across segments. */
   recentRecords: PersistentAuditRecordV1[];
+  /**
+   * Trusted primary chain boundary to confirm while scanning, if any.
+   *
+   * Checked against EVERY record rather than only at segment terminals, so a
+   * boundary recorded mid-segment — or in the live active segment, which is
+   * where the newest records live — is satisfied exactly as Task-2 recovery
+   * satisfies it.
+   */
+  trustedBoundary?: { sequenceNumber: number; recordHash: string };
   /** Label used in error messages. */
   label: string;
 }
@@ -417,10 +661,26 @@ interface ScanCore {
   firstSequence: number | null;
   terminalSequence: number;
   terminalRecordHash: string;
+  /**
+   * Sequence the next record must carry.
+   *
+   * `0` is reported only when the caller passed `expectedFirstSequence: null`
+   * and the segment yielded no complete record; no caller consumes the value in
+   * that case.
+   */
   nextSequence: number;
   previousRecordHash: string;
   logicalByteLength: number;
   tornBytes: Buffer | null;
+  /** Operational open time: the first verified record's timestamp, in ms. */
+  openedAtMs: number | null;
+  /**
+   * True when this segment carried the trusted boundary record.
+   *
+   * `true` vacuously when no boundary was requested, mirroring the "nothing to
+   * prove" reading that the caller's final check depends on.
+   */
+  trustedBoundaryMatched: boolean;
 }
 
 async function* bufferChunks(source: AsyncIterable<Buffer | string>): AsyncIterable<Buffer> {
@@ -453,14 +713,16 @@ async function scanSegmentStream(
 ): Promise<ScanCore> {
   const utf8Decoder = new TextDecoder('utf-8', { fatal: true });
 
+  let trustedBoundaryMatched = options.trustedBoundary === undefined;
   let recordCount = 0;
   let firstSequence: number | null = null;
   let terminalSequence = 0;
   let terminalRecordHash = GENESIS_HASH;
-  let nextSequence = options.expectedFirstSequence;
+  let nextSequence = options.expectedFirstSequence ?? 0;
   let previousRecordHash = options.expectedPreviousRecordHash ?? GENESIS_HASH;
   let logicalByteLength = 0;
   let tornBytes: Buffer | null = null;
+  let openedAtMs: number | null = null;
 
   let accumulated = Buffer.alloc(0);
   /** A newline-terminated line that failed to parse, still a torn-tail candidate. */
@@ -494,8 +756,13 @@ async function scanSegmentStream(
       });
     }
 
-    if (record.sequenceNumber !== nextSequence) {
-      corrupt(`sequence discontinuity: expected ${nextSequence}, got ${record.sequenceNumber}`);
+    // When the caller does not know where the segment starts
+    // (`expectedFirstSequence === null`), only the first record is exempt from
+    // the discontinuity check; every later record must still be consecutive.
+    if (recordCount > 0 || options.expectedFirstSequence !== null) {
+      if (record.sequenceNumber !== nextSequence) {
+        corrupt(`sequence discontinuity: expected ${nextSequence}, got ${record.sequenceNumber}`);
+      }
     }
     // When the predecessor is unknown (`expectedPreviousRecordHash === null`),
     // only the segment's first record is exempt; every later record is still
@@ -513,6 +780,29 @@ async function scanSegmentStream(
 
     if (firstSequence === null) {
       firstSequence = record.sequenceNumber;
+      // The operational open time of a segment is the timestamp of its first
+      // record, not the moment the process happened to look at it. The record's
+      // timestamp is a canonical ISO-8601 UTC string already enforced by
+      // `validatePersistentRecordV1`, so parsing cannot fail here.
+      const parsedTimestamp = Date.parse(record.timestamp);
+      openedAtMs = Number.isNaN(parsedTimestamp) ? null : parsedTimestamp;
+    }
+
+    // The trusted boundary is confirmed on the record that carries it, wherever
+    // in the retained history that turns out to be. A boundary sequence that
+    // only ever appeared inside a torn tail is never parsed, so it can never
+    // reach this line — which is exactly what makes a torn tail incapable of
+    // satisfying the boundary.
+    if (
+      options.trustedBoundary !== undefined &&
+      record.sequenceNumber === options.trustedBoundary.sequenceNumber
+    ) {
+      if (record.integrity.recordHash !== options.trustedBoundary.recordHash) {
+        corrupt(
+          `trusted boundary hash mismatch at sequence ${record.sequenceNumber}: expected ${options.trustedBoundary.recordHash}, got ${record.integrity.recordHash}`,
+        );
+      }
+      trustedBoundaryMatched = true;
     }
 
     recordCount++;
@@ -529,14 +819,25 @@ async function scanSegmentStream(
     return true;
   };
 
+  /**
+   * Applies the shared torn-tail rule (see `internal/torn-tail.ts`).
+   *
+   * Decodability is deliberately not consulted: an incomplete JSON prefix that
+   * happens to decode as UTF-8 is just as much a crash artifact as one that does
+   * not, and treating the two differently would make Task-3 startup reject
+   * stores that Task-2 restart recovery accepts.
+   */
   const acceptTornTail = (bytes: Buffer): void => {
-    if (!options.allowTornTail) {
-      corrupt('segment is a finalized rotated segment but ends in a truncated record');
+    const classification = classifyTrailingBytes(bytes, { allowTornTail: options.allowTornTail });
+    if (classification.recoverable) {
+      tornBytes = classification.tornBytes;
+      return;
     }
-    if (bytes.length > MAX_TORN_TAIL_BYTES) {
-      corrupt(`torn tail exceeds MAX_TORN_TAIL_BYTES (${MAX_TORN_TAIL_BYTES})`);
-    }
-    tornBytes = Buffer.from(bytes);
+    corrupt(
+      classification.rejection === 'TORN_TAIL_TOO_LARGE'
+        ? `torn tail exceeds MAX_TORN_TAIL_BYTES (${MAX_TORN_TAIL_BYTES})`
+        : 'segment is a finalized rotated segment but ends in a truncated record',
+    );
   };
 
   for await (const chunk of bufferChunks(source)) {
@@ -581,20 +882,9 @@ async function scanSegmentStream(
     }
     acceptTornTail(malformedCandidate);
   } else if (accumulated.length > 0) {
-    // An unterminated final fragment. It is a torn tail only when it is not a
-    // complete, canonical record that merely lost its newline.
-    if (accumulated.length > MAX_RECORD_BYTES) {
-      corrupt(`record line exceeds MAX_RECORD_BYTES (${MAX_RECORD_BYTES})`);
-    }
-    let decodes = true;
-    try {
-      utf8Decoder.decode(accumulated);
-    } catch {
-      decodes = false;
-    }
-    if (decodes) {
-      corrupt('segment does not end with a newline');
-    }
+    // An unterminated final fragment. Whether it decodes, and whether it happens
+    // to be a complete record missing only its newline, is irrelevant: the
+    // shared rule decides, exactly as it does for Task-2 recovery.
     acceptTornTail(accumulated);
   }
 
@@ -634,6 +924,8 @@ async function scanSegmentStream(
     previousRecordHash,
     logicalByteLength,
     tornBytes,
+    openedAtMs,
+    trustedBoundaryMatched,
   };
 }
 
@@ -648,6 +940,7 @@ async function digestSegment(
   expectedUid: number,
   compressed: boolean,
   options: ScanOptions,
+  expectedIdentity?: FileIdentity,
 ): Promise<SegmentDigest> {
   let fd: number | null = null;
   let readStream: fs.ReadStream | null = null;
@@ -664,6 +957,22 @@ async function digestSegment(
     }
 
     const stats = validateFileDescriptorAuthority(fd, 0o600, expectedUid);
+
+    // When the caller already knows which artifact it means, the descriptor must
+    // be that artifact. This is what stops a pathname swapped between the
+    // physical rotation and the compression step from being read instead.
+    if (expectedIdentity !== undefined) {
+      if (
+        stats.dev !== expectedIdentity.dev ||
+        stats.ino !== expectedIdentity.ino ||
+        stats.size !== expectedIdentity.size
+      ) {
+        throw createCodedError(
+          'AUDIT_ROTATION_FAILED',
+          `segment no longer matches the identity it was validated with: ${options.label}`,
+        );
+      }
+    }
 
     const hash = createHash('sha256');
     readStream = fs.createReadStream(filePath, {
@@ -741,6 +1050,52 @@ export interface RetainedPrimaryHistoryVerificationOptions {
   recentRecordsLimit?: number;
 }
 
+/**
+ * Requires two physical representations of one logical range to describe
+ * exactly the same record sequence.
+ *
+ * Every fact that identifies the logical content is compared: the decompressed
+ * bytes themselves, their length, the record count, the first and terminal
+ * sequences and the terminal hash. A mismatch is corruption — the two files
+ * disagree about what was written, and there is no basis for preferring one.
+ */
+function assertRepresentationsEquivalent(
+  primary: PhysicalArchiveRepresentation,
+  primaryDigest: SegmentDigest,
+  secondary: PhysicalArchiveRepresentation,
+  secondaryDigest: SegmentDigest,
+): void {
+  const mismatch = (detail: string): never => {
+    throw createCodedError(
+      'AUDIT_CORRUPTION_DETECTED',
+      `dual representations of one sequence range disagree: ${primary.filename} and ${secondary.filename} ${detail}`,
+    );
+  };
+
+  if (primaryDigest.sha256 !== secondaryDigest.sha256) {
+    mismatch('decompress to different bytes');
+  }
+  if (primaryDigest.logicalByteLength !== secondaryDigest.logicalByteLength) {
+    mismatch(
+      `decompress to different lengths (${primaryDigest.logicalByteLength} vs ${secondaryDigest.logicalByteLength})`,
+    );
+  }
+  if (primaryDigest.recordCount !== secondaryDigest.recordCount) {
+    mismatch(
+      `contain different record counts (${primaryDigest.recordCount} vs ${secondaryDigest.recordCount})`,
+    );
+  }
+  if (primaryDigest.firstSequence !== secondaryDigest.firstSequence) {
+    mismatch('begin at different sequences');
+  }
+  if (
+    primaryDigest.terminalSequence !== secondaryDigest.terminalSequence ||
+    primaryDigest.terminalRecordHash !== secondaryDigest.terminalRecordHash
+  ) {
+    mismatch('terminate at different chain positions');
+  }
+}
+
 /** The verified state of the whole retained primary history. */
 export interface RetainedPrimaryHistoryVerificationResult {
   status: 'VERIFIED' | 'RECOVERABLE_TORN_ACTIVE_TAIL';
@@ -762,8 +1117,13 @@ export interface RetainedPrimaryHistoryVerificationResult {
   recentRecords: PersistentAuditRecordV1[];
   /** Operations left dangling across the whole retained history. */
   danglingOperations: DanglingOperation[];
-  /** Per-segment digests in canonical order. */
-  segments: Array<{ filename: string; digest: SegmentDigest }>;
+  /**
+   * Per-logical-segment digests in canonical order.
+   *
+   * `filename` is the primary representation's name; `filenames` lists every
+   * physical representation that was verified for that one logical range.
+   */
+  segments: Array<{ filename: string; filenames: string[]; digest: SegmentDigest }>;
   /** The active segment digest, or null when the active segment is absent or empty. */
   active: SegmentDigest | null;
 }
@@ -784,29 +1144,14 @@ export async function verifyRetainedPrimaryHistory(
 ): Promise<RetainedPrimaryHistoryVerificationResult> {
   const entries = enumerateAuditStoreEntries(auditDir, expectedUid);
 
-  const archiveEntries = entries
-    .filter(
-      (entry): entry is StoreEntry & { parsed: ParsedRotatedSegmentFilename } =>
-        entry.kind === 'ROTATED' && entry.parsed !== null,
-    )
-    .sort((a, b) => a.parsed.sequenceStart - b.parsed.sequenceStart);
+  // Grouping, duplicate/overlap detection and the canonical-pair rule all run on
+  // the authoritative ranges before any content is read, so a conflicting store
+  // is rejected as a whole.
+  const archiveEntries = groupArchiveEntriesByRange(auditDir, expectedUid);
 
   const activeEntry = entries.find((entry) => entry.kind === 'ACTIVE') ?? null;
 
-  // Duplicate / overlap detection runs on the authoritative ranges before any
-  // content is read, so a conflicting store is rejected as a whole.
-  for (let i = 1; i < archiveEntries.length; i++) {
-    const previous = archiveEntries[i - 1].parsed;
-    const current = archiveEntries[i].parsed;
-    if (current.sequenceStart <= previous.sequenceEnd) {
-      throw createCodedError(
-        'AUDIT_SEGMENT_RANGE_CONFLICT',
-        `rotated segments overlap or duplicate: ${previous.filename} and ${current.filename}`,
-      );
-    }
-  }
-
-  const firstArchive = archiveEntries[0]?.parsed;
+  const firstArchive = archiveEntries[0];
   if (firstArchive !== undefined && firstArchive.sequenceStart !== 1) {
     throw createCodedError(
       'AUDIT_CORRUPTION_DETECTED',
@@ -831,53 +1176,77 @@ export async function verifyRetainedPrimaryHistory(
   let nextSequence: number;
   let previousRecordHash: string;
   let physicalPrimaryBytes = 0;
+  // Each segment reports whether it carried the boundary; the walk ORs them.
   let trustedBoundaryMatched = options.trustedBoundary === undefined;
-  const segments: Array<{ filename: string; digest: SegmentDigest }> = [];
-
-  const noteBoundary = (sequence: number, hash: string): void => {
-    if (
-      options.trustedBoundary !== undefined &&
-      sequence === options.trustedBoundary.sequenceNumber
-    ) {
-      if (hash !== options.trustedBoundary.recordHash) {
-        throw createCodedError(
-          'AUDIT_CORRUPTION_DETECTED',
-          `trusted boundary hash mismatch at sequence ${sequence}: expected ${options.trustedBoundary.recordHash}, got ${hash}`,
-        );
-      }
-      trustedBoundaryMatched = true;
-    }
-  };
+  const segments: Array<{ filename: string; filenames: string[]; digest: SegmentDigest }> = [];
 
   for (const entry of archiveEntries) {
-    if (entry.parsed.sequenceStart !== expectedFirstSequence) {
+    if (entry.sequenceStart !== expectedFirstSequence) {
       throw createCodedError(
         'AUDIT_CORRUPTION_DETECTED',
-        `missing retained segment before ${entry.filename}: expected sequence ${expectedFirstSequence}, segment starts at ${entry.parsed.sequenceStart}`,
+        `missing retained segment before ${entry.label}: expected sequence ${expectedFirstSequence}, segment starts at ${entry.sequenceStart}`,
       );
     }
 
-    const digest = await digestSegment(entry.filePath, expectedUid, entry.parsed.compressed, {
+    const representations = [entry.plain, entry.gzip].filter(
+      (rep): rep is PhysicalArchiveRepresentation => rep !== undefined,
+    );
+    // The uncompressed representation is primary when it exists, purely so the
+    // choice is deterministic; both are verified either way.
+    const primary = representations[0];
+
+    const shared = {
       expectedFirstSequence,
       expectedPreviousRecordHash,
-      allowTornTail: false,
+      allowTornTail: false as const,
       declaredRange: {
-        sequenceStart: entry.parsed.sequenceStart,
-        sequenceEnd: entry.parsed.sequenceEnd,
+        sequenceStart: entry.sequenceStart,
+        sequenceEnd: entry.sequenceEnd,
       },
+      trustedBoundary: options.trustedBoundary,
+    };
+
+    const secondary = representations[1] ?? null;
+
+    // A dual representation is verified twice and consumed once. The secondary
+    // is verified first, into throwaway state, so the shared lifecycle map and
+    // recent-record cache advance exactly once per logical archive and never
+    // twice for a crash pair. Its digest is then compared with the primary's:
+    // a disagreement is corruption, and there is no "the valid copy wins" path.
+    let secondaryDigest: SegmentDigest | null = null;
+    if (secondary !== null) {
+      secondaryDigest = await digestSegment(secondary.filePath, expectedUid, secondary.compressed, {
+        ...shared,
+        lifecycleMap: new Map(),
+        recentRecords: [],
+        label: secondary.filename,
+      });
+    }
+
+    const digest = await digestSegment(primary.filePath, expectedUid, primary.compressed, {
+      ...shared,
       lifecycleMap,
       recentRecords,
-      label: entry.filename,
+      label: primary.filename,
     });
+
+    if (secondary !== null && secondaryDigest !== null) {
+      assertRepresentationsEquivalent(primary, digest, secondary, secondaryDigest);
+    }
 
     recordCount += digest.recordCount;
     terminalSequence = digest.terminalSequence;
     terminalRecordHash = digest.terminalRecordHash;
     expectedFirstSequence = digest.nextSequence;
     expectedPreviousRecordHash = digest.previousRecordHash;
-    physicalPrimaryBytes += digest.physicalByteLength;
-    segments.push({ filename: entry.filename, digest });
-    noteBoundary(digest.terminalSequence, digest.terminalRecordHash);
+    trustedBoundaryMatched ||= digest.trustedBoundaryMatched;
+    // Both physical representations occupy disk, so both are budgeted.
+    physicalPrimaryBytes += entry.physicalByteLength;
+    segments.push({
+      filename: primary.filename,
+      filenames: representations.map((rep) => rep.filename),
+      digest,
+    });
   }
 
   let active: SegmentDigest | null = null;
@@ -888,6 +1257,7 @@ export async function verifyRetainedPrimaryHistory(
       expectedFirstSequence,
       expectedPreviousRecordHash,
       allowTornTail: true,
+      trustedBoundary: options.trustedBoundary,
       lifecycleMap,
       recentRecords,
       label: activeEntry.filename,
@@ -898,6 +1268,7 @@ export async function verifyRetainedPrimaryHistory(
     terminalRecordHash = active.terminalRecordHash;
     nextSequence = active.nextSequence;
     previousRecordHash = active.previousRecordHash;
+    trustedBoundaryMatched ||= active.trustedBoundaryMatched;
     physicalPrimaryBytes += active.physicalByteLength;
 
     if (active.tornBytes !== null) {
@@ -966,6 +1337,13 @@ export class RotatingAuditStore {
 
   private segmentStartSequence: number;
   private segmentOpenedAtMs: number;
+  /**
+   * False until {@link ensureBootstrapped} has established the active segment's
+   * operational state from durable bytes. No append and no rotation may run
+   * before then, so a store recovered with a non-empty active segment can never
+   * operate on a guessed boundary.
+   */
+  private bootstrapped = false;
   private recentRecords: PersistentAuditRecordV1[] = [];
   private queue: Promise<unknown> = Promise.resolve();
   private lastRotation: RotationResult | null = null;
@@ -1003,8 +1381,127 @@ export class RotatingAuditStore {
     this.storage = storage;
     this.sealer = options.sealer;
     this.capability = storage._rotationCapability(ROTATION_CAPABILITY_TOKEN);
+    // Provisional only, and never used before `ensureBootstrapped` replaces it.
+    // Deriving the active segment's origin from the chain cursor is correct
+    // solely for a fresh, empty active segment; after Task-2 recovery the active
+    // segment may already hold records 8..12 while the cursor reads 13, and a
+    // rotation boundary of 13..12 would be nonsense.
     this.segmentStartSequence = storage.getCurrentSequence();
     this.segmentOpenedAtMs = this.now();
+  }
+
+  /**
+   * Establishes the active segment's operational state from verified durable
+   * bytes, once, before the first mutating operation.
+   *
+   * The constructor cannot do this: it would require streaming the active
+   * segment, and a constructor that returns before the bytes have been read
+   * would have to guess. Guessing is exactly the defect this replaces, so the
+   * work is deferred to the first append or rotation and no operation may run
+   * ahead of it.
+   *
+   * Bounded by construction: only the active segment is streamed, never the
+   * retained archives, and never more than one record line is buffered.
+   */
+  private async ensureBootstrapped(): Promise<void> {
+    if (this.bootstrapped) return;
+
+    const capability = this.capability;
+    const activeByteLength = capability.getActiveByteSize();
+
+    if (activeByteLength === null || activeByteLength === 0) {
+      // A fresh, empty active segment: the next record it receives is the one
+      // the chain cursor names, and the interval clock starts now.
+      this.segmentStartSequence = this.storage.getCurrentSequence();
+      this.segmentOpenedAtMs = this.now();
+      this.bootstrapped = true;
+      return;
+    }
+
+    const scan = await this.readActiveSegmentState();
+
+    // The durable bytes and the in-memory cursors must agree. If they do not,
+    // one of them is wrong and there is no safe way to choose.
+    const storageNextSequence = this.storage.getCurrentSequence();
+    if (scan.terminalRecordHash !== this.storage.getLastRecordHash()) {
+      throw createCodedError(
+        'AUDIT_STORAGE_INVALID_STATE',
+        'active segment terminal hash disagrees with the storage cursor',
+      );
+    }
+    if (scan.recordCount > 0 && scan.terminalSequence + 1 !== storageNextSequence) {
+      throw createCodedError(
+        'AUDIT_STORAGE_INVALID_STATE',
+        'active segment terminal sequence disagrees with the storage cursor',
+      );
+    }
+
+    this.segmentStartSequence = scan.firstSequence ?? storageNextSequence;
+    // The segment's age is measured from the timestamp of its first record, not
+    // from the moment this process happened to start. Restarting a process does
+    // not make an old segment young.
+    this.segmentOpenedAtMs = scan.openedAtMs ?? this.now();
+    this.bootstrapped = true;
+  }
+
+  /**
+   * Streams the live active segment to recover its operational state.
+   *
+   * The read is bound to the authoritative active descriptor: the pathname is
+   * opened with `O_NOFOLLOW`, put through descriptor authority validation, and
+   * required to resolve to the same inode the writer is appending to. A
+   * pathname swapped out from under the store therefore fails bootstrap rather
+   * than producing a boundary taken from someone else's bytes.
+   */
+  private async readActiveSegmentState(): Promise<ScanCore> {
+    const capability = this.capability;
+    const activeFd = capability.getActiveFd();
+    if (activeFd === null) {
+      throw createCodedError('AUDIT_STORAGE_INVALID_STATE', 'no authoritative active descriptor');
+    }
+    const authoritative = fs.fstatSync(activeFd);
+
+    let readFd: number | null = null;
+    try {
+      readFd = fs.openSync(capability.activePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+      const opened = validateFileDescriptorAuthority(readFd, 0o600, capability.expectedUid);
+      if (opened.dev !== authoritative.dev || opened.ino !== authoritative.ino) {
+        throw createCodedError(
+          'AUDIT_STORAGE_INVALID_STATE',
+          'active segment pathname does not refer to the authoritative active descriptor',
+        );
+      }
+
+      const readStream = fs.createReadStream(capability.activePath, {
+        fd: readFd,
+        autoClose: true,
+        highWaterMark: 64 * 1024,
+      });
+      // Ownership of the descriptor transfers to the stream, which closes it
+      // exactly once. Closing it here as well would be a double close.
+      readFd = null;
+
+      return await scanSegmentStream(
+        readStream,
+        {
+          expectedFirstSequence: null,
+          expectedPreviousRecordHash: null,
+          allowTornTail: true,
+          lifecycleMap: new Map(),
+          recentRecords: [],
+          label: ACTIVE_SEGMENT_FILENAME,
+        },
+        () => undefined,
+      );
+    } finally {
+      if (readFd !== null) {
+        try {
+          fs.closeSync(readFd);
+        } catch {
+          // ignore
+        }
+      }
+    }
   }
 
   private now(): number {
@@ -1057,6 +1554,8 @@ export class RotatingAuditStore {
         throw createCodedError('AUDIT_STORAGE_INVALID_STATE', 'rotating store is not active');
       }
 
+      await this.ensureBootstrapped();
+
       // Fail-closed capacity preflight: a record known to exceed the remaining
       // budget is refused before any byte is written.
       assertAuditStorageCapacity(
@@ -1064,6 +1563,13 @@ export class RotatingAuditStore {
         this.capability.expectedUid,
         this.capability.projectSerializedBytes(recordCandidate),
       );
+
+      // Archive-count preflight. A store that already holds the ceiling number of
+      // logical archives has no room to archive the segment this record would
+      // join, so the append is refused now rather than accepted and then found
+      // unrotatable. Nothing is written, no cursor moves, and no checkpoint is
+      // consumed.
+      assertArchiveCapacityAvailable(this.capability.auditDir, this.capability.expectedUid);
 
       if (this.isIntervalRotationDue()) {
         if (this.activeSegmentHasRecords()) {
@@ -1120,7 +1626,10 @@ export class RotatingAuditStore {
    * byte still retained.
    */
   public rotateNow(reason: SegmentRotationReason): Promise<RotationResult> {
-    return this.runExclusive(() => this.performRotation(reason));
+    return this.runExclusive(async () => {
+      await this.ensureBootstrapped();
+      return this.performRotation(reason);
+    });
   }
 
   private async performRotation(reason: SegmentRotationReason): Promise<RotationResult> {
@@ -1136,22 +1645,17 @@ export class RotatingAuditStore {
     // other rotation precondition so exhaustion is always the reported cause.
     assertAuditStorageCapacity(capability.auditDir, capability.expectedUid, 0);
 
+    // The archive ceiling is checked just as early, and from the same basis: a
+    // store that already holds the maximum number of logical archives cannot
+    // archive this segment at all, so it must not be sealed first and refused
+    // afterwards. Checking before the seal is what keeps the sealer unconsumed.
+    assertArchiveCapacityAvailable(capability.auditDir, capability.expectedUid);
+
     const sequenceEnd = this.storage.getCurrentSequence() - 1;
     if (sequenceEnd < this.segmentStartSequence) {
       throw createCodedError(
         'AUDIT_ROTATION_EMPTY_SEGMENT',
         'refusing to rotate a segment that contains no records',
-      );
-    }
-
-    const inventory = listArchiveInventory(capability.auditDir, capability.expectedUid);
-
-    // The archive-count ceiling is checked before sealing, so an exhausted store
-    // never consumes a checkpoint and never removes an older segment.
-    if (inventory.length + 1 > MAX_ARCHIVE_SEGMENTS) {
-      throw createCodedError(
-        'AUDIT_STORAGE_EXHAUSTED',
-        `archive segment limit reached: ${inventory.length} retained, limit ${MAX_ARCHIVE_SEGMENTS}`,
       );
     }
 
@@ -1181,6 +1685,23 @@ export class RotatingAuditStore {
       compressed: true,
     });
 
+    // The identity of the artifact about to be sealed is read from the
+    // authoritative descriptor BEFORE the fault seam runs. Capturing it after
+    // the seam would let the seam redefine what "the segment" means — a
+    // replacement pathname, an in-place growth, or an in-place shrink would all
+    // be adopted as the new truth and then faithfully archived. Captured here,
+    // every one of them is a mismatch.
+    const activeFd = capability.getActiveFd();
+    if (activeFd === null) {
+      throw createCodedError('AUDIT_STORAGE_INVALID_STATE', 'no authoritative active descriptor');
+    }
+    const activeStats = validateFileDescriptorAuthority(activeFd, 0o600, capability.expectedUid);
+    const sourceIdentity: FileIdentity = {
+      dev: activeStats.dev,
+      ino: activeStats.ino,
+      size: activeStats.size,
+    };
+
     this.hooks?.beforePhysicalRotation?.();
 
     if (this.hooks?.failPhysicalRotation === true) {
@@ -1191,27 +1712,29 @@ export class RotatingAuditStore {
     // ---- The one synchronous physical critical section.
     let sourcePath: string;
     try {
-      sourcePath = capability.rotateActiveSegmentPhysical(plainFilename).archivedPath;
+      const physical = capability.rotateActiveSegmentPhysical(plainFilename, sourceIdentity);
+      sourcePath = physical.archivedPath;
     } catch (err) {
       capability.markRotationFailed();
-      throw createCodedError('AUDIT_ROTATION_FAILED', 'physical rotation failed', { cause: err });
+      // The specific failure is preserved: an operator needs to know whether a
+      // pathname was replaced, a symlink appeared, or the descriptor changed.
+      const detail = err instanceof Error ? err.message : String(err);
+      const code = (err as CodedError | undefined)?.code ?? 'AUDIT_ROTATION_FAILED';
+      throw createCodedError(code, `physical rotation failed: ${detail}`, { cause: err });
     }
 
-    let sourceByteLength: number;
-    try {
-      sourceByteLength = fs.lstatSync(sourcePath).size;
-    } catch (err) {
-      capability.markRotationFailed();
-      throw createCodedError('AUDIT_ROTATION_FAILED', 'unable to stat the rotated segment', {
-        cause: err,
-      });
-    }
+    // The archived artifact is the source segment, byte for byte: the physical
+    // critical section proved both the descriptor and the installed name still
+    // refer to the identity captured above, and that identity is carried forward
+    // so compression and deletion can each re-prove it.
+    const sourceByteLength = sourceIdentity.size;
 
     this.segmentStartSequence = this.storage.getCurrentSequence();
     this.segmentOpenedAtMs = this.now();
 
     const archivePath = await this.compressAndVerify({
       sourcePath,
+      sourceIdentity,
       plainFilename,
       compressedFilename,
       expectedUid: capability.expectedUid,
@@ -1227,7 +1750,7 @@ export class RotatingAuditStore {
       archiveByteLength: fs.lstatSync(archivePath).size,
       sourceByteLength,
       sourceRemoved: true,
-      archiveCount: listArchiveInventory(capability.auditDir, capability.expectedUid).length,
+      archiveCount: countLogicalArchives(capability.auditDir, capability.expectedUid),
     };
 
     this.lastRotation = result;
@@ -1239,29 +1762,65 @@ export class RotatingAuditStore {
    * removes the source.
    *
    * In order:
-   *   1. gzip the source into an exclusively-created scratch file, streamed;
-   *   2. fsync and validate the scratch descriptor;
-   *   3. install the `.gz` name without overwriting anything;
-   *   4. verify the compressed artifact by streaming gunzip, hashing the
+   *   1. establish the remaining physical budget and refuse to start without it;
+   *   2. open the source by its authoritative descriptor and prove it is still
+   *      the artifact the physical rotation produced;
+   *   3. gzip the source into an exclusively-created scratch file, streamed,
+   *      aborting the moment the compressed bytes would reach the budget;
+   *   4. fsync and validate the scratch descriptor;
+   *   5. install the `.gz` name without overwriting anything;
+   *   6. verify the compressed artifact by streaming gunzip, hashing the
    *      decompressed bytes and replaying the whole chain contract;
-   *   5. verify the source `.jsonl` the same way;
-   *   6. require raw-byte and record-for-record equivalence;
-   *   7. unlink the source and fsync the directory.
+   *   7. verify the source `.jsonl` the same way;
+   *   8. require raw-byte and record-for-record equivalence;
+   *   9. re-prove the source pathname, then unlink it, then fsync the directory.
    *
-   * A failure anywhere before step 7 leaves the source `.jsonl` in place, so the
-   * store never loses a segment to a compression fault.
+   * A failure anywhere before step 9 leaves the source `.jsonl` in place, so the
+   * store never loses a segment to a compression fault. The scratch file is the
+   * only thing a failure removes, and only because it was never installed as
+   * evidence. Nothing else is ever deleted to reclaim capacity.
    */
   private async compressAndVerify(params: {
     sourcePath: string;
+    sourceIdentity: FileIdentity;
     plainFilename: string;
     compressedFilename: string;
     expectedUid: number;
     auditDir: string;
     boundary: RotationSealBoundary;
   }): Promise<string> {
-    const { sourcePath, compressedFilename, expectedUid, auditDir } = params;
+    const { sourcePath, sourceIdentity, compressedFilename, expectedUid, auditDir } = params;
     const archivePath = path.join(auditDir, compressedFilename);
     const scratchPath = path.join(auditDir, `rotation-${randomUUID()}.tmp`);
+
+    // The transition holds both representations at once, so its peak is the
+    // current usage plus every compressed byte written. The budget is measured
+    // against that peak, not against the finished size.
+    const usedAtStart = scanAuditStorePhysicalBytes(auditDir, expectedUid);
+    if (usedAtStart >= TOTAL_AUDIT_BUDGET_BYTES) {
+      this.capability.markRotationFailed();
+      throw createCodedError(
+        'AUDIT_STORAGE_EXHAUSTED',
+        `audit storage budget exhausted before compression: ${usedAtStart} bytes retained of ${TOTAL_AUDIT_BUDGET_BYTES}`,
+      );
+    }
+
+    let compressedBytesWritten = 0;
+    const budgetGuard = new Transform({
+      transform: (chunk: Buffer, _encoding, callback) => {
+        compressedBytesWritten += chunk.length;
+        if (usedAtStart + compressedBytesWritten >= TOTAL_AUDIT_BUDGET_BYTES) {
+          callback(
+            createCodedError(
+              'AUDIT_STORAGE_EXHAUSTED',
+              `compression would reach the audit storage budget: ${usedAtStart} bytes retained plus ${compressedBytesWritten} compressed bytes of ${TOTAL_AUDIT_BUDGET_BYTES}`,
+            ),
+          );
+          return;
+        }
+        callback(null, chunk);
+      },
+    });
 
     if (this.hooks?.failCompressionCreate === true) {
       this.capability.markRotationFailed();
@@ -1269,6 +1828,7 @@ export class RotatingAuditStore {
     }
 
     let scratchFd: number | null = null;
+    let sourceFd: number | null = null;
     try {
       scratchFd = fs.openSync(
         scratchPath,
@@ -1276,9 +1836,41 @@ export class RotatingAuditStore {
         0o600,
       );
 
+      // Descriptor authority, not pathname trust: the source is opened with
+      // `O_NOFOLLOW`, validated, and required to be the exact inode and size the
+      // physical rotation finalized.
+      try {
+        sourceFd = fs.openSync(sourcePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+      } catch (err: unknown) {
+        if ((err as { code?: string })?.code === 'ELOOP') {
+          throw createCodedError('SYMLINK_DETECTED', 'rotated segment is a symbolic link');
+        }
+        throw err;
+      }
+      const sourceStats = validateFileDescriptorAuthority(sourceFd, 0o600, expectedUid);
+      if (
+        sourceStats.dev !== sourceIdentity.dev ||
+        sourceStats.ino !== sourceIdentity.ino ||
+        sourceStats.size !== sourceIdentity.size
+      ) {
+        throw createCodedError(
+          'AUDIT_ROTATION_FAILED',
+          'rotated source no longer matches the finalized active segment',
+        );
+      }
+
+      const sourceStream = fs.createReadStream(sourcePath, {
+        fd: sourceFd,
+        autoClose: true,
+        highWaterMark: 64 * 1024,
+      });
+      // Ownership of the descriptor transfers to the stream.
+      sourceFd = null;
+
       await pipeline(
-        fs.createReadStream(sourcePath),
+        sourceStream,
         createGzip({ level: 6 }),
+        budgetGuard,
         fs.createWriteStream(scratchPath, { fd: scratchFd, autoClose: false }),
       );
 
@@ -1308,10 +1900,18 @@ export class RotatingAuditStore {
         archivePath,
         compressedFilename,
         sourcePath,
+        sourceIdentity,
         plainFilename: params.plainFilename,
         expectedUid,
         boundary: params.boundary,
       });
+
+      this.hooks?.beforeSourceRemoval?.();
+
+      // Removal is identity-checked, never name-checked. The pathname must still
+      // resolve to the very artifact that was compressed; a replacement left in
+      // its place is neither deleted nor mistaken for the source.
+      assertPathIdentity(sourcePath, sourceIdentity, 'plain rotated source');
 
       if (this.hooks?.failSourceRemoval === true) {
         throw createCodedError(
@@ -1335,6 +1935,13 @@ export class RotatingAuditStore {
           // ignore
         }
       }
+      if (sourceFd !== null) {
+        try {
+          fs.closeSync(sourceFd);
+        } catch {
+          // ignore
+        }
+      }
       try {
         if (fs.existsSync(scratchPath)) fs.unlinkSync(scratchPath);
       } catch {
@@ -1349,12 +1956,20 @@ export class RotatingAuditStore {
     archivePath: string;
     compressedFilename: string;
     sourcePath: string;
+    sourceIdentity: FileIdentity;
     plainFilename: string;
     expectedUid: number;
     boundary: RotationSealBoundary;
   }): Promise<void> {
-    const { archivePath, compressedFilename, sourcePath, plainFilename, expectedUid, boundary } =
-      params;
+    const {
+      archivePath,
+      compressedFilename,
+      sourcePath,
+      sourceIdentity,
+      plainFilename,
+      expectedUid,
+      boundary,
+    } = params;
 
     const parsed = parseRotatedSegmentFilename(compressedFilename);
     if (parsed === null) {
@@ -1384,11 +1999,20 @@ export class RotatingAuditStore {
       label: compressedFilename,
     });
 
-    const plainDigest = await digestSegment(sourcePath, expectedUid, false, {
-      ...shared,
-      lifecycleMap: new Map(),
-      label: plainFilename,
-    });
+    // The plain source is verified against the identity the physical rotation
+    // finalized, so a pathname swapped between rotation and verification is
+    // rejected instead of being certified as the compressed artifact's twin.
+    const plainDigest = await digestSegment(
+      sourcePath,
+      expectedUid,
+      false,
+      {
+        ...shared,
+        lifecycleMap: new Map(),
+        label: plainFilename,
+      },
+      sourceIdentity,
+    );
 
     if (this.hooks?.failPostCompressionVerification === true) {
       throw createCodedError(
