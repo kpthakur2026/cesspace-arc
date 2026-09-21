@@ -22,6 +22,9 @@
  *
  * @internal
  */
+
+import type { AuditCheckpointV1 } from '../checkpoint.js';
+
 export const CHECKPOINT_TEST_TOKEN = Symbol('CHECKPOINT_TEST_TOKEN');
 
 /** Deterministic seams for Task-4 security tests. @internal */
@@ -103,4 +106,16 @@ export interface CheckpointTestHooks {
    * runs after it, on the descriptor that was really opened.
    */
   beforeFinalKeyOpen?: () => void;
+
+  /**
+   * Runs after a checkpoint has been durably appended, `fdatasync`ed and had
+   * every in-memory cursor advanced.
+   *
+   * This is the Tier-3 verified-checkpoint handoff (Task 5 §37): the checkpoint
+   * offered here is already on disk, so a handler that spools and transmits it
+   * inherits the §14.4 ordering without having to reconstruct it. The hook
+   * cannot make an unpersisted checkpoint observable, because it runs strictly
+   * after the durable transition.
+   */
+  onCheckpointEmitted?: (checkpoint: AuditCheckpointV1) => void | Promise<void>;
 }

@@ -48,6 +48,13 @@ import { MAX_TORN_TAIL_BYTES, classifyTrailingBytes } from './internal/torn-tail
 import { assertPathIdentity } from './internal/file-identity.js';
 import { CHECKPOINT_FILENAME } from './internal/checkpoint-constants.js';
 import {
+  ANCHOR_RECEIPT_FILENAME,
+  ANCHOR_SPOOL_DIRECTORY_MODE,
+  ANCHOR_SPOOL_DIRNAME,
+  ANCHOR_SPOOL_FILENAME_REGEX,
+  ANCHOR_SPOOL_FILE_MODE,
+} from './internal/anchor-constants.js';
+import {
   ROTATION_CAPABILITY_TOKEN,
   type FileIdentity,
   type RotationStorageCapability,
@@ -357,7 +364,8 @@ export interface RotationResult {
  * Directory enumeration, authority and classification (rc06 §50, §72)
  * -------------------------------------------------------------------------- */
 
-type StoreEntryKind = 'ACTIVE' | 'AUXILIARY' | 'ROTATED' | 'SCRATCH' | 'UNKNOWN';
+type StoreEntryKind =
+  'ACTIVE' | 'AUXILIARY' | 'AUXILIARY_DIRECTORY' | 'ROTATED' | 'SCRATCH' | 'UNKNOWN';
 
 interface StoreEntry {
   filename: string;
@@ -365,6 +373,117 @@ interface StoreEntry {
   kind: StoreEntryKind;
   parsed: ParsedRotatedSegmentFilename | null;
   physicalByteLength: number;
+}
+
+/**
+ * Validates the Tier-3 spool directory and returns its total physical bytes.
+ *
+ * The directory is the one recognized store entry that is not a file, so its
+ * authority is checked against the directory rules — 0700, expected uid, not a
+ * symbolic link, not multiply reachable — and then every child is checked
+ * against the spool entry rules: a canonical lowercase 64-hex `<checkpointHash>
+ * .json` name, a regular file, 0600, the expected uid, a single link and not a
+ * symlink.
+ *
+ * This is rc06 §21 and RC06-NEG-99: a spool directory that is wider than 0700,
+ * or an entry that is wider than 0600 or is a symbolic link, is a loading
+ * failure rather than something to be repaired. The bytes returned include the
+ * directory's own inode size, because the budget is about physical storage and a
+ * directory occupies some.
+ */
+function scanAnchorSpoolDirectory(
+  directoryPath: string,
+  directoryStats: fs.Stats,
+  expectedUid: number,
+): number {
+  if (!directoryStats.isDirectory()) {
+    throw createCodedError(
+      'AUDIT_STORE_INSECURE_ENTRY',
+      `audit store entry is not a directory: ${ANCHOR_SPOOL_DIRNAME}`,
+    );
+  }
+  if (directoryStats.uid !== expectedUid) {
+    throw createCodedError(
+      'AUDIT_STORE_INSECURE_ENTRY',
+      `audit store entry is not owned by the expected uid: ${ANCHOR_SPOOL_DIRNAME}`,
+    );
+  }
+  if ((directoryStats.mode & 0o777) !== ANCHOR_SPOOL_DIRECTORY_MODE) {
+    throw createCodedError(
+      'AUDIT_STORE_INSECURE_ENTRY',
+      `audit store entry mode must be 0700: ${ANCHOR_SPOOL_DIRNAME}`,
+    );
+  }
+
+  let children: string[];
+  try {
+    children = fs.readdirSync(directoryPath);
+  } catch (err) {
+    throw createCodedError(
+      'AUDIT_STORAGE_UNAVAILABLE',
+      `unable to enumerate ${ANCHOR_SPOOL_DIRNAME}`,
+      { cause: err },
+    );
+  }
+
+  let bytes = directoryStats.size;
+
+  for (const child of children) {
+    const childPath = path.join(directoryPath, child);
+
+    if (!ANCHOR_SPOOL_FILENAME_REGEX.test(child)) {
+      throw createCodedError(
+        'AUDIT_STORE_UNRECOGNIZED_ENTRY',
+        `Unrecognized entry in ${ANCHOR_SPOOL_DIRNAME}: ${child}`,
+      );
+    }
+
+    let childStats: fs.Stats;
+    try {
+      childStats = fs.lstatSync(childPath);
+    } catch (err) {
+      throw createCodedError(
+        'AUDIT_STORAGE_UNAVAILABLE',
+        `unable to stat ${ANCHOR_SPOOL_DIRNAME}/${child}`,
+        { cause: err },
+      );
+    }
+
+    if (childStats.isSymbolicLink()) {
+      throw createCodedError(
+        'SYMLINK_DETECTED',
+        `${ANCHOR_SPOOL_DIRNAME} entry is a symbolic link: ${child}`,
+      );
+    }
+    if (!childStats.isFile()) {
+      throw createCodedError(
+        'AUDIT_STORE_INSECURE_ENTRY',
+        `${ANCHOR_SPOOL_DIRNAME} entry is not a regular file: ${child}`,
+      );
+    }
+    if (childStats.uid !== expectedUid) {
+      throw createCodedError(
+        'AUDIT_STORE_INSECURE_ENTRY',
+        `${ANCHOR_SPOOL_DIRNAME} entry is not owned by the expected uid: ${child}`,
+      );
+    }
+    if (childStats.nlink !== 1) {
+      throw createCodedError(
+        'AUDIT_STORE_INSECURE_ENTRY',
+        `${ANCHOR_SPOOL_DIRNAME} entry has an unexpected link count: ${child}`,
+      );
+    }
+    if ((childStats.mode & 0o777) !== ANCHOR_SPOOL_FILE_MODE) {
+      throw createCodedError(
+        'AUDIT_STORE_INSECURE_ENTRY',
+        `${ANCHOR_SPOOL_DIRNAME} entry mode must be 0600: ${child}`,
+      );
+    }
+
+    bytes += childStats.size;
+  }
+
+  return bytes;
 }
 
 function classifyStoreEntry(filename: string): StoreEntryKind {
@@ -378,6 +497,15 @@ function classifyStoreEntry(filename: string): StoreEntryKind {
   // teaching the rotated-filename parser about it — keeps a checkpoint from ever
   // being mistaken for primary evidence.
   if (filename === CHECKPOINT_FILENAME) return 'AUXILIARY';
+  // The Tier-3 anchor receipt ledger is a durable auxiliary artifact for the same
+  // reasons, and it is recognized by exact name for the same reason (rc06 §21).
+  if (filename === ANCHOR_RECEIPT_FILENAME) return 'AUXILIARY';
+  // The Tier-3 pending-checkpoint spool is the one recognized entry that is a
+  // *directory*. It is enumerated and authority-checked like every other entry,
+  // and every byte it holds counts toward the physical budget — but it is
+  // validated as a directory, and its children recursively, rather than being
+  // rejected for failing the regular-file rules that do not apply to it.
+  if (filename === ANCHOR_SPOOL_DIRNAME) return 'AUXILIARY_DIRECTORY';
   if (TORN_SIDECAR_REGEX.test(filename)) return 'AUXILIARY';
   if (ROTATION_SCRATCH_REGEX.test(filename)) return 'SCRATCH';
   if (parseRotatedSegmentFilename(filename) !== null) return 'ROTATED';
@@ -433,6 +561,18 @@ function enumerateAuditStoreEntries(auditDir: string, expectedUid: number): Stor
         `audit store entry is a symbolic link: ${filename}`,
       );
     }
+
+    if (kind === 'AUXILIARY_DIRECTORY') {
+      entries.push({
+        filename,
+        filePath,
+        kind,
+        parsed: null,
+        physicalByteLength: scanAnchorSpoolDirectory(filePath, lstat, expectedUid),
+      });
+      continue;
+    }
+
     if (!lstat.isFile()) {
       throw createCodedError(
         'AUDIT_STORE_INSECURE_ENTRY',

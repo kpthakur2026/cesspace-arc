@@ -674,6 +674,22 @@ interface CheckpointVerificationCore {
   fingerprint: string;
   /** Deterministic seams. Absent on the offline public verification path. */
   hooks?: CheckpointTestHooks;
+  /**
+   * The verified-checkpoint handoff (Task 5 §37).
+   *
+   * Called once per checkpoint, in checkpoint order, after every Task-4 check
+   * on that checkpoint has passed — coverage, chain continuity, terminal record
+   * hash against the verified primary evidence, store binding, trust-root
+   * binding and the Ed25519 signature. A checkpoint handed here is a checkpoint
+   * that was proven from the primary ledger, not merely one that parsed.
+   *
+   * The observer is offered the checkpoint before the artifact identity is
+   * re-established, so an observer that persists anything must treat its own
+   * writes as provisional until the verification promise resolves: a raced
+   * artifact fails the whole verification, and a plan built here is discarded
+   * with it.
+   */
+  onVerifiedCheckpoint?: (checkpoint: AuditCheckpointV1) => void | Promise<void>;
 }
 
 /**
@@ -877,6 +893,13 @@ async function verifyCheckpointHistoryCore(
     previousCheckpointHash = checkpoint.checkpointHash;
     lastCheckpointHash = checkpoint.checkpointHash;
     lastCheckpointTerminalRecordHash = checkpoint.terminalRecordHash;
+
+    // Every claim above holds, so this checkpoint is verified primary-derived
+    // evidence. The handoff runs last, so an observer never sees a checkpoint
+    // that a later check on the same checkpoint would have rejected.
+    if (core.onVerifiedCheckpoint !== undefined) {
+      await core.onVerifiedCheckpoint(checkpoint);
+    }
   };
 
   // Identity of the artifact this history was verified from. Only a PRESENT
@@ -1023,6 +1046,56 @@ export async function verifyCheckpointHistory(
     publicKey: trustRoot.publicKey,
     storeId: metadata.storeId,
     fingerprint: trustRoot.fingerprint,
+  });
+}
+
+/**
+ * Verifies the checkpoint history and hands every verified checkpoint to an
+ * observer as it is proven (RC-06 Task 5 §37).
+ *
+ * This is the same pass, with the same authority rules and the same fail-closed
+ * outcomes as {@link verifyCheckpointHistory}; the only difference is the
+ * handoff. It exists because Tier-3 reconciliation has to walk the verified
+ * checkpoint history in order without ever retaining it: the anchor spool plan
+ * is built from the checkpoints the primary ledger actually proves, one at a
+ * time, and is thrown away entirely if the verification does not complete.
+ *
+ * Reusing the Task-4 verifier rather than re-deriving server-anchor state from
+ * `audit-checkpoints.jsonl` directly is the point: a checkpoint is only ever
+ * spooled or acknowledged because the primary evidence proved it.
+ *
+ * @internal
+ */
+export async function verifyCheckpointHistoryWithObserver(
+  options: CheckpointHistoryVerificationOptions & { expectedUid?: number },
+  onVerifiedCheckpoint: (checkpoint: AuditCheckpointV1) => void | Promise<void>,
+): Promise<CheckpointHistoryVerificationResult> {
+  const expectedUid = options.expectedUid ?? getProcessUid();
+  validateAuditDirectory(options.directory, {
+    expectedUid,
+    workspacePaths: [...(options.workspacePaths ?? [])],
+  });
+
+  const metadata = loadStoreMetadataFile(options.directory, expectedUid);
+  const trustRoot = loadEd25519TrustRootFile(options.publicKeyPath, {
+    purpose: 'CHECKPOINT',
+    expectedUid,
+  });
+
+  if (trustRoot.fingerprint !== metadata.checkpointPublicKeyFingerprint) {
+    throw createCodedError(
+      'FINGERPRINT_MISMATCH',
+      'configured checkpoint public key does not match audit-store.json.checkpointPublicKeyFingerprint',
+    );
+  }
+
+  return verifyCheckpointHistoryCore({
+    auditDir: options.directory,
+    expectedUid,
+    publicKey: trustRoot.publicKey,
+    storeId: metadata.storeId,
+    fingerprint: trustRoot.fingerprint,
+    onVerifiedCheckpoint,
   });
 }
 
@@ -1687,6 +1760,15 @@ export class Tier2CheckpointEngine implements RotationCheckpointSealer {
     this.lastCheckpointSequence = sequenceEnd;
     this.lastCheckpointHash = checkpointHash;
     this.lastCheckpointTerminalRecordHash = terminalRecordHash;
+
+    // The durable-completion handoff (Task 5 §37). It runs after the append and
+    // its `fdatasync` have both succeeded and after every cursor has advanced,
+    // so an observer can only ever be offered a checkpoint that is already on
+    // disk. A composition that anchors from here therefore gets the ordering
+    // §14.4 mandates for free: checkpoint durable, then spool, then network.
+    if (this.hooks.onCheckpointEmitted !== undefined) {
+      await this.hooks.onCheckpointEmitted(checkpoint);
+    }
 
     return checkpoint;
   }
