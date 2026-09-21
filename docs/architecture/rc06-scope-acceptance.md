@@ -195,10 +195,16 @@ When ARC starts against an existing non-empty audit store:
 3. Attempting to reset `sequenceNumber` to 1 or starting with the zero genesis hash while prior
    persistent records exist causes immediate fatal startup failure.
 
-### 5.3 Prohibition of `clear()` in Production
+### 5.3 Prohibition of `clear()` and Evidence Deletion in Production
 
-The `clear()` method is designated exclusively for isolated in-memory unit tests.
-In persistent production mode, calling `clear()` throws an uncatchable fatal error.
+Persistent production audit storage exposes no `clear()` API.
+
+- **Test-Only Isolation:** The `clear()` method is designated exclusively for isolated in-memory unit tests and remains permitted only on the isolated legacy/in-memory test logger (`AuditLogger`) where already required by pre-RC-06 tests.
+- **Production Interface Prohibition:** `PersistentAuditStorage` and all future persistent audit production interfaces MUST NOT expose a history-clearing method.
+- **No Clearing Vector:** No MCP method, CLI command, configuration option, admin IPC method, or runtime execution path may invoke or expose automatic clearing of persistent audit evidence.
+- **Test Helpers Bounded:** Any test-only reset helper or test seam must remain strictly outside production-reachable interfaces.
+- **No "Catch-and-Continue":** Production callers must never implement "catch and continue" semantics around an attempted persistent evidence deletion because no such operation exists or is reachable.
+- **Zero-Auto-Deletion Invariant:** Persistent production storage strictly adheres to zero automatic audit evidence deletion. No `purge`, `reset`, `clear`, `truncate-history`, `delete-all`, or `log-wrap` functionality exists or may be added to production interfaces.
 
 ---
 
@@ -326,7 +332,24 @@ export interface AuditLifecycleMetadata {
 - `RECOVERY_INDETERMINATE` signifies that ARC cannot establish whether the operation completed
   before a process crash or power loss.
 
-### 7.2 Strict Execution State Machine
+### 7.2 Strict Execution & Lifecycle State Machine
+
+The frozen lifecycle state machine establishes two mutually exclusive execution branches from initial request receipt:
+
+```text
+NEW
+ ├─→ DENIED
+ │    terminal
+ │
+ └─→ STARTED
+      ├─→ COMPLETED
+      │    terminal
+      │
+      └─→ RECOVERY_INDETERMINATE
+           terminal
+```
+
+There are no other valid transitions. In particular, `STARTED → DENIED` is **NOT** a valid lifecycle transition because policy evaluation strictly precedes subsystem dispatch and `STARTED` emission.
 
 For every privileged tool invocation (filesystem reads, Git reads, terminal/process executions, mutations):
 
@@ -366,7 +389,7 @@ For every privileged tool invocation (filesystem reads, Git reads, terminal/proc
    - All subsequent privileged MCP tool invocations (reads AND mutations) are rejected.
    - No remote "read-only availability" escape hatch is preserved.
    - Only bounded local operator audit status and verification commands remain accessible.
-3. **Denied Requests:** A policy `DENY` produces one durable `DENIED` record before returning the denial error.
+3. **Denied Requests & operationId Semantics:** A policy `DENY` produces one durable `DENIED` record before returning the denial error. A durable policy denial carries a server-generated UUIDv4 `operationId`. Its full lifecycle consists solely of `DENIED`. That operation ID represents a standalone terminal branch and MUST NOT later be reused by `STARTED`, `COMPLETED`, or `RECOVERY_INDETERMINATE`.
 
 ### 7.3 Crash Recovery for Dangling `STARTED` Operations
 
@@ -380,27 +403,55 @@ This state MUST NOT be silently interpreted as success or failure.
 
 #### 7.3.1 Dangling-Operation Determination & Terminal Invariants
 
-An `operationId` is defined as dangling **if and only if** retained history contains a valid `STARTED` record and **no later** valid lifecycle record for that same `operationId` with phase:
+An `operationId` is defined as dangling **if and only if** retained history contains one valid `STARTED` record and **no later** valid lifecycle record for that same `operationId` with phase:
 
 - `COMPLETED`
-- `DENIED`
 - `RECOVERY_INDETERMINATE`
 
+A policy-denied operation never has a preceding `STARTED` record; its complete lifecycle is solely `DENIED`.
 A prior `RECOVERY_INDETERMINATE` record is terminal for reconciliation purposes. Startup MUST NOT append a second recovery marker for an already-reconciled operation.
 
-#### 7.3.2 Strict Malformed Lifecycle Histories Handling
+#### 7.3.2 Lifecycle Structural Invariants
 
-Task-2 recovery and verification MUST fail closed rather than invent semantics or auto-normalize if a cryptographically valid chain contains structurally impossible lifecycle sequences:
+For each `operationId`, only these complete histories are valid in an audit store:
+
+1. `DENIED` (standalone policy/auth rejection)
+2. `STARTED → COMPLETED` (normal execution completion)
+3. `STARTED → RECOVERY_INDETERMINATE` (reconciled crash recovery)
+
+During a crash before startup reconciliation, this temporary incomplete history is valid:
+
+- `STARTED` (dangling operation requiring Task-2 reconciliation)
+
+Everything else is structural lifecycle corruption.
+
+#### 7.3.3 Strict Malformed Lifecycle Histories Handling
+
+Task-2 recovery and verification MUST fail closed rather than invent semantics or auto-normalize if a cryptographically valid chain contains structurally impossible lifecycle sequences. Fail-closed rejection is enforced for at least:
 
 - `COMPLETED` without prior `STARTED`
-- `DENIED` after `STARTED` for an execution that was already `COMPLETED`
-- Multiple `STARTED` records for the same `operationId` without an intervening terminal phase
-- Multiple terminal phases for the same `operationId`
-- `RECOVERY_INDETERMINATE` without a prior `STARTED`
+- `RECOVERY_INDETERMINATE` without prior `STARTED`
+- `STARTED` after `DENIED`
+- `DENIED` after `STARTED`
+- `DENIED` after `COMPLETED`
+- `DENIED` after `RECOVERY_INDETERMINATE`
+- Multiple `STARTED` records for the same `operationId`
+- Multiple `COMPLETED` records for the same `operationId`
+- Multiple `DENIED` records for the same `operationId`
+- Multiple `RECOVERY_INDETERMINATE` records for the same `operationId`
+- `COMPLETED` after `RECOVERY_INDETERMINATE`
+- `RECOVERY_INDETERMINATE` after `COMPLETED`
+- Any lifecycle record after a terminal phase (`COMPLETED`, `DENIED`, or `RECOVERY_INDETERMINATE`) for the same `operationId`
 
-Any such structural impossibility halts startup with a bounded recovery/integrity error (`AUDIT_LIFECYCLE_CORRUPTION`).
+Any such structural impossibility halts startup with a bounded recovery/integrity error:
 
-#### 7.3.3 Canonical Recovery Actor Encoding
+```text
+AUDIT_LIFECYCLE_CORRUPTION
+```
+
+The recovery engine MUST NOT normalize, repair, or discard these histories.
+
+#### 7.3.4 Canonical Recovery Actor Encoding
 
 The recovery record MUST adhere to the closed V1 actor schema. The canonical recovery actor is frozen as exactly:
 
@@ -420,7 +471,7 @@ Rules:
 - `clientType: 'SYSTEM'` is the canonical V1 representation of a system-derived recovery actor.
 - Callers cannot supply or override this actor for recovery reconciliation.
 
-#### 7.3.4 Exact `RECOVERY_INDETERMINATE` Record Construction
+#### 7.3.5 Exact `RECOVERY_INDETERMINATE` Record Construction
 
 A recovery record MUST be a valid `PersistentAuditRecordV1`. For each dangling `STARTED` operation, ARC constructs the recovery record with:
 
@@ -449,7 +500,7 @@ A recovery record MUST be a valid `PersistentAuditRecordV1`. For each dangling `
   - `lifecycle` (phase is `RECOVERY_INDETERMINATE`)
   - `gateway` (omitted from recovery record)
 
-#### 7.3.5 Mandatory `execution` Block Representation
+#### 7.3.6 Mandatory `execution` Block Representation
 
 The V1 record requires an `execution` block, but recovery must not claim that the underlying operation succeeded or failed. The recovery record's `execution` block is frozen as:
 
@@ -468,7 +519,7 @@ execution: {
 
 The authoritative underlying-operation outcome remains strictly **`INDETERMINATE`** by virtue of `lifecycle.phase = 'RECOVERY_INDETERMINATE'`. The Task-1 protocol execution status enum (`SUCCESS | ERROR | DENIED | TIMEOUT | CANCELLED`) is preserved without widening.
 
-#### 7.3.6 Mandatory Recovery `error` Block Representation
+#### 7.3.7 Mandatory Recovery `error` Block Representation
 
 The recovery record includes a fixed, bounded error block:
 
@@ -484,7 +535,7 @@ Rules:
 - The error message is fixed and deterministic.
 - No raw exception strings, stack traces, host paths, request payload data, or caller-controlled text may be placed in this block.
 
-#### 7.3.7 Recovery Persistence & Failure Handling
+#### 7.3.8 Recovery Persistence & Failure Handling
 
 On startup, after active segment verification and torn-tail recovery:
 
