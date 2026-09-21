@@ -1749,48 +1749,25 @@ describe('CesSpace ARC — RC-06 Task 1: Persistent Append Storage Foundation', 
       assert.strictEqual(storage.getState(), 'UNINITIALIZED');
     });
 
-    test('Package deep-import subpath protection for internal modules', async () => {
-      await assert.rejects(
-        async () => {
-          await import('@cesspace-arc/audit/internal/storage-testing');
-        },
-        (err) => err.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED',
-      );
+    test('Package deep-import subpath protection for internal modules', () => {
+      const pkgUrl = new URL('../packages/audit/package.json', import.meta.url);
+      const subpaths = [
+        '@cesspace-arc/audit/internal/storage-testing',
+        '@cesspace-arc/audit/internal/recovery-testing',
+        '@cesspace-arc/audit/internal/storage-capability',
+        '@cesspace-arc/audit/internal/recovery-capability',
+        '@cesspace-arc/audit/storage',
+        '@cesspace-arc/audit/recovery',
+      ];
 
-      await assert.rejects(
-        async () => {
-          await import('@cesspace-arc/audit/internal/recovery-testing');
-        },
-        (err) => err.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED',
-      );
-
-      await assert.rejects(
-        async () => {
-          await import('@cesspace-arc/audit/internal/storage-capability');
-        },
-        (err) => err.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED',
-      );
-
-      await assert.rejects(
-        async () => {
-          await import('@cesspace-arc/audit/internal/recovery-capability');
-        },
-        (err) => err.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED',
-      );
-
-      await assert.rejects(
-        async () => {
-          await import('@cesspace-arc/audit/storage');
-        },
-        (err) => err.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED',
-      );
-
-      await assert.rejects(
-        async () => {
-          await import('@cesspace-arc/audit/recovery');
-        },
-        (err) => err.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED',
-      );
+      for (const subpath of subpaths) {
+        assert.throws(
+          () => {
+            import.meta.resolve(subpath, pkgUrl);
+          },
+          (err) => err.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED',
+        );
+      }
     });
   });
 });
