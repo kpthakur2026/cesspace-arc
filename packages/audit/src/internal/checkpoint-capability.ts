@@ -81,4 +81,26 @@ export interface CheckpointTestHooks {
    * revalidation runs after it and fails closed.
    */
   beforeCheckpointAppend?: (filePath: string) => void;
+
+  /**
+   * Runs after the checkpoint stream has been read to EOF and verified, and
+   * immediately before the artifact identity is re-established.
+   *
+   * Lets a test grow, shrink, replace or detach the verified artifact in the
+   * window between "the bytes were consumed" and "the bytes are still what the
+   * artifact contains". The identity check runs after it and fails closed, so it
+   * cannot make unverified bytes look verified.
+   */
+  beforeCheckpointVerificationIdentityCheck?: (filePath: string) => void;
+
+  /**
+   * Runs after the signing key's parent chain has been pinned by descriptor and
+   * immediately before the final key component is opened.
+   *
+   * Lets a test substitute a parent pathname in exactly the window a pathname-
+   * based check would be vulnerable in. The walk no longer consults a pathname,
+   * so the substitution cannot redirect it — and the workspace decision still
+   * runs after it, on the descriptor that was really opened.
+   */
+  beforeFinalKeyOpen?: () => void;
 }

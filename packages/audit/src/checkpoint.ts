@@ -587,14 +587,22 @@ function syncAuditDirectory(auditDir: string): void {
  * "line" that grows past {@link MAX_CHECKPOINT_LINE_BYTES} without a newline is
  * rejected rather than accumulated. The whole checkpoint file is never read into
  * memory, however long the store lives.
+ *
+ * Every physical byte handed back by the read — terminators included — is also
+ * counted into `consumed`, so the caller can hold the artifact to the identity
+ * it had before the first byte was read.
  */
-async function* readCheckpointLines(handle: FileHandle): AsyncGenerator<Buffer> {
+async function* readCheckpointLines(
+  handle: FileHandle,
+  consumed: { bytes: number },
+): AsyncGenerator<Buffer> {
   const chunk = Buffer.allocUnsafe(CHECKPOINT_READ_CHUNK_BYTES);
   let carry = Buffer.alloc(0);
 
   for (;;) {
     const { bytesRead } = await handle.read(chunk, 0, chunk.length, null);
     if (bytesRead === 0) break;
+    consumed.bytes += bytesRead;
 
     const slice = chunk.subarray(0, bytesRead);
     carry = carry.length === 0 ? Buffer.from(slice) : Buffer.concat([carry, slice]);
@@ -664,6 +672,47 @@ interface CheckpointVerificationCore {
   publicKey: crypto.KeyObject;
   storeId: string;
   fingerprint: string;
+  /** Deterministic seams. Absent on the offline public verification path. */
+  hooks?: CheckpointTestHooks;
+}
+
+/**
+ * The identity of the checkpoint artifact as it was BEFORE verification read it.
+ *
+ * A size observed after the read is not evidence about the bytes that were read:
+ * the same inode can be appended to between the verifier's EOF and its final
+ * `fstat`. Recording the identity first and then accounting for every byte
+ * consumed is what makes the recorded size describe the verified stream rather
+ * than whatever the file happened to be when the verifier looked back.
+ *
+ * @internal
+ */
+interface CheckpointArtifactIdentity {
+  dev: number;
+  ino: number;
+  size: number;
+}
+
+/** Reads the identity a descriptor currently names. @internal */
+function captureCheckpointArtifactIdentity(fd: number): CheckpointArtifactIdentity {
+  const stats = fs.fstatSync(fd);
+  return { dev: Number(stats.dev), ino: Number(stats.ino), size: Number(stats.size) };
+}
+
+/**
+ * The bounded error for "the checkpoint artifact is not the artifact that was
+ * verified". One code covers growth, shrink, replacement and detachment, because
+ * they are one condition: the stream stopped being the stream.
+ */
+function checkpointRaceError(
+  message: string,
+  cause?: unknown,
+): ReturnType<typeof createCodedError> {
+  return createCodedError(
+    'AUDIT_CHECKPOINT_FILE_RACE',
+    `${CHECKPOINT_FILENAME} ${message}`,
+    cause === undefined ? undefined : { cause },
+  );
 }
 
 /**
@@ -730,10 +779,18 @@ async function verifyCheckpointHistoryCore(
     }
   }
 
+  // The identity of the stream BEFORE a single byte of it has been read. Every
+  // conclusion this function reaches about the artifact is bound to it, so a size
+  // observed after the read can never be mistaken for a statement about the bytes
+  // that were read.
+  const verificationStartIdentity =
+    checkpointHandle === null ? null : captureCheckpointArtifactIdentity(checkpointHandle.fd);
+
+  const consumed = { bytes: 0 };
   const iterator =
     checkpointHandle === null
       ? null
-      : readCheckpointLines(checkpointHandle)[Symbol.asyncIterator]();
+      : readCheckpointLines(checkpointHandle, consumed)[Symbol.asyncIterator]();
 
   let checkpointCount = 0;
   let checkpointedThrough = 0;
@@ -823,9 +880,9 @@ async function verifyCheckpointHistoryCore(
   };
 
   // Identity of the artifact this history was verified from. Only a PRESENT
-  // finding carries an identity, and it is taken from the very descriptor the
-  // two streams were read through — before that descriptor is closed, so the
-  // recorded identity cannot describe a file that was swapped in afterwards.
+  // finding carries an identity, and it is established by accounting for the
+  // bytes actually consumed — before the descriptor is closed, so the recorded
+  // identity cannot describe a file that was swapped in afterwards.
   let artifactState: VerifiedCheckpointArtifactState = { kind: 'ABSENT' };
 
   try {
@@ -852,13 +909,58 @@ async function verifyCheckpointHistoryCore(
       }
     }
 
-    if (checkpointHandle !== null) {
-      const stats = fs.fstatSync(checkpointHandle.fd);
+    if (checkpointHandle !== null && verificationStartIdentity !== null) {
+      // The stream has been read to EOF and every required checkpoint in it has
+      // been proven against the primary evidence. What remains is to prove that
+      // the artifact still *is* the stream those bytes came from: a same-inode
+      // append between the verifier's EOF and this moment would otherwise let an
+      // unverified suffix be recorded as a verified length.
+      core.hooks?.beforeCheckpointVerificationIdentityCheck?.(checkpointPath);
+
+      let finalStats: fs.Stats;
+      try {
+        finalStats = fs.fstatSync(checkpointHandle.fd);
+      } catch (cause) {
+        throw checkpointRaceError('could not be re-examined after verification', cause);
+      }
+
+      // Same object, same length, and that length is exactly what was read:
+      // neither growth nor shrink nor replacement is a verified stable artifact.
+      if (
+        Number(finalStats.dev) !== verificationStartIdentity.dev ||
+        Number(finalStats.ino) !== verificationStartIdentity.ino ||
+        Number(finalStats.size) !== verificationStartIdentity.size ||
+        consumed.bytes !== verificationStartIdentity.size
+      ) {
+        throw checkpointRaceError('changed while its history was being verified');
+      }
+
+      // And the canonical pathname must still name that same descriptor, so a
+      // verified history can never be reported as a PRESENT state for an inode
+      // the canonical path no longer identifies.
+      let pathStats: fs.Stats;
+      try {
+        pathStats = fs.lstatSync(checkpointPath);
+      } catch (cause) {
+        throw checkpointRaceError(
+          'no longer occupies its canonical pathname after verification',
+          cause,
+        );
+      }
+      if (
+        pathStats.isSymbolicLink() ||
+        Number(pathStats.dev) !== Number(finalStats.dev) ||
+        Number(pathStats.ino) !== Number(finalStats.ino)
+      ) {
+        throw checkpointRaceError('canonical pathname no longer identifies the verified artifact');
+      }
+
+      // The verified stable size, not a newly observed one.
       artifactState = {
         kind: 'PRESENT',
-        dev: Number(stats.dev),
-        ino: Number(stats.ino),
-        size: Number(stats.size),
+        dev: verificationStartIdentity.dev,
+        ino: verificationStartIdentity.ino,
+        size: verificationStartIdentity.size,
       };
     }
   } finally {
@@ -1037,6 +1139,9 @@ export class Tier2CheckpointEngine implements RotationCheckpointSealer {
     const metadata = loadStoreMetadataFile(config.directory, expectedUid);
 
     // Path isolation is established BEFORE any key bytes are read (Task 4 §47).
+    // This is defense in depth: it narrows nothing that the loader does not
+    // already enforce on the descriptor it actually opened, which is where the
+    // decision that matters is made.
     assertSigningKeyOutsideWorkspaces(config.signingKeyPath, workspacePaths);
 
     const trustRoot = loadEd25519TrustRootFile(config.publicKeyPath, {
@@ -1051,7 +1156,18 @@ export class Tier2CheckpointEngine implements RotationCheckpointSealer {
       );
     }
 
-    const signing = loadEd25519SigningKeyFile(config.signingKeyPath, { expectedUid });
+    // The loader owns the ordering: it pins every parent component by
+    // descriptor, decides workspace isolation against the location of the
+    // descriptor it is about to read, and only then hands back key material.
+    // No caller can read a key before that rule has been applied to the file it
+    // really came from.
+    const signing = loadEd25519SigningKeyFile(config.signingKeyPath, {
+      expectedUid,
+      workspacePaths,
+      ...(this.hooks.beforeFinalKeyOpen === undefined
+        ? {}
+        : { beforeFinalKeyOpen: this.hooks.beforeFinalKeyOpen }),
+    });
     if (signing.derivedFingerprint !== trustRoot.fingerprint) {
       throw createCodedError(
         'AUDIT_SIGNING_KEY_MISMATCH',
@@ -1065,6 +1181,7 @@ export class Tier2CheckpointEngine implements RotationCheckpointSealer {
       publicKey: trustRoot.publicKey,
       storeId: metadata.storeId,
       fingerprint: trustRoot.fingerprint,
+      hooks: this.hooks,
     });
 
     this.auditDir = config.directory;
@@ -1250,13 +1367,37 @@ export class Tier2CheckpointEngine implements RotationCheckpointSealer {
     }
 
     const filePath = path.join(this.auditDir, CHECKPOINT_FILENAME);
-    const fd =
-      state.kind === 'ABSENT'
-        ? this.createCheckpointFile(filePath)
-        : this.openVerifiedCheckpointFile(filePath, state);
 
+    // A stream verified PRESENT must still be reopenable as that same object.
+    // If any part of the reopen fails — deleted, replaced, redirected, or no
+    // longer carrying the authority it was verified with — the engine cannot
+    // distinguish an uncertain outcome from a durable one, so it stops for good
+    // rather than recreating the artifact, adopting what is there now, or
+    // retrying on a later call. The failure is reported as the race it is, with
+    // the underlying refusal preserved as the cause.
+    if (state.kind === 'PRESENT') {
+      let fd: number;
+      try {
+        fd = this.openVerifiedCheckpointFile(filePath, state);
+      } catch (err) {
+        this.failed = true;
+        if ((err as { code?: string } | null)?.code === 'AUDIT_CHECKPOINT_FILE_RACE') {
+          throw err;
+        }
+        throw createCodedError(
+          'AUDIT_CHECKPOINT_FILE_RACE',
+          `${CHECKPOINT_FILENAME} is no longer the artifact whose history was verified`,
+          { cause: err },
+        );
+      }
+      this.checkpointFd = fd;
+      this.expectedSize = state.size;
+      return fd;
+    }
+
+    const fd = this.createCheckpointFile(filePath);
     this.checkpointFd = fd;
-    this.expectedSize = state.kind === 'PRESENT' ? state.size : 0;
+    this.expectedSize = 0;
     return fd;
   }
 

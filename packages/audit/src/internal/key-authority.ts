@@ -10,14 +10,22 @@
  *  - regular file, mode exactly `0600`, owned by the expected real UID,
  *    `nlink === 1`, never a symbolic link (`O_NOFOLLOW`),
  *  - **no symbolic link anywhere in the path**, not merely in its final
- *    component: a `O_NOFOLLOW` final open still follows a symlinked *parent*, so
+ *    component: an `O_NOFOLLOW` final open still follows a symlinked *parent*, so
  *    a path such as `/safe/keys-link/signing.pem` reaches whatever
  *    `/safe/keys-link` points at while the final component stays a regular file,
- *  - opened with `O_NOFOLLOW`, then validated through `fstat()` on the resulting
- *    descriptor — never by validating a pathname and reopening it,
- *  - the validated pathname and the opened descriptor proven to be the same
- *    object (`dev`/`ino` agreement), so the authority check cannot be satisfied
- *    by one file while a different one is read,
+ *  - **traversed by descriptor, not by pathname**. Every component is opened
+ *    relative to the descriptor of the directory already proven to contain it —
+ *    the parent is never re-resolved from its path — so a parent directory
+ *    replaced *after* it was checked cannot redirect the walk. Node has no
+ *    `openat(2)`, but Linux exposes open descriptors under `/proc/self/fd`, and
+ *    opening `<bridge>/<parentFd>/<component>` is exactly that call. A host
+ *    without the bridge refuses with `AUDIT_PLATFORM_UNSUPPORTED` rather than
+ *    falling back to the pathname validation this replaced,
+ *  - each directory component validated through `fstat()` on its own descriptor
+ *    and retained until the next component has been opened through it,
+ *  - the final descriptor's location taken from the kernel's own answer for that
+ *    descriptor, so "the key is at this path" and "this is the file being read"
+ *    are one fact rather than two checks a race can separate,
  *  - read at most `MAX_SIGNING_KEY_BYTES + 1` bytes, so an oversize file is
  *    established by the read itself rather than by a `stat()` that could lie,
  *  - the file's whole content constrained to exactly one PEM block of the
@@ -27,9 +35,11 @@
  *  - algorithm fixed to Ed25519 by both the PEM label and
  *    `asymmetricKeyType`, with no negotiation and no fallback.
  *
- * Workspace isolation is evaluated on the same canonical, symlink-free identity
- * the file is actually opened through, so a symlink alias cannot make a key
- * inside a workspace merely *appear* to be outside one.
+ * Workspace isolation is evaluated on the location of the descriptor that is
+ * about to be read, against workspace boundaries resolved by the same pinned
+ * walk, so a symlink alias cannot make a key inside a workspace merely *appear*
+ * to be outside one — and no private key byte is consumed before that decision
+ * has been made.
  *
  * The purpose label parameterizes the loader for the future anchor-receipt trust
  * root. It does not weaken anything: both purposes enforce identical filesystem
@@ -44,7 +54,7 @@ import fs, { constants as fsConstants } from 'node:fs';
 import path from 'node:path';
 
 import { MAX_SIGNING_KEY_BYTES } from './checkpoint-constants.js';
-import { createCodedError } from './errors.js';
+import { createCodedError, type CodedError } from './errors.js';
 import { getProcessUid, validateFileDescriptorAuthority } from '../storage.js';
 
 /** Which trust root a load is for. Both currently enforce identical authority. */
@@ -131,32 +141,70 @@ export function getPrivateKeyLoadCount(): number {
 }
 
 /* -------------------------------------------------------------------------- *
- * Descriptor authority
- * -------------------------------------------------------------------------- */
-
-/* -------------------------------------------------------------------------- *
- * Canonical, symlink-free path authority
+ * Descriptor-pinned, symlink-free path authority
  * -------------------------------------------------------------------------- */
 
 /**
- * Resolves a key path to the canonical location it is actually reached through,
- * refusing any symbolic link in any component.
+ * The descriptor bridge used to open a child relative to an already-open parent.
  *
- * `O_NOFOLLOW` protects only the final component. A symlinked *parent* directory
- * is followed by the kernel exactly like a real directory, so `O_NOFOLLOW` alone
- * cannot establish where a key really lives — and the workspace rule is a
- * statement about location, not about the last path segment. Every component is
- * therefore inspected with `lstat` before the file is opened.
+ * Node exposes no `openat(2)`, but Linux exposes every open descriptor here, and
+ * opening `<bridge>/<parentFd>/<component>` is an `openat(parentFd, component)`:
+ * the resolution of `component` happens relative to the *descriptor*, never
+ * relative to a pathname that could have been replaced in the meantime.
+ */
+const PROC_SELF_FD = '/proc/self/fd';
+
+/** Kernel suffix reported for a descriptor whose file is no longer linked. */
+const DELETED_SUFFIX = ' (deleted)';
+
+/**
+ * Proves the host can traverse by descriptor rather than by pathname.
  *
- * The returned path is proven canonical twice over: no component is a symbolic
- * link, and the filesystem's own `realpath` agrees with it. The caller may use
- * it for policy comparisons, but must still bind it to the descriptor it opens —
- * a check on a pathname is not a check on a file.
+ * Checking a pathname and then opening it is not a security boundary: a parent
+ * directory can be replaced by a symbolic link in between, and the kernel
+ * follows a symlinked *parent* exactly like a real directory, so `O_NOFOLLOW`
+ * on the final component proves nothing about where the file came from. The
+ * remedy is to open each component relative to the descriptor of a directory
+ * that was already proven — which is only possible through this bridge.
+ *
+ * When the bridge is absent the loader refuses rather than silently falling
+ * back to the pathname-only validation it exists to replace.
+ */
+function assertDescriptorPinnedTraversalAvailable(): void {
+  const unsupported = (cause?: unknown): CodedError =>
+    createCodedError(
+      'AUDIT_PLATFORM_UNSUPPORTED',
+      'host platform lacks the descriptor-pinned path traversal required for key authority',
+      cause === undefined ? undefined : { cause },
+    );
+
+  if (process.platform !== 'linux') {
+    throw unsupported();
+  }
+
+  let probe: number | null = null;
+  try {
+    probe = fs.openSync(PROC_SELF_FD, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY);
+  } catch (cause) {
+    throw unsupported(cause);
+  } finally {
+    if (probe !== null) {
+      fs.closeSync(probe);
+    }
+  }
+}
+
+/**
+ * Validates the *shape* of a configured key path, lexically only.
+ *
+ * This decides nothing about authority. It exists so the component walk below
+ * has a well-defined, absolute, traversal-free path to walk; every statement
+ * about where the file actually is comes from the descriptors that walk yields.
  *
  * The error messages deliberately name no host path: a rejected key location
  * must not become a disclosure of the operator's filesystem layout.
  */
-function resolveCanonicalKeyPath(filePath: string, label: string): string {
+function assertKeyPathShape(filePath: string, label: string): string {
   if (typeof filePath !== 'string' || filePath.length === 0) {
     throw createCodedError('AUDIT_KEY_PATH_INVALID', `${label} path is required`);
   }
@@ -180,120 +228,356 @@ function resolveCanonicalKeyPath(filePath: string, label: string): string {
     );
   }
 
-  const segments = canonicalPath.split(path.sep);
-  let current = '';
-  for (let i = 1; i < segments.length; i++) {
-    current += path.sep + segments[i];
-    let stats: fs.Stats;
-    try {
-      stats = fs.lstatSync(current);
-    } catch (cause: unknown) {
-      const code = (cause as { code?: string } | null)?.code;
-      if (code === 'ENOENT') {
-        throw createCodedError('AUDIT_KEY_FILE_MISSING', `${label} does not exist`);
-      }
-      throw createCodedError(
-        'AUDIT_KEY_FILE_UNAVAILABLE',
-        `${label} could not be inspected safely`,
-        { cause },
-      );
+  return canonicalPath;
+}
+
+/** The path components of a canonical absolute path, outermost first. */
+function pathComponents(canonicalPath: string, label: string): string[] {
+  const components = canonicalPath.split(path.sep).filter((segment) => segment.length > 0);
+  for (const component of components) {
+    if (component === '.' || component === '' || component.includes('\0')) {
+      throw createCodedError('AUDIT_KEY_PATH_INVALID', `${label} path contains an invalid segment`);
     }
-    if (stats.isSymbolicLink()) {
-      throw createCodedError(
+  }
+  return components;
+}
+
+/**
+ * Classifies one component of a pinned parent without following it.
+ *
+ * Used only to choose an error code. `lstat` through `/proc/self/fd` never
+ * dereferences the component, so a symlink is observed as a symlink. A component
+ * that cannot be examined at all is reported as "not a symbolic link", which
+ * sends the caller down the `ENOENT` / not-a-directory branch rather than
+ * inventing a symlink finding it did not observe.
+ */
+function pinnedComponentIsSymlink(parentFd: number, component: string): boolean {
+  try {
+    return fs.lstatSync(`${PROC_SELF_FD}/${parentFd}/${component}`).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Turns a failed pinned open into the bounded error that describes it.
+ *
+ * A symbolic link is reported as `ENOTDIR` once `O_DIRECTORY` is in play, so the
+ * component is classified with a non-following `lstat` through the *same* pinned
+ * parent. That classification chooses the error text only — it is never the
+ * authority, which is the descriptor this function failed to produce.
+ */
+function pinnedOpenError(
+  parentFd: number,
+  component: string,
+  cause: unknown,
+  label: string,
+): CodedError {
+  const code = (cause as { code?: string } | null)?.code;
+
+  if (code === 'ELOOP' || code === 'ENOENT' || code === 'ENOTDIR') {
+    if (pinnedComponentIsSymlink(parentFd, component)) {
+      return createCodedError(
         'SYMLINK_DETECTED',
         `${label} path contains a symbolic link component`,
       );
     }
-  }
-
-  // Redundant with the walk above, and deliberately so: it is the filesystem's
-  // own answer to "where does this path actually lead", and any disagreement
-  // means the path is not the stable, canonical location the rules require.
-  let realPath: string;
-  try {
-    realPath = fs.realpathSync(canonicalPath);
-  } catch (cause: unknown) {
-    const code = (cause as { code?: string } | null)?.code;
     if (code === 'ENOENT') {
-      throw createCodedError('AUDIT_KEY_FILE_MISSING', `${label} does not exist`);
+      return createCodedError('AUDIT_KEY_FILE_MISSING', `${label} does not exist`);
     }
-    throw createCodedError('AUDIT_KEY_FILE_UNAVAILABLE', `${label} could not be resolved safely`, {
-      cause,
-    });
-  }
-  if (realPath !== canonicalPath) {
-    throw createCodedError(
-      'AUDIT_KEY_PATH_INVALID',
-      `${label} path is not a stable canonical location`,
-    );
+    return createCodedError('AUDIT_KEY_PATH_INVALID', `${label} path component is not a directory`);
   }
 
-  return canonicalPath;
+  return createCodedError('AUDIT_KEY_FILE_UNAVAILABLE', `${label} could not be opened safely`, {
+    cause,
+  });
+}
+
+/** Opens one path component relative to an already-authoritative parent. */
+function openPinnedComponent(
+  parentFd: number,
+  component: string,
+  directory: boolean,
+  label: string,
+): number {
+  const flags = directory
+    ? fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW
+    : fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW;
+
+  try {
+    return fs.openSync(`${PROC_SELF_FD}/${parentFd}/${component}`, flags);
+  } catch (cause) {
+    throw pinnedOpenError(parentFd, component, cause, label);
+  }
 }
 
 /**
- * Opens a canonical key path and proves the descriptor and the pathname are the
- * same object.
+ * Opens a key file by walking its path one descriptor at a time.
  *
- * The caller must close the returned descriptor. The `dev`/`ino` comparison is
- * what closes the window between "this path is authoritative" and "this is the
- * file being read": a pathname swapped for another regular file after the
- * authority check satisfies every pathname-level rule while handing back a
- * different inode.
+ * Each intermediate component is opened relative to the descriptor of the
+ * directory already proven to contain it, with `O_NOFOLLOW` so a symbolic link
+ * is refused rather than followed, and `O_DIRECTORY` so a non-directory cannot
+ * stand in for one. The directory descriptor is then validated by `fstat` —
+ * never by a pathname — and retained until the next component has been opened
+ * through it, so no step of the walk can be redirected after the fact.
+ *
+ * Directory descriptors are released as soon as the key descriptor exists. The
+ * caller owns the returned descriptor.
+ *
+ * `beforeFinalOpen` runs after the parent chain is pinned and immediately before
+ * the final component is opened. It exists so a test can attempt to substitute a
+ * parent *pathname* in exactly that window; it cannot redirect the walk, because
+ * the walk no longer reads a pathname.
+ */
+function openDescriptorPinnedKeyFile(
+  canonicalPath: string,
+  label: string,
+  beforeFinalOpen?: () => void,
+): number {
+  assertDescriptorPinnedTraversalAvailable();
+
+  const components = pathComponents(canonicalPath, label);
+  if (components.length === 0) {
+    throw createCodedError('AUDIT_KEY_PATH_INVALID', `${label} path names no file`);
+  }
+
+  const directoryFds: number[] = [];
+  let keyFd: number | null = null;
+
+  try {
+    const rootFd = fs.openSync(
+      path.sep,
+      fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+    );
+    directoryFds.push(rootFd);
+
+    let parentFd = rootFd;
+    for (let i = 0; i < components.length - 1; i++) {
+      const directoryFd = openPinnedComponent(parentFd, components[i], true, label);
+
+      let stats: fs.Stats;
+      try {
+        stats = fs.fstatSync(directoryFd);
+      } catch (cause) {
+        fs.closeSync(directoryFd);
+        throw createCodedError(
+          'AUDIT_KEY_FILE_UNAVAILABLE',
+          `${label} directory could not be validated`,
+          { cause },
+        );
+      }
+      if (!stats.isDirectory()) {
+        fs.closeSync(directoryFd);
+        throw createCodedError(
+          'AUDIT_KEY_PATH_INVALID',
+          `${label} path component is not a directory`,
+        );
+      }
+
+      directoryFds.push(directoryFd);
+      parentFd = directoryFd;
+    }
+
+    beforeFinalOpen?.();
+    keyFd = openPinnedComponent(parentFd, components[components.length - 1], false, label);
+    return keyFd;
+  } catch (err) {
+    if (keyFd !== null) {
+      fs.closeSync(keyFd);
+    }
+    throw err;
+  } finally {
+    for (const directoryFd of directoryFds) {
+      fs.closeSync(directoryFd);
+    }
+  }
+}
+
+/**
+ * The kernel's own answer for the location a descriptor names.
+ *
+ * This is the step that turns the pinned walk into a statement about *the opened
+ * file*: the workspace rule is decided against where this descriptor actually
+ * lives, not against the pathname that was configured. A descriptor whose file
+ * has been unlinked still resolves here, with a kernel suffix, and is refused —
+ * a key that is no longer linked into the filesystem is not the file the
+ * configured path names.
+ */
+function descriptorLocation(fd: number, label: string): string {
+  let target: string;
+  try {
+    target = fs.readlinkSync(`${PROC_SELF_FD}/${fd}`);
+  } catch (cause) {
+    throw createCodedError('AUDIT_KEY_FILE_UNAVAILABLE', `${label} location could not be read`, {
+      cause,
+    });
+  }
+
+  if (target.endsWith(DELETED_SUFFIX)) {
+    throw createCodedError(
+      'AUDIT_KEY_FILE_UNAVAILABLE',
+      `${label} is no longer linked into the filesystem`,
+    );
+  }
+
+  return target;
+}
+
+/**
+ * Establishes the authoritative key descriptor and the location it names.
+ *
+ * The caller must close the returned descriptor. The location is derived from
+ * the descriptor itself, so "the key is at this path" and "this is the file
+ * being read" are the same fact rather than two checks that a race can separate.
  */
 function openAuthoritativeKeyFile(
   canonicalPath: string,
   expectedUid: number,
   label: string,
-): { fd: number; stats: fs.Stats } {
-  let fd: number;
-  try {
-    fd = fs.openSync(canonicalPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-  } catch (err: unknown) {
-    const code = (err as { code?: string } | null)?.code;
-    if (code === 'ELOOP') {
-      throw createCodedError('SYMLINK_DETECTED', `${label} is a symbolic link`);
-    }
-    if (code === 'ENOENT') {
-      throw createCodedError('AUDIT_KEY_FILE_MISSING', `${label} does not exist`);
-    }
-    throw createCodedError('AUDIT_KEY_FILE_UNAVAILABLE', `${label} could not be opened safely`, {
-      cause: err,
-    });
-  }
+  beforeFinalOpen?: () => void,
+): { fd: number; location: string } {
+  const fd = openDescriptorPinnedKeyFile(canonicalPath, label, beforeFinalOpen);
 
   try {
-    // fstat on the validated descriptor: regular file, mode exactly 0600, real
-    // UID, nlink 1. A symlink never reaches here because O_NOFOLLOW refused it.
-    const stats = validateFileDescriptorAuthority(fd, 0o600, expectedUid);
-
-    let pathStats: fs.Stats;
-    try {
-      pathStats = fs.lstatSync(canonicalPath);
-    } catch (cause: unknown) {
-      throw createCodedError(
-        'AUDIT_KEY_FILE_UNAVAILABLE',
-        `${label} path could not be re-inspected after opening`,
-        { cause },
-      );
-    }
-    if (pathStats.isSymbolicLink()) {
-      throw createCodedError('SYMLINK_DETECTED', `${label} is a symbolic link`);
-    }
-    if (
-      Number(pathStats.dev) !== Number(stats.dev) ||
-      Number(pathStats.ino) !== Number(stats.ino)
-    ) {
+    const location = descriptorLocation(fd, label);
+    if (location !== canonicalPath) {
       throw createCodedError(
         'AUDIT_KEY_PATH_INVALID',
         `${label} path does not identify the opened file`,
       );
     }
 
-    return { fd, stats };
+    // fstat on the descriptor: regular file, mode exactly 0600, real UID,
+    // nlink 1. A symlink never reaches here because every component was opened
+    // with O_NOFOLLOW.
+    validateFileDescriptorAuthority(fd, 0o600, expectedUid);
+
+    return { fd, location };
   } catch (err) {
     fs.closeSync(fd);
     throw err;
+  }
+}
+
+/* -------------------------------------------------------------------------- *
+ * Workspace isolation on canonical filesystem identity
+ * -------------------------------------------------------------------------- */
+
+/**
+ * A workspace boundary as resolved for comparison: either the descriptor-pinned
+ * location it really names, or the canonical spelling of a boundary that does
+ * not exist at all.
+ */
+type CanonicalWorkspace = { kind: 'PINNED' | 'ABSENT'; location: string };
+
+/** The one bounded error for "workspace isolation could not be established". */
+function workspaceAuthorityError(): CodedError {
+  return createCodedError(
+    'AUDIT_SIGNING_KEY_WORKSPACE_OVERLAP',
+    'the signing key workspace isolation rule could not be satisfied',
+  );
+}
+
+/**
+ * Resolves an authenticated workspace boundary to the location it really names.
+ *
+ * A workspace is an authenticated input, so it is resolved by the same
+ * descriptor-pinned walk the key path uses: a boundary reached through a symlink
+ * could otherwise make a key inside it look like a key outside it, which is
+ * exactly the comparison this rule exists to make.
+ *
+ * A boundary that does not exist contains nothing — no existing path lies
+ * beneath a directory that is not there — so it is resolved as absent instead of
+ * refusing the load. A boundary that exists but cannot be pinned refuses: falling
+ * back to its lexical spelling would silently downgrade the comparison.
+ */
+function canonicalizeWorkspacePath(workspacePath: string): CanonicalWorkspace {
+  if (typeof workspacePath !== 'string' || workspacePath.length === 0) {
+    throw workspaceAuthorityError();
+  }
+
+  const canonicalPath = path.normalize(workspacePath);
+  if (
+    !path.isAbsolute(workspacePath) ||
+    canonicalPath !== workspacePath ||
+    canonicalPath === path.sep ||
+    canonicalPath.endsWith(path.sep)
+  ) {
+    throw workspaceAuthorityError();
+  }
+
+  const components = canonicalPath.split(path.sep).filter((segment) => segment.length > 0);
+  if (components.length === 0 || components.includes('..') || components.includes('.')) {
+    throw workspaceAuthorityError();
+  }
+
+  assertDescriptorPinnedTraversalAvailable();
+
+  const directoryFds: number[] = [];
+  try {
+    const rootFd = fs.openSync(
+      path.sep,
+      fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW,
+    );
+    directoryFds.push(rootFd);
+
+    let parentFd = rootFd;
+    for (const component of components) {
+      let directoryFd: number;
+      try {
+        directoryFd = openPinnedComponent(parentFd, component, true, 'workspace');
+      } catch (cause) {
+        if ((cause as { code?: string } | null)?.code === 'AUDIT_KEY_FILE_MISSING') {
+          return { kind: 'ABSENT', location: canonicalPath };
+        }
+        throw workspaceAuthorityError();
+      }
+
+      let stats: fs.Stats;
+      try {
+        stats = fs.fstatSync(directoryFd);
+      } catch {
+        fs.closeSync(directoryFd);
+        throw workspaceAuthorityError();
+      }
+      if (!stats.isDirectory()) {
+        fs.closeSync(directoryFd);
+        throw workspaceAuthorityError();
+      }
+
+      directoryFds.push(directoryFd);
+      parentFd = directoryFd;
+    }
+
+    return { kind: 'PINNED', location: canonicalPath };
+  } finally {
+    for (const directoryFd of directoryFds) {
+      fs.closeSync(directoryFd);
+    }
+  }
+}
+
+/**
+ * Applies the frozen containment rule to a key's actual opened location.
+ *
+ * Both sides are real filesystem locations, which is what makes this a statement
+ * about where the key is rather than about how its path was spelled. The three
+ * frozen relations are refused: the key equals a workspace, lies beneath one, or
+ * contains one.
+ */
+function assertLocationOutsideWorkspaces(
+  location: string,
+  workspacePaths: readonly string[],
+): void {
+  for (const workspacePath of workspacePaths) {
+    const workspace = canonicalizeWorkspacePath(workspacePath);
+    if (
+      location === workspace.location ||
+      location.startsWith(workspace.location + path.sep) ||
+      workspace.location.startsWith(location + path.sep)
+    ) {
+      throw workspaceAuthorityError();
+    }
   }
 }
 
@@ -437,7 +721,7 @@ export function loadEd25519TrustRootFile(
   const expectedUid = options.expectedUid ?? getProcessUid();
   const label = options.purpose === 'ANCHOR_RECEIPT' ? 'anchor receipt public key' : 'public key';
 
-  const canonicalPath = resolveCanonicalKeyPath(filePath, label);
+  const canonicalPath = assertKeyPathShape(filePath, label);
   const { fd } = openAuthoritativeKeyFile(canonicalPath, expectedUid, label);
   try {
     const { buffer, byteLength } = readBoundedKeyBytes(fd, label);
@@ -498,25 +782,49 @@ export function computeTrustRootFingerprintFromFile(
  * The PEM bytes are read into a mutable `Buffer` and zeroized in a `finally`
  * block whether parsing succeeded or failed, so the raw key text does not
  * outlive this call. The returned `KeyObject` is what the engine signs with.
+ *
+ * The ordering below is the authority rule, and it is enforced here rather than
+ * left to each caller:
+ *
+ * ```text
+ * validate the path's shape
+ * → descriptor-pinned walk to an authoritative key descriptor
+ * → the location that descriptor actually names
+ * → workspace non-overlap against authenticated boundaries
+ * → only then read private PEM bytes
+ * ```
+ *
+ * Nothing is decided from a pathname that could be replaced between the check
+ * and the open, and no private key byte is consumed before workspace isolation
+ * has been settled about the file that was really opened.
+ *
+ * `beforeFinalKeyOpen` is a deterministic race seam for the test suite. It runs
+ * after the parent chain has been pinned and immediately before the final
+ * component is opened. It cannot widen authority: the walk it interrupts no
+ * longer consults a pathname, and the workspace decision still runs after it.
  */
 export function loadEd25519SigningKeyFile(
   filePath: string,
-  options: { expectedUid?: number; workspacePaths?: readonly string[] } = {},
+  options: {
+    expectedUid?: number;
+    workspacePaths?: readonly string[];
+    beforeFinalKeyOpen?: () => void;
+  } = {},
 ): LoadedSigningKey {
   const expectedUid = options.expectedUid ?? getProcessUid();
   const label = 'signing key';
   const workspacePaths = options.workspacePaths ?? [];
 
-  // Canonicalize, then establish workspace non-overlap, then open, then bind the
-  // descriptor to the validated path — and only then read key bytes. The
-  // ordering is enforced here rather than left to the caller, so no code path
-  // can consume a private key before the workspace rule has been applied to the
-  // location it actually came from.
-  const canonicalPath = resolveCanonicalKeyPath(filePath, label);
-  assertCanonicalOutsideWorkspaces(canonicalPath, workspacePaths);
-
-  const { fd } = openAuthoritativeKeyFile(canonicalPath, expectedUid, label);
+  const canonicalPath = assertKeyPathShape(filePath, label);
+  const { fd, location } = openAuthoritativeKeyFile(
+    canonicalPath,
+    expectedUid,
+    label,
+    options.beforeFinalKeyOpen,
+  );
   try {
+    assertLocationOutsideWorkspaces(location, workspacePaths);
+
     const { buffer, byteLength } = readBoundedKeyBytes(fd, label);
     try {
       if (privateKeyLoadProbeEnabled) {
@@ -575,6 +883,12 @@ export function loadEd25519SigningKeyFile(
  * workspace exposes the key to everything the workspace can reach just as
  * surely as a key inside it.
  *
+ * This is an *earlier* check than the one {@link loadEd25519SigningKeyFile}
+ * performs, and it is defense in depth rather than the boundary: a caller that
+ * validates here and then loads separately leaves a window between the two. The
+ * loader is the boundary, because it decides against the descriptor it is about
+ * to read.
+ *
  * The message names no path: an operator gets the rule, and no absolute host
  * path is echoed into a log.
  */
@@ -582,46 +896,12 @@ export function assertSigningKeyOutsideWorkspaces(
   signingKeyPath: string,
   workspacePaths: readonly string[],
 ): void {
-  const canonicalKeyPath = resolveCanonicalKeyPath(signingKeyPath, 'signing key');
-  assertCanonicalOutsideWorkspaces(canonicalKeyPath, workspacePaths);
-}
-
-/**
- * Compares two already-canonical locations.
- *
- * Both sides are canonical filesystem locations, which is what makes the
- * comparison a statement about where the key really is. Comparing lexical paths
- * would let a symlinked alias make a key inside a workspace look like a key
- * outside one — the containment test would pass on the alias while the
- * filesystem resolved it straight back into the workspace.
- *
- * A workspace that cannot be resolved is compared at its lexical location: an
- * unresolvable workspace boundary cannot be shown to contain anything, and
- * failing the whole load because an unrelated workspace is absent would make the
- * rule unusable without making it safer.
- */
-function assertCanonicalOutsideWorkspaces(
-  canonicalKeyPath: string,
-  workspacePaths: readonly string[],
-): void {
-  for (const workspacePath of workspacePaths) {
-    let workspace: string;
-    try {
-      workspace = fs.realpathSync(workspacePath);
-    } catch {
-      workspace = path.resolve(workspacePath);
-    }
-
-    if (
-      canonicalKeyPath === workspace ||
-      canonicalKeyPath.startsWith(workspace + path.sep) ||
-      workspace.startsWith(canonicalKeyPath + path.sep)
-    ) {
-      throw createCodedError(
-        'AUDIT_SIGNING_KEY_WORKSPACE_OVERLAP',
-        'checkpoint signing key must reside outside every agent workspace',
-      );
-    }
+  const canonicalKeyPath = assertKeyPathShape(signingKeyPath, 'signing key');
+  const fd = openDescriptorPinnedKeyFile(canonicalKeyPath, 'signing key');
+  try {
+    assertLocationOutsideWorkspaces(descriptorLocation(fd, 'signing key'), workspacePaths);
+  } finally {
+    fs.closeSync(fd);
   }
 }
 

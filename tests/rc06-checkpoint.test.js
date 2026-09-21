@@ -2006,9 +2006,24 @@ describe('CesSpace ARC — RC-06 Task 4: Tier-2 Ed25519 Checkpoint Artifacts & K
         'CHECKPOINT_TEST_TOKEN',
         'CheckpointTestHooks',
         'CheckpointArtifactIdentity',
+        'captureCheckpointArtifactIdentity',
+        'checkpointRaceError',
+        'beforeCheckpointVerificationIdentityCheck',
+        'beforeFinalKeyOpen',
         'resolveCanonicalKeyPath',
         'openAuthoritativeKeyFile',
         'assertCanonicalOutsideWorkspaces',
+        'assertDescriptorPinnedTraversalAvailable',
+        'assertKeyPathShape',
+        'pathComponents',
+        'pinnedOpenError',
+        'openPinnedComponent',
+        'openDescriptorPinnedKeyFile',
+        'descriptorLocation',
+        'canonicalizeWorkspacePath',
+        'workspaceAuthorityError',
+        'assertLocationOutsideWorkspaces',
+        'PROC_SELF_FD',
       ];
 
       for (const file of publicDeclarations) {
@@ -2033,6 +2048,329 @@ describe('CesSpace ARC — RC-06 Task 4: Tier-2 Ed25519 Checkpoint Artifacts & K
       ]) {
         assert.ok(index.includes(symbol), `index.d.ts must still export ${symbol}`);
       }
+    });
+
+    test('RC06-T4-REG-42: a parent substituted after pinning cannot redirect the signing key', () => {
+      const root = path.join(tempBaseDir, 'reg42');
+      const outside = path.join(root, 'outside');
+      const workspace = path.join(root, 'workspace');
+      const staged = path.join(root, 'staged-outside');
+      fs.mkdirSync(workspace, { recursive: true, mode: 0o700 });
+
+      // The canonical key is a regular file in a regular directory. The
+      // workspace holds a DIFFERENT keypair under the very same file name, so
+      // "which of the two was read" is decidable from the fingerprint alone.
+      const material = writeKeyPair(outside, 'reg42');
+      const decoy = writeKeyPair(workspace, 'reg42');
+      assert.notEqual(decoy.fingerprint, material.fingerprint);
+
+      // The substitution happens after every parent component has been pinned
+      // by descriptor and immediately before the final component is opened:
+      // exactly the window a pathname-based check cannot survive. The alias now
+      // points into the workspace, so a walk that re-resolved `outside` from
+      // its pathname would land on the workspace key.
+      let loadedFingerprint = null;
+      let refusal = null;
+      try {
+        loadedFingerprint = loadEd25519SigningKeyFile(material.signingKeyPath, {
+          workspacePaths: [workspace],
+          beforeFinalKeyOpen: () => {
+            fs.renameSync(outside, staged);
+            fs.symlinkSync(workspace, outside, 'dir');
+          },
+        }).derivedFingerprint;
+      } catch (err) {
+        refusal = err;
+      }
+
+      // Either the loader refuses, or it stays bound to the directory it pinned
+      // — and the pinned directory is the one holding the canonical key. The
+      // one outcome that is not permitted is the workspace key.
+      assert.equal(loadedFingerprint, refusal === null ? material.fingerprint : null);
+      assert.notEqual(loadedFingerprint, decoy.fingerprint);
+
+      assert.ok(refusal !== null, 'the substituted pathname must not be accepted');
+      assert.equal(refusal.code, 'AUDIT_KEY_PATH_INVALID');
+
+      // The substitution was not undone and nothing was adopted: the descriptor
+      // that was really opened no longer occupies the canonical pathname, and
+      // that disagreement is the refusal. A later load cannot reach the
+      // workspace through the alias either.
+      assert.ok(fs.lstatSync(outside).isSymbolicLink());
+      assert.equal(fs.realpathSync(outside), fs.realpathSync(workspace));
+      assertThrowsWithCode(
+        () => loadEd25519SigningKeyFile(material.signingKeyPath, { workspacePaths: [workspace] }),
+        'SYMLINK_DETECTED',
+      );
+      // The workspace key is still exactly where it was, untouched.
+      assert.equal(
+        loadEd25519SigningKeyFile(decoy.signingKeyPath, {
+          workspacePaths: [path.join(root, 'not-a-workspace')],
+        }).derivedFingerprint,
+        decoy.fingerprint,
+      );
+    });
+
+    test('RC06-T4-REG-43: engine initialization is bound by the same substitution rule', async () => {
+      const root = path.join(tempBaseDir, 'reg43');
+      const auditDir = path.join(root, 'audit');
+      const workspace = path.join(root, 'workspace');
+      const staged = path.join(root, 'staged-keys');
+      const keyDir = path.join(root, 'keys');
+      fs.mkdirSync(workspace, { recursive: true, mode: 0o700 });
+
+      const material = writeKeyPair(keyDir, 'reg43');
+      const decoy = writeKeyPair(workspace, 'reg43');
+      assert.notEqual(decoy.fingerprint, material.fingerprint);
+
+      const storage = new PersistentAuditStorage({
+        directory: auditDir,
+        createIfMissing: true,
+        metadata: {
+          checkpointPublicKeyFingerprint: material.fingerprint,
+          anchorMode: 'DISABLED',
+        },
+      });
+      storage.initialize();
+
+      // The store is bound to the CANONICAL key's fingerprint, so a loader that
+      // were redirected to the workspace key would be refused a second time, by
+      // a different rule than the pathname binding — proving the refusal came
+      // from the pathname binding and not from the key being unusable.
+      const enginePromise = createTestTier2CheckpointEngine(
+        {
+          directory: auditDir,
+          signingKeyPath: material.signingKeyPath,
+          publicKeyPath: material.publicKeyPath,
+          workspacePaths: [workspace],
+        },
+        {
+          beforeFinalKeyOpen: () => {
+            fs.renameSync(keyDir, staged);
+            fs.symlinkSync(workspace, keyDir, 'dir');
+          },
+        },
+      );
+      await assertRejectsWithCode(enginePromise, 'AUDIT_KEY_PATH_INVALID');
+
+      // The refusal was about the substituted path, not about the key behind it:
+      // the decoy loads cleanly from its own path when that path is outside
+      // every workspace, and the canonical key does too once the alias is gone.
+      assert.equal(
+        loadEd25519SigningKeyFile(decoy.signingKeyPath, {
+          workspacePaths: [path.join(root, 'not-a-workspace')],
+        }).derivedFingerprint,
+        decoy.fingerprint,
+      );
+
+      // Removing the planted alias restores the canonical path and the engine
+      // initializes against the untouched store.
+      fs.unlinkSync(keyDir);
+      fs.renameSync(staged, keyDir);
+      const restored = await createTestTier2CheckpointEngine({
+        directory: auditDir,
+        signingKeyPath: material.signingKeyPath,
+        publicKeyPath: material.publicKeyPath,
+        workspacePaths: [workspace],
+      });
+      openFixtures.push({ engine: restored, storage });
+      assert.equal(restored.getCheckpointState().failed, false);
+    });
+
+    test('RC06-T4-REG-44: the trust-root path decision precedes any content decision', () => {
+      const root = path.join(tempBaseDir, 'reg44');
+      const hidden = path.join(root, 'hidden');
+      fs.mkdirSync(hidden, { recursive: true, mode: 0o700 });
+      const material = writeKeyPair(hidden, 'reg44');
+
+      // `alias` is a directory symlink, so the path is lexically canonical while
+      // its parent component is not. Every trust root this loader serves — the
+      // checkpoint one today and the future anchor-receipt one — is reached
+      // through the same walk, so both must refuse identically.
+      fs.symlinkSync(hidden, path.join(root, 'alias'), 'dir');
+      const aliased = path.join(root, 'alias', 'reg44-public.pem');
+
+      for (const purpose of ['CHECKPOINT', 'ANCHOR_RECEIPT']) {
+        // A valid, correctly framed trust root behind the alias.
+        assertThrowsWithCode(
+          () => loadEd25519TrustRootFile(aliased, { purpose }),
+          'SYMLINK_DETECTED',
+        );
+        // The very same alias with nothing behind it at all. The refusal code
+        // is unchanged, which is what makes it a decision about the path
+        // structure rather than about what the file happens to contain or
+        // whether it happens to exist.
+        fs.rmSync(material.publicKeyPath);
+        assertThrowsWithCode(
+          () => loadEd25519TrustRootFile(aliased, { purpose }),
+          'SYMLINK_DETECTED',
+        );
+        fs.writeFileSync(
+          material.publicKeyPath,
+          material.publicKey.export({ type: 'spki', format: 'pem' }),
+          { mode: 0o600 },
+        );
+      }
+
+      // The fingerprint behind the alias is never reported, and the canonical
+      // trust root still loads and still identifies the same SPKI DER.
+      assert.notEqual(
+        loadEd25519TrustRootFile(material.publicKeyPath, { purpose: 'CHECKPOINT' }).fingerprint,
+        null,
+      );
+      assert.equal(
+        loadEd25519TrustRootFile(material.publicKeyPath, { purpose: 'CHECKPOINT' }).fingerprint,
+        material.fingerprint,
+      );
+    });
+
+    test('RC06-T4-REG-45: growth of the artifact after the stream was consumed is refused', async () => {
+      const fixture = await createFixture('reg45', { records: 2, rotateAt: [2] });
+      const verifiedBytes = fs.readFileSync(fixture.checkpointPath);
+      fixture.engine.close();
+
+      // The verifier has read the artifact to EOF and proven every checkpoint
+      // in it. Only now are the extra bytes added — to the SAME inode, so the
+      // identity is unchanged and only the length disagrees with what was read.
+      const restarted = createTestTier2CheckpointEngine(
+        {
+          directory: fixture.auditDir,
+          signingKeyPath: fixture.material.signingKeyPath,
+          publicKeyPath: fixture.material.publicKeyPath,
+        },
+        {
+          beforeCheckpointVerificationIdentityCheck: (filePath) => {
+            fs.appendFileSync(filePath, 'externally-added\n');
+          },
+        },
+      );
+      await assertRejectsWithCode(restarted, 'AUDIT_CHECKPOINT_FILE_RACE');
+
+      // Nothing was truncated, repaired or removed: the appended bytes are
+      // exactly as the racing writer left them.
+      const after = fs.readFileSync(fixture.checkpointPath);
+      assert.equal(after.length, verifiedBytes.length + 'externally-added\n'.length);
+      assert.ok(after.subarray(0, verifiedBytes.length).equals(verifiedBytes));
+    });
+
+    test('RC06-T4-REG-46: shrinkage of the artifact after the stream was consumed is refused', async () => {
+      const fixture = await createFixture('reg46', { records: 2, rotateAt: [2] });
+      const verifiedBytes = fs.readFileSync(fixture.checkpointPath);
+      const inodeBefore = fs.statSync(fixture.checkpointPath).ino;
+      fixture.engine.close();
+
+      // The opposite direction, on the same inode: a length that is shorter than
+      // what was consumed is just as unverified as one that is longer, because
+      // the recorded length must describe the bytes that were actually read.
+      const restarted = createTestTier2CheckpointEngine(
+        {
+          directory: fixture.auditDir,
+          signingKeyPath: fixture.material.signingKeyPath,
+          publicKeyPath: fixture.material.publicKeyPath,
+        },
+        {
+          beforeCheckpointVerificationIdentityCheck: (filePath) => {
+            fs.truncateSync(filePath, 1);
+          },
+        },
+      );
+      await assertRejectsWithCode(restarted, 'AUDIT_CHECKPOINT_FILE_RACE');
+
+      assert.equal(fs.statSync(fixture.checkpointPath).ino, inodeBefore);
+      assert.equal(fs.readFileSync(fixture.checkpointPath).length, 1);
+      assert.notEqual(verifiedBytes.length, 1);
+    });
+
+    test('RC06-T4-REG-47: an identical-bytes replacement after the stream was consumed is refused', async () => {
+      const fixture = await createFixture('reg47', { records: 2, rotateAt: [2] });
+      const verifiedBytes = fs.readFileSync(fixture.checkpointPath);
+      const inodeBefore = fs.statSync(fixture.checkpointPath).ino;
+      const statBefore = fs.statSync(fixture.checkpointPath);
+      fixture.engine.close();
+
+      // Identical bytes, identical mode, identical ownership, identical length.
+      // Only the inode differs, so a length or content check would accept this
+      // artifact — and every future verifier would be reading a stream that the
+      // engine recorded as verified when it was a different file.
+      const restarted = createTestTier2CheckpointEngine(
+        {
+          directory: fixture.auditDir,
+          signingKeyPath: fixture.material.signingKeyPath,
+          publicKeyPath: fixture.material.publicKeyPath,
+        },
+        {
+          beforeCheckpointVerificationIdentityCheck: (filePath) => {
+            fs.unlinkSync(filePath);
+            fs.writeFileSync(filePath, verifiedBytes, { mode: 0o600 });
+          },
+        },
+      );
+      await assertRejectsWithCode(restarted, 'AUDIT_CHECKPOINT_FILE_RACE');
+
+      const statAfter = fs.statSync(fixture.checkpointPath);
+      assert.notEqual(statAfter.ino, inodeBefore);
+      assert.equal(statAfter.size, statBefore.size);
+      assert.ok(fs.readFileSync(fixture.checkpointPath).equals(verifiedBytes));
+    });
+
+    test('RC06-T4-REG-48: a verified artifact that disappears before its reopen fails closed', async () => {
+      const fixture = await createFixture('reg48', { records: 2, rotateAt: [2] });
+      const verifiedBytes = fs.readFileSync(fixture.checkpointPath);
+      fixture.engine.close();
+
+      // A restart verifies the artifact PRESENT and records its identity. Nothing
+      // is cached yet: the descriptor is established lazily, on the first append.
+      const restarted = await createTestTier2CheckpointEngine({
+        directory: fixture.auditDir,
+        signingKeyPath: fixture.material.signingKeyPath,
+        publicKeyPath: fixture.material.publicKeyPath,
+      });
+      openFixtures.push({ engine: restarted });
+
+      const before = restarted.getCheckpointState();
+      assert.equal(before.failed, false);
+      assert.equal(fs.existsSync(fixture.checkpointPath), true);
+
+      // The canonical path is removed after verification and before the reopen.
+      // Recreating it would silently start a second checkpoint history that the
+      // already-verified one does not describe.
+      fs.unlinkSync(fixture.checkpointPath);
+
+      const restartedStore = createTestRotatingAuditStore(
+        fixture.storage,
+        { sealer: restarted },
+        {},
+      );
+      await restartedStore.append(createSampleRecordCandidate());
+      await assertRejectsWithCode(
+        restartedStore.rotateNow('SIZE_THRESHOLD'),
+        'AUDIT_CHECKPOINT_FILE_RACE',
+      );
+
+      const after = restarted.getCheckpointState();
+      assert.equal(after.failed, true);
+      assert.equal(after.nextCoverageStart, before.nextCoverageStart);
+      assert.equal(after.lastCheckpointSequence, before.lastCheckpointSequence);
+      assert.equal(after.lastCheckpointHash, before.lastCheckpointHash);
+
+      // No replacement artifact was created at the canonical path, and the
+      // verified bytes were not resurrected from anywhere.
+      assert.equal(fs.existsSync(fixture.checkpointPath), false);
+      assert.equal(
+        fs.readdirSync(fixture.auditDir).some((name) => name.includes('checkpoint')),
+        false,
+      );
+
+      // And the failure is latched: no later call can retry the reopen.
+      await assertRejectsWithCode(
+        restarted.sealRotation({
+          sequenceStart: 1,
+          sequenceEnd: fixture.records.length,
+          terminalRecordHash: 'a'.repeat(64),
+        }),
+        'AUDIT_CHECKPOINT_INVALID_STATE',
+      );
+      assert.equal(verifiedBytes.length > 0, true);
     });
   });
 
