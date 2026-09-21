@@ -13,6 +13,16 @@
  * - Storage budget accounting, archive-count bounds and non-deletion retention
  * - Single-writer preservation across rotation (one lock, one descriptor)
  * - All frozen Task-3 negative security controls RC06-NEG-48..63
+ *
+ * Control namespace: Task 3 owns exactly the RC06-NEG range 48..63 and no
+ * more. The additive correction regressions below carry the RC06-T3-REG-nn
+ * namespace precisely because it is NOT part of the frozen 108-control
+ * architecture numbering — they assert behavior, they are not frozen security
+ * controls, and they must never be counted as controls.
+ *
+ * The next block of the RC06-NEG namespace, 64..83, is reserved to Task 4
+ * (Tier 2 Ed25519 checkpoint artifacts and key authority). No Task-3 test may
+ * claim an ID from it; this file deliberately contains none.
  */
 
 import { test, describe, before, after } from 'node:test';
@@ -1411,7 +1421,7 @@ describe('CesSpace ARC — RC-06 Task 3: Segment Rotation, Streaming Compression
       return { auditDir, store, sealer, plainName, gzipName };
     }
 
-    test('RC06-NEG-64: a legitimate dual plain+gzip crash state verifies as one logical archive', async () => {
+    test('RC06-T3-REG-01: a legitimate dual plain+gzip crash state verifies as one logical archive', async () => {
       const { auditDir, plainName, gzipName } = await createCrashPairState('neg64');
 
       const plainBytes = fs.statSync(path.join(auditDir, plainName)).size;
@@ -1447,7 +1457,7 @@ describe('CesSpace ARC — RC-06 Task 3: Segment Rotation, Streaming Compression
       );
     });
 
-    test('RC06-NEG-65: a dual crash state whose representations disagree is corruption', async () => {
+    test('RC06-T3-REG-02: a dual crash state whose representations disagree is corruption', async () => {
       const { auditDir, gzipName } = await createCrashPairState('neg65');
 
       // Replace the compressed half with a different, internally self-consistent
@@ -1479,7 +1489,7 @@ describe('CesSpace ARC — RC-06 Task 3: Segment Rotation, Streaming Compression
       });
     });
 
-    test('RC06-NEG-66: a replacement left at the plain source pathname is never unlinked', async () => {
+    test('RC06-T3-REG-03: a replacement left at the plain source pathname is never unlinked', async () => {
       const auditDir = path.join(tempBaseDir, 'neg66');
       const displacedPath = path.join(tempBaseDir, 'neg66-displaced.jsonl');
       let plainPath = null;
@@ -1532,7 +1542,7 @@ describe('CesSpace ARC — RC-06 Task 3: Segment Rotation, Streaming Compression
       );
     });
 
-    test('RC06-NEG-67: an active segment pathname replaced before rotation is never archived', async () => {
+    test('RC06-T3-REG-04: an active segment pathname replaced before rotation is never archived', async () => {
       const auditDir = path.join(tempBaseDir, 'neg67');
       const activePath = path.join(auditDir, ACTIVE_SEGMENT_FILENAME);
       const displacedPath = path.join(tempBaseDir, 'neg67-displaced-active.jsonl');
@@ -1559,7 +1569,7 @@ describe('CesSpace ARC — RC-06 Task 3: Segment Rotation, Streaming Compression
       assert.equal(store.getState(), 'FAILED');
     });
 
-    test('RC06-NEG-68: an active segment grown in place before rotation is never archived', async () => {
+    test('RC06-T3-REG-05: an active segment grown in place before rotation is never archived', async () => {
       const auditDir = path.join(tempBaseDir, 'neg68');
       const activePath = path.join(auditDir, ACTIVE_SEGMENT_FILENAME);
       const firstRecord = buildRecordLine({ sequenceNumber: 1, previousRecordHash: GENESIS });
@@ -1593,7 +1603,7 @@ describe('CesSpace ARC — RC-06 Task 3: Segment Rotation, Streaming Compression
       assert.equal(store.getState(), 'FAILED');
     });
 
-    test('RC06-NEG-69: an active segment shrunk in place before rotation is never archived', async () => {
+    test('RC06-T3-REG-06: an active segment shrunk in place before rotation is never archived', async () => {
       const auditDir = path.join(tempBaseDir, 'neg69');
       const activePath = path.join(auditDir, ACTIVE_SEGMENT_FILENAME);
       let shrunkSize = null;
@@ -1619,7 +1629,7 @@ describe('CesSpace ARC — RC-06 Task 3: Segment Rotation, Streaming Compression
       assert.equal(store.getState(), 'FAILED');
     });
 
-    test('RC06-NEG-70: the physical budget is enforced per compressed chunk, not after the fact', async () => {
+    test('RC06-T3-REG-07: the physical budget is enforced per compressed chunk, not after the fact', async () => {
       const auditDir = path.join(tempBaseDir, 'neg70');
       const { store } = createRotatingStore('neg70');
 
@@ -1656,7 +1666,7 @@ describe('CesSpace ARC — RC-06 Task 3: Segment Rotation, Streaming Compression
       assert.ok(fs.existsSync(activePath), 'the active segment is untouched');
     });
 
-    test('RC06-NEG-71: a UTF-8-valid incomplete active JSON fragment is a recoverable torn tail', async () => {
+    test('RC06-T3-REG-08: a UTF-8-valid incomplete active JSON fragment is a recoverable torn tail', async () => {
       const auditDir = path.join(tempBaseDir, 'neg71');
       const { store, storage } = createRotatingStore('neg71');
       await store.append(createSampleRecordCandidate());
@@ -1683,7 +1693,7 @@ describe('CesSpace ARC — RC-06 Task 3: Segment Rotation, Streaming Compression
       recovered.storage.close();
     });
 
-    test('RC06-NEG-72: the same torn tail inside a finalized rotated segment is corruption', async () => {
+    test('RC06-T3-REG-09: the same torn tail inside a finalized rotated segment is corruption', async () => {
       const auditDir = path.join(tempBaseDir, 'neg72');
       const { store, storage } = createRotatingStore('neg72');
       await store.append(createSampleRecordCandidate());
@@ -1708,7 +1718,7 @@ describe('CesSpace ARC — RC-06 Task 3: Segment Rotation, Streaming Compression
       });
     });
 
-    test('RC06-NEG-73: a rotation source replaced before compression is never compressed or deleted', async () => {
+    test('RC06-T3-REG-10: a rotation source replaced before compression is never compressed or deleted', async () => {
       const auditDir = path.join(tempBaseDir, 'neg73');
       const { store } = createRotatingStore('neg73', { hooks: { failCompressionCreate: true } });
 
@@ -1730,7 +1740,7 @@ describe('CesSpace ARC — RC-06 Task 3: Segment Rotation, Streaming Compression
       assert.equal(verification.status, 'VERIFIED');
     });
 
-    test('RC06-NEG-74: a recovered non-empty active segment rotates exactly the range it holds', async () => {
+    test('RC06-T3-REG-11: a recovered non-empty active segment rotates exactly the range it holds', async () => {
       const auditDir = path.join(tempBaseDir, 'neg74');
       const { store, storage } = createRotatingStore('neg74');
       await store.append(createSampleRecordCandidate());
@@ -1769,7 +1779,7 @@ describe('CesSpace ARC — RC-06 Task 3: Segment Rotation, Streaming Compression
       assert.equal(restarted.getStorage().getCurrentSequence(), 5);
     });
 
-    test('RC06-NEG-75: a recovered older active segment keeps its true age for the interval trigger', async () => {
+    test('RC06-T3-REG-12: a recovered older active segment keeps its true age for the interval trigger', async () => {
       const auditDir = path.join(tempBaseDir, 'neg75');
       const { store, storage } = createRotatingStore('neg75');
       await store.append(createSampleRecordCandidate());
@@ -1798,7 +1808,7 @@ describe('CesSpace ARC — RC-06 Task 3: Segment Rotation, Streaming Compression
       assert.equal(rotation.boundary.sequenceEnd, 1);
     });
 
-    test('RC06-NEG-76: an active segment whose age cannot be established still rotates on size', async () => {
+    test('RC06-T3-REG-13: an active segment whose age cannot be established still rotates on size', async () => {
       const auditDir = path.join(tempBaseDir, 'neg76');
       const { store, storage } = createRotatingStore('neg76');
       await store.append(createSampleRecordCandidate());
@@ -1893,7 +1903,7 @@ describe('CesSpace ARC — RC-06 Task 3: Segment Rotation, Streaming Compression
       return { taskThree, taskTwo };
     }
 
-    test('RC06-NEG-77: parity — an incomplete JSON prefix is a recoverable tail for both surfaces', async () => {
+    test('RC06-T3-REG-14: parity — an incomplete JSON prefix is a recoverable tail for both surfaces', async () => {
       await assertParity(
         await buildActiveTailFixture(
           'parity-json-prefix',
@@ -1904,7 +1914,7 @@ describe('CesSpace ARC — RC-06 Task 3: Segment Rotation, Streaming Compression
       );
     });
 
-    test('RC06-NEG-78: parity — a complete record that lost only its newline is a recoverable tail', async () => {
+    test('RC06-T3-REG-15: parity — a complete record that lost only its newline is a recoverable tail', async () => {
       // Syntactically a whole, valid record; the only thing missing is the
       // terminator that would have made the write complete.
       const complete = buildRecordLine({ sequenceNumber: 2, previousRecordHash: GENESIS });
@@ -1915,7 +1925,7 @@ describe('CesSpace ARC — RC-06 Task 3: Segment Rotation, Streaming Compression
       );
     });
 
-    test('RC06-NEG-79: parity — trailing bytes that are not valid UTF-8 are a recoverable tail', async () => {
+    test('RC06-T3-REG-16: parity — trailing bytes that are not valid UTF-8 are a recoverable tail', async () => {
       // A partial multibyte sequence: undecodable, but no less a crash artifact.
       const undecodable = Buffer.from([
         0x7b, 0x22, 0x61, 0x22, 0x3a, 0x22, 0xe2, 0x82, 0xac, 0xff, 0xfe, 0x80,
@@ -1931,7 +1941,7 @@ describe('CesSpace ARC — RC-06 Task 3: Segment Rotation, Streaming Compression
       );
     });
 
-    test('RC06-NEG-80: parity — a tail beyond MAX_TORN_TAIL_BYTES is corruption for both surfaces', async () => {
+    test('RC06-T3-REG-17: parity — a tail beyond MAX_TORN_TAIL_BYTES is corruption for both surfaces', async () => {
       await assertParity(
         await buildActiveTailFixture(
           'parity-too-large',
@@ -1942,7 +1952,7 @@ describe('CesSpace ARC — RC-06 Task 3: Segment Rotation, Streaming Compression
       );
     });
 
-    test('RC06-NEG-81: parity — a tail at exactly MAX_TORN_TAIL_BYTES is recoverable for both', async () => {
+    test('RC06-T3-REG-18: parity — a tail at exactly MAX_TORN_TAIL_BYTES is recoverable for both', async () => {
       await assertParity(
         await buildActiveTailFixture('parity-exact-limit', Buffer.alloc(MAX_TORN_TAIL_BYTES, 0x61)),
         'RECOVERABLE',
@@ -1950,7 +1960,7 @@ describe('CesSpace ARC — RC-06 Task 3: Segment Rotation, Streaming Compression
       );
     });
 
-    test('RC06-NEG-82: a trusted boundary inside the verified prefix is satisfied by both surfaces', async () => {
+    test('RC06-T3-REG-19: a trusted boundary inside the verified prefix is satisfied by both surfaces', async () => {
       const fixture = await buildActiveTailFixture(
         'parity-boundary-prefix',
         '{"schemaVersion":1,"sequenceNumber":2,',
@@ -1973,7 +1983,7 @@ describe('CesSpace ARC — RC-06 Task 3: Segment Rotation, Streaming Compression
       recovery.storage.close();
     });
 
-    test('RC06-NEG-83: a trusted boundary inside the torn tail is never satisfied by either surface', async () => {
+    test('RC06-T3-REG-20: a trusted boundary inside the torn tail is never satisfied by either surface', async () => {
       const fixture = await buildActiveTailFixture(
         'parity-boundary-tail',
         '{"schemaVersion":1,"sequenceNumber":2,',
