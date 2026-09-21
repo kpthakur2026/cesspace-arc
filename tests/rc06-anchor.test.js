@@ -50,6 +50,7 @@ import { execFileSync } from 'node:child_process';
 
 import {
   PersistentAuditStorage,
+  ACTIVE_SEGMENT_FILENAME,
   CHECKPOINT_FILENAME,
   ANCHOR_RECEIPT_FILENAME,
   ANCHOR_SPOOL_DIRNAME,
@@ -81,6 +82,9 @@ import {
   scanAuditStorePhysicalBytes,
   parseAndValidateCheckpointLineV1,
   computeCheckpointHash,
+  computeCheckpointSignaturePreimage,
+  verifyCheckpointSignature,
+  serializeCheckpointV1,
   getProcessUid,
 } from '../packages/audit/dist/index.js';
 
@@ -403,6 +407,59 @@ describe('CesSpace ARC — RC-06 Task 5: Tier-3 External Anchoring', () => {
 
   function spoolEntryPath(fixture, checkpointHash) {
     return path.join(fixture.spoolDir, `${checkpointHash}.json`);
+  }
+
+  /** Every entry currently in the fixture's spool directory, in directory order. */
+  function spoolEntries(fixture) {
+    if (!fs.existsSync(fixture.spoolDir)) return [];
+    return fs.readdirSync(fixture.spoolDir).sort();
+  }
+
+  /**
+   * Mints a checkpoint that has every property a caller is able to control.
+   *
+   * The signature is produced over the frozen preimage exactly as the real Tier-2
+   * engine produces it, the hash is the canonical digest of the checkpoint the
+   * caller actually holds, and the back-link and coverage are taken from the
+   * fixture's real durable artifact so they genuinely continue its history.
+   * Anything a caller can get right, this helper gets right; the caller then
+   * says which single property should be wrong.
+   *
+   * That is the point. `RC06-T5-REG-34`..`RC06-T5-REG-39` use it to show that
+   * shape, a self-consistent hash, a correct back-link and even a valid Ed25519
+   * signature are each insufficient on their own — a checkpoint is admissible
+   * only when the Task-4 verifier produces it from the durable artifact and the
+   * retained primary evidence.
+   */
+  function forgeCheckpoint(fixture, overrides = {}) {
+    const sealed = fs.existsSync(fixture.checkpointPath) ? readCheckpoints(fixture) : [];
+    const head = sealed.length === 0 ? null : sealed[sealed.length - 1];
+    const next = head === null ? 1 : head.sequenceEnd + 1;
+
+    const unsigned = {
+      version: 1,
+      storeId: fixture.storeId,
+      checkpointId: crypto.randomUUID(),
+      sequenceStart: next,
+      sequenceEnd: next,
+      terminalRecordHash: 'f'.repeat(64),
+      previousCheckpointHash: head === null ? '0'.repeat(64) : head.checkpointHash,
+      createdAt: '2026-09-20T18:00:00.000Z',
+      publicKeyFingerprint: fixture.checkpointMaterial.fingerprint,
+      ...overrides,
+    };
+    const signature =
+      overrides.signature ??
+      crypto
+        .sign(
+          null,
+          computeCheckpointSignaturePreimage(unsigned),
+          fixture.checkpointMaterial.privateKey,
+        )
+        .toString('base64url');
+
+    const signed = { ...unsigned, signature };
+    return { ...signed, checkpointHash: computeCheckpointHash(signed) };
   }
 
   function receiptLines(fixture) {
@@ -2498,6 +2555,446 @@ describe('CesSpace ARC — RC-06 Task 5: Tier-3 External Anchoring', () => {
       assert.equal(fs.existsSync(pki.trustedCaCertPath), true);
       assert.equal(fs.existsSync(pki.sanMismatchCertPath), true);
       assert.equal(fs.existsSync(pki.unknownCaClientCertPath), true);
+    });
+  });
+
+  /* ------------------------------------------------------------------------ *
+   * RC06-T5-REG-34..40 — the anchor authority chain
+   *
+   * A checkpoint is admissible only when Task 4 has produced it from the durable
+   * checkpoint artifact and the retained primary evidence. Shape, a
+   * self-consistent `checkpointHash`, a correct back-link and a valid Ed25519
+   * signature are each insufficient on their own: every one of them is
+   * reproducible by a caller who has read the store's own public artifacts, and a
+   * checkpoint admitted on any of them would put an independent attestation of
+   * evidence the primary store never contained into the receipt ledger.
+   *
+   * `RC06-T5-REG-34`..`RC06-T5-REG-39` each forge exactly one checkpoint with
+   * every caller-controllable property correct except the one under test, and
+   * `RC06-T5-REG-40` is the counterpart that shows the proof is a gate rather
+   * than a wall: the ordinary production shape — a genuine checkpoint sealed by
+   * the Tier-2 engine after the anchor engine already reconciled — still passes.
+   * ------------------------------------------------------------------------ */
+
+  describe('anchor authority: only verified checkpoint evidence may be spooled', () => {
+    test('RC06-T5-REG-34: a fabricated genesis checkpoint cannot be spooled or transmitted', async () => {
+      // The reviewed reproduction, in its own terms: an ENABLED store whose
+      // primary active stream is empty (0 bytes) and which has no
+      // `audit-checkpoints.jsonl` at all, offered a fabricated `AuditCheckpointV1`
+      // whose shape is valid, whose back-link is genesis, whose hash is the
+      // self-consistent digest of its own content, and whose 64-byte signature is
+      // well-formed Base64url that is not an Ed25519 signature over anything.
+      const fixture = await createFixture('forged-genesis', { records: 0 });
+      assert.equal(
+        fs.statSync(path.join(fixture.auditDir, ACTIVE_SEGMENT_FILENAME)).size,
+        0,
+        'the primary active stream must really be empty',
+      );
+      assert.equal(fs.existsSync(fixture.checkpointPath), false, 'no checkpoint artifact exists');
+
+      const forged = forgeCheckpoint(fixture, {
+        signature: Buffer.alloc(64, 0x5a).toString('base64url'),
+      });
+      assert.equal(forged.sequenceStart, 1);
+      assert.equal(forged.sequenceEnd, 1);
+      assert.equal(forged.previousCheckpointHash, '0'.repeat(64));
+      assert.equal(computeCheckpointHash(forged), forged.checkpointHash);
+      assert.equal(
+        verifyCheckpointSignature(forged, fixture.checkpointMaterial.publicKey),
+        false,
+        'the signature must be shape-valid but worthless, or this proves nothing',
+      );
+
+      const observations = [];
+      let transportCalls = 0;
+      const engine = await createTestTier3AnchorEngine(anchorConfig(fixture), {
+        networkObserver: (observation) => observations.push(observation),
+        transport: async () => {
+          transportCalls++;
+          throw new Error('the anchor must never be contacted for fabricated evidence');
+        },
+      });
+
+      await assertRejectsWithCode(engine.anchorCheckpoint(forged), 'ANCHOR_CHECKPOINT_UNVERIFIED');
+
+      assert.equal(transportCalls, 0);
+      assert.deepEqual(observations, [], 'no attempt may be observed at all');
+      assert.equal(fs.existsSync(spoolEntryPath(fixture, forged.checkpointHash)), false);
+      assert.deepEqual(spoolEntries(fixture), []);
+      assert.equal(fs.existsSync(fixture.spoolDir), false, 'no spool directory may be created');
+      assert.equal(fs.existsSync(fixture.receiptPath), false);
+
+      // The refusal is about the argument rather than the store, so the engine is
+      // not stopped and claims nothing.
+      assert.equal(engine.getStatus().anchorState, 'HEALTHY');
+      assert.equal(engine.getStatus().unanchoredCheckpoints, 0);
+      engine.assertPrivilegedOperationsAllowed();
+      await engine.close();
+    });
+
+    test('RC06-T5-REG-35: a checkpoint with a garbage signature is refused before spool and network', async () => {
+      // A real store with one real durable checkpoint, so the forged checkpoint
+      // has a genuine predecessor to chain from: coverage, store binding, key
+      // fingerprint and back-link are all correct, and only the signature is not.
+      const fixture = await createFixture('forged-signature', { records: 2 });
+      const [sealed] = readCheckpoints(fixture);
+      assert.equal(sealed.sequenceEnd, 2);
+
+      const forged = forgeCheckpoint(fixture, {
+        sequenceStart: 3,
+        sequenceEnd: 3,
+        previousCheckpointHash: sealed.checkpointHash,
+        signature: Buffer.alloc(64, 0x5a).toString('base64url'),
+      });
+      assert.equal(forged.previousCheckpointHash, sealed.checkpointHash);
+      assert.equal(forged.storeId, fixture.storeId);
+      assert.equal(forged.publicKeyFingerprint, fixture.checkpointMaterial.fingerprint);
+      assert.equal(computeCheckpointHash(forged), forged.checkpointHash);
+      assert.equal(verifyCheckpointSignature(forged, fixture.checkpointMaterial.publicKey), false);
+
+      const submitted = [];
+      const engine = await createTestTier3AnchorEngine(
+        anchorConfig(fixture),
+        instantRetryHooks({
+          transport: acknowledgingTransport(fixture, [sealed, forged], submitted),
+        }).hooks,
+      );
+
+      // Reconciliation legitimately reconstructed the genuine pending
+      // checkpoint, so the spool is not empty to begin with — which is what makes
+      // "unchanged" the meaningful assertion rather than "empty".
+      const spoolBefore = spoolEntries(fixture);
+      assert.deepEqual(spoolBefore, [`${sealed.checkpointHash}.json`]);
+
+      await assertRejectsWithCode(engine.anchorCheckpoint(forged), 'ANCHOR_CHECKPOINT_UNVERIFIED');
+
+      assert.deepEqual(submitted, [], 'the forged checkpoint must never reach the transport');
+      assert.deepEqual(spoolEntries(fixture), spoolBefore, 'the refusal must not touch the spool');
+      assert.equal(fs.existsSync(spoolEntryPath(fixture, forged.checkpointHash)), false);
+      assert.equal(fs.existsSync(fixture.receiptPath), false);
+
+      // The refusal is scoped to the argument: the store's own genuine pending
+      // checkpoint is still admissible, still dispatched, still acknowledged.
+      const genuine = await engine.anchorCheckpoint(sealed);
+      assert.deepEqual(submitted, [sealed.checkpointHash]);
+      assert.equal(genuine.outcome, 'ACKNOWLEDGED');
+      assert.equal(genuine.status.unanchoredCheckpoints, 0);
+      assert.deepEqual(
+        receiptLines(fixture).map((line) => line.checkpointHash),
+        [sealed.checkpointHash],
+      );
+
+      await engine.close();
+    });
+
+    test('RC06-T5-REG-36: a correctly signed checkpoint that was never durably appended is refused', async () => {
+      const fixture = await createFixture('never-appended', { records: 2 });
+      const [sealed] = readCheckpoints(fixture);
+
+      const forged = forgeCheckpoint(fixture, {
+        sequenceStart: 3,
+        sequenceEnd: 3,
+        previousCheckpointHash: sealed.checkpointHash,
+      });
+
+      // Every property a caller controls is correct here. The signature verifies
+      // under the configured checkpoint key; the store binding matches
+      // audit-store.json; the key fingerprint matches the pinned trust root; the
+      // coverage continues the verified boundary; the back-link names the real
+      // preceding checkpoint; the hash is the canonical digest of the checkpoint
+      // itself.
+      assert.equal(verifyCheckpointSignature(forged, fixture.checkpointMaterial.publicKey), true);
+      assert.equal(forged.storeId, fixture.storeId);
+      assert.equal(forged.publicKeyFingerprint, fixture.checkpointMaterial.fingerprint);
+      assert.equal(forged.previousCheckpointHash, sealed.checkpointHash);
+      assert.equal(computeCheckpointHash(forged), forged.checkpointHash);
+
+      // The one thing that is not true is that this store ever produced it: there
+      // is no line for it in the durable checkpoint artifact. Signature validity
+      // alone is demonstrably not the test.
+      assert.equal(
+        readCheckpoints(fixture).some((cp) => cp.checkpointHash === forged.checkpointHash),
+        false,
+      );
+
+      const observations = [];
+      let transportCalls = 0;
+      const engine = await createTestTier3AnchorEngine(anchorConfig(fixture), {
+        networkObserver: (observation) => observations.push(observation),
+        transport: async () => {
+          transportCalls++;
+          throw new Error('the anchor must never be contacted for fabricated evidence');
+        },
+      });
+
+      const spoolBefore = spoolEntries(fixture);
+      assert.deepEqual(spoolBefore, [`${sealed.checkpointHash}.json`]);
+
+      await assertRejectsWithCode(engine.anchorCheckpoint(forged), 'ANCHOR_CHECKPOINT_UNVERIFIED');
+
+      assert.equal(transportCalls, 0);
+      assert.deepEqual(observations, []);
+      assert.deepEqual(spoolEntries(fixture), spoolBefore);
+      assert.equal(fs.existsSync(spoolEntryPath(fixture, forged.checkpointHash)), false);
+      assert.equal(fs.existsSync(fixture.receiptPath), false);
+      await engine.close();
+    });
+
+    test('RC06-T5-REG-37: a signed checkpoint the primary ledger does not support is refused', async () => {
+      // Two genuine checkpoints, covering 1..2 and 3..4, so the store has a real
+      // two-checkpoint history and a real verified boundary at sequence 4.
+      const fixture = await createFixture('forged-terminal', { records: 4, rotateAt: [2, 4] });
+      const [first, second] = readCheckpoints(fixture);
+      assert.equal(second.sequenceStart, 3);
+      assert.equal(second.sequenceEnd, 4);
+
+      const observations = [];
+      let transportCalls = 0;
+      const engine = await createTestTier3AnchorEngine(anchorConfig(fixture), {
+        networkObserver: (observation) => observations.push(observation),
+        transport: async () => {
+          transportCalls++;
+          throw new Error('the anchor must never be contacted for fabricated evidence');
+        },
+      });
+      assert.equal(engine.getStatus().unanchoredCheckpoints, 2);
+
+      // A third checkpoint is then really sealed, so the forgery below sits
+      // BEYOND the boundary the engine reconciled: it is not refused for being at
+      // or below a checkpoint already verified, which is what the positional
+      // pre-check would catch.
+      const record = await fixture.store.append(createSampleRecordCandidate());
+      await fixture.checkpointEngine.checkpointAfterDurablePrimary({
+        sequenceNumber: record.sequenceNumber,
+        recordHash: record.integrity.recordHash,
+      });
+      await fixture.store.rotateNow('SIZE_THRESHOLD');
+      const sealedThird = readCheckpoints(fixture)[2];
+      assert.equal(sealedThird.sequenceStart, 5);
+      assert.equal(sealedThird.sequenceEnd, 5);
+
+      // A correctly signed checkpoint with the same coverage, the same chain and
+      // the same store and key binding, carrying a `terminalRecordHash` no
+      // primary record in this store has. It is then written exactly where the
+      // real checkpoint belongs, so it is durably PRESENT: absence from the
+      // artifact is not the reason it must fail, and its signature verifies, so
+      // the signature is not the reason either. The primary evidence is.
+      const forged = forgeCheckpoint(fixture, {
+        sequenceStart: 5,
+        sequenceEnd: 5,
+        previousCheckpointHash: second.checkpointHash,
+        terminalRecordHash: 'b'.repeat(64),
+      });
+      assert.notEqual(forged.terminalRecordHash, sealedThird.terminalRecordHash);
+      assert.equal(forged.previousCheckpointHash, second.checkpointHash);
+      assert.equal(verifyCheckpointSignature(forged, fixture.checkpointMaterial.publicKey), true);
+      assert.equal(computeCheckpointHash(forged), forged.checkpointHash);
+      fs.writeFileSync(
+        fixture.checkpointPath,
+        readCheckpointLines(fixture).slice(0, 2).join('') + serializeCheckpointV1(forged),
+      );
+      assert.deepEqual(
+        readCheckpointLines(fixture).slice(0, 2),
+        [serializeCheckpointV1(first), serializeCheckpointV1(second)],
+        'the forgery must replace only the third line',
+      );
+      assert.equal(
+        readCheckpoints(fixture)[2].checkpointHash,
+        forged.checkpointHash,
+        'the forgery must really be the durable third line',
+      );
+
+      await assert.rejects(engine.anchorCheckpoint(forged), (err) => {
+        assert.equal(err.code, 'ANCHOR_CHECKPOINT_UNVERIFIED');
+        assert.equal(
+          err.cause?.code,
+          'AUDIT_CHECKPOINT_TERMINAL_MISMATCH',
+          'the refusal must be the primary ledger contradicting the terminal record hash',
+        );
+        return true;
+      });
+
+      assert.equal(transportCalls, 0);
+      assert.deepEqual(observations, []);
+      assert.equal(fs.existsSync(spoolEntryPath(fixture, forged.checkpointHash)), false);
+      assert.equal(fs.existsSync(fixture.receiptPath), false);
+
+      // A durable checkpoint artifact that cannot be verified against the primary
+      // ledger stops the engine, exactly as an orphaned receipt or an orphaned
+      // spool entry does: no later "acknowledged" claim would be verifiable.
+      assertThrowsWithCode(
+        () => engine.assertPrivilegedOperationsAllowed(),
+        'ANCHOR_ENGINE_FAILED',
+      );
+      assert.equal(engine.getStatus().anchorState, 'FAILED');
+      await engine.close();
+    });
+
+    test('RC06-T5-REG-38: a correctly signed checkpoint at a coverage the cadence does not require is refused', async () => {
+      // Records 3 and 4 are retained, but nothing seals at record 4: the only
+      // rotation is at record 2, and the thousandth-record interval is nowhere
+      // near. The frozen cadence therefore requires exactly one checkpoint — the
+      // one covering 1..2 — and a checkpoint covering 3..4 is not a boundary this
+      // store ever had.
+      const fixture = await createFixture('forged-cadence', { records: 4, rotateAt: [2] });
+      const [sealed] = readCheckpoints(fixture);
+      assert.equal(sealed.sequenceEnd, 2);
+
+      const forged = forgeCheckpoint(fixture, {
+        sequenceStart: 3,
+        sequenceEnd: 4,
+        previousCheckpointHash: sealed.checkpointHash,
+        terminalRecordHash: 'e'.repeat(64),
+      });
+      assert.equal(verifyCheckpointSignature(forged, fixture.checkpointMaterial.publicKey), true);
+
+      const observations = [];
+      let transportCalls = 0;
+      const engine = await createTestTier3AnchorEngine(anchorConfig(fixture), {
+        networkObserver: (observation) => observations.push(observation),
+        transport: async () => {
+          transportCalls++;
+          throw new Error('the anchor must never be contacted for fabricated evidence');
+        },
+      });
+
+      const spoolBefore = spoolEntries(fixture);
+      assert.deepEqual(spoolBefore, [`${sealed.checkpointHash}.json`]);
+
+      await assertRejectsWithCode(engine.anchorCheckpoint(forged), 'ANCHOR_CHECKPOINT_UNVERIFIED');
+      assert.equal(transportCalls, 0);
+      assert.deepEqual(observations, []);
+      assert.deepEqual(spoolEntries(fixture), spoolBefore);
+      assert.equal(fs.existsSync(spoolEntryPath(fixture, forged.checkpointHash)), false);
+      assert.equal(fs.existsSync(fixture.receiptPath), false);
+      await engine.close();
+
+      // And the cadence is what refuses it, not merely its absence from disk:
+      // written into the durable artifact, the store fails closed at
+      // initialization rather than adopting it as evidence to anchor.
+      fs.appendFileSync(fixture.checkpointPath, serializeCheckpointV1(forged));
+      await assertRejectsWithCode(
+        createTestTier3AnchorEngine(anchorConfig(fixture), {}),
+        'AUDIT_CHECKPOINT_UNEXPECTED',
+      );
+    });
+
+    test('RC06-T5-REG-39: a cooperating anchor cannot make the ledger attest to a checkpoint the store never produced', async () => {
+      const fixture = await createFixture('forged-ledger', { records: 2 });
+      const [sealed] = readCheckpoints(fixture);
+
+      const forged = forgeCheckpoint(fixture, {
+        sequenceStart: 3,
+        sequenceEnd: 3,
+        previousCheckpointHash: sealed.checkpointHash,
+      });
+      assert.equal(verifyCheckpointSignature(forged, fixture.checkpointMaterial.publicKey), true);
+
+      // The transport is the one the defect would have wanted: it acknowledges
+      // whatever hash it is handed, minting a receipt signed by the real anchor
+      // key. Under the reviewed defect that is exactly how a fabricated
+      // checkpoint became a durable acknowledgement of evidence the primary store
+      // never contained.
+      const submitted = [];
+      const engine = await createTestTier3AnchorEngine(
+        anchorConfig(fixture),
+        instantRetryHooks({
+          transport: acknowledgingTransport(fixture, [sealed, forged], submitted),
+        }).hooks,
+      );
+
+      const spoolBefore = spoolEntries(fixture);
+      assert.deepEqual(spoolBefore, [`${sealed.checkpointHash}.json`]);
+
+      await assertRejectsWithCode(engine.anchorCheckpoint(forged), 'ANCHOR_CHECKPOINT_UNVERIFIED');
+
+      assert.deepEqual(submitted, [], 'the forged hash must never be submitted');
+      assert.deepEqual(spoolEntries(fixture), spoolBefore);
+      assert.equal(fs.existsSync(spoolEntryPath(fixture, forged.checkpointHash)), false);
+      assert.equal(fs.existsSync(fixture.receiptPath), false, 'the ledger must gain no line');
+      assert.equal(engine.getStatus().acknowledgedCheckpoints, 0);
+
+      // The genuine checkpoint the store really produced is still anchored, and
+      // the ledger then holds exactly one line — for it, and for nothing else.
+      const genuine = await engine.anchorCheckpoint(sealed);
+      assert.deepEqual(submitted, [sealed.checkpointHash]);
+      assert.equal(genuine.outcome, 'ACKNOWLEDGED');
+      assert.deepEqual(
+        receiptLines(fixture).map((line) => line.checkpointHash),
+        [sealed.checkpointHash],
+      );
+
+      await engine.close();
+    });
+
+    test('RC06-T5-REG-40: a genuine checkpoint sealed after reconciliation is still admitted', async () => {
+      // The counterpart to every refusal above: the authority proof is a gate,
+      // not a wall. This is the ordinary production shape — the engine reconciles
+      // a store holding one checkpoint, the Tier-2 engine really seals a second
+      // one afterwards, and that new checkpoint, which the pending queue has
+      // never seen, has to be admitted and dispatched in order.
+      const fixture = await createFixture('post-reconcile', { records: 2 });
+      const [sealed] = readCheckpoints(fixture);
+
+      // The receipt is minted for whichever hash is asked, from the artifact as
+      // it stands at request time, because the second checkpoint does not exist
+      // yet when the engine is constructed.
+      const submitted = [];
+      const transport = async (request) => {
+        const hash = request.headers[ANCHOR_IDEMPOTENCY_HEADER];
+        submitted.push(hash);
+        const checkpoint = readCheckpoints(fixture).find((cp) => cp.checkpointHash === hash);
+        if (checkpoint === undefined) {
+          return { statusCode: 400, body: Buffer.from('unknown checkpoint', 'utf8') };
+        }
+        return {
+          statusCode: 200,
+          body: Buffer.from(
+            JSON.stringify(mintReceipt(fixture, checkpoint, fixture.anchorMaterial.privateKey)),
+            'utf8',
+          ),
+        };
+      };
+
+      const engine = await createTestTier3AnchorEngine(
+        anchorConfig(fixture),
+        instantRetryHooks({ transport }).hooks,
+      );
+      assert.equal(engine.getStatus().unanchoredCheckpoints, 1);
+
+      // A real record, a real cadence offer and a real rotation, so the new
+      // checkpoint is durable before the anchor engine is told about it — the
+      // ordering the whole module is built on.
+      const record = await fixture.store.append(createSampleRecordCandidate());
+      await fixture.checkpointEngine.checkpointAfterDurablePrimary({
+        sequenceNumber: record.sequenceNumber,
+        recordHash: record.integrity.recordHash,
+      });
+      await fixture.store.rotateNow('SIZE_THRESHOLD');
+
+      const checkpoints = readCheckpoints(fixture);
+      assert.equal(checkpoints.length, 2);
+      const fresh = checkpoints[1];
+      assert.equal(fresh.sequenceStart, 3);
+      assert.equal(fresh.sequenceEnd, 3);
+      assert.equal(fresh.previousCheckpointHash, sealed.checkpointHash);
+
+      const result = await engine.anchorCheckpoint(fresh);
+
+      assert.deepEqual(
+        submitted,
+        checkpoints.map((cp) => cp.checkpointHash),
+        'the backlog is dispatched in order, and the new checkpoint is included',
+      );
+      assert.equal(result.outcome, 'ACKNOWLEDGED');
+      assert.equal(result.attempts, 2);
+      assert.equal(result.status.unanchoredCheckpoints, 0);
+      assert.deepEqual(
+        receiptLines(fixture).map((line) => line.checkpointHash),
+        checkpoints.map((cp) => cp.checkpointHash),
+      );
+
+      await engine.close();
     });
   });
 });

@@ -105,6 +105,7 @@ import {
   validateCheckpointV1,
   verifyCheckpointHistoryWithObserver,
   type AuditCheckpointV1,
+  type CheckpointHistoryVerificationResult,
 } from './checkpoint.js';
 
 export {
@@ -1186,11 +1187,15 @@ export class Tier3AnchorEngine {
    * checkpoint, or a ledger that changed under the reader are all conditions in
    * which any later "acknowledged" claim would be unverifiable.
    */
-  private markFailed(reason: string): never {
+  private markFailed(reason: string, cause?: unknown): never {
     this.failed = true;
     this.failedReason = reason;
     this.state = 'FAILED';
-    throw createCodedError(reason, 'anchor state integrity check failed');
+    throw createCodedError(
+      reason,
+      'anchor state integrity check failed',
+      cause === undefined ? undefined : { cause },
+    );
   }
 
   /**
@@ -2250,14 +2255,21 @@ export class Tier3AnchorEngine {
   /**
    * Submits one checkpoint to the external anchor.
    *
-   * The checkpoint must be the next one the verified history admits. Order is
-   * load-bearing rather than cosmetic: receipts are only ever appended in
-   * checkpoint order, so a later checkpoint acknowledged before an earlier one
-   * would put the ledger out of the monotonic subsequence reconciliation
-   * requires, and the store would fail closed on its next startup for a reason
-   * that had nothing to do with tampering. Dispatch therefore always proceeds
-   * from the head of the pending queue, and stops at the first checkpoint the
-   * anchor will not accept.
+   * The checkpoint must be the next one the verified history admits, and it must
+   * *be* verified history. Order is load-bearing rather than cosmetic: receipts
+   * are only ever appended in checkpoint order, so a later checkpoint
+   * acknowledged before an earlier one would put the ledger out of the monotonic
+   * subsequence reconciliation requires, and the store would fail closed on its
+   * next startup for a reason that had nothing to do with tampering. Dispatch
+   * therefore always proceeds from the head of the pending queue, and stops at
+   * the first checkpoint the anchor will not accept.
+   *
+   * Authority is the other half, and it is not satisfied by the checkpoint
+   * parsing, hashing or linking correctly. A checkpoint reconciliation did not
+   * hand over is admitted only after the Task-4 verifier has produced it from the
+   * durable checkpoint artifact and the retained primary evidence (see
+   * {@link admitVerifiedCheckpoint}); anything else is refused before a spool
+   * entry exists and before a socket is opened.
    */
   async anchorCheckpoint(checkpoint: AuditCheckpointV1): Promise<AnchorDispatchResult> {
     return this.serialize(async () => {
@@ -2300,6 +2312,7 @@ export class Tier3AnchorEngine {
             );
           }
           this.assertCheckpointExtendsHistory(validated);
+          await this.admitVerifiedCheckpoint(validated);
           await this.spoolPendingCheckpoint(auditDirFd, validated);
           this.pendingOrder.push(hash);
         }
@@ -2323,13 +2336,14 @@ export class Tier3AnchorEngine {
   }
 
   /**
-   * The extension check for a checkpoint that reconciliation has not seen.
+   * The *positional* check for a checkpoint the pending queue does not hold.
    *
-   * A checkpoint the engine has not verified through Task 4 can still be accepted
-   * for anchoring, but only when its coverage and its back-link agree with the
-   * boundary reconciliation established. Without this, a caller could have an
-   * arbitrary signed checkpoint anchored, and the receipt ledger would then
-   * contain an acknowledgement of evidence the primary store never produced.
+   * It is a cheap pre-filter, not an authority check: it only asks whether the
+   * offered coverage continues where the verified boundary ended. Shape, a
+   * self-consistent `checkpointHash` and a plausible back-link are all
+   * reproducible by any caller, so none of them is evidence that a checkpoint is
+   * one this store actually produced. {@link admitVerifiedCheckpoint} is what
+   * decides that, and it always runs before anything is spooled.
    */
   private assertCheckpointExtendsHistory(checkpoint: AuditCheckpointV1): void {
     const previous = this.lastVerifiedCheckpointHash ?? GENESIS_PREVIOUS_CHECKPOINT_HASH;
@@ -2354,6 +2368,83 @@ export class Tier3AnchorEngine {
         'checkpoint coverage does not continue the verified checkpoint history',
       );
     }
+  }
+
+  /**
+   * Proves that an offered checkpoint is authoritative Task-4 evidence.
+   *
+   * `pendingOrder` is populated exclusively by the reconciliation observer, which
+   * runs inside the Task-4 verifier's handoff — so a hash already in it was
+   * proven from the primary ledger, and a hash that is not in it has never been
+   * through that proof. Shape, a self-consistent `checkpointHash` and a
+   * plausible back-link are all things any caller can produce: a fabricated
+   * checkpoint with a garbage signature, an invented `terminalRecordHash` and no
+   * durable artifact line behind it would otherwise be spooled and transmitted,
+   * and the receipt ledger would then hold an independent attestation of evidence
+   * the primary store never contained.
+   *
+   * The proof is the Task-4 streaming verifier itself, run again over the durable
+   * `audit-checkpoints.jsonl` and the retained primary evidence. The offered
+   * checkpoint is admitted only if that pass actually hands it back as verified —
+   * which is exactly the conjunction this module needs and cannot check for
+   * itself: the artifact line exists, its coverage is the cadence the primary
+   * ledger requires, its `terminalRecordHash` is the verified record hash at that
+   * sequence, it continues the checkpoint chain, it is bound to this store and
+   * this trust root, and its Ed25519 signature verifies under the pinned key.
+   * Signature validity alone is deliberately not the test: a correctly signed
+   * checkpoint that was never durably appended fails here on the artifact, not on
+   * the signature.
+   *
+   * Reusing the verifier rather than re-deriving any of that is what keeps the
+   * two paths from drifting apart, and it keeps memory bounded the same way Task
+   * 4 does: one checkpoint line, one chain cursor and the bounded archive
+   * inventory, never a retained history.
+   *
+   * A verifier that THROWS is a different finding from one that completes without
+   * handing the checkpoint back, and the two are not treated alike. A throw means
+   * the durable store could not be verified — a broken chain, a coverage
+   * mismatch, a forged artifact line — which is a fact about the store rather
+   * than about the argument, so the engine stops exactly as it does for an
+   * orphaned receipt or an orphaned spool entry, and the verifier's own error is
+   * kept as the cause. A pass that completes and simply never produces the
+   * checkpoint is a statement about the argument: the engine stays healthy and
+   * refuses the checkpoint alone.
+   */
+  private async admitVerifiedCheckpoint(checkpoint: AuditCheckpointV1): Promise<void> {
+    let proven = false;
+    let result: CheckpointHistoryVerificationResult;
+    try {
+      result = await verifyCheckpointHistoryWithObserver(
+        {
+          directory: this.auditDir,
+          publicKeyPath: this.checkpointPublicKeyPath,
+          workspacePaths: [...(this.config.workspacePaths ?? [])],
+          expectedUid: this.expectedUid,
+        },
+        (verified) => {
+          if (verified.checkpointHash === checkpoint.checkpointHash) {
+            proven = true;
+          }
+        },
+      );
+    } catch (cause) {
+      return this.markFailed('ANCHOR_CHECKPOINT_UNVERIFIED', cause);
+    }
+
+    if (!proven) {
+      throw createCodedError(
+        'ANCHOR_CHECKPOINT_UNVERIFIED',
+        'checkpoint is not a verified checkpoint of this store',
+      );
+    }
+
+    // The boundary advances to what the verifier proved, never to what the caller
+    // offered: the result's last checkpoint comes from the artifact, so a
+    // fabricated coverage cannot move the ceiling a later call is measured
+    // against. Without this, a legitimate second new checkpoint would be refused
+    // for not continuing a boundary that is merely stale.
+    this.lastVerifiedSequence = result.lastCheckpointSequence;
+    this.lastVerifiedCheckpointHash = result.lastCheckpointHash;
   }
 
   private async spoolPendingCheckpoint(
