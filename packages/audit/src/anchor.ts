@@ -745,7 +745,29 @@ interface AnchorSpoolPlan {
   reconstruct: { checkpointHash: string; bytes: Buffer }[];
   /** Stale spool entries a durable receipt supersedes (State D). */
   staleSpool: string[];
+  /**
+   * The first spool entry the verified history does not account for (State E),
+   * or null.
+   *
+   * The finding is *observed* by verification, which reads the spool
+   * inventory as one of its inputs, and it is *acted on* when the plan is
+   * applied. Keeping the decision in the plan is what lets the read-only phase
+   * report a State E condition without itself deciding the fate of a spool
+   * artifact: the engine stops at the same point, with the same code, but only
+   * once spool reconciliation has been entered.
+   */
+  orphanSpoolEntry: string | null;
 }
+
+/**
+ * The verified reconciliation waiting to be applied to the spool.
+ *
+ * A discriminated union rather than a nullable plan, because `DISABLED` is a
+ * verified outcome in its own right: a store whose metadata records anchoring
+ * off has nothing to reconcile, and a `null` staged value would make "nothing to
+ * do" indistinguishable from "verification never ran".
+ */
+type StagedReconciliation = { kind: 'DISABLED' } | { kind: 'ENABLED'; plan: AnchorSpoolPlan };
 
 /** The receipt ledger, read as a stream so history is never retained. */
 interface ReceiptLedgerReader {
@@ -920,6 +942,31 @@ export class Tier3AnchorEngine {
   private degradedReason: string | null = null;
   private failedReason: string | null = null;
 
+  /**
+   * The reconciliation that receipt verification staged and spool
+   * reconciliation has not yet consumed.
+   *
+   * Tier-3 reconciliation is deliberately two operations. Verification reads the
+   * verified checkpoint history and the receipt ledger and decides what the spool
+   * ought to contain — it mutates nothing. Application is the only code in this
+   * class that writes to or removes from `anchor-spool/`. The frozen startup
+   * order runs them in different stages (receipt verification at
+   * `ANCHOR_RECEIPT_VERIFICATION`, spool reconciliation at
+   * `ANCHOR_SPOOL_RECONCILIATION`), which is only a real ordering guarantee if the
+   * first of them cannot perform any part of the second.
+   */
+  private stagedReconciliation: StagedReconciliation | null = null;
+
+  /**
+   * Whether a staged reconciliation has been applied.
+   *
+   * Nothing privileged may run against an engine whose verification has resolved
+   * but whose spool does not yet reflect it: the engine would be accepting
+   * operations while the artifacts it is accountable for describe a different
+   * state than the one it verified.
+   */
+  private reconciliationApplied = false;
+
   private chain: Promise<unknown> = Promise.resolve();
 
   /** @internal */
@@ -996,6 +1043,28 @@ export class Tier3AnchorEngine {
    * @internal
    */
   async initializeEngine(): Promise<void> {
+    await this.initializeEngineForStartup();
+    await this.applyReconciliationInternal();
+  }
+
+  /**
+   * Validates configuration and trust roots, then verifies — without reconciling.
+   *
+   * This is the same authority `initializeEngine` performs up to, and including,
+   * the read-only half of reconciliation: configuration, the store's anchor mode,
+   * the endpoint, both trust roots, the receipt ledger and its bindings to the
+   * verified checkpoint history. It creates nothing, removes nothing and appends
+   * nothing.
+   *
+   * It exists because the frozen startup order gives receipt verification and
+   * spool reconciliation separate stages. A caller that stops here holds an
+   * engine whose reconciliation is staged and unapplied, and such an engine
+   * refuses every privileged operation until {@link applyAnchorReconciliation}
+   * runs.
+   *
+   * @internal
+   */
+  async initializeEngineForStartup(): Promise<void> {
     if (this.initialized) return;
     if (this.closed) {
       throw createCodedError('ANCHOR_ENGINE_CLOSED', 'anchor engine is closed');
@@ -1073,7 +1142,48 @@ export class Tier3AnchorEngine {
     // The checkpoint trust root is proven to match the store's pinned
     // fingerprint inside the verifier, so nothing here re-derives it.
     this.initialized = true;
-    await this.reconcileInternal();
+    await this.verifyReconciliationInternal();
+  }
+
+  /**
+   * Verifies the receipt ledger and its checkpoint bindings, staging the spool
+   * decisions without performing any of them.
+   *
+   * The staged result is applied by {@link applyAnchorReconciliation}. Nothing
+   * is written, removed or created here — including the spool directory, which
+   * `probeSpoolDirectory` treats as absent rather than creating.
+   *
+   * @internal
+   */
+  async verifyAnchorEvidence(): Promise<AnchorStatus> {
+    return this.serialize(async () => {
+      this.assertInitialized();
+      if (this.closed) {
+        throw createCodedError('ANCHOR_ENGINE_CLOSED', 'anchor engine is closed');
+      }
+      return this.verifyReconciliationInternal();
+    });
+  }
+
+  /**
+   * Applies the staged reconciliation to the spool — the only spool mutations
+   * this engine performs.
+   *
+   * It refuses to run without a staged, verified result, so it can never be used
+   * to reach a state the receipt ledger and the verified checkpoint history do
+   * not jointly imply. `reconcileAnchorState()` reaches it through a fresh
+   * verification; startup reaches it after stage 6 verified.
+   *
+   * @internal
+   */
+  async applyAnchorReconciliation(): Promise<AnchorStatus> {
+    return this.serialize(async () => {
+      this.assertInitialized();
+      if (this.closed) {
+        throw createCodedError('ANCHOR_ENGINE_CLOSED', 'anchor engine is closed');
+      }
+      return this.applyReconciliationInternal();
+    });
   }
 
   /** Releases every retained descriptor. Safe to call more than once. */
@@ -1097,11 +1207,31 @@ export class Tier3AnchorEngine {
     }
   }
 
+  /**
+   * Refuses an operation on an engine whose verified plan has not been applied.
+   *
+   * This is what makes the split between receipt verification and spool
+   * reconciliation a security boundary rather than an ordering convention. An
+   * engine that has verified the receipt ledger but not yet reconciled the spool
+   * holds a plan that is provably right and demonstrably not yet true of the
+   * artifacts on disk; allowing it to serve privileged operations in that window
+   * would be exactly the state the frozen startup order exists to prevent.
+   */
+  private assertReconciliationApplied(): void {
+    if (!this.reconciliationApplied) {
+      throw createCodedError(
+        'ANCHOR_RECONCILIATION_PENDING',
+        'anchor spool reconciliation has not been applied; receipt verification alone does not authorize privileged operations',
+      );
+    }
+  }
+
   private assertUsable(): void {
     this.assertInitialized();
     if (this.closed) {
       throw createCodedError('ANCHOR_ENGINE_CLOSED', 'anchor engine is closed');
     }
+    this.assertReconciliationApplied();
     if (this.failed) {
       throw createCodedError(
         'ANCHOR_ENGINE_FAILED',
@@ -1205,6 +1335,10 @@ export class Tier3AnchorEngine {
    * invocation. In `DISABLED` mode it is a no-op: a store that does not claim
    * external non-repudiation has nothing to gate on.
    *
+   * An engine whose reconciliation is staged but unapplied refuses here, before
+   * the mode is even considered — the gate is about authority, not about what is
+   * configured.
+   *
    * `FULL` and `FAILED` refuse unconditionally. `DEGRADED` does not refuse here:
    * a single unacknowledged checkpoint is the ordinary condition of a briefly
    * unreachable anchor, and refusing every operation for it would make the
@@ -1213,6 +1347,7 @@ export class Tier3AnchorEngine {
    */
   assertPrivilegedOperationsAllowed(): void {
     this.assertInitialized();
+    this.assertReconciliationApplied();
     if (this.anchorMode === 'DISABLED') return;
     if (this.failed) {
       throw createCodedError(
@@ -1253,12 +1388,21 @@ export class Tier3AnchorEngine {
       if (this.closed) {
         throw createCodedError('ANCHOR_ENGINE_CLOSED', 'anchor engine is closed');
       }
-      await this.reconcileInternal();
-      return this.getStatus();
+      await this.verifyReconciliationInternal();
+      return this.applyReconciliationInternal();
     });
   }
 
-  private async reconcileInternal(): Promise<AnchorStatus> {
+  /**
+   * The read-only half of reconciliation.
+   *
+   * Every input it reads is evidence: the verified checkpoint history, the
+   * receipt ledger and the spool *inventory*. Every output it produces is a
+   * decision held in memory. It opens no descriptor for writing, creates no
+   * directory and no file, and removes nothing, so an artifact observed while it
+   * runs is still there — unchanged — when it returns.
+   */
+  private async verifyReconciliationInternal(): Promise<AnchorStatus> {
     const auditDirFd = openAuthoritativeDirectoryFd(this.auditDir, this.expectedUid);
     try {
       const spoolFd = this.probeSpoolDirectory(auditDirFd);
@@ -1285,13 +1429,14 @@ export class Tier3AnchorEngine {
         this.resetReconciledState();
         this.state = 'DISABLED';
         this.degradedReason = null;
+        this.stagedReconciliation = { kind: 'DISABLED' };
         return this.getStatus();
       }
 
       this.resetReconciledState();
 
       const inventory = this.scanSpoolDirectory(spoolFd);
-      const plan: AnchorSpoolPlan = { reconstruct: [], staleSpool: [] };
+      const plan: AnchorSpoolPlan = { reconstruct: [], staleSpool: [], orphanSpoolEntry: null };
       const consumedSpool = new Set<string>();
       const reconstructBudget = { count: 0, bytes: 0 };
 
@@ -1377,13 +1522,21 @@ export class Tier3AnchorEngine {
         // longer holds per-entry identity for the excess, so it does not claim to
         // have checked them; the state is already FULL, which withholds the same
         // privileged operations either way.
+        //
+        // The finding is recorded, not raised. Raising it here would make this
+        // read-only operation the point at which a spool artifact's fate is
+        // decided, which is spool reconciliation's authority and not receipt
+        // verification's. `applyReconciliationInternal` stops on it before it
+        // mutates anything, so the engine fails closed at the same evidence,
+        // with the same code, one stage later.
         if (!inventory.overflow) {
           for (const hash of inventory.sizes.keys()) {
             if (
               !consumedSpool.has(hash) &&
               !plan.reconstruct.some((entry) => entry.checkpointHash === hash)
             ) {
-              this.markFailed('ANCHOR_ORPHAN_SPOOL_ENTRY');
+              plan.orphanSpoolEntry = hash;
+              break;
             }
           }
         }
@@ -1399,18 +1552,61 @@ export class Tier3AnchorEngine {
         }
       }
 
-      // The verification resolved, so every decision in the plan is derived from
-      // primary-proved evidence. Only now is anything mutated.
-      this.applySpoolPlan(auditDirFd, plan);
-
       this.lastVerifiedSequence = lastSequence;
       this.lastVerifiedCheckpointHash = lastHash;
-      this.recaptureSpoolCounters(auditDirFd);
+
+      // Every decision in the plan is derived from primary-proved evidence. None
+      // of them has been performed.
+      this.stagedReconciliation = { kind: 'ENABLED', plan };
+      this.reconciliationApplied = false;
       this.refreshState();
       return this.getStatus();
     } finally {
       fs.closeSync(auditDirFd);
     }
+  }
+
+  /**
+   * The mutating half of reconciliation: it applies the staged plan, and it is
+   * the only code in this class that writes to or removes from `anchor-spool/`.
+   *
+   * It refuses to run without a staged result. A caller therefore cannot reach a
+   * reconciled spool except through a verification that resolved against the
+   * durable primary evidence — there is no path that applies a plan nobody
+   * verified, and no path that applies one plan twice.
+   */
+  private async applyReconciliationInternal(): Promise<AnchorStatus> {
+    const staged = this.stagedReconciliation;
+    if (staged === null) {
+      throw createCodedError(
+        'ANCHOR_RECONCILIATION_NOT_STAGED',
+        'no verified reconciliation is staged; receipt verification has not resolved',
+      );
+    }
+    this.stagedReconciliation = null;
+
+    if (staged.kind === 'DISABLED') {
+      this.reconciliationApplied = true;
+      this.refreshState();
+      return this.getStatus();
+    }
+
+    const plan = staged.plan;
+    const auditDirFd = openAuthoritativeDirectoryFd(this.auditDir, this.expectedUid);
+    try {
+      if (plan.orphanSpoolEntry !== null) {
+        this.markFailed('ANCHOR_ORPHAN_SPOOL_ENTRY');
+      }
+
+      this.applySpoolPlan(auditDirFd, plan);
+      this.recaptureSpoolCounters(auditDirFd);
+    } finally {
+      fs.closeSync(auditDirFd);
+    }
+
+    this.reconciliationApplied = true;
+    this.refreshState();
+    return this.getStatus();
   }
 
   private resetReconciledState(): void {
@@ -2848,5 +3044,35 @@ export async function openTier3AnchorEngine(
 ): Promise<Tier3AnchorEngine> {
   const engine = new Tier3AnchorEngine(config, ANCHOR_TEST_TOKEN);
   await engine.initializeEngine();
+  return engine;
+}
+
+/**
+ * Opens a Tier-3 anchor engine for the frozen startup sequence, verified but not
+ * yet reconciled.
+ *
+ * The returned engine has validated its configuration and both trust roots,
+ * verified the receipt ledger and its bindings to the checkpoint history, and
+ * staged the spool decisions it derived — and has performed none of them. It
+ * refuses privileged operations until
+ * {@link Tier3AnchorEngine.applyAnchorReconciliation} runs.
+ *
+ * This exists so the startup sequence's stage 6
+ * (`ANCHOR_RECEIPT_VERIFICATION`) and stage 7
+ * (`ANCHOR_SPOOL_RECONCILIATION`) are two authorities rather than one authority
+ * invoked twice. Stage 8's torn-tail recovery reads the spool as an input, and a
+ * stage that both verifies and reconciles would leave the spool mutated before
+ * the stage that is supposed to be the first to touch it.
+ *
+ * {@link openTier3AnchorEngine} keeps its contract: a standalone caller gets an
+ * engine that has already reconciled.
+ *
+ * @internal
+ */
+export async function openTier3AnchorEngineForStartup(
+  config: Tier3AnchorEngineConfig,
+): Promise<Tier3AnchorEngine> {
+  const engine = new Tier3AnchorEngine(config, ANCHOR_TEST_TOKEN);
+  await engine.initializeEngineForStartup();
   return engine;
 }

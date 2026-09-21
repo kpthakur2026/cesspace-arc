@@ -53,6 +53,26 @@ export async function createTestTier3AnchorEngine(
 }
 
 /**
+ * Constructs an anchor engine for the frozen startup sequence, with seams.
+ *
+ * The counterpart of {@link createTestTier3AnchorEngine} for the runtime
+ * composition: configuration and trust roots validated, receipt ledger verified,
+ * spool decisions staged and unapplied. The runtime's stage 7 applies them
+ * through the same public path production uses, so a regression observes the
+ * staging boundary rather than a testing shortcut around it.
+ *
+ * @internal
+ */
+export async function createTestTier3AnchorEngineForStartup(
+  config: Tier3AnchorEngineConfig,
+  hooks: AnchorTestHooks = {},
+): Promise<Tier3AnchorEngine> {
+  const engine = new Tier3AnchorEngine(config, ANCHOR_TEST_TOKEN, hooks);
+  await engine.initializeEngineForStartup();
+  return engine;
+}
+
+/**
  * Mints a receipt with an ephemeral anchor key, exactly as a real anchor would.
  *
  * The signature is produced over the frozen preimage, so a test can construct a

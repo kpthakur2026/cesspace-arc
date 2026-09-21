@@ -95,6 +95,12 @@ export interface AuditRuntimeTestHooks {
  * the engines' own capability tokens, so the token boundaries stay exactly where
  * each Task put them.
  *
+ * `createAnchorEngineForStartup` is not interchangeable with the standalone
+ * `openTier3AnchorEngine` factory: the runtime's stage 6 is receipt verification
+ * and its stage 7 is spool reconciliation, so the engine stage 6 opens must
+ * arrive verified and *unreconciled*. A substitute that reconciled on the way in
+ * would make the frozen stage order unobservable.
+ *
  * @internal
  */
 export interface AuditRuntimeCompositionSeams {
@@ -102,7 +108,7 @@ export interface AuditRuntimeCompositionSeams {
     config: Tier2CheckpointEngineConfig,
     hooks?: CheckpointTestHooks,
   ) => Promise<Tier2CheckpointEngine>;
-  createAnchorEngine?: (
+  createAnchorEngineForStartup?: (
     config: Tier3AnchorEngineConfig,
     hooks?: AnchorTestHooks,
   ) => Promise<Tier3AnchorEngine>;

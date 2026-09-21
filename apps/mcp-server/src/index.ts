@@ -44,6 +44,7 @@ import {
 } from './remote-execution.js';
 import type { BoundedRequestLimiter } from './remote-resource-limits.js';
 import { ApprovalAuditSink, getApprovalAuditSink } from './approval-audit.js';
+import { getAuditWriteAuthority, type AuditWriteAuthority } from './audit-write-authority.js';
 import { getGatewayAuditSink } from './gateway-audit.js';
 import { RemoteGateway, type RemoteGatewayStatus } from './remote-gateway.js';
 import { readRemoteRequestContext, RemoteMcpSurface } from './remote-mcp-surface.js';
@@ -989,11 +990,42 @@ export interface IArcMcpServer {
   ): Promise<{ isError?: boolean; content: Array<{ type: 'text'; text: string }> }>;
 }
 
+/**
+ * Raised when a denial could not be made durable.
+ *
+ * Module-private on purpose. It is never exported, so no subsystem, transport,
+ * CLI path or test can construct one, and `instanceof` at the single conversion
+ * point in {@link ArcMcpServer.executeAuthenticatedToolCall} cannot be satisfied
+ * by anything but a real failed durable `DENIED` append.
+ *
+ * It carries the already-bounded refusal. It never carries the raw cause: an
+ * `fs` error, a directory, a key path, an inode or a device number added to it,
+ * or read out of it, would be a leak with no security value.
+ */
+class AuditPersistenceFailure extends Error {
+  constructor(public readonly refusal: ArcError) {
+    super('a durable audit denial could not be recorded');
+    this.name = 'AuditPersistenceFailure';
+  }
+}
+
 export class ProcessAuditSink implements IProcessLifecycleSink {
+  /**
+   * The ONE production write authority for this chain.
+   *
+   * It is derived from the logger the composition root handed in, so a process
+   * lifecycle record lands in the same persistent primary sequence as the tool
+   * invocation that spawned it — rather than appearing only on the historical
+   * in-memory chain, where it would vanish on restart.
+   */
+  private readonly authority: AuditWriteAuthority;
+
   constructor(
-    private auditLogger: AuditLogger,
+    auditLogger: AuditLogger,
     private workspaceRegistry: WorkspaceRegistry,
-  ) {}
+  ) {
+    this.authority = getAuditWriteAuthority(auditLogger);
+  }
 
   public async onProcessEvent(event: ProcessLifecycleEvent): Promise<void> {
     const ws = this.workspaceRegistry.getWorkspace(event.workspaceId);
@@ -1002,7 +1034,7 @@ export class ProcessAuditSink implements IProcessLifecycleSink {
     const isFailure = event.eventType === 'PROCESS_SPAWN_FAILED';
     const isTimeout = event.eventType === 'PROCESS_TIMEOUT';
 
-    await this.auditLogger.log({
+    await this.authority.write({
       timestamp: event.timestamp,
       actor: {
         clientId: event.actor.clientId,
@@ -1674,6 +1706,12 @@ export class ArcMcpServer implements IArcMcpServer {
         { cause },
       );
     }
+    // The durable chain is verified and open, so the production write authority
+    // can now commit to it. This runs BEFORE any transport is bound: there is no
+    // window in which a gateway event, an approval transition or a process
+    // lifecycle record can be emitted into a process whose evidence authority is
+    // still the in-memory mirror alone.
+    getAuditWriteAuthority(this.auditLogger).bindDurableRuntime(this.auditRuntime);
   }
 
   /**
@@ -1725,35 +1763,25 @@ export class ArcMcpServer implements IArcMcpServer {
    * a raw workspace path. Only the persistence-owned fields are stripped, and
    * the lifecycle block is added.
    *
+   * This is a delegation to the ONE production write authority every other
+   * emitter uses — the gateway sink, the approval sink and the process sink —
+   * so there is a single definition of "a production audit record" rather than
+   * one per emitter. It remains here because the call sites below are the tool
+   * lifecycle, and their contract (a rejection means the evidence is not
+   * secured) is unchanged.
+   *
    * @internal
    */
   private async appendDurableRecord(
     body: Omit<AuditRecord, 'eventId' | 'sequenceNumber' | 'integrity'>,
     lifecycle?: AuditLifecycleMetadata,
   ): Promise<void> {
-    const runtime = this.auditRuntime;
-    if (runtime === undefined) {
-      // No durable chain is composed for this object, which is only reachable
-      // on a server that was never started. The record still reaches the
-      // historical in-memory chain, exactly as it did before Task 6 — this is
-      // NOT a second authority, because a started server always has a runtime.
-      await this.auditLogger.log(body);
-      return;
-    }
-    const minimized = await this.auditLogger.log(body);
-    await runtime.appendRecord({
-      eventId: minimized.eventId,
-      timestamp: minimized.timestamp,
-      actor: minimized.actor,
-      target: minimized.target,
-      invocation: minimized.invocation,
-      policy: minimized.policy,
-      execution: minimized.execution,
-      ...(minimized.error === undefined ? {} : { error: minimized.error }),
-      ...(minimized.approval === undefined ? {} : { approval: minimized.approval }),
-      ...(minimized.gateway === undefined ? {} : { gateway: minimized.gateway }),
-      ...(lifecycle === undefined ? {} : { lifecycle }),
-    });
+    // No durable chain is composed for this object only when it was never
+    // started; a started server always has a runtime bound to the authority by
+    // `startAuditRuntime`. In that state the write is the historical
+    // in-memory-only write, exactly as it was before Task 6 — this is NOT a
+    // second authority, because the mirror never defines production truth.
+    await getAuditWriteAuthority(this.auditLogger).write(body, lifecycle);
   }
 
   /**
@@ -1764,10 +1792,22 @@ export class ArcMcpServer implements IArcMcpServer {
    * `operationId` (rc06 §7.2, §22). A fresh identifier is minted per denial and
    * is never reused, so `STARTED → DENIED` cannot arise from this path.
    *
-   * A failure to make the denial durable does NOT silently degrade into a normal
-   * policy response: the caller still returns the denial, and the process-wide
-   * degraded latch is set so no later privileged invocation is dispatched
-   * against a chain that can no longer record it.
+   * A failure to make the denial durable is NOT swallowed. The denial the caller
+   * asked about is a policy fact; "the refusal is not on the record" is a
+   * different fact, and answering with the first would tell the caller the
+   * refusal was recorded when the durable chain holds no record of it — at the
+   * exact moment the process became unfit to serve. So this method:
+   *
+   *   1. latches the process-wide degraded audit state, so no later privileged
+   *      operation is dispatched against a chain that cannot record its outcome;
+   *   2. raises {@link AuditPersistenceFailure} carrying the bounded
+   *      audit-persistence refusal — never the ordinary policy/schema denial,
+   *      and never a fabricated durable `DENIED` record.
+   *
+   * It runs before any subsystem boundary and before any approval record is
+   * created, inspected or redeemed, so a persistence failure here executes zero
+   * privileged subsystem work — {@link executeAuthenticatedToolCall} converts it
+   * into the response, and nothing else in the pipeline has run.
    *
    * @internal
    */
@@ -1777,8 +1817,9 @@ export class ArcMcpServer implements IArcMcpServer {
     const operationId = randomUUID();
     try {
       await this.appendDurableRecord(body, { operationId, phase: 'DENIED' });
-    } catch {
+    } catch (cause) {
       this.auditRuntime?.latchDegradedAuditFailure();
+      throw new AuditPersistenceFailure(boundedAuditPersistenceFailure(cause));
     }
   }
 
@@ -1824,6 +1865,42 @@ export class ArcMcpServer implements IArcMcpServer {
    * @internal Reachable from the remote bridge and from stdio; not a transport.
    */
   public async executeAuthenticatedToolCall(
+    actor: CompleteActor,
+    toolName: string,
+    parameters: Record<string, unknown>,
+  ): Promise<{ isError?: boolean; content: Array<{ type: 'text'; text: string }> }> {
+    try {
+      return await this.executeToolCallPipeline(actor, toolName, parameters);
+    } catch (cause: unknown) {
+      // The ONE place a failed durable denial becomes a response (rc06 §22, §26,
+      // §44). Every DENIED branch in the pipeline records its refusal through
+      // `recordDurableDenial`, which raises this sentinel rather than returning
+      // the ordinary denial when the refusal could not be made durable. The
+      // conversion lives here so the caller is answered with the bounded
+      // audit-persistence failure instead of a policy answer it would have no way
+      // to know is unrecorded.
+      if (cause instanceof AuditPersistenceFailure) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: JSON.stringify(cause.refusal.toJSON(), null, 2) }],
+        };
+      }
+      throw cause;
+    }
+  }
+
+  /**
+   * The execution pipeline itself, from admission to the terminal response.
+   *
+   * It is separate from {@link executeAuthenticatedToolCall} only so that one
+   * failure — a denial that could not be recorded durably — has a single
+   * conversion point that no branch inside can bypass, without a `try`/`catch`
+   * around a thousand lines of dispatch logic that would also capture subsystem
+   * failures.
+   *
+   * @internal
+   */
+  private async executeToolCallPipeline(
     actor: CompleteActor,
     toolName: string,
     parameters: Record<string, unknown>,
@@ -3693,7 +3770,22 @@ export class ArcMcpServer implements IArcMcpServer {
     if (this.adminIpcServer) {
       await this.adminIpcServer.stop();
     }
-    await this.flushAudit();
+    // The last records are committed before the surface that produced them is
+    // released. A failure to secure them is NOT swallowed — it is rethrown after
+    // teardown below, because a caller that is told shutdown succeeded has been
+    // told the evidence is durable. What it must not do is stop the teardown:
+    // the flush is the one step here that can fail on a store that is already
+    // degraded, and abandoning the rest of this method on that failure would
+    // strand the transport, the writer lock and every descriptor the runtime
+    // holds, leaving a process that holds its store lock forever and a listener
+    // that never closes. Teardown therefore always runs to completion, and the
+    // failure is reported from the end.
+    let flushFailure: unknown;
+    try {
+      await this.flushAudit();
+    } catch (cause: unknown) {
+      flushFailure = cause;
+    }
     if (this.transport) {
       await this.transport.close();
     }
@@ -3705,6 +3797,9 @@ export class ArcMcpServer implements IArcMcpServer {
     // write to. One deterministic order, no descriptor or lock leak, and no
     // historical evidence deleted.
     await this.closeAuditRuntime();
+    if (flushFailure !== undefined) {
+      throw flushFailure;
+    }
   }
 
   /**
@@ -3757,6 +3852,33 @@ export function boundedAuditRefusal(cause: unknown): ArcError {
   }
   return ArcError.internalError(
     'Privileged operations are halted: durable audit evidence could not be secured.',
+  );
+}
+
+/**
+ * The bounded client-facing failure for a refusal the audit layer could not
+ * record durably (rc06 §22, §26, §44).
+ *
+ * The operation it answers WAS denied by policy, authorization or schema — and
+ * that denial is evidence. A process that returns the ordinary denial has told
+ * the caller "you were refused, and the refusal is on the record" when the
+ * durable chain holds no such record, and it has done so at the exact moment the
+ * process-wide degraded latch was set. The two facts are not interchangeable, so
+ * they do not share a response.
+ *
+ * It carries the frozen bounded vocabulary and the same shape as
+ * {@link boundedAuditRefusal}: no `fs` error, no directory, no key path, no
+ * sequence number, no store detail, and no raw cause.
+ */
+export function boundedAuditPersistenceFailure(cause: unknown): ArcError {
+  const code = boundedAuditFailureCode(cause);
+  if (code === 'ANCHOR_SPOOL_FULL' || code === 'AUDIT_STORAGE_EXHAUSTED') {
+    return ArcError.resourceExhausted(
+      'Audit evidence capacity is exhausted, so the refusal could not be recorded. Privileged operations are halted until an operator remediates the audit store.',
+    );
+  }
+  return ArcError.internalError(
+    'The refusal could not be recorded durably: durable audit evidence could not be secured. Privileged operations are halted until restart.',
   );
 }
 

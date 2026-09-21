@@ -97,7 +97,7 @@ import {
 import {
   Tier3AnchorEngine,
   computeAnchorReceiptPublicKeyFingerprint,
-  openTier3AnchorEngine,
+  openTier3AnchorEngineForStartup,
   validateAnchorEndpoint,
   type AnchorState,
 } from './anchor.js';
@@ -840,11 +840,20 @@ async function executeStartup(
         anchorReceiptPublicKeyPath: config.anchorReceiptPublicKeyPath,
         checkpointPublicKeyPath: config.publicKeyPath,
       };
+      // The engine arrives verified and *unreconciled*: this stage's authority is
+      // the receipt ledger and its bindings to the verified checkpoint history,
+      // not the spool. Opening a reconciled engine here would make stage 6 the
+      // first point at which a State C reconstruction, a State D removal or the
+      // spool directory itself can appear, which is stage 7's authority.
       anchor =
-        seams.createAnchorEngine === undefined
-          ? await openTier3AnchorEngine(anchorConfig)
-          : await seams.createAnchorEngine(anchorConfig);
+        seams.createAnchorEngineForStartup === undefined
+          ? await openTier3AnchorEngineForStartup(anchorConfig)
+          : await seams.createAnchorEngineForStartup(anchorConfig);
       handoffSlot.anchor = anchor;
+      // Read-only verification of the ledger and its checkpoint bindings. It
+      // creates nothing and removes nothing, so the spool directory and every
+      // entry in it are exactly as the store left them when this returns.
+      await anchor.verifyAnchorEvidence();
       if (anchor.getStatus().anchorState === 'FAILED') {
         throw createCodedError(
           'ANCHOR_ENGINE_FAILED',
@@ -858,10 +867,11 @@ async function executeStartup(
     if (anchor !== null) {
       // States A..F: pending entries retained, missing entries reconstructed
       // from the durable checkpoint artifact, stale entries removed only on the
-      // authority of a durable receipt. Run explicitly and separately from
-      // initialization so the reconciliation is an observable stage rather than
-      // a side effect, and so a failure at it is attributable to it.
-      await anchor.reconcileAnchorState();
+      // authority of a durable receipt. This is the first operation in the
+      // startup sequence with the authority to create, change or remove a spool
+      // artifact, and it applies only the plan stage 6 verified — an engine that
+      // staged nothing refuses rather than reconciling on an unverified basis.
+      await anchor.applyAnchorReconciliation();
       if (anchor.getStatus().anchorState === 'FAILED') {
         throw createCodedError(
           'ANCHOR_ENGINE_FAILED',

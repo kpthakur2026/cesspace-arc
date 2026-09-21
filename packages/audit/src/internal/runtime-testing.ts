@@ -24,7 +24,7 @@
 import type { AuditCheckpointV1 } from '../checkpoint.js';
 import { openAuditRuntimeInternal, type AuditConfig, type AuditRuntime } from '../startup.js';
 import { createTestTier2CheckpointEngine } from './checkpoint-testing.js';
-import { createTestTier3AnchorEngine } from './anchor-testing.js';
+import { createTestTier3AnchorEngineForStartup } from './anchor-testing.js';
 import {
   AUDIT_RUNTIME_TEST_TOKEN,
   type AuditRuntimeCompositionSeams,
@@ -73,8 +73,8 @@ export async function createTestAuditRuntime(
     ({
       createCheckpointEngine: (checkpointConfig) =>
         createTestTier2CheckpointEngine(checkpointConfig, options.checkpointHooks ?? {}),
-      createAnchorEngine: (anchorConfig) =>
-        createTestTier3AnchorEngine(anchorConfig, options.anchorHooks ?? {}),
+      createAnchorEngineForStartup: (anchorConfig) =>
+        createTestTier3AnchorEngineForStartup(anchorConfig, options.anchorHooks ?? {}),
     } satisfies AuditRuntimeCompositionSeams);
 
   return openAuditRuntimeInternal(config, options.hooks ?? {}, AUDIT_RUNTIME_TEST_TOKEN, seams);

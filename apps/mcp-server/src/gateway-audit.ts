@@ -32,6 +32,12 @@ import {
   projectGatewayMetadata,
   type AuditLogger,
 } from '@cesspace-arc/audit';
+import {
+  getAuditWriteAuthority,
+  resolveAuditWriteAuthority,
+  type AuditChainLike,
+  type AuditWriteAuthority,
+} from './audit-write-authority.js';
 
 /**
  * Maximum buffered gateway events awaiting an audit write.
@@ -167,7 +173,10 @@ export function getGatewayAuditSink(
 ): GatewayAuditSink {
   let sink = sinksByLogger.get(auditLogger);
   if (sink === undefined) {
-    sink = new GatewayAuditSink(auditLogger, options);
+    // The sink holds the ONE production write authority for this chain, not the
+    // logger and not the runtime. The authority is memoized per logger, so every
+    // sink over one chain drains through one writer.
+    sink = new GatewayAuditSink(getAuditWriteAuthority(auditLogger), options);
     sinksByLogger.set(auditLogger, sink);
   }
   return sink;
@@ -179,10 +188,19 @@ export class GatewayAuditSink {
   private overflowed = false;
   private writeFailed = false;
 
+  private readonly authority: AuditWriteAuthority;
+
+  /**
+   * Accepts the ONE production write authority, or the bare in-memory chain the
+   * historical callers compose a sink over. Both are normalized to one `write`,
+   * so there is never a second way into the chain.
+   */
   constructor(
-    private readonly auditLogger: AuditLogger,
+    target: AuditWriteAuthority | AuditChainLike,
     private readonly options: GatewayAuditSinkOptions = {},
-  ) {}
+  ) {
+    this.authority = resolveAuditWriteAuthority(target);
+  }
 
   /**
    * Records one gateway lifecycle event.
@@ -306,7 +324,7 @@ export class GatewayAuditSink {
     while (this.queue.length > 0) {
       const event = this.queue[0];
       try {
-        await this.auditLogger.log(this.toAuditRecord(event));
+        await this.authority.write(this.toAuditRecord(event));
       } catch {
         this.writeFailed = true;
         throw new GatewayAuditError('Gateway lifecycle audit write failed.', 'WRITE_FAILED');

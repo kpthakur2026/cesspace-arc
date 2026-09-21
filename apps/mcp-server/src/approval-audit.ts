@@ -7,8 +7,8 @@
  *   ApprovalStateManager
  *     -> synchronous, safe ApprovalLifecycleEvent
  *     -> ApprovalAuditSink buffers it (bounded)
- *     -> control plane flushes it into AuditLogger
- *     -> AuditLogger appends to the ONE existing SHA-256 chain
+ *     -> the ONE production write authority drains it (AuditWriteAuthority)
+ *     -> the durable primary chain, with the in-memory chain as a mirror
  *
  * The sink holds only bounded, safe lifecycle facts: no token, no token digest,
  * no review material, no content, no patch text, no environment value, and no
@@ -18,6 +18,12 @@
 import type { ApprovalLifecycleEvent, AuditRecord } from '@cesspace-arc/protocol';
 import { canonicalJson, computeSha256, type AuditLogger } from '@cesspace-arc/audit';
 import type { IApprovalLifecycleSink } from '@cesspace-arc/policy';
+import {
+  getAuditWriteAuthority,
+  resolveAuditWriteAuthority,
+  type AuditChainLike,
+  type AuditWriteAuthority,
+} from './audit-write-authority.js';
 
 /**
  * Maximum buffered lifecycle events awaiting an audit write.
@@ -102,7 +108,10 @@ const sinksByLogger = new WeakMap<AuditLogger, ApprovalAuditSink>();
 export function getApprovalAuditSink(auditLogger: AuditLogger): ApprovalAuditSink {
   let sink = sinksByLogger.get(auditLogger);
   if (sink === undefined) {
-    sink = new ApprovalAuditSink(auditLogger);
+    // The sink drains through the ONE production write authority for this chain,
+    // so approval evidence lands in the same persistent primary sequence as tool,
+    // gateway and process evidence.
+    sink = new ApprovalAuditSink(getAuditWriteAuthority(auditLogger));
     sinksByLogger.set(auditLogger, sink);
   }
   return sink;
@@ -113,7 +122,16 @@ export class ApprovalAuditSink implements IApprovalLifecycleSink {
   private flushTail: Promise<void> = Promise.resolve();
   private overflowed = false;
 
-  constructor(private readonly auditLogger: AuditLogger) {}
+  private readonly authority: AuditWriteAuthority;
+
+  /**
+   * Accepts the ONE production write authority, or the bare in-memory chain the
+   * historical callers and pre-RC-06 tests compose a sink over. Both are
+   * normalized to one `write`, so there is never a second way into the chain.
+   */
+  constructor(target: AuditWriteAuthority | AuditChainLike) {
+    this.authority = resolveAuditWriteAuthority(target);
+  }
 
   /**
    * Receives one synchronous lifecycle event. Enqueue only: never performs I/O,
@@ -178,7 +196,7 @@ export class ApprovalAuditSink implements IApprovalLifecycleSink {
     while (this.queue.length > 0) {
       const event = this.queue[0];
       try {
-        await this.auditLogger.log(this.toAuditRecord(event));
+        await this.authority.write(this.toAuditRecord(event));
       } catch {
         throw new ApprovalAuditError('Approval lifecycle audit write failed.', 'WRITE_FAILED');
       }

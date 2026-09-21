@@ -34,6 +34,10 @@ import { fileURLToPath } from 'node:url';
 
 import { ArcMcpServer } from '../apps/mcp-server/dist/index.js';
 import { RemoteExecutionBridge } from '../apps/mcp-server/dist/remote-execution.js';
+// The gateway sink is reached through its own module rather than the package
+// root: it is memoized per audit chain, so this is the SAME instance the server
+// composed, and the test drives the production emitter rather than a copy.
+import { getGatewayAuditSink } from '../apps/mcp-server/dist/gateway-audit.js';
 import {
   ApprovalStateManager,
   SecurityKernel,
@@ -43,6 +47,8 @@ import { DeviceTrustStore, resolveActiveDeviceIdentity } from '../packages/auth/
 import { AuditLogger } from '../packages/audit/dist/index.js';
 import { FilesystemSubsystem } from '../packages/filesystem/dist/index.js';
 import { GitSubsystem } from '../packages/git/dist/index.js';
+import { ProcessRegistry } from '../packages/processes/dist/index.js';
+import { ControlledProcessRunner } from '../packages/terminal/dist/index.js';
 
 import {
   ACTIVE_SEGMENT_FILENAME,
@@ -62,6 +68,7 @@ import {
   parseAndValidateRecordLineV1,
   parseRotatedSegmentFilename,
   scanAuditStorePhysicalBytes,
+  serializeAnchorReceiptV1,
   verifyCheckpointSignature,
   verifyRetainedPrimaryHistory,
   getProcessUid,
@@ -320,6 +327,141 @@ async function closeRuntime(runtime) {
   await runtime.close();
 }
 
+/**
+ * A Tier-3 transport that refuses every submission, so nothing is ever
+ * acknowledged and every genuine checkpoint stays spooled.
+ */
+const FAILING_ANCHOR_HOOKS = Object.freeze({
+  transport: async () => ({ statusCode: 500, body: Buffer.from('no', 'utf8') }),
+  sleep: async () => {},
+});
+
+/**
+ * Seeds a store holding exactly ONE genuine, unacknowledged checkpoint.
+ *
+ * The store is built by the real runtime: append, force a size-triggered
+ * rotation (which seals a real signed checkpoint and hands it to Tier 3, where
+ * the failing transport spools it), then append again. The result on disk is the
+ * precondition both anchor reconciliation states share — a checkpoint artifact,
+ * a durable spool entry, and no receipt.
+ */
+async function seedUnacknowledgedCheckpoint(fixture) {
+  const runtime = await createTestAuditRuntime(fixture.config, {
+    anchorHooks: FAILING_ANCHOR_HOOKS,
+  });
+  await runtime.appendRecord(sampleRecordCandidate());
+  await runtime.store.rotateNow('SIZE_THRESHOLD');
+  await runtime.appendRecord(sampleRecordCandidate());
+  await closeRuntime(runtime);
+
+  const checkpoints = readCheckpointRecords(fixture.auditDir);
+  assert.equal(checkpoints.length, 1, 'the fixture must hold exactly one genuine checkpoint');
+  assert.equal(
+    fs.existsSync(
+      path.join(fixture.auditDir, ANCHOR_SPOOL_DIRNAME, `${checkpoints[0].checkpointHash}.json`),
+    ),
+    true,
+    'the unacknowledged checkpoint must have spooled durably',
+  );
+  return checkpoints[0];
+}
+
+/**
+ * Every artifact class startup is allowed to mutate, read from disk.
+ *
+ * This is the observation the authority-boundary regressions compare: stage
+ * NAMES prove nothing about authority, while these six values change exactly
+ * when — and only when — the stage that owns each artifact has run.
+ */
+function artifactSnapshot(auditDir) {
+  const spoolDir = path.join(auditDir, ANCHOR_SPOOL_DIRNAME);
+  const checkpointFile = path.join(auditDir, CHECKPOINT_FILENAME);
+  const receiptFile = path.join(auditDir, ANCHOR_RECEIPT_FILENAME);
+  const active = rawActiveStats(auditDir);
+  return {
+    activeBytes: active.bytes,
+    activeLines: active.completeLines,
+    checkpointBytes: fs.existsSync(checkpointFile)
+      ? fs.readFileSync(checkpointFile).toString('base64')
+      : null,
+    receiptBytes: fs.existsSync(receiptFile)
+      ? fs.readFileSync(receiptFile).toString('base64')
+      : null,
+    receiptLines: receiptLineCount(auditDir),
+    spoolDirExists: fs.existsSync(spoolDir),
+    spoolEntries: fs.existsSync(spoolDir) ? fs.readdirSync(spoolDir).sort() : [],
+  };
+}
+
+/** Complete receipt lines currently durable in the ledger (0 when absent). */
+function receiptLineCount(auditDir) {
+  const file = path.join(auditDir, ANCHOR_RECEIPT_FILENAME);
+  if (!fs.existsSync(file)) return 0;
+  return fs
+    .readFileSync(file, 'utf8')
+    .split('\n')
+    .filter((line) => line.length > 0).length;
+}
+
+/** The spool directory of an audit directory. */
+function spoolDirOf(auditDir) {
+  return path.join(auditDir, ANCHOR_SPOOL_DIRNAME);
+}
+
+/**
+ * Waits until the process registry has recorded the child's terminal transition.
+ *
+ * A spawn that never happened still produces a truthful control plane: the
+ * registry reports `PROCESS_SPAWN_FAILED` from the child's `error` event (which
+ * is what the tool response is produced from), and the child's `close` event
+ * lands on a later tick and drives the terminal `PROCESS_EXITED` transition.
+ * Reading the chain between the two would race that emission, so the fixture
+ * waits for the transition the registry itself records before it reads anything.
+ */
+async function awaitProcessTerminalTransition(processRegistry, processId) {
+  const deadline = Date.now() + 10_000;
+  while (Date.now() < deadline) {
+    const record = processRegistry.getProcess(processId);
+    // `exitCode` is written by the terminal transition and by nothing else.
+    if (record !== undefined && record.exitCode !== undefined) {
+      return;
+    }
+    await new Promise((resolve) => {
+      setTimeout(resolve, 5);
+    });
+  }
+  throw new Error(`process ${processId} never reached a terminal transition`);
+}
+
+/**
+ * Proves a record list is ONE contiguous chain: a gapless sequence starting at
+ * 1 that re-verifies from genesis under the frozen verifier.
+ *
+ * A second ledger, or a category of evidence written to a private chain with its
+ * own numbering, cannot satisfy this — and neither can a chain whose records
+ * only look well-formed.
+ */
+async function assertOneSequence(fixture, records) {
+  assert.deepEqual(
+    records.map((record) => record.sequenceNumber),
+    records.map((_, index) => index + 1),
+    'the primary sequence must be gapless from 1',
+  );
+  const verification = await verifyRetainedPrimaryHistory(fixture.auditDir, EXPECTED_UID);
+  assert.equal(verification.status, 'VERIFIED');
+  assert.equal(verification.recordCount, records.length, 'every record must be on the one chain');
+  assert.equal(verification.terminalSequence, records.length);
+  assert.equal(verification.nextSequence, records.length + 1);
+}
+
+/** The bounded audit-persistence refusal the caller must be answered with. */
+const AUDIT_PERSISTENCE_FAILURE_MESSAGE =
+  'The refusal could not be recorded durably: durable audit evidence could not be secured. Privileged operations are halted until restart.';
+
+/** The bounded refusal a latched process answers every privileged request with. */
+const AUDIT_GATE_REFUSAL_MESSAGE =
+  'Privileged operations are halted: durable audit evidence could not be secured.';
+
 /** Counts real filesystem subsystem invocations, split into reads and mutations. */
 class FilesystemSpy extends FilesystemSubsystem {
   constructor() {
@@ -414,7 +556,7 @@ class GitSpy extends GitSubsystem {
  * startup sequence.
  */
 class DurabilityServer extends ArcMcpServer {
-  constructor(parts, runtimeOptions) {
+  constructor(parts, runtimeOptions, terminalSubsystem, processRegistry) {
     super(
       parts.registry,
       parts.kernel,
@@ -422,8 +564,8 @@ class DurabilityServer extends ArcMcpServer {
       parts.filesystem,
       parts.git,
       parts.config,
-      undefined,
-      undefined,
+      terminalSubsystem,
+      processRegistry,
       parts.approvals,
     );
     this.runtimeOptions = runtimeOptions;
@@ -437,12 +579,20 @@ class DurabilityServer extends ArcMcpServer {
   }
 }
 
-/** Builds a server over a real workspace with a real store. */
+/**
+ * Builds a server over a real workspace with a real store.
+ *
+ * `processRegistry` composes the real process-lifecycle path — the same
+ * registry/runner pair the production entry point composes — so a regression can
+ * prove that a genuine process lifecycle record reaches the persistent primary
+ * chain. Every other caller keeps the process-free composition.
+ */
 function buildServer(fixture, options = {}) {
   const registry = new WorkspaceRegistry();
   registry.registerWorkspace('ws', workspaceDir);
 
-  const kernel = new SecurityKernel(registry);
+  const processRegistry = options.processRegistry;
+  const kernel = new SecurityKernel(registry, processRegistry);
   const audit = new AuditLogger();
   const filesystem = options.filesystem ?? new FilesystemSpy();
   const git = options.git ?? new GitSpy();
@@ -459,8 +609,20 @@ function buildServer(fixture, options = {}) {
   const server = new DurabilityServer(
     { registry, kernel, audit, filesystem, git, approvals, config },
     options.runtimeOptions,
+    options.terminalSubsystem,
+    processRegistry,
   );
-  return { server, registry, kernel, audit, filesystem, git, approvals, config };
+  return {
+    server,
+    registry,
+    kernel,
+    audit,
+    filesystem,
+    git,
+    approvals,
+    config,
+    processRegistry,
+  };
 }
 
 /** Starts a server and registers it for teardown. */
@@ -2214,6 +2376,911 @@ describe('CesSpace ARC — RC-06 Task 6: Universal Lifecycle & Full-History Star
       assert.equal(surfaceSet.has('appendRecord'), true);
       assert.equal(surfaceSet.has('assertPrivilegedOperationsAllowed'), true);
       assert.equal(surfaceSet.has('latchDegradedAuditFailure'), true);
+    });
+  });
+
+  /* ======================================================================== *
+   * 15. Anchor authority boundaries — stage 6 verifies, stage 7 reconciles
+   *
+   * The frozen startup order gives receipt verification (6) and spool
+   * reconciliation (7) separate stages. Stage names prove nothing about
+   * authority: an implementation that reconciles inside stage 6 satisfies any
+   * assertion made about the order the names are entered in. Every assertion
+   * below therefore reads the ARTIFACTS — active primary bytes, the checkpoint
+   * artifact, the receipt ledger, the spool directory and its entries, the
+   * recovery append and service readiness — and a failure is injected at
+   * stage-7 ENTRY so that "no reconciliation happened before stage 7" is
+   * observed rather than asserted.
+   * ======================================================================== */
+
+  describe('Anchor authority boundaries', () => {
+    test('RC06-T6-REG-26: a missing spool entry (State C) is reconstructed by stage 7 alone, and a failure at stage-7 entry leaves the spool absent', async () => {
+      const fixture = makeAuditConfig('reg26', { anchor: true });
+      const checkpoint = await seedUnacknowledgedCheckpoint(fixture);
+      const entryName = `${checkpoint.checkpointHash}.json`;
+
+      // State C: the checkpoint artifact and the receipt ledger are exactly as
+      // the store left them; only the spool artifact is gone.
+      fs.rmSync(spoolDirOf(fixture.auditDir), { recursive: true, force: true });
+      const before = artifactSnapshot(fixture.auditDir);
+      assert.equal(before.spoolDirExists, false, 'the fixture must start from State C');
+      assert.equal(before.receiptLines, 0, 'an unacknowledged checkpoint has no receipt');
+
+      // (1) FAIL AT STAGE-7 ENTRY. `failStartupStage` raises before any line of
+      //     stage 7 can run, so a spool directory — or a reconstructed entry —
+      //     existing afterwards could only have been produced by stage 6 (or by
+      //     the engine construction stage 6 performs). Neither may.
+      const failingParts = buildServer(fixture, {
+        runtimeOptions: {
+          anchorHooks: FAILING_ANCHOR_HOOKS,
+          hooks: { failStartupStage: 'ANCHOR_SPOOL_RECONCILIATION' },
+        },
+      });
+      await assert.rejects(() => failingParts.server.start());
+      assert.equal(failingParts.server.transport, undefined);
+      await failingParts.server.stop();
+
+      assert.deepEqual(
+        artifactSnapshot(fixture.auditDir),
+        before,
+        'no artifact class may change before stage 7 runs',
+      );
+      assert.equal(
+        fs.existsSync(path.join(spoolDirOf(fixture.auditDir), entryName)),
+        false,
+        'stage 6 must not reconstruct a spool entry',
+      );
+      assert.equal(fs.existsSync(spoolDirOf(fixture.auditDir)), false);
+
+      // (2) RUN NORMALLY. Stage 7 is the first and only place the spool is
+      //     rebuilt — and the observation taken at stage-7 entry proves the
+      //     reconstruction had not happened when stage 7 began.
+      const observed = [];
+      const parts = buildServer(fixture, {
+        runtimeOptions: {
+          anchorHooks: FAILING_ANCHOR_HOOKS,
+          hooks: {
+            onStartupStage: (stage) =>
+              observed.push({ stage, ...artifactSnapshot(fixture.auditDir) }),
+          },
+        },
+      });
+      await startServer(parts);
+
+      assert.deepEqual(
+        observed.map((entry) => entry.stage),
+        [...AUDIT_STARTUP_STAGE_ORDER],
+      );
+      const at = (stage) => observed.find((entry) => entry.stage === stage);
+
+      assert.equal(
+        at('ANCHOR_RECEIPT_VERIFICATION').spoolDirExists,
+        false,
+        'stage 6 owns the receipt ledger, not the spool',
+      );
+      assert.deepEqual(at('ANCHOR_RECEIPT_VERIFICATION').spoolEntries, []);
+      assert.equal(
+        at('ANCHOR_SPOOL_RECONCILIATION').spoolDirExists,
+        false,
+        'stage-7 entry must precede every spool mutation',
+      );
+      assert.deepEqual(at('ANCHOR_SPOOL_RECONCILIATION').spoolEntries, []);
+      assert.equal(
+        at('TORN_TAIL_RECOVERY').spoolDirExists,
+        true,
+        'stage 7 must have reconstructed the spool directory',
+      );
+      assert.deepEqual(at('TORN_TAIL_RECOVERY').spoolEntries, [entryName]);
+      assert.deepEqual(at('RUNTIME_CURSORS').spoolEntries, [entryName]);
+
+      // The reconstruction is the canonical durable checkpoint the verified
+      // checkpoint chain implies, byte for byte — not a placeholder.
+      const reconstructed = JSON.parse(
+        fs.readFileSync(path.join(spoolDirOf(fixture.auditDir), entryName), 'utf8'),
+      );
+      assert.deepEqual(reconstructed, checkpoint);
+
+      // Nothing outside the spool was touched by the anchor stages.
+      assert.equal(at('RUNTIME_CURSORS').checkpointBytes, before.checkpointBytes);
+      assert.equal(at('RUNTIME_CURSORS').receiptLines, 0, 'no receipt may be invented');
+      assert.equal(at('RUNTIME_CURSORS').activeLines, before.activeLines);
+      assert.equal((await auditHealth(parts)).persistence, 'ACTIVE');
+    });
+
+    test('RC06-T6-REG-27: a stale spool entry (State D) is removed by stage 7 alone, and a failure at stage-7 entry leaves it in place', async () => {
+      const fixture = makeAuditConfig('reg27', { anchor: true });
+      const checkpoint = await seedUnacknowledgedCheckpoint(fixture);
+      const entryName = `${checkpoint.checkpointHash}.json`;
+      const entryPath = path.join(spoolDirOf(fixture.auditDir), entryName);
+
+      // State D: the checkpoint now HAS a valid, durable receipt — signed by the
+      // key the store is pinned to, for the store's own id — so the spool entry
+      // the store already holds is stale.
+      const receiptPath = path.join(fixture.auditDir, ANCHOR_RECEIPT_FILENAME);
+      fs.writeFileSync(
+        receiptPath,
+        serializeAnchorReceiptV1(
+          signTestAnchorReceipt(
+            {
+              version: 1,
+              storeId: readStoreId(fixture.auditDir),
+              receiptId: crypto.randomUUID(),
+              checkpointHash: checkpoint.checkpointHash,
+              anchorTimestamp: '2026-09-21T00:00:00.000Z',
+              anchorKeyFingerprint: fixture.anchorMaterial.fingerprint,
+            },
+            fixture.anchorMaterial.privateKey,
+          ),
+        ),
+        { mode: 0o600 },
+      );
+      fs.chmodSync(receiptPath, 0o600);
+
+      const before = artifactSnapshot(fixture.auditDir);
+      assert.deepEqual(before.spoolEntries, [entryName], 'the fixture must start from State D');
+      assert.equal(before.receiptLines, 1);
+
+      // (1) FAIL AT STAGE-7 ENTRY: the stale entry must still be there, and no
+      //     other artifact class may have moved either.
+      const failingParts = buildServer(fixture, {
+        runtimeOptions: {
+          anchorHooks: FAILING_ANCHOR_HOOKS,
+          hooks: { failStartupStage: 'ANCHOR_SPOOL_RECONCILIATION' },
+        },
+      });
+      await assert.rejects(() => failingParts.server.start());
+      await failingParts.server.stop();
+
+      assert.equal(
+        fs.existsSync(entryPath),
+        true,
+        'no stage before 7 may remove a stale spool entry',
+      );
+      assert.deepEqual(
+        artifactSnapshot(fixture.auditDir),
+        before,
+        'no artifact class may change before stage 7 runs',
+      );
+
+      // (2) RUN NORMALLY: stage 7 removes exactly the stale entry, and the
+      //     receipt that made it stale is untouched.
+      const observed = [];
+      const parts = buildServer(fixture, {
+        runtimeOptions: {
+          anchorHooks: FAILING_ANCHOR_HOOKS,
+          hooks: {
+            onStartupStage: (stage) =>
+              observed.push({ stage, ...artifactSnapshot(fixture.auditDir) }),
+          },
+        },
+      });
+      await startServer(parts);
+
+      const at = (stage) => observed.find((entry) => entry.stage === stage);
+      assert.deepEqual(
+        observed.map((entry) => entry.stage),
+        [...AUDIT_STARTUP_STAGE_ORDER],
+      );
+      assert.deepEqual(
+        at('ANCHOR_RECEIPT_VERIFICATION').spoolEntries,
+        [entryName],
+        'stage 6 verifies the receipt without removing the entry it makes stale',
+      );
+      assert.deepEqual(
+        at('ANCHOR_SPOOL_RECONCILIATION').spoolEntries,
+        [entryName],
+        'stage-7 entry must precede the removal',
+      );
+      assert.deepEqual(
+        at('TORN_TAIL_RECOVERY').spoolEntries,
+        [],
+        'stage 7 must have removed the stale entry',
+      );
+      assert.equal(fs.existsSync(entryPath), false);
+      assert.equal(at('RUNTIME_CURSORS').receiptBytes, before.receiptBytes, 'no receipt discarded');
+      assert.equal(at('RUNTIME_CURSORS').checkpointBytes, before.checkpointBytes);
+      assert.equal((await auditHealth(parts)).persistence, 'ACTIVE');
+    });
+
+    test('RC06-T6-REG-28: authority boundaries hold across every mutable artifact class, with a stage-7 failure proving no spool work happened first', async () => {
+      const fixture = makeAuditConfig('reg28', { anchor: true });
+      const danglingOperationId = crypto.randomUUID();
+
+      // One damaged store carrying every artifact class startup touches: a
+      // genuine unacknowledged checkpoint (spool entry, no receipt), a valid
+      // receipt that makes that entry stale, and — in the ACTIVE segment, where
+      // the torn-tail and dangling stages can see them — a torn tail and a
+      // dangling STARTED record.
+      const runtime = await createTestAuditRuntime(fixture.config, {
+        anchorHooks: FAILING_ANCHOR_HOOKS,
+      });
+      await runtime.appendRecord(sampleRecordCandidate());
+      await runtime.store.rotateNow('SIZE_THRESHOLD');
+      await runtime.appendRecord(
+        sampleRecordCandidate({
+          invocation: {
+            toolName: 'create_file',
+            parametersRedacted: { path: 'dangling.txt' },
+            payloadHash: 'e'.repeat(64),
+          },
+          lifecycle: { operationId: danglingOperationId, phase: 'STARTED' },
+        }),
+      );
+      await closeRuntime(runtime);
+
+      const checkpoints = readCheckpointRecords(fixture.auditDir);
+      assert.equal(checkpoints.length, 1);
+      const entryName = `${checkpoints[0].checkpointHash}.json`;
+      const receiptPath = path.join(fixture.auditDir, ANCHOR_RECEIPT_FILENAME);
+      fs.writeFileSync(
+        receiptPath,
+        serializeAnchorReceiptV1(
+          signTestAnchorReceipt(
+            {
+              version: 1,
+              storeId: readStoreId(fixture.auditDir),
+              receiptId: crypto.randomUUID(),
+              checkpointHash: checkpoints[0].checkpointHash,
+              anchorTimestamp: '2026-09-21T00:00:00.000Z',
+              anchorKeyFingerprint: fixture.anchorMaterial.fingerprint,
+            },
+            fixture.anchorMaterial.privateKey,
+          ),
+        ),
+        { mode: 0o600 },
+      );
+      fs.chmodSync(receiptPath, 0o600);
+
+      const tornBytes = Buffer.from('{"eventId":"torn-tail-fragment",', 'utf8');
+      assert.ok(tornBytes.length < MAX_TORN_TAIL_BYTES);
+      fs.appendFileSync(activeSegmentPath(fixture.auditDir), tornBytes);
+
+      const damaged = artifactSnapshot(fixture.auditDir);
+      assert.equal(damaged.activeLines, 1, 'the active segment holds the dangling STARTED record');
+      assert.deepEqual(damaged.spoolEntries, [entryName]);
+      assert.equal(damaged.receiptLines, 1);
+
+      // (1) STAGE-7 FAILURE. Every artifact class — including the receipt ledger
+      //     and the spool — must be byte-identical afterwards. If ANY stage-7
+      //     authority had already run inside stage 6, the stale entry would be
+      //     gone here.
+      const failingParts = buildServer(fixture, {
+        runtimeOptions: {
+          anchorHooks: FAILING_ANCHOR_HOOKS,
+          hooks: { failStartupStage: 'ANCHOR_SPOOL_RECONCILIATION' },
+        },
+      });
+      await assert.rejects(() => failingParts.server.start());
+      await failingParts.server.stop();
+      assert.deepEqual(
+        artifactSnapshot(fixture.auditDir),
+        damaged,
+        'a failure at stage-7 entry must leave every artifact class untouched',
+      );
+
+      // (2) OBSERVED RUN. Every mutable artifact class is read at the entry of
+      //     every stage, so each boundary is proven by the artifact that moves
+      //     across it — and by which stage it has not moved at yet.
+      const observed = [];
+      const parts = buildServer(fixture, {
+        runtimeOptions: {
+          anchorHooks: FAILING_ANCHOR_HOOKS,
+          hooks: {
+            onStartupStage: (stage) =>
+              observed.push({
+                stage,
+                ...artifactSnapshot(fixture.auditDir),
+                transportBound: parts.server.transport !== undefined,
+                runtimeBound: parts.server.auditRuntime !== undefined,
+              }),
+          },
+        },
+      });
+      await startServer(parts);
+
+      assert.deepEqual(
+        observed.map((entry) => entry.stage),
+        [...AUDIT_STARTUP_STAGE_ORDER],
+      );
+      const at = (stage) => observed.find((entry) => entry.stage === stage);
+
+      // (a) The checkpoint artifact is never rewritten by any stage: the
+      //     verified checkpoint chain is an input to startup, not an output.
+      for (const entry of observed) {
+        assert.equal(
+          entry.checkpointBytes,
+          damaged.checkpointBytes,
+          `${entry.stage} rewrote the checkpoint artifact`,
+        );
+      }
+
+      // (b) The receipt ledger is verified, never appended to: no receipt is
+      //     written by any stage of startup.
+      for (const entry of observed) {
+        assert.equal(
+          entry.receiptBytes,
+          damaged.receiptBytes,
+          `${entry.stage} wrote the receipt ledger`,
+        );
+      }
+
+      // (c) The spool is the stage-7 artifact, and stage 7 is the FIRST stage
+      //     that touches it: the stale entry is present through stage-7 entry
+      //     and gone by stage-8 entry.
+      for (const stage of AUDIT_STARTUP_STAGE_ORDER.slice(
+        0,
+        AUDIT_STARTUP_STAGE_ORDER.indexOf('ANCHOR_SPOOL_RECONCILIATION') + 1,
+      )) {
+        assert.deepEqual(at(stage).spoolEntries, [entryName], `${stage} must not touch the spool`);
+      }
+      assert.deepEqual(at('TORN_TAIL_RECOVERY').spoolEntries, []);
+
+      // (d) The active primary segment is the torn-tail artifact: unchanged
+      //     through stage-7 entry, truncated by stage 8, appended to exactly
+      //     once by stage 10.
+      for (const stage of AUDIT_STARTUP_STAGE_ORDER.slice(
+        0,
+        AUDIT_STARTUP_STAGE_ORDER.indexOf('TORN_TAIL_RECOVERY') + 1,
+      )) {
+        assert.equal(
+          at(stage).activeBytes,
+          damaged.activeBytes,
+          `${stage} must not mutate the active segment`,
+        );
+      }
+      assert.ok(at('DANGLING_OPERATION_DETECTION').activeBytes < damaged.activeBytes);
+      assert.equal(at('DANGLING_OPERATION_DETECTION').activeLines, 1);
+      assert.equal(at('RECOVERY_APPEND_DURABILITY').activeLines, 1);
+      assert.equal(
+        at('RUNTIME_CURSORS').activeLines,
+        2,
+        'stage 10 appends the recovery exactly once',
+      );
+
+      // (e) Service readiness: no transport and no runtime cursor is bound in
+      //     ANY stage — readiness is not a stage artifact.
+      for (const entry of observed) {
+        assert.equal(entry.transportBound, false, `${entry.stage} bound a transport`);
+        assert.equal(entry.runtimeBound, false, `${entry.stage} exposed the durable runtime`);
+      }
+      assert.equal(parts.server.transport !== undefined, true);
+      assert.equal(parts.server.auditRuntime !== undefined, true);
+
+      // The recovery append is the dangling operation's own evidence, and the
+      // whole store — the archived first record included — re-verifies end to
+      // end afterwards.
+      const records = readActiveRecords(fixture.auditDir);
+      assert.equal(records.length, 2);
+      assert.equal(records[1].lifecycle.phase, 'RECOVERY_INDETERMINATE');
+      assert.equal(records[1].lifecycle.operationId, danglingOperationId);
+      assert.deepEqual(
+        records.map((record) => record.sequenceNumber),
+        [2, 3],
+        'the active segment continues the archived history rather than restarting it',
+      );
+      const verification = await verifyRetainedPrimaryHistory(fixture.auditDir, EXPECTED_UID);
+      assert.equal(verification.status, 'VERIFIED');
+      assert.equal(verification.recordCount, 3);
+      assert.equal(verification.terminalSequence, 3);
+    });
+  });
+
+  /* ======================================================================== *
+   * 16. One persistent primary sequence for every production emitter
+   *
+   * A durable tool chain with a separate in-memory gateway/approval/process
+   * chain is two audit truths. These regressions read the STORE, never
+   * `AuditLogger.getRecords()`: an emitter that still writes only to the
+   * in-memory mirror produces records that are absent from disk, and an emitter
+   * that writes to both without converging on one authority produces records
+   * that are present twice.
+   * ======================================================================== */
+
+  describe('One persistent primary sequence', () => {
+    test('RC06-T6-REG-29: gateway lifecycle evidence reaches the persistent primary chain exactly once, in the frozen safe projection', async () => {
+      const fixture = makeAuditConfig('reg29');
+      const parts = buildServer(fixture);
+      await startServer(parts);
+
+      const read = body(
+        await parts.server.dispatchToolCall('read_file', { path: 'README.md', workspaceId: 'ws' }),
+      );
+      assert.equal(read.isError, undefined, 'the fixture read must succeed');
+
+      const spkiPin = 'a'.repeat(64);
+      const deviceId = 'b'.repeat(32);
+      const mcpSessionId = 'c'.repeat(64);
+      const sink = getGatewayAuditSink(parts.audit);
+      sink.emit({ eventType: 'GATEWAY_STARTED', transportMode: 'remote' });
+      sink.emit({
+        eventType: 'AUTH_SUCCEEDED',
+        clientId: 'agent-alpha',
+        clientType: 'claude-code',
+        deviceId,
+        spkiPin,
+        mcpSessionId,
+        admissionLayer: 'A',
+        transportMode: 'remote',
+      });
+      sink.emit({
+        eventType: 'AUTH_FAILED',
+        reason: 'SECRET_MISMATCH',
+        admissionLayer: 'A',
+        transportMode: 'remote',
+      });
+      sink.emit({
+        eventType: 'RATE_LIMITED',
+        reason: 'QUOTA_EXCEEDED',
+        admissionLayer: 'C',
+        transportMode: 'remote',
+      });
+      await sink.flush();
+
+      const records = readActiveRecords(fixture.auditDir);
+      const gatewayRecords = records.filter((record) => record.gateway !== undefined);
+      assert.deepEqual(
+        gatewayRecords.map((record) => record.gateway.eventType),
+        ['GATEWAY_STARTED', 'AUTH_SUCCEEDED', 'AUTH_FAILED', 'RATE_LIMITED'],
+        'the allow and denial transitions must all be durable, in emission order',
+      );
+
+      for (const type of ['GATEWAY_STARTED', 'AUTH_SUCCEEDED', 'AUTH_FAILED', 'RATE_LIMITED']) {
+        assert.equal(
+          gatewayRecords.filter((record) => record.gateway.eventType === type).length,
+          1,
+          `${type} must appear exactly once on disk`,
+        );
+      }
+
+      // The frozen safe projection: only bounded, server-derived fields, and no
+      // credential shape anywhere on the record.
+      const allowedGatewayKeys = [
+        'admissionLayer',
+        'clientId',
+        'clientType',
+        'deviceId',
+        'enrollmentId',
+        'eventType',
+        'mcpSessionId',
+        'reason',
+        'spkiPin',
+        'transportMode',
+      ];
+      for (const record of gatewayRecords) {
+        assert.deepEqual(
+          Object.keys(record.gateway).filter((key) => !allowedGatewayKeys.includes(key)),
+          [],
+        );
+        const raw = JSON.stringify(record);
+        // No credential FIELD of any kind: the record has no place to put an
+        // `Authorization` value, a session token, an enrollment secret or a
+        // private key, so no such key may exist at any depth.
+        const keys = [];
+        const collectKeys = (value) => {
+          if (value === null || typeof value !== 'object') return;
+          if (Array.isArray(value)) {
+            value.forEach(collectKeys);
+            return;
+          }
+          for (const [key, child] of Object.entries(value)) {
+            keys.push(key);
+            collectKeys(child);
+          }
+        };
+        collectKeys(record);
+        assert.deepEqual(
+          keys.filter((key) => /token|secret|password|authorization|credential|header/i.test(key)),
+          [],
+          'a gateway record must carry no credential field',
+        );
+        assert.equal(/bearer\s|BEGIN [A-Z ]*PRIVATE KEY/i.test(raw), false);
+        // No host address of any form: the gateway records expose no network
+        // location, so nothing in the record may parse as an IPv4 literal.
+        assert.equal(
+          /\b\d{1,3}(\.\d{1,3}){3}\b/.test(raw.replace(/T[0-9:.]+Z/g, '')),
+          false,
+          'a gateway record must carry no peer address',
+        );
+      }
+      const succeeded = gatewayRecords.find((r) => r.gateway.eventType === 'AUTH_SUCCEEDED');
+      const failed = gatewayRecords.find((r) => r.gateway.eventType === 'AUTH_FAILED');
+      assert.equal(succeeded.policy.decision, 'ALLOW');
+      assert.equal(failed.policy.decision, 'DENY');
+      assert.equal(failed.execution.status, 'DENIED');
+      assert.equal(succeeded.gateway.spkiPin, spkiPin);
+      assert.equal(succeeded.gateway.deviceId, deviceId);
+      assert.equal(succeeded.gateway.mcpSessionId, mcpSessionId);
+      assert.equal(succeeded.actor.deviceId, deviceId);
+
+      // ONE sequence: the gateway records share their numbering with the tool
+      // lifecycle records rather than sitting on a chain of their own.
+      assert.ok(records.some((record) => record.lifecycle?.phase === 'COMPLETED'));
+      assert.ok(
+        records.findIndex((record) => record.gateway !== undefined) >
+          records.findIndex((record) => record.lifecycle?.phase === 'COMPLETED'),
+        'gateway evidence must be appended after the tool evidence it followed',
+      );
+      await assertOneSequence(fixture, records);
+
+      // The historical in-memory chain is a mirror of that ONE truth.
+      assert.deepEqual(
+        parts.audit.getRecords().map((record) => record.eventId),
+        records.map((record) => record.eventId),
+      );
+      assert.equal((await auditHealth(parts)).persistence, 'ACTIVE');
+    });
+
+    test('RC06-T6-REG-30: approval lifecycle evidence joins the same persistent sequence exactly once, with no token or review material on disk', async () => {
+      const fixture = makeAuditConfig('reg30');
+      const parts = buildServer(fixture);
+      await startServer(parts);
+
+      const sink = getGatewayAuditSink(parts.audit);
+      sink.emit({ eventType: 'GATEWAY_STARTED', transportMode: 'remote' });
+      await sink.flush();
+
+      const target = path.join(workspaceDir, 'approval-evidence.json');
+      const params = {
+        path: 'approval-evidence.json',
+        content: 'approved-evidence-content',
+        workspaceId: 'ws',
+      };
+      const first = body(await parts.server.dispatchToolCall('create_file', { ...params }));
+      assert.equal(first.code, 'APPROVAL_REQUIRED');
+      const requestId = first.details.approvalRequestId;
+      const grant = parts.approvals.approve(requestId);
+      assert.equal(typeof grant.token, 'string');
+      const second = body(
+        await parts.server.dispatchToolCall('create_file', {
+          ...params,
+          _arcApproval: { requestId, token: grant.token },
+        }),
+      );
+      assert.equal(second.isError, undefined, 'the approved mutation must execute');
+      await parts.server.flushAudit();
+      assert.equal(fs.readFileSync(target, 'utf8'), 'approved-evidence-content');
+
+      const records = readActiveRecords(fixture.auditDir);
+      const approvalRecords = records.filter((record) => record.approval?.eventType !== undefined);
+      assert.deepEqual(
+        approvalRecords.map((record) => record.approval.eventType).slice(0, 3),
+        ['APPROVAL_REQUESTED', 'APPROVAL_GRANTED', 'APPROVAL_CONSUMED'],
+        'the real approval lifecycle must be durable, in order',
+      );
+      const lifecyclePairs = approvalRecords.map(
+        (record) => `${record.approval.requestId}:${record.approval.eventType}`,
+      );
+      assert.equal(
+        new Set(lifecyclePairs).size,
+        lifecyclePairs.length,
+        'no approval lifecycle event may be recorded twice',
+      );
+      assert.deepEqual(
+        [...new Set(approvalRecords.map((record) => record.approval.requestId))],
+        [requestId],
+      );
+
+      // The bounded lifecycle projection carries no review material: only the
+      // frozen field set, and no operator-supplied text.
+      const allowedApprovalKeys = [
+        'eventType',
+        'operatorReasonProvided',
+        'reasonCode',
+        'requestId',
+        'source',
+        'state',
+      ];
+      for (const record of approvalRecords) {
+        assert.deepEqual(
+          Object.keys(record.approval).filter((key) => !allowedApprovalKeys.includes(key)),
+          [],
+        );
+      }
+      assert.deepEqual(
+        Object.keys(approvalRecords[0].invocation.parametersRedacted).filter(
+          (key) => !['eventType', 'requestId', 'state', 'workspaceId', 'reasonCode'].includes(key),
+        ),
+        [],
+      );
+
+      // The approved EXECUTION record is bound to the same request on the same
+      // chain, so the tool evidence and the approval evidence cannot diverge.
+      const executed = records.find((record) => record.lifecycle?.phase === 'COMPLETED');
+      assert.equal(executed.policy.approvalId, requestId);
+      assert.equal(executed.approval.requestId, requestId);
+      assert.equal(executed.approval.state, 'CONSUMED');
+
+      // No authorization material on disk: not the redemption token, not the
+      // file content that was approved.
+      const rawChain = readActiveRecordLines(fixture.auditDir).join('');
+      assert.equal(rawChain.includes(grant.token), false, 'no approval token may reach the store');
+      assert.equal(
+        rawChain.includes('approved-evidence-content'),
+        false,
+        'no approved content may reach the store',
+      );
+
+      // Same global sequence as the tool and gateway evidence.
+      assert.ok(records.some((record) => record.gateway !== undefined));
+      assert.ok(records.some((record) => record.lifecycle?.phase === 'COMPLETED'));
+      await assertOneSequence(fixture, records);
+      assert.deepEqual(
+        parts.audit.getRecords().map((record) => record.eventId),
+        records.map((record) => record.eventId),
+      );
+      assert.equal((await auditHealth(parts)).persistence, 'ACTIVE');
+    });
+
+    test('RC06-T6-REG-31: a real process lifecycle record is committed to the same persistent chain exactly once', async () => {
+      const fixture = makeAuditConfig('reg31');
+      const processRegistry = new ProcessRegistry();
+      const terminal = new ControlledProcessRunner(processRegistry, undefined, {
+        resolveExecutable: () => '/usr/bin/ces-nonexistent-rc06-process-bin',
+      });
+      const parts = buildServer(fixture, { processRegistry, terminalSubsystem: terminal });
+      await startServer(parts);
+      assert.equal(parts.processRegistry, processRegistry);
+
+      const result = body(
+        await parts.server.dispatchToolCall(
+          'run_command',
+          { executable: 'node', args: ['--version'], runInBackground: true },
+          { clientId: 'rc06-process-client', sessionId: 'rc06-process-session' },
+        ),
+      );
+      assert.equal(result.state, 'FAILED', 'the fixture must produce a truthful failed spawn');
+      await awaitProcessTerminalTransition(processRegistry, result.processId);
+      await parts.server.flushAudit();
+
+      const records = readActiveRecords(fixture.auditDir);
+      const processRecords = records.filter((record) =>
+        record.invocation.toolName.startsWith('PROCESS_'),
+      );
+      // The spawn attempt contributes exactly two lifecycle records — the
+      // failure and the terminal close, each exactly once — and no other
+      // process event of any kind.
+      assert.deepEqual(
+        processRecords.map((record) => record.invocation.toolName),
+        ['PROCESS_SPAWN_FAILED', 'PROCESS_EXITED'],
+        'the spawn attempt must be recorded exactly once, end to end',
+      );
+      const failure = processRecords[0];
+      assert.equal(failure.policy.ruleId, 'process-lifecycle-event');
+      assert.equal(failure.execution.status, 'ERROR');
+      assert.equal(failure.invocation.parametersRedacted.processId, result.processId);
+      for (const record of processRecords) {
+        assert.equal(
+          record.invocation.parametersRedacted.processId,
+          result.processId,
+          'every process record must belong to the process the tool reported',
+        );
+      }
+      assert.equal(
+        records.some((record) => record.invocation.toolName === 'PROCESS_SPAWN_SUCCEEDED'),
+        false,
+        'no success may be recorded for a spawn that never happened',
+      );
+      // The lifecycle records share the chain — and the hash chain — with the
+      // tool invocation that produced them.
+      assert.ok(records.some((record) => record.lifecycle !== undefined));
+      await assertOneSequence(fixture, records);
+      assert.deepEqual(
+        parts.audit.getRecords().map((record) => record.eventId),
+        records.map((record) => record.eventId),
+      );
+    });
+
+    test('RC06-T6-REG-32: the combined tool, gateway, approval and process history survives a restart', async () => {
+      const fixture = makeAuditConfig('reg32');
+      const processRegistry = new ProcessRegistry();
+      const terminal = new ControlledProcessRunner(processRegistry, undefined, {
+        resolveExecutable: () => '/usr/bin/ces-nonexistent-rc06-restart-bin',
+      });
+      const first = buildServer(fixture, { processRegistry, terminalSubsystem: terminal });
+      await startServer(first);
+
+      await first.server.dispatchToolCall('read_file', { path: 'README.md', workspaceId: 'ws' });
+      const sink = getGatewayAuditSink(first.audit);
+      sink.emit({ eventType: 'GATEWAY_STARTED', transportMode: 'remote' });
+      sink.emit({
+        eventType: 'AUTH_FAILED',
+        reason: 'SECRET_MISMATCH',
+        admissionLayer: 'A',
+        transportMode: 'remote',
+      });
+      await sink.flush();
+      const redeemed = await requestApproveRedeem(first, 'create_file', {
+        path: 'restart-evidence.txt',
+        content: 'durable-across-restart',
+        workspaceId: 'ws',
+      });
+      assert.equal(redeemed.secondBody.isError, undefined);
+      const processResult = body(
+        await first.server.dispatchToolCall(
+          'run_command',
+          { executable: 'node', args: ['--version'], runInBackground: true },
+          { clientId: 'rc06-restart-client', sessionId: 'rc06-restart-session' },
+        ),
+      );
+      await awaitProcessTerminalTransition(processRegistry, processResult.processId);
+      await first.server.flushAudit();
+
+      const classify = (records) => ({
+        toolLifecycle: records.filter((record) => record.lifecycle !== undefined).length,
+        gateway: records.filter((record) => record.gateway !== undefined).length,
+        approval: records.filter((record) => record.approval !== undefined).length,
+        process: records.filter((record) => record.invocation.toolName.startsWith('PROCESS_'))
+          .length,
+      });
+      const before = readActiveRecords(fixture.auditDir);
+      const beforeCounts = classify(before);
+      for (const [category, count] of Object.entries(beforeCounts)) {
+        assert.ok(count > 0, `${category} evidence must exist before the restart`);
+      }
+      await assertOneSequence(fixture, before);
+
+      await first.server.stop();
+      startedServers.splice(startedServers.indexOf(first.server), 1);
+      assert.equal(
+        fs.existsSync(path.join(fixture.auditDir, LOCK_FILENAME)),
+        false,
+        'shutdown must release the single writer lock',
+      );
+
+      const second = buildServer(fixture);
+      await startServer(second);
+      assert.equal((await auditHealth(second)).persistence, 'ACTIVE');
+
+      const after = readActiveRecords(fixture.auditDir);
+      assert.ok(after.length >= before.length);
+      assert.deepEqual(
+        after.slice(0, before.length).map((record) => record.eventId),
+        before.map((record) => record.eventId),
+        'the recorded history must be intact and in order after the restart',
+      );
+      assert.deepEqual(
+        classify(after.slice(0, before.length)),
+        beforeCounts,
+        'no evidence category may disappear on restart merely because it existed only in memory',
+      );
+      await assertOneSequence(fixture, after);
+    });
+  });
+
+  /* ======================================================================== *
+   * 17. Denied-refusal persistence failure
+   *
+   * A refused operation IS evidence, and a process that answers with the
+   * ordinary policy or schema denial has told the caller the refusal is on the
+   * record. When the durable append fails, that answer would be false — at the
+   * exact moment the process became unfit to serve. The refusal the caller
+   * receives must then be the audit-persistence failure, and the process must
+   * be latched.
+   * ======================================================================== */
+
+  describe('Denied-refusal persistence failure', () => {
+    /** Runs one denial whose durable DENIED append fails, and proves the contract. */
+    async function assertDeniedPersistenceFailure(label, controlBody, call) {
+      const fixture = makeAuditConfig(label);
+      const parts = buildServer(fixture, {
+        runtimeOptions: { hooks: { failAppendPhase: 'DENIED' } },
+      });
+      await startServer(parts);
+
+      const linesBefore = readActiveRecordLines(fixture.auditDir).length;
+      const readsBefore = parts.filesystem.reads;
+      const mutationsBefore = parts.filesystem.mutations;
+      const approvalsBefore = parts.approvals.listActive().length;
+
+      const parsed = body(await call(parts));
+
+      // (1) The response is the bounded audit-persistence failure — never the
+      //     ordinary denial the same request produces on a healthy chain.
+      assert.equal(parsed.code, 'INTERNAL_ERROR');
+      assert.equal(parsed.category, 'INTERNAL');
+      assert.equal(parsed.message, AUDIT_PERSISTENCE_FAILURE_MESSAGE);
+      assert.notEqual(parsed.code, controlBody.code, 'the ordinary denial must not be the answer');
+      assert.equal(
+        /[/\\]|README|passwd|\.pem|store|spool|sequence|inode/i.test(parsed.message),
+        false,
+      );
+
+      // (2) Zero privileged subsystem work and zero approval side effects: the
+      //     failure happens at the denial boundary, before either.
+      assert.equal(parts.filesystem.reads, readsBefore, 'zero subsystem reads');
+      assert.equal(parts.filesystem.mutations, mutationsBefore, 'zero subsystem mutations');
+      assert.equal(parts.approvals.listActive().length, approvalsBefore, 'zero approval requests');
+
+      // (3) No durable DENIED record was invented, and nothing else was written.
+      const records = readActiveRecords(fixture.auditDir);
+      assert.equal(
+        records.filter((record) => record.lifecycle?.phase === 'DENIED').length,
+        0,
+        'a failed append must not be papered over with an invented DENIED record',
+      );
+      assert.equal(readActiveRecordLines(fixture.auditDir).length, linesBefore);
+
+      // (4) The runtime is latched degraded, and the latch is what answers the
+      //     NEXT privileged request — before policy, before approval, before any
+      //     subsystem.
+      assert.equal((await auditHealth(parts)).persistence, 'DEGRADED');
+      const latchedReads = parts.filesystem.reads;
+      const latchedApprovals = parts.approvals.listActive().length;
+      const gated = body(
+        await parts.server.dispatchToolCall('read_file', { path: 'README.md', workspaceId: 'ws' }),
+      );
+      assert.equal(gated.code, 'INTERNAL_ERROR');
+      assert.equal(gated.message, AUDIT_GATE_REFUSAL_MESSAGE);
+      assert.equal(parts.filesystem.reads, latchedReads);
+      assert.equal(parts.approvals.listActive().length, latchedApprovals);
+      const afterGate = body(
+        await parts.server.dispatchToolCall('create_file', {
+          path: 'never-created.txt',
+          content: 'x',
+          workspaceId: 'ws',
+        }),
+      );
+      assert.equal(afterGate.code, 'INTERNAL_ERROR');
+      assert.notEqual(afterGate.code, 'APPROVAL_REQUIRED');
+      assert.equal(parts.filesystem.mutations, mutationsBefore);
+      assert.equal(readActiveRecordLines(fixture.auditDir).length, linesBefore);
+      assert.equal((await auditHealth(parts)).persistence, 'DEGRADED');
+    }
+
+    /** The SAME schema denial on a healthy chain, for the control comparison. */
+    async function schemaDenialControl() {
+      const fixture = makeAuditConfig('neg46-control');
+      const parts = buildServer(fixture);
+      await startServer(parts);
+      const parsed = body(
+        await parts.server.dispatchToolCall('read_file', {
+          path: 'README.md',
+          workspaceId: 'ws',
+          // Above the frozen 1 MiB read ceiling: a schema denial decided before
+          // any subsystem, policy or approval work.
+          length: 2_000_000,
+        }),
+      );
+      await parts.server.stop();
+      startedServers.splice(startedServers.indexOf(parts.server), 1);
+      return parsed;
+    }
+
+    test('RC06-NEG-46: a schema denial whose durable DENIED append fails answers with the bounded audit persistence failure', async () => {
+      const control = await schemaDenialControl();
+      assert.equal(control.code, 'PAYLOAD_TOO_LARGE');
+
+      await assertDeniedPersistenceFailure('neg46', control, (parts) =>
+        parts.server.dispatchToolCall('read_file', {
+          path: 'README.md',
+          workspaceId: 'ws',
+          length: 2_000_000,
+        }),
+      );
+    });
+
+    test('RC06-NEG-47: a policy denial whose durable DENIED append fails answers with the bounded audit persistence failure', async () => {
+      const controlFixture = makeAuditConfig('neg47-control');
+      const controlParts = buildServer(controlFixture);
+      await startServer(controlParts);
+      const control = body(
+        await controlParts.server.dispatchToolCall('read_file', {
+          // A traversal target: the request fails the workspace boundary at the
+          // policy layer, before any subsystem or approval work.
+          path: '../neg47-outside.txt',
+          workspaceId: 'ws',
+        }),
+      );
+      await controlParts.server.stop();
+      startedServers.splice(startedServers.indexOf(controlParts.server), 1);
+      assert.equal(control.code, 'POLICY_DENIED');
+
+      await assertDeniedPersistenceFailure('neg47', control, (parts) =>
+        parts.server.dispatchToolCall('read_file', {
+          path: '../neg47-outside.txt',
+          workspaceId: 'ws',
+        }),
+      );
     });
   });
 });
