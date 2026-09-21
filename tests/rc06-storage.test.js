@@ -20,6 +20,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { createRequire } from 'node:module';
 
 import { MAX_RECORD_BYTES } from '../packages/protocol/dist/index.js';
 
@@ -1750,7 +1751,16 @@ describe('CesSpace ARC — RC-06 Task 1: Persistent Append Storage Foundation', 
     });
 
     test('Package deep-import subpath protection for internal modules', () => {
-      const pkgUrl = new URL('../packages/audit/package.json', import.meta.url);
+      const auditPkgJsonPath = path.resolve('packages/audit/package.json');
+      const pkgJson = JSON.parse(fs.readFileSync(auditPkgJsonPath, 'utf8'));
+      assert.deepStrictEqual(Object.keys(pkgJson.exports), ['.']);
+
+      const auditRequire = createRequire(auditPkgJsonPath);
+      assert.strictEqual(
+        auditRequire.resolve('@cesspace-arc/audit'),
+        path.resolve('packages/audit/dist/index.js'),
+      );
+
       const subpaths = [
         '@cesspace-arc/audit/internal/storage-testing',
         '@cesspace-arc/audit/internal/recovery-testing',
@@ -1763,7 +1773,7 @@ describe('CesSpace ARC — RC-06 Task 1: Persistent Append Storage Foundation', 
       for (const subpath of subpaths) {
         assert.throws(
           () => {
-            import.meta.resolve(subpath, pkgUrl);
+            auditRequire.resolve(subpath);
           },
           (err) => err.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED',
         );
