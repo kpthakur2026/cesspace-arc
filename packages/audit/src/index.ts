@@ -517,4 +517,16 @@ export type { AuditRecord };
 export * from './storage.js';
 export * from './metadata.js';
 export * from './lock.js';
-export * from './recovery.js';
+export {
+  MAX_TORN_TAIL_BYTES,
+  type TrustedPrimaryChainBoundary,
+  type DanglingOperation,
+  type VerifiedStreamResult,
+  type TornTailStreamResult,
+  type ActiveStreamVerificationResult,
+  type StreamVerificationOptions,
+  verifyActiveStream,
+  type AuditRecoveryResult,
+  type AuditRecoveryOptions,
+  recoverPersistentAuditStorage,
+} from './recovery.js';

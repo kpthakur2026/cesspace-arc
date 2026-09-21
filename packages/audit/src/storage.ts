@@ -972,16 +972,10 @@ export interface PersistentAuditStorageConfig {
   platformProbe?: Partial<PlatformCapabilities>;
 }
 
-export const RECOVERY_HANDOFF_TOKEN = Symbol('RECOVERY_HANDOFF_TOKEN');
-
-export interface VerifiedRecoveryHandoff {
-  lock: AuditLockAcquisition;
-  metadata: AuditStoreMetadataV1;
-  activeFd: number;
-  terminalSequence: number;
-  terminalRecordHash: string;
-  verifiedActiveIdentity: { dev: number; ino: number };
-}
+import {
+  RECOVERY_HANDOFF_TOKEN,
+  type VerifiedRecoveryHandoff,
+} from './internal/recovery-capability.js';
 
 export class PersistentAuditStorage {
   /** @internal Package-private recovery bootstrap */

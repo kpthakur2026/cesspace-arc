@@ -11,17 +11,17 @@ import {
   ACTIVE_SEGMENT_FILENAME,
   DEFAULT_AUDIT_DIR,
   PersistentAuditStorage,
-  RECOVERY_HANDOFF_TOKEN,
   createCodedError,
   type CodedError,
   getProcessUid,
   parseAndValidateRecordLineV1,
   type PersistentAuditStorageConfig,
-  type StorageTestFaults,
   validateAuditDirectory,
   validateFileDescriptorAuthority,
   validatePlatformCapabilities,
 } from './storage.js';
+import { RECOVERY_HANDOFF_TOKEN } from './internal/recovery-capability.js';
+import type { RecoveryTestHooks } from './internal/recovery-testing.js';
 import { acquireWriterLock } from './lock.js';
 import {
   METADATA_FILENAME,
@@ -490,25 +490,21 @@ export interface AuditRecoveryResult {
   nextSequence: number;
 }
 
-export interface RecoveryTestHooks {
-  sidecarTimestamp?: string;
-  failSidecarCreation?: boolean;
-  failSidecarWrite?: boolean;
-  failSidecarSync?: boolean;
-  failTruncation?: boolean;
-  beforeTruncate?: () => void;
-  beforeFinalAppendOpen?: () => void;
-  storageTestFaults?: StorageTestFaults;
-}
-
 export interface AuditRecoveryOptions {
   trustedBoundary?: TrustedPrimaryChainBoundary;
-  testHooks?: RecoveryTestHooks;
 }
 
-export async function recoverPersistentAuditStorage(
+/**
+ * Internal implementation of restart recovery coordinating verification,
+ * torn tail recovery, and dangling operation reconciliation.
+ *
+ * Test hooks are supplied strictly through package-internal test entry points.
+ * @internal
+ */
+export async function executeAuditRecoveryInternal(
   config: PersistentAuditStorageConfig,
-  options?: AuditRecoveryOptions,
+  trustedBoundary?: TrustedPrimaryChainBoundary,
+  testHooks?: RecoveryTestHooks,
 ): Promise<AuditRecoveryResult> {
   validatePlatformCapabilities(config.platformProbe);
 
@@ -608,7 +604,7 @@ export async function recoverPersistentAuditStorage(
     }
 
     let verifyResult = verifyActiveStream(activePath, expectedUid, {
-      trustedBoundary: options?.trustedBoundary,
+      trustedBoundary,
     });
 
     let recoveredTornTail = false;
@@ -618,8 +614,7 @@ export async function recoverPersistentAuditStorage(
       recoveredTornTail = true;
       try {
         const now = new Date();
-        const isoTime =
-          options?.testHooks?.sidecarTimestamp ?? now.toISOString().replace(/:/g, '-');
+        const isoTime = testHooks?.sidecarTimestamp ?? now.toISOString().replace(/:/g, '-');
         let sidecarFilename = `${ACTIVE_SEGMENT_FILENAME}.torn.${isoTime}`;
         let sidecarCandidate = path.join(auditDir, sidecarFilename);
 
@@ -627,7 +622,7 @@ export async function recoverPersistentAuditStorage(
         let counter = 0;
         while (sidecarFd === null) {
           try {
-            if (options?.testHooks?.failSidecarCreation) {
+            if (testHooks?.failSidecarCreation) {
               throw createCodedError(
                 'SIMULATED_SIDECAR_CREATION_FAILURE',
                 'Simulated sidecar creation failure',
@@ -675,7 +670,7 @@ export async function recoverPersistentAuditStorage(
             );
           }
 
-          if (options?.testHooks?.failSidecarWrite) {
+          if (testHooks?.failSidecarWrite) {
             throw createCodedError(
               'SIMULATED_SIDECAR_WRITE_FAILURE',
               'Simulated sidecar write failure',
@@ -695,7 +690,7 @@ export async function recoverPersistentAuditStorage(
             written += n;
           }
 
-          if (options?.testHooks?.failSidecarSync) {
+          if (testHooks?.failSidecarSync) {
             throw createCodedError(
               'SIMULATED_SIDECAR_SYNC_FAILURE',
               'Simulated sidecar sync failure',
@@ -714,8 +709,8 @@ export async function recoverPersistentAuditStorage(
           fs.closeSync(dirFd);
         }
 
-        if (options?.testHooks?.beforeTruncate) {
-          options.testHooks.beforeTruncate();
+        if (testHooks?.beforeTruncate) {
+          testHooks.beforeTruncate();
         }
 
         const truncFd = fs.openSync(activePath, fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW);
@@ -730,17 +725,17 @@ export async function recoverPersistentAuditStorage(
               'Active file identity changed between classification and truncation',
             );
           }
-          if (
-            truncStats.size <
-            verifyResult.lastVerifiedByteOffset + verifyResult.tornBytes.length
-          ) {
+
+          const classifiedFileSize =
+            verifyResult.lastVerifiedByteOffset + verifyResult.tornBytes.length;
+          if (truncStats.size !== classifiedFileSize) {
             throw createCodedError(
               'AUDIT_RECOVERY_FAILED',
-              'Active file size changed unexpectedly before truncation',
+              `Active file size changed unexpectedly before truncation (expected: ${classifiedFileSize}, actual: ${truncStats.size})`,
             );
           }
 
-          if (options?.testHooks?.failTruncation) {
+          if (testHooks?.failTruncation) {
             throw createCodedError('SIMULATED_TRUNCATION_FAILURE', 'Simulated truncation failure');
           }
 
@@ -751,7 +746,7 @@ export async function recoverPersistentAuditStorage(
         }
 
         const reverifyResult = verifyActiveStream(activePath, expectedUid, {
-          trustedBoundary: options?.trustedBoundary,
+          trustedBoundary,
         });
         if (reverifyResult.status !== 'VERIFIED') {
           throw createCodedError(
@@ -777,8 +772,8 @@ export async function recoverPersistentAuditStorage(
       }
     }
 
-    if (options?.testHooks?.beforeFinalAppendOpen) {
-      options.testHooks.beforeFinalAppendOpen();
+    if (testHooks?.beforeFinalAppendOpen) {
+      testHooks.beforeFinalAppendOpen();
     }
 
     try {
@@ -823,13 +818,12 @@ export async function recoverPersistentAuditStorage(
         terminalRecordHash: verifyResult.terminalRecordHash,
         verifiedActiveIdentity: { dev: appendStats.dev, ino: appendStats.ino },
       },
-      options?.testHooks?.storageTestFaults
-        ? { testFaults: options.testHooks.storageTestFaults }
-        : undefined,
+      testHooks?.storageTestFaults ? { testFaults: testHooks.storageTestFaults } : undefined,
     );
 
     let indeterminateRecoveries = 0;
     const danglingOps = verifyResult.danglingOperations;
+    let opIndex = 0;
 
     for (const danglingOp of danglingOps) {
       const recoveryTimestamp = new Date().toISOString();
@@ -868,8 +862,19 @@ export async function recoverPersistentAuditStorage(
       };
 
       try {
+        if (
+          testHooks?.failRecoveryAppendAtIndex !== undefined &&
+          opIndex === testHooks.failRecoveryAppendAtIndex
+        ) {
+          throw createCodedError(
+            'SIMULATED_RECOVERY_APPEND_FAILURE',
+            `Simulated recovery append failure at index ${opIndex}`,
+          );
+        }
+
         await storage.append(recoveryCandidate);
         indeterminateRecoveries++;
+        opIndex++;
       } catch (appendErr: unknown) {
         throw createCodedError(
           'AUDIT_RECOVERY_FAILED',
@@ -911,4 +916,17 @@ export async function recoverPersistentAuditStorage(
     }
     throw err;
   }
+}
+
+/**
+ * Recovers persistent audit storage on restart.
+ *
+ * Public production API: accepts only production configuration and optional
+ * trusted primary-chain boundary. Exposes zero test callbacks or fault flags.
+ */
+export async function recoverPersistentAuditStorage(
+  config: PersistentAuditStorageConfig,
+  options?: AuditRecoveryOptions,
+): Promise<AuditRecoveryResult> {
+  return executeAuditRecoveryInternal(config, options?.trustedBoundary);
 }

@@ -34,6 +34,8 @@ import {
   ACTIVE_SEGMENT_FILENAME,
 } from '../packages/audit/dist/index.js';
 
+import { recoverPersistentAuditStorageForTest } from '../packages/audit/dist/internal/recovery-testing.js';
+
 function createSampleRecord(seq, prevHash, overrides = {}) {
   const base = {
     schemaVersion: 1,
@@ -748,27 +750,44 @@ describe('CesSpace ARC — RC-06 Task 2: Restart Recovery, Torn Tails & Dangling
 
       storage1.close();
 
-      // Simulate failure on recovery append
+      // Simulate failure on second recovery append (index 1) after first append succeeds
       await assert.rejects(
         async () => {
-          await recoverPersistentAuditStorage(config, {
+          await recoverPersistentAuditStorageForTest(config, {
             testHooks: {
-              storageTestFaults: { writeFault: 'error' },
+              failRecoveryAppendAtIndex: 1,
             },
           });
         },
         (err) => err.code === 'AUDIT_RECOVERY_FAILED',
       );
 
-      // Verify that store lock was cleaned up (another process/recovery can acquire it)
+      // Verify that store lock was cleaned up
       const lockPath = path.join(config.directory, 'audit.lock');
       assert.strictEqual(fs.existsSync(lockPath), false);
 
-      // Now run recovery without faults: both dangling operations are successfully reconciled
+      // Verify durable partial progress: Op 1 recovery record was persisted at sequence 3
+      const activePath = path.join(config.directory, ACTIVE_SEGMENT_FILENAME);
+      const linesAfterPartial = fs.readFileSync(activePath, 'utf8').trim().split('\n');
+      assert.strictEqual(linesAfterPartial.length, 3);
+      const rec1 = JSON.parse(linesAfterPartial[2]);
+      assert.strictEqual(rec1.sequenceNumber, 3);
+      assert.strictEqual(rec1.lifecycle.operationId, opId1);
+      assert.strictEqual(rec1.lifecycle.phase, 'RECOVERY_INDETERMINATE');
+
+      // Second restart: Op 1 is already terminal; only Op 2 is reconciled (indeterminateRecoveries === 1)
       const recResult = await recoverPersistentAuditStorage(config);
-      assert.strictEqual(recResult.indeterminateRecoveries, 2);
-      assert.strictEqual(recResult.terminalSequence, 4); // 2 started + 2 recovered = 4
+      assert.strictEqual(recResult.indeterminateRecoveries, 1);
+      assert.strictEqual(recResult.terminalSequence, 4);
       assert.strictEqual(recResult.nextSequence, 5);
+
+      const linesAfterFinal = fs.readFileSync(activePath, 'utf8').trim().split('\n');
+      assert.strictEqual(linesAfterFinal.length, 4);
+      const rec2 = JSON.parse(linesAfterFinal[3]);
+      assert.strictEqual(rec2.sequenceNumber, 4);
+      assert.strictEqual(rec2.lifecycle.operationId, opId2);
+      assert.strictEqual(rec2.lifecycle.phase, 'RECOVERY_INDETERMINATE');
+      assert.strictEqual(rec2.integrity.previousRecordHash, rec1.integrity.recordHash);
 
       recResult.storage.close();
     });
@@ -1127,7 +1146,7 @@ describe('CesSpace ARC — RC-06 Task 2: Restart Recovery, Torn Tails & Dangling
 
       await assert.rejects(
         async () => {
-          await recoverPersistentAuditStorage(config, {
+          await recoverPersistentAuditStorageForTest(config, {
             testHooks: { failSidecarCreation: true },
           });
         },
@@ -1166,7 +1185,7 @@ describe('CesSpace ARC — RC-06 Task 2: Restart Recovery, Torn Tails & Dangling
 
       await assert.rejects(
         async () => {
-          await recoverPersistentAuditStorage(config, {
+          await recoverPersistentAuditStorageForTest(config, {
             testHooks: { failSidecarWrite: true },
           });
         },
@@ -1175,6 +1194,53 @@ describe('CesSpace ARC — RC-06 Task 2: Restart Recovery, Torn Tails & Dangling
 
       const fileBytesAfter = fs.readFileSync(activePath);
       assert.deepStrictEqual(fileBytesAfter, fileBytesBefore);
+    });
+
+    test('Sidecar fsync failure preserves active file unchanged, retains sidecar, and fails closed', async () => {
+      const config = createTestStoreConfig('sidecar-fail-sync');
+      const storage1 = new PersistentAuditStorage(config);
+      storage1.initialize();
+
+      await storage1.append({
+        eventId: randomUUID(),
+        timestamp: '2026-09-21T08:00:00.000Z',
+        actor: { clientId: 'c1', clientType: 'admin', deviceId: '', sessionId: '' },
+        target: { workspaceId: 'w1', workspacePath: '', workspaceRootHash: 'a'.repeat(64) },
+        invocation: { toolName: 't1', parametersRedacted: {}, payloadHash: 'b'.repeat(64) },
+        policy: { decision: 'ALLOW', ruleId: 'r1', evaluationDurationMs: 1 },
+        execution: {
+          status: 'SUCCESS',
+          startTime: '2026-09-21T08:00:00.000Z',
+          endTime: '2026-09-21T08:00:00.001Z',
+          durationMs: 1,
+        },
+      });
+      storage1.close();
+
+      const activePath = path.join(config.directory, ACTIVE_SEGMENT_FILENAME);
+      const tornBytes = Buffer.from('{"torn":2.5');
+      fs.appendFileSync(activePath, tornBytes);
+      const fileBytesBefore = fs.readFileSync(activePath);
+
+      await assert.rejects(
+        async () => {
+          await recoverPersistentAuditStorageForTest(config, {
+            testHooks: { failSidecarSync: true },
+          });
+        },
+        (err) => err.code === 'AUDIT_RECOVERY_FAILED',
+      );
+
+      // Active file MUST remain byte-for-byte unchanged
+      const fileBytesAfter = fs.readFileSync(activePath);
+      assert.deepStrictEqual(fileBytesAfter, fileBytesBefore);
+
+      // Sidecar file remains as retained forensic evidence
+      const files = fs.readdirSync(config.directory);
+      const sidecars = files.filter((f) => f.includes('.torn.'));
+      assert.strictEqual(sidecars.length, 1);
+      const sidecarContent = fs.readFileSync(path.join(config.directory, sidecars[0]));
+      assert.deepStrictEqual(sidecarContent, tornBytes);
     });
 
     test('Truncation failure retains sidecar as forensic evidence and fails closed', async () => {
@@ -1204,7 +1270,7 @@ describe('CesSpace ARC — RC-06 Task 2: Restart Recovery, Torn Tails & Dangling
 
       await assert.rejects(
         async () => {
-          await recoverPersistentAuditStorage(config, {
+          await recoverPersistentAuditStorageForTest(config, {
             testHooks: { failTruncation: true },
           });
         },
@@ -1253,7 +1319,7 @@ describe('CesSpace ARC — RC-06 Task 2: Restart Recovery, Torn Tails & Dangling
       fs.writeFileSync(collidingSidecar, preExistingContent, { mode: 0o600 });
 
       // Run recovery with fixedTimestamp
-      const recResult = await recoverPersistentAuditStorage(config, {
+      const recResult = await recoverPersistentAuditStorageForTest(config, {
         testHooks: { sidecarTimestamp: fixedTimestamp },
       });
 
@@ -1266,6 +1332,107 @@ describe('CesSpace ARC — RC-06 Task 2: Restart Recovery, Torn Tails & Dangling
       assert.deepStrictEqual(preExistingAfter, preExistingContent);
 
       recResult.storage.close();
+    });
+
+    test('Active file same-inode growth before truncation fails closed (no truncation, new bytes preserved)', async () => {
+      const config = createTestStoreConfig('same-inode-growth');
+      const storage1 = new PersistentAuditStorage(config);
+      storage1.initialize();
+
+      await storage1.append({
+        eventId: randomUUID(),
+        timestamp: '2026-09-21T08:00:00.000Z',
+        actor: { clientId: 'c1', clientType: 'admin', deviceId: '', sessionId: '' },
+        target: { workspaceId: 'w1', workspacePath: '', workspaceRootHash: 'a'.repeat(64) },
+        invocation: { toolName: 't1', parametersRedacted: {}, payloadHash: 'b'.repeat(64) },
+        policy: { decision: 'ALLOW', ruleId: 'r1', evaluationDurationMs: 1 },
+        execution: {
+          status: 'SUCCESS',
+          startTime: '2026-09-21T08:00:00.000Z',
+          endTime: '2026-09-21T08:00:00.001Z',
+          durationMs: 1,
+        },
+      });
+      storage1.close();
+
+      const activePath = path.join(config.directory, ACTIVE_SEGMENT_FILENAME);
+      fs.appendFileSync(activePath, '{"torn":6');
+
+      const statBefore = fs.statSync(activePath);
+      let statAfterAppend = null;
+
+      await assert.rejects(
+        async () => {
+          await recoverPersistentAuditStorageForTest(config, {
+            testHooks: {
+              beforeTruncate: () => {
+                // Append extra bytes to the SAME file/inode without unlinking or replacing
+                const extraFd = fs.openSync(
+                  activePath,
+                  fs.constants.O_WRONLY | fs.constants.O_APPEND,
+                );
+                fs.writeSync(extraFd, Buffer.from('EXTRA_CONCURRENT_GROWTH'));
+                fs.closeSync(extraFd);
+
+                statAfterAppend = fs.statSync(activePath);
+                // Inode remains identical, size increases
+                assert.strictEqual(statAfterAppend.ino, statBefore.ino);
+                assert.strictEqual(statAfterAppend.dev, statBefore.dev);
+                assert.ok(statAfterAppend.size > statBefore.size);
+              },
+            },
+          });
+        },
+        (err) =>
+          err.code === 'AUDIT_RECOVERY_FAILED' &&
+          err.message.includes('size changed unexpectedly before truncation'),
+      );
+
+      // Verify that ftruncate never occurred: active file bytes match exact bytes after injected growth
+      const currentBytes = fs.readFileSync(activePath);
+      assert.strictEqual(currentBytes.length, statAfterAppend.size);
+      assert.ok(currentBytes.toString('utf8').includes('EXTRA_CONCURRENT_GROWTH'));
+    });
+
+    test('Active file same-inode shrink before truncation fails closed (no truncation)', async () => {
+      const config = createTestStoreConfig('same-inode-shrink');
+      const storage1 = new PersistentAuditStorage(config);
+      storage1.initialize();
+
+      await storage1.append({
+        eventId: randomUUID(),
+        timestamp: '2026-09-21T08:00:00.000Z',
+        actor: { clientId: 'c1', clientType: 'admin', deviceId: '', sessionId: '' },
+        target: { workspaceId: 'w1', workspacePath: '', workspaceRootHash: 'a'.repeat(64) },
+        invocation: { toolName: 't1', parametersRedacted: {}, payloadHash: 'b'.repeat(64) },
+        policy: { decision: 'ALLOW', ruleId: 'r1', evaluationDurationMs: 1 },
+        execution: {
+          status: 'SUCCESS',
+          startTime: '2026-09-21T08:00:00.000Z',
+          endTime: '2026-09-21T08:00:00.001Z',
+          durationMs: 1,
+        },
+      });
+      storage1.close();
+
+      const activePath = path.join(config.directory, ACTIVE_SEGMENT_FILENAME);
+      fs.appendFileSync(activePath, '{"torn":7');
+
+      await assert.rejects(
+        async () => {
+          await recoverPersistentAuditStorageForTest(config, {
+            testHooks: {
+              beforeTruncate: () => {
+                // Shrink file to smaller size
+                fs.truncateSync(activePath, 10);
+              },
+            },
+          });
+        },
+        (err) =>
+          err.code === 'AUDIT_RECOVERY_FAILED' &&
+          err.message.includes('size changed unexpectedly before truncation'),
+      );
     });
 
     test('Active file replacement race safety: pathname replacement between verification and truncation fails closed', async () => {
@@ -1294,7 +1461,7 @@ describe('CesSpace ARC — RC-06 Task 2: Restart Recovery, Torn Tails & Dangling
 
       await assert.rejects(
         async () => {
-          await recoverPersistentAuditStorage(config, {
+          await recoverPersistentAuditStorageForTest(config, {
             testHooks: {
               beforeTruncate: () => {
                 // Replace active file with a new file before truncation using different inode
@@ -1336,7 +1503,7 @@ describe('CesSpace ARC — RC-06 Task 2: Restart Recovery, Torn Tails & Dangling
 
       await assert.rejects(
         async () => {
-          await recoverPersistentAuditStorage(config, {
+          await recoverPersistentAuditStorageForTest(config, {
             testHooks: {
               beforeFinalAppendOpen: () => {
                 // Replace active file right before final append open using different inode
@@ -1433,6 +1600,68 @@ describe('CesSpace ARC — RC-06 Task 2: Restart Recovery, Torn Tails & Dangling
       assert.strictEqual(finalVerification.recordCount, 3);
       assert.strictEqual(finalVerification.terminalSequence, 3);
       assert.strictEqual(finalVerification.terminalRecordHash, r3.integrity.recordHash);
+    });
+  });
+
+  describe('10. Public API Surface & Capability Boundary Verification', () => {
+    test('Public API root does not expose RECOVERY_HANDOFF_TOKEN or internal testing helpers', async () => {
+      const auditPublic = await import('../packages/audit/dist/index.js');
+      assert.strictEqual(auditPublic.RECOVERY_HANDOFF_TOKEN, undefined);
+      assert.strictEqual(auditPublic.VerifiedRecoveryHandoff, undefined);
+      assert.strictEqual(auditPublic.RecoveryTestHooks, undefined);
+      assert.strictEqual(auditPublic.TestAuditRecoveryOptions, undefined);
+      assert.strictEqual(auditPublic.recoverPersistentAuditStorageForTest, undefined);
+      assert.strictEqual(auditPublic.executeAuditRecoveryInternal, undefined);
+    });
+
+    test('PersistentAuditStorage._fromVerifiedRecovery rejects unauthorized invocation without internal symbol', async () => {
+      const auditPublic = await import('../packages/audit/dist/index.js');
+      const fakeToken = Symbol('RECOVERY_HANDOFF_TOKEN');
+      assert.throws(
+        () => {
+          auditPublic.PersistentAuditStorage._fromVerifiedRecovery(
+            fakeToken,
+            { directory: '/tmp/test' },
+            {},
+          );
+        },
+        (err) =>
+          err.code === 'AUDIT_STORAGE_INVALID_STATE' &&
+          err.message.includes('unauthorized recovery handoff'),
+      );
+    });
+
+    test('Production recoverPersistentAuditStorage rejects test hooks and accepts only production options', async () => {
+      const config = createTestStoreConfig('pub-api-no-hooks');
+      const storage1 = new PersistentAuditStorage(config);
+      storage1.initialize();
+
+      await storage1.append({
+        eventId: randomUUID(),
+        timestamp: '2026-09-21T08:00:00.000Z',
+        actor: { clientId: 'c1', clientType: 'admin', deviceId: '', sessionId: '' },
+        target: { workspaceId: 'w1', workspacePath: '', workspaceRootHash: 'a'.repeat(64) },
+        invocation: { toolName: 't1', parametersRedacted: {}, payloadHash: 'b'.repeat(64) },
+        policy: { decision: 'ALLOW', ruleId: 'r1', evaluationDurationMs: 1 },
+        execution: {
+          status: 'SUCCESS',
+          startTime: '2026-09-21T08:00:00.000Z',
+          endTime: '2026-09-21T08:00:00.001Z',
+          durationMs: 1,
+        },
+      });
+      storage1.close();
+
+      const activePath = path.join(config.directory, ACTIVE_SEGMENT_FILENAME);
+      fs.appendFileSync(activePath, '{"torn":8');
+
+      // Calling public recoverPersistentAuditStorage with testHooks ignored
+      // (it will NOT trigger failTruncation because public API does not accept testHooks)
+      const res = await recoverPersistentAuditStorage(config, {
+        testHooks: { failTruncation: true },
+      });
+      assert.strictEqual(res.recoveredTornTail, true);
+      res.storage.close();
     });
   });
 });
