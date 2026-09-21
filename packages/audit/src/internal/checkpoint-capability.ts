@@ -60,4 +60,25 @@ export interface CheckpointTestHooks {
 
   /** Observes the open flags used for the checkpoint artifact. */
   openFlagsProbe?: (flags: number) => void;
+
+  /**
+   * Runs after initialization has verified the artifact ABSENT and immediately
+   * before the exclusive creation is attempted.
+   *
+   * Lets a test place a racing artifact on the canonical path in the one window
+   * where the engine has already committed to owning creation, which is the only
+   * way to exercise the `EEXIST` outcome deterministically.
+   */
+  beforeCheckpointExclusiveCreate?: (filePath: string) => void;
+
+  /**
+   * Runs immediately before the checkpoint artifact is revalidated for an
+   * append, and therefore before the write.
+   *
+   * Lets a test substitute the pathname, grow the inode, or detach the canonical
+   * path in the window between the descriptor being established and the next
+   * checkpoint being committed. It cannot make an invalid append succeed: the
+   * revalidation runs after it and fails closed.
+   */
+  beforeCheckpointAppend?: (filePath: string) => void;
 }

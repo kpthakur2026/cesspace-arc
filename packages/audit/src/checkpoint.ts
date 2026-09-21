@@ -522,6 +522,22 @@ export function parseAndValidateCheckpointLineV1(line: string): {
  * Checkpoint artifact file authority (rc06 §8.4, Task 4 §20-§23)
  * -------------------------------------------------------------------------- */
 
+/**
+ * The identity of the checkpoint artifact as VERIFIED, captured from the exact
+ * descriptor verification read.
+ *
+ * This is security state, not a cache. The engine initializes its cursor from
+ * verified history, so the artifact it later appends to must be the same object
+ * that history was verified from. Recording `ABSENT` as a positive finding is
+ * just as important as recording a present artifact: it is what entitles the
+ * engine to *create* the stream, and what makes a file appearing afterwards a
+ * refusal rather than an adoption.
+ *
+ * @internal
+ */
+type VerifiedCheckpointArtifactState =
+  { kind: 'ABSENT' } | { kind: 'PRESENT'; dev: number; ino: number; size: number };
+
 /** Opens an existing checkpoint artifact with `O_NOFOLLOW` and validates it. */
 async function openExistingCheckpointFile(
   filePath: string,
@@ -651,6 +667,21 @@ interface CheckpointVerificationCore {
 }
 
 /**
+ * The public verification result plus the verified artifact identity.
+ *
+ * The identity stays on this internal shape rather than on
+ * {@link CheckpointHistoryVerificationResult}: an offline verifier has no writer
+ * to bind, so it has no use for the inode of the file it just read, and a public
+ * surface that exposed it would invite a caller to treat it as authority.
+ *
+ * @internal
+ */
+interface CheckpointVerificationOutcome extends CheckpointHistoryVerificationResult {
+  /** Identity of the artifact the history was verified from. */
+  artifactState: VerifiedCheckpointArtifactState;
+}
+
+/**
  * Verifies the checkpoint history against the actual retained primary evidence.
  *
  * The two streams are walked together. The primary walk supplies the only
@@ -672,7 +703,7 @@ interface CheckpointVerificationCore {
  */
 async function verifyCheckpointHistoryCore(
   core: CheckpointVerificationCore,
-): Promise<CheckpointHistoryVerificationResult> {
+): Promise<CheckpointVerificationOutcome> {
   const { auditDir, expectedUid, publicKey, storeId, fingerprint } = core;
 
   // Rotated-segment terminals are mandatory rotation-checkpoint boundaries
@@ -683,9 +714,22 @@ async function verifyCheckpointHistoryCore(
   );
 
   const checkpointPath = path.join(auditDir, CHECKPOINT_FILENAME);
-  const checkpointHandle = fs.existsSync(checkpointPath)
-    ? await openExistingCheckpointFile(checkpointPath, expectedUid)
-    : null;
+
+  // Absence is established by the open itself rather than by a separate
+  // existence probe, so there is no window between "the path looked empty" and
+  // "the open was attempted" in which the answer could change. Either way the
+  // finding is recorded as verified state below, and never re-inferred later.
+  let checkpointHandle: FileHandle | null;
+  try {
+    checkpointHandle = await openExistingCheckpointFile(checkpointPath, expectedUid);
+  } catch (err: unknown) {
+    if ((err as { code?: string } | null)?.code === 'AUDIT_CHECKPOINT_FILE_MISSING') {
+      checkpointHandle = null;
+    } else {
+      throw err;
+    }
+  }
+
   const iterator =
     checkpointHandle === null
       ? null
@@ -778,6 +822,12 @@ async function verifyCheckpointHistoryCore(
     lastCheckpointTerminalRecordHash = checkpoint.terminalRecordHash;
   };
 
+  // Identity of the artifact this history was verified from. Only a PRESENT
+  // finding carries an identity, and it is taken from the very descriptor the
+  // two streams were read through — before that descriptor is closed, so the
+  // recorded identity cannot describe a file that was swapped in afterwards.
+  let artifactState: VerifiedCheckpointArtifactState = { kind: 'ABSENT' };
+
   try {
     await verifyRetainedPrimaryHistory(auditDir, expectedUid, {
       onVerifiedRecord: async (fact) => {
@@ -801,6 +851,16 @@ async function verifyCheckpointHistoryCore(
         );
       }
     }
+
+    if (checkpointHandle !== null) {
+      const stats = fs.fstatSync(checkpointHandle.fd);
+      artifactState = {
+        kind: 'PRESENT',
+        dev: Number(stats.dev),
+        ino: Number(stats.ino),
+        size: Number(stats.size),
+      };
+    }
   } finally {
     if (checkpointHandle !== null) {
       await checkpointHandle.close();
@@ -808,6 +868,7 @@ async function verifyCheckpointHistoryCore(
   }
 
   return {
+    artifactState,
     checkpointCount,
     lastCheckpointSequence: checkpointCount === 0 ? null : checkpointedThrough,
     lastCheckpointHash,
@@ -933,6 +994,12 @@ export class Tier2CheckpointEngine implements RotationCheckpointSealer {
 
   private checkpointFd: number | null = null;
 
+  /** The artifact identity verified during initialization; never re-inferred. */
+  private artifactState: VerifiedCheckpointArtifactState | null = null;
+
+  /** Durable length of the checkpoint artifact, advanced only after fdatasync. */
+  private expectedSize = 0;
+
   private nextCoverageStart = 1;
   private previousCheckpointHash = ZERO_HASH;
   private lastCheckpointSequence: number | null = null;
@@ -1016,6 +1083,12 @@ export class Tier2CheckpointEngine implements RotationCheckpointSealer {
       verified.lastCheckpointSequence === null ? 1 : verified.lastCheckpointSequence + 1;
     this.previousCheckpointHash = verified.lastCheckpointHash ?? ZERO_HASH;
 
+    // The stream this engine may append to is the exact stream it just verified.
+    // An ABSENT finding is recorded just as positively: it is what authorizes
+    // creation, and what makes a later arrival at that path a refusal.
+    this.artifactState = verified.artifactState;
+    this.expectedSize = verified.artifactState.kind === 'PRESENT' ? verified.artifactState.size : 0;
+
     this.initialized = true;
   }
 
@@ -1037,6 +1110,7 @@ export class Tier2CheckpointEngine implements RotationCheckpointSealer {
       this.checkpointFd = null;
       fs.closeSync(fd);
     }
+    this.artifactState = null;
     this.initialized = false;
   }
 
@@ -1151,48 +1225,90 @@ export class Tier2CheckpointEngine implements RotationCheckpointSealer {
     return this.hooks.randomUUID?.() ?? crypto.randomUUID();
   }
 
-  /** Opens (or securely creates) the checkpoint artifact for appending. */
+  /**
+   * Opens the checkpoint artifact for appending, bound to the verified identity.
+   *
+   * Which of the two paths is taken is decided by the state initialization
+   * *verified*, never by what the filesystem looks like now. A stream that was
+   * verified ABSENT may only be created — by this engine, exclusively — and a
+   * stream that was verified PRESENT may only be reopened if it is provably the
+   * same object. There is no third path, and in particular there is no
+   * "the path exists now, so adopt it" path: a file that appears where the
+   * verified state was absent is the race this exists to refuse.
+   */
   private ensureCheckpointFd(): number {
     if (this.checkpointFd !== null) {
       return this.checkpointFd;
     }
 
+    const state = this.artifactState;
+    if (state === null) {
+      throw createCodedError(
+        'AUDIT_CHECKPOINT_INVALID_STATE',
+        'checkpoint artifact identity has not been verified',
+      );
+    }
+
     const filePath = path.join(this.auditDir, CHECKPOINT_FILENAME);
-    const openFlags = fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_NOFOLLOW;
-    this.hooks.openFlagsProbe?.(openFlags);
-
-    let fd: number;
-    try {
-      fd = fs.openSync(filePath, openFlags);
-    } catch (err: unknown) {
-      const code = (err as { code?: string } | null)?.code;
-      if (code === 'ELOOP') {
-        throw createCodedError('SYMLINK_DETECTED', `${CHECKPOINT_FILENAME} is a symbolic link`);
-      }
-      if (code !== 'ENOENT') {
-        throw createCodedError(
-          'AUDIT_CHECKPOINT_FILE_UNAVAILABLE',
-          `${CHECKPOINT_FILENAME} could not be opened safely`,
-          { cause: err },
-        );
-      }
-      fd = this.createCheckpointFile(filePath);
-      this.checkpointFd = fd;
-      return fd;
-    }
-
-    try {
-      validateFileDescriptorAuthority(fd, 0o600, this.expectedUid);
-    } catch (err) {
-      fs.closeSync(fd);
-      throw err;
-    }
+    const fd =
+      state.kind === 'ABSENT'
+        ? this.createCheckpointFile(filePath)
+        : this.openVerifiedCheckpointFile(filePath, state);
 
     this.checkpointFd = fd;
+    this.expectedSize = state.kind === 'PRESENT' ? state.size : 0;
     return fd;
   }
 
-  /** Creates the checkpoint artifact exclusively, then syncs the directory. */
+  /** Reopens the verified artifact and proves it is still the same object. */
+  private openVerifiedCheckpointFile(
+    filePath: string,
+    state: { kind: 'PRESENT'; dev: number; ino: number; size: number },
+  ): number {
+    const openFlags = fsConstants.O_WRONLY | fsConstants.O_APPEND | fsConstants.O_NOFOLLOW;
+    this.hooks.openFlagsProbe?.(openFlags);
+
+    const fd = openExistingCheckpointFileForAppend(filePath, this.expectedUid);
+
+    let stats: fs.Stats;
+    try {
+      stats = fs.fstatSync(fd);
+    } catch (cause) {
+      fs.closeSync(fd);
+      this.failed = true;
+      throw createCodedError(
+        'AUDIT_CHECKPOINT_FILE_RACE',
+        `${CHECKPOINT_FILENAME} could not be re-examined after opening`,
+        { cause },
+      );
+    }
+
+    if (
+      Number(stats.dev) !== state.dev ||
+      Number(stats.ino) !== state.ino ||
+      Number(stats.size) !== state.size
+    ) {
+      fs.closeSync(fd);
+      this.failed = true;
+      throw createCodedError(
+        'AUDIT_CHECKPOINT_FILE_RACE',
+        `${CHECKPOINT_FILENAME} is not the artifact whose history was verified`,
+      );
+    }
+
+    return fd;
+  }
+
+  /**
+   * Creates the checkpoint artifact exclusively, then syncs the directory.
+   *
+   * `O_EXCL` is what makes this a creation rather than an acquisition. If it
+   * reports `EEXIST`, something placed an artifact on the canonical path after
+   * initialization verified the stream absent — and that artifact's contents
+   * were never verified against the primary chain, so adopting it would append
+   * to a stream the cursor does not describe. Nothing is opened, nothing is
+   * truncated and nothing is deleted: the engine simply stops.
+   */
   private createCheckpointFile(filePath: string): number {
     const flags =
       fsConstants.O_CREAT |
@@ -1201,6 +1317,7 @@ export class Tier2CheckpointEngine implements RotationCheckpointSealer {
       fsConstants.O_APPEND |
       fsConstants.O_NOFOLLOW;
     this.hooks.openFlagsProbe?.(flags);
+    this.hooks.beforeCheckpointExclusiveCreate?.(filePath);
 
     let fd: number;
     try {
@@ -1211,9 +1328,11 @@ export class Tier2CheckpointEngine implements RotationCheckpointSealer {
         throw createCodedError('SYMLINK_DETECTED', `${CHECKPOINT_FILENAME} is a symbolic link`);
       }
       if (code === 'EEXIST') {
-        // A concurrent creator won the race. Re-open the existing artifact and
-        // validate it rather than trusting it, and never truncate it.
-        return openExistingCheckpointFileForAppend(filePath, this.expectedUid);
+        this.failed = true;
+        throw createCodedError(
+          'AUDIT_CHECKPOINT_FILE_RACE',
+          `${CHECKPOINT_FILENAME} appeared after verification established it was absent`,
+        );
       }
       throw createCodedError(
         'AUDIT_CHECKPOINT_FILE_UNAVAILABLE',
@@ -1226,11 +1345,89 @@ export class Tier2CheckpointEngine implements RotationCheckpointSealer {
       validateFileDescriptorAuthority(fd, 0o600, this.expectedUid);
     } catch (err) {
       fs.closeSync(fd);
+      this.failed = true;
       throw err;
     }
 
     syncAuditDirectory(this.auditDir);
     return fd;
+  }
+
+  /**
+   * Re-proves, immediately before every append, that the descriptor still
+   * describes the verified stream and is still the file the canonical path
+   * names.
+   *
+   * The descriptor alone is not enough. An attacker who cannot influence the
+   * descriptor can still replace the *pathname*, leaving the engine holding a
+   * perfectly valid descriptor to an inode that is no longer the checkpoint
+   * stream — a successful append there would be durable, correctly signed, and
+   * invisible to every future verifier. So both are checked: the descriptor's
+   * own authority and size, and the pathname's resolution back to the same
+   * `dev`/`ino`. Any disagreement fails closed rather than writing to an
+   * ambiguous stream.
+   */
+  private assertAppendAuthoritative(fd: number): void {
+    const filePath = path.join(this.auditDir, CHECKPOINT_FILENAME);
+    const state = this.artifactState;
+
+    this.hooks.beforeCheckpointAppend?.(filePath);
+
+    const reject: (reason: string) => never = (reason) => {
+      this.failed = true;
+      throw createCodedError('AUDIT_CHECKPOINT_FILE_RACE', `${CHECKPOINT_FILENAME} ${reason}`);
+    };
+
+    let stats: fs.Stats;
+    try {
+      stats = fs.fstatSync(fd);
+    } catch (cause) {
+      this.failed = true;
+      throw createCodedError(
+        'AUDIT_CHECKPOINT_FILE_RACE',
+        `${CHECKPOINT_FILENAME} could not be re-examined before append`,
+        { cause },
+      );
+    }
+
+    if (
+      !stats.isFile() ||
+      (stats.mode & 0o777) !== 0o600 ||
+      stats.uid !== this.expectedUid ||
+      stats.nlink !== 1
+    ) {
+      reject('lost its descriptor authority before append');
+    }
+
+    // Externally added or removed bytes mean the stream is no longer the one the
+    // verified history and the cursor describe. They are never adopted.
+    if (Number(stats.size) !== this.expectedSize) {
+      reject('changed length since its last durable write');
+    }
+
+    if (
+      state !== null &&
+      state.kind === 'PRESENT' &&
+      (Number(stats.dev) !== state.dev || Number(stats.ino) !== state.ino)
+    ) {
+      reject('is not the artifact whose history was verified');
+    }
+
+    let pathStats: fs.Stats;
+    try {
+      pathStats = fs.lstatSync(filePath);
+    } catch {
+      reject('no longer occupies its canonical pathname');
+    }
+    if (pathStats.isSymbolicLink()) {
+      reject('canonical pathname was replaced by a symbolic link');
+    }
+    if (
+      Number(pathStats.dev) !== Number(stats.dev) ||
+      Number(pathStats.ino) !== Number(stats.ino)
+    ) {
+      reject('canonical pathname no longer identifies the open artifact');
+    }
   }
 
   /** Writes every byte or throws; a zero or short write is never a success. */
@@ -1324,7 +1521,10 @@ export class Tier2CheckpointEngine implements RotationCheckpointSealer {
     assertAuditStorageCapacity(this.auditDir, this.expectedUid, Buffer.byteLength(line, 'utf8'));
 
     const fd = this.ensureCheckpointFd();
-    this.writeCheckpointBytes(fd, Buffer.from(line, 'utf8'));
+    this.assertAppendAuthoritative(fd);
+
+    const bytes = Buffer.from(line, 'utf8');
+    this.writeCheckpointBytes(fd, bytes);
 
     if (this.hooks.fdatasyncFault === true) {
       this.failed = true;
@@ -1334,6 +1534,11 @@ export class Tier2CheckpointEngine implements RotationCheckpointSealer {
       );
     }
     fs.fdatasyncSync(fd);
+
+    // The durable length advances exactly when the bytes do, and never before.
+    // A short or failed write never reaches this line, so the expected size can
+    // never describe bytes that are not on disk.
+    this.expectedSize += bytes.length;
 
     // Durable completion is the ONLY thing that advances the cursor (§23/§53).
     this.nextCoverageStart = sequenceEnd + 1;

@@ -24,6 +24,14 @@
  * Task 3 (segment rotation) and 84..99 belong to Task 5 (Tier-3 anchoring). This
  * file claims no control from either range.
  *
+ * Regression numbering note: the post-review correction added the eight
+ * regressions covering symlinked key-path components, exact PEM framing, and
+ * checkpoint-artifact identity as RC06-T4-REG-33..40. The reviewed instruction
+ * named them 32..39, but 32 was already in use by the test-clock/UUID seam
+ * regression and the same instruction forbids renaming the existing additive
+ * regressions, so the block continues after the highest number in use instead.
+ * (15 was already vacant and remains so; it is not reused for new work.)
+ *
  * Two ideas run through every control in Category 8. The first is that a valid
  * signature is not sufficient: wherever a checkpoint can lie — about its covered
  * range, its terminal hash, its position in its own chain, or the ledger it
@@ -40,6 +48,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   PersistentAuditStorage,
@@ -82,6 +91,12 @@ import { createTestRotatingAuditStore } from '../packages/audit/dist/internal/ro
 const ZERO_HASH = '0'.repeat(64);
 const FIXED_CLOCK_START = Date.parse('2026-09-21T00:00:00.000Z');
 const OTHER_HASH = '9'.repeat(64);
+
+/** Built declarations, for the public-surface assertions. */
+const PACKAGE_DIST_DIR = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  '../packages/audit/dist',
+);
 
 /* -------------------------------------------------------------------------- *
  * Harness
@@ -1631,6 +1646,393 @@ describe('CesSpace ARC — RC-06 Task 4: Tier-2 Ed25519 Checkpoint Artifacts & K
       });
       assert.equal(engine.getCheckpointState().failed, false);
       engine.close();
+    });
+  });
+
+  /* ====================================================================== *
+   * Post-review correction: key-path authority, exact PEM framing and
+   * checkpoint-artifact identity
+   *
+   * Each regression here corresponds to a defect that was independently
+   * verified against the reviewed Task-4 head. They are additive regressions,
+   * not frozen controls, so they carry the non-frozen RC06-T4-REG-nn namespace
+   * and claim no RC06-NEG number.
+   * ====================================================================== */
+
+  describe('Post-Review Correction: Key Path, PEM Framing and Artifact Identity', () => {
+    /** Error codes that legitimately express "this key path is not authoritative". */
+    const KEY_PATH_AUTHORITY_CODES = [
+      'SYMLINK_DETECTED',
+      'AUDIT_KEY_PATH_INVALID',
+      'AUDIT_SIGNING_KEY_WORKSPACE_OVERLAP',
+    ];
+
+    /** Codes for a file whose framing is not exactly one expected PEM block. */
+    const PEM_FRAMING_CODES = ['AUDIT_KEY_ENCODING_FORBIDDEN', 'AUDIT_KEY_MALFORMED'];
+
+    test('RC06-T4-REG-33: a key path reached through a symlinked component is refused', () => {
+      const root = path.join(tempBaseDir, 'reg33');
+      const workspace = path.join(root, 'workspace');
+      const outside = path.join(root, 'outside');
+      fs.mkdirSync(workspace, { recursive: true, mode: 0o700 });
+      fs.mkdirSync(outside, { recursive: true, mode: 0o700 });
+
+      const material = writeKeyPair(workspace, 'workspace');
+      // The signing key is a regular file inside the workspace. The alias is a
+      // directory symlink pointing at the workspace, so `/outside/alias/...`
+      // names the same file while looking, lexically, like a path outside it.
+      fs.symlinkSync(workspace, path.join(outside, 'alias'), 'dir');
+      const aliasedSigningKey = path.join(outside, 'alias', `${'workspace'}-signing.pem`);
+
+      // Final-component `O_NOFOLLOW` alone cannot catch this: the final
+      // component is a genuine regular file. The whole path is therefore
+      // checked, and the alias is refused before the key is ever read.
+      assert.equal(fs.lstatSync(aliasedSigningKey).isSymbolicLink(), false);
+      assert.ok(fs.readFileSync(aliasedSigningKey, 'utf8').includes('PRIVATE KEY'));
+
+      assertThrowsWithCode(
+        () =>
+          loadEd25519SigningKeyFile(aliasedSigningKey, {
+            workspacePaths: [workspace],
+          }),
+        KEY_PATH_AUTHORITY_CODES,
+      );
+      assertThrowsWithCode(
+        () => assertSigningKeyOutsideWorkspaces(aliasedSigningKey, [workspace]),
+        KEY_PATH_AUTHORITY_CODES,
+      );
+
+      // The canonical path to the same file is still perfectly loadable, so the
+      // refusal is about the alias and not about the key.
+      const direct = loadEd25519SigningKeyFile(material.signingKeyPath, {
+        workspacePaths: [path.join(root, 'not-a-workspace')],
+      });
+      assert.equal(direct.derivedFingerprint, material.fingerprint);
+
+      // And workspace isolation is decided on canonical identity, not on the
+      // lexical spelling: a workspace declared through the alias still contains
+      // the key when both are resolved for real.
+      const aliasedWorkspace = path.join(outside, 'alias');
+      assertThrowsWithCode(
+        () => assertSigningKeyOutsideWorkspaces(material.signingKeyPath, [aliasedWorkspace]),
+        ['AUDIT_SIGNING_KEY_WORKSPACE_OVERLAP'],
+      );
+    });
+
+    test('RC06-T4-REG-34: a trust root reached through a symlinked component is refused', () => {
+      const root = path.join(tempBaseDir, 'reg34');
+      const real = path.join(root, 'real');
+      fs.mkdirSync(real, { recursive: true, mode: 0o700 });
+      const material = writeKeyPair(real, 'real');
+
+      fs.symlinkSync(real, path.join(root, 'alias'), 'dir');
+      const aliased = path.join(root, 'alias', 'real-public.pem');
+      assert.equal(fs.lstatSync(aliased).isSymbolicLink(), false);
+
+      // The same rule applies to every trust root the loader serves, including
+      // the future anchor-receipt one. No anchor logic is involved here.
+      for (const purpose of ['CHECKPOINT', 'ANCHOR_RECEIPT']) {
+        assertThrowsWithCode(
+          () => loadEd25519TrustRootFile(aliased, { purpose }),
+          KEY_PATH_AUTHORITY_CODES,
+        );
+      }
+
+      // A symlinked *final* component is still refused too: that protection was
+      // not traded away for the parent-component one.
+      const fileLink = path.join(root, 'link-public.pem');
+      fs.symlinkSync(material.publicKeyPath, fileLink, 'file');
+      assertThrowsWithCode(
+        () => loadEd25519TrustRootFile(fileLink, { purpose: 'CHECKPOINT' }),
+        KEY_PATH_AUTHORITY_CODES,
+      );
+
+      // The canonical trust root still loads and still fingerprints the SPKI DER.
+      const loaded = loadEd25519TrustRootFile(material.publicKeyPath, { purpose: 'CHECKPOINT' });
+      assert.equal(loaded.fingerprint, material.fingerprint);
+    });
+
+    test('RC06-T4-REG-35: a signing-key PEM with surrounding content is refused', () => {
+      const dir = path.join(tempBaseDir, 'reg35');
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      const material = writeKeyPair(dir, 'reg35');
+      const privatePem = fs.readFileSync(material.signingKeyPath, 'utf8');
+
+      const write = (name, content) => {
+        const filePath = path.join(dir, name);
+        fs.writeFileSync(filePath, content, { mode: 0o600 });
+        return filePath;
+      };
+
+      // `node:crypto` extracts a usable key from a block embedded in arbitrary
+      // text, so these are files that *would* have produced a working signing
+      // key. Framing is therefore validated on the whole file, before parsing.
+      assertThrowsWithCode(
+        () => loadEd25519SigningKeyFile(write('prefix.pem', `garbage\n${privatePem}`)),
+        PEM_FRAMING_CODES,
+      );
+      assertThrowsWithCode(
+        () => loadEd25519SigningKeyFile(write('suffix.pem', `${privatePem}\ngarbage`)),
+        PEM_FRAMING_CODES,
+      );
+      assertThrowsWithCode(
+        () => loadEd25519SigningKeyFile(write('both.pem', `garbage\n${privatePem}\ngarbage`)),
+        PEM_FRAMING_CODES,
+      );
+      assertThrowsWithCode(
+        () => loadEd25519SigningKeyFile(write('nul.pem', `${privatePem}\0`)),
+        PEM_FRAMING_CODES,
+      );
+      assertThrowsWithCode(
+        () =>
+          loadEd25519SigningKeyFile(
+            write('comment.pem', `# operator note\n${privatePem}# trailing note\n`),
+          ),
+        PEM_FRAMING_CODES,
+      );
+
+      // Permitted surrounding ASCII whitespace is still harmless: the rule
+      // constrains what else the file may contain, not how it is padded.
+      const padded = loadEd25519SigningKeyFile(write('padded.pem', `\n \t${privatePem}\n\n`));
+      assert.equal(padded.derivedFingerprint, material.fingerprint);
+
+      // The same key bytes remain loadable from their canonical file, so the
+      // refusals are about the wrapping rather than about the key.
+      assert.equal(
+        loadEd25519SigningKeyFile(material.signingKeyPath).derivedFingerprint,
+        material.fingerprint,
+      );
+    });
+
+    test('RC06-T4-REG-36: a trust-root PEM with surrounding content is refused', () => {
+      const dir = path.join(tempBaseDir, 'reg36');
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      const material = writeKeyPair(dir, 'reg36');
+      const publicPem = fs.readFileSync(material.publicKeyPath, 'utf8');
+
+      const write = (name, content) => {
+        const filePath = path.join(dir, name);
+        fs.writeFileSync(filePath, content, { mode: 0o600 });
+        return filePath;
+      };
+      const load = (filePath) => loadEd25519TrustRootFile(filePath, { purpose: 'CHECKPOINT' });
+
+      assertThrowsWithCode(
+        () => load(write('prefix.pem', `garbage\n${publicPem}`)),
+        PEM_FRAMING_CODES,
+      );
+      assertThrowsWithCode(
+        () => load(write('suffix.pem', `${publicPem}\ngarbage`)),
+        PEM_FRAMING_CODES,
+      );
+      assertThrowsWithCode(
+        () => load(write('both.pem', `garbage\n${publicPem}\ngarbage`)),
+        PEM_FRAMING_CODES,
+      );
+      assertThrowsWithCode(
+        () =>
+          load(
+            write(
+              'cert-then-key.pem',
+              `-----BEGIN CERTIFICATE-----\nZm9v\n-----END CERTIFICATE-----\n${publicPem}`,
+            ),
+          ),
+        PEM_FRAMING_CODES,
+      );
+
+      // Two blocks of the correct label are still two blocks.
+      assertThrowsWithCode(
+        () => load(write('double.pem', publicPem + publicPem)),
+        PEM_FRAMING_CODES,
+      );
+
+      // The fingerprint stays a property of the parsed SPKI DER, so whitespace
+      // around the block cannot change which key is identified.
+      const padded = load(write('padded.pem', `\n\t${publicPem}\n`));
+      assert.equal(padded.fingerprint, material.fingerprint);
+      assert.equal(
+        crypto.createHash('sha256').update(padded.spkiDer).digest('hex'),
+        material.fingerprint,
+      );
+    });
+
+    test('RC06-T4-REG-37: replacing the verified checkpoint pathname is refused', async () => {
+      const fixture = await createFixture('reg37', { records: 2 });
+      await fixture.store.rotateNow('SIZE_THRESHOLD');
+
+      const verifiedBytes = fs.readFileSync(fixture.checkpointPath);
+      const before = fixture.engine.getCheckpointState();
+
+      // The verified artifact is replaced at its canonical pathname by a
+      // different inode carrying identical bytes, identical mode and identical
+      // ownership. Only its identity distinguishes it from the verified stream.
+      fs.unlinkSync(fixture.checkpointPath);
+      fs.writeFileSync(fixture.checkpointPath, verifiedBytes, { mode: 0o600 });
+      assert.notEqual(fs.statSync(fixture.checkpointPath).ino, 0);
+
+      await fixture.store.append(createSampleRecordCandidate());
+      await assertRejectsWithCode(
+        fixture.store.rotateNow('SIZE_THRESHOLD'),
+        'AUDIT_CHECKPOINT_FILE_RACE',
+      );
+
+      const after = fixture.engine.getCheckpointState();
+      assert.equal(after.failed, true);
+      assert.equal(after.nextCoverageStart, before.nextCoverageStart);
+      assert.equal(after.lastCheckpointSequence, before.lastCheckpointSequence);
+      // The replacement was neither overwritten nor truncated.
+      assert.ok(fs.readFileSync(fixture.checkpointPath).equals(verifiedBytes));
+
+      // And the engine is unusable for further checkpoint progression.
+      await assertRejectsWithCode(
+        fixture.engine.sealRotation({
+          sequenceStart: 1,
+          sequenceEnd: fixture.records.length,
+          terminalRecordHash: 'a'.repeat(64),
+        }),
+        'AUDIT_CHECKPOINT_INVALID_STATE',
+      );
+    });
+
+    test('RC06-T4-REG-38: an artifact appearing after verified absence is not adopted', async () => {
+      const fixture = await createFixture('reg38', {
+        records: 2,
+        hooks: {
+          beforeCheckpointExclusiveCreate: (filePath) => {
+            if (!fs.existsSync(filePath)) {
+              fs.writeFileSync(filePath, 'RACING\n', { mode: 0o600 });
+            }
+          },
+        },
+      });
+
+      assert.equal(fs.existsSync(fixture.checkpointPath), false);
+      const before = fixture.engine.getCheckpointState();
+
+      await assertRejectsWithCode(
+        fixture.store.rotateNow('SIZE_THRESHOLD'),
+        'AUDIT_CHECKPOINT_FILE_RACE',
+      );
+
+      const after = fixture.engine.getCheckpointState();
+      assert.equal(after.failed, true);
+      assert.equal(after.nextCoverageStart, before.nextCoverageStart);
+      assert.equal(after.lastCheckpointSequence, null);
+      assert.equal(after.lastCheckpointHash, null);
+
+      // The racing artifact was not reopened, adopted, overwritten or removed,
+      // and no checkpoint was appended to it.
+      assert.equal(fs.readFileSync(fixture.checkpointPath, 'utf8'), 'RACING\n');
+    });
+
+    test('RC06-T4-REG-39: growth of the verified checkpoint inode is refused', async () => {
+      const fixture = await createFixture('reg39', { records: 2 });
+      await fixture.store.rotateNow('SIZE_THRESHOLD');
+
+      const before = fixture.engine.getCheckpointState();
+      const inodeBefore = fs.statSync(fixture.checkpointPath).ino;
+
+      // Bytes are appended to the SAME inode the engine verified. The identity
+      // is unchanged; only the length is, and the length is what proves the
+      // stream still ends where the last durable write left it.
+      fs.appendFileSync(fixture.checkpointPath, 'externally-added\n');
+      const grown = fs.readFileSync(fixture.checkpointPath);
+      assert.equal(fs.statSync(fixture.checkpointPath).ino, inodeBefore);
+
+      await fixture.store.append(createSampleRecordCandidate());
+      await assertRejectsWithCode(
+        fixture.store.rotateNow('SIZE_THRESHOLD'),
+        'AUDIT_CHECKPOINT_FILE_RACE',
+      );
+
+      const after = fixture.engine.getCheckpointState();
+      assert.equal(after.failed, true);
+      assert.equal(after.nextCoverageStart, before.nextCoverageStart);
+      // No repair: the externally added bytes are still there, untouched.
+      assert.ok(fs.readFileSync(fixture.checkpointPath).equals(grown));
+    });
+
+    test('RC06-T4-REG-40: detaching the canonical path from the open descriptor is refused', async () => {
+      const fixture = await createFixture('reg40', { records: 2 });
+
+      // This rotation emits the first checkpoint, which establishes and caches
+      // the append descriptor. The next append is then made while the engine
+      // still holds that descriptor.
+      await fixture.store.rotateNow('SIZE_THRESHOLD');
+      const orphanBytes = fs.readFileSync(fixture.checkpointPath);
+
+      const orphanPath = path.join(fixture.root, 'detached-checkpoints.jsonl');
+      fs.renameSync(fixture.checkpointPath, orphanPath);
+      fs.writeFileSync(fixture.checkpointPath, '', { mode: 0o600 });
+
+      const before = fixture.engine.getCheckpointState();
+
+      await fixture.store.append(createSampleRecordCandidate());
+      await assertRejectsWithCode(
+        fixture.store.rotateNow('SIZE_THRESHOLD'),
+        'AUDIT_CHECKPOINT_FILE_RACE',
+      );
+
+      const after = fixture.engine.getCheckpointState();
+      assert.equal(after.failed, true);
+      assert.equal(after.nextCoverageStart, before.nextCoverageStart);
+
+      // Nothing was written to the orphaned inode the descriptor still names,
+      // and nothing was written to the replacement now occupying the canonical
+      // path — a write to either would have been durable, signed, and invisible
+      // to every future verifier.
+      assert.ok(fs.readFileSync(orphanPath).equals(orphanBytes));
+      assert.equal(fs.readFileSync(fixture.checkpointPath).length, 0);
+    });
+
+    test('RC06-T4-REG-41: the corrected internals stay out of the public declarations', () => {
+      // Only the package's public declarations are in scope. The internal
+      // modules are not reachable through the package exports map, and their
+      // own declarations carrying internal names is what makes the test suite's
+      // import of them possible.
+      const publicDeclarations = [
+        path.join(PACKAGE_DIST_DIR, 'index.d.ts'),
+        path.join(PACKAGE_DIST_DIR, 'checkpoint.d.ts'),
+      ];
+
+      // The correction added internal security state and internal race seams.
+      // Neither may become exported surface: `stripInternal` must keep removing
+      // them, so a caller can never hand the engine a precondition of its own.
+      const forbidden = [
+        'VerifiedCheckpointArtifactState',
+        'CheckpointVerificationOutcome',
+        'beforeCheckpointExclusiveCreate',
+        'beforeCheckpointAppend',
+        'CHECKPOINT_TEST_TOKEN',
+        'CheckpointTestHooks',
+        'CheckpointArtifactIdentity',
+        'resolveCanonicalKeyPath',
+        'openAuthoritativeKeyFile',
+        'assertCanonicalOutsideWorkspaces',
+      ];
+
+      for (const file of publicDeclarations) {
+        const text = fs.readFileSync(file, 'utf8');
+        for (const symbol of forbidden) {
+          assert.equal(
+            text.includes(symbol),
+            false,
+            `${path.basename(file)} must not declare internal symbol ${symbol}`,
+          );
+        }
+      }
+
+      // The production-safe surface the correction hardened is unchanged.
+      const index = fs.readFileSync(path.join(PACKAGE_DIST_DIR, 'index.d.ts'), 'utf8');
+      for (const symbol of [
+        'verifyCheckpointHistory',
+        'Tier2CheckpointEngine',
+        'computeCheckpointPublicKeyFingerprint',
+        'computeTrustRootFingerprintFromFile',
+        'assertNoRawSigningKeyMaterial',
+      ]) {
+        assert.ok(index.includes(symbol), `index.d.ts must still export ${symbol}`);
+      }
     });
   });
 

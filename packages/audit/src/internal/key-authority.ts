@@ -9,12 +9,27 @@
  *
  *  - regular file, mode exactly `0600`, owned by the expected real UID,
  *    `nlink === 1`, never a symbolic link (`O_NOFOLLOW`),
+ *  - **no symbolic link anywhere in the path**, not merely in its final
+ *    component: a `O_NOFOLLOW` final open still follows a symlinked *parent*, so
+ *    a path such as `/safe/keys-link/signing.pem` reaches whatever
+ *    `/safe/keys-link` points at while the final component stays a regular file,
  *  - opened with `O_NOFOLLOW`, then validated through `fstat()` on the resulting
  *    descriptor — never by validating a pathname and reopening it,
+ *  - the validated pathname and the opened descriptor proven to be the same
+ *    object (`dev`/`ino` agreement), so the authority check cannot be satisfied
+ *    by one file while a different one is read,
  *  - read at most `MAX_SIGNING_KEY_BYTES + 1` bytes, so an oversize file is
  *    established by the read itself rather than by a `stat()` that could lie,
+ *  - the file's whole content constrained to exactly one PEM block of the
+ *    expected label plus optional surrounding ASCII whitespace. Nothing else is
+ *    tolerated, because `node:crypto` will happily extract a key out of a file
+ *    that carries arbitrary text before and after the block,
  *  - algorithm fixed to Ed25519 by both the PEM label and
  *    `asymmetricKeyType`, with no negotiation and no fallback.
+ *
+ * Workspace isolation is evaluated on the same canonical, symlink-free identity
+ * the file is actually opened through, so a symlink alias cannot make a key
+ * inside a workspace merely *appear* to be outside one.
  *
  * The purpose label parameterizes the loader for the future anchor-receipt trust
  * root. It does not weaken anything: both purposes enforce identical filesystem
@@ -74,7 +89,11 @@ const PRIVATE_KEY_PEM_LABEL = 'PRIVATE KEY';
 /** SPKI public key PEM label. The only accepted public-key encoding. */
 const PUBLIC_KEY_PEM_LABEL = 'PUBLIC KEY';
 
-const PEM_BLOCK_REGEX = /-----BEGIN ([A-Z0-9 ]+)-----/g;
+/** ASCII whitespace permitted before and after the one PEM block. */
+const PEM_WHITESPACE_BYTES: ReadonlySet<number> = new Set([0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x20]);
+
+const PEM_BEGIN_PREFIX = '-----BEGIN ';
+const PEM_END_PREFIX = '-----END ';
 
 /**
  * Shape of a PEM private-key block header.
@@ -115,27 +134,121 @@ export function getPrivateKeyLoadCount(): number {
  * Descriptor authority
  * -------------------------------------------------------------------------- */
 
+/* -------------------------------------------------------------------------- *
+ * Canonical, symlink-free path authority
+ * -------------------------------------------------------------------------- */
+
 /**
- * Opens a key file with `O_NOFOLLOW` and proves its authority on the descriptor.
+ * Resolves a key path to the canonical location it is actually reached through,
+ * refusing any symbolic link in any component.
  *
- * The caller must close the returned descriptor. Nothing here is done by
- * pathname after the open, so a swap between validation and use is not possible.
+ * `O_NOFOLLOW` protects only the final component. A symlinked *parent* directory
+ * is followed by the kernel exactly like a real directory, so `O_NOFOLLOW` alone
+ * cannot establish where a key really lives — and the workspace rule is a
+ * statement about location, not about the last path segment. Every component is
+ * therefore inspected with `lstat` before the file is opened.
+ *
+ * The returned path is proven canonical twice over: no component is a symbolic
+ * link, and the filesystem's own `realpath` agrees with it. The caller may use
+ * it for policy comparisons, but must still bind it to the descriptor it opens —
+ * a check on a pathname is not a check on a file.
+ *
+ * The error messages deliberately name no host path: a rejected key location
+ * must not become a disclosure of the operator's filesystem layout.
  */
-function openKeyFile(
-  filePath: string,
-  expectedUid: number,
-  label: string,
-): { fd: number; stats: fs.Stats } {
+function resolveCanonicalKeyPath(filePath: string, label: string): string {
   if (typeof filePath !== 'string' || filePath.length === 0) {
     throw createCodedError('AUDIT_KEY_PATH_INVALID', `${label} path is required`);
+  }
+  if (filePath.includes('~')) {
+    throw createCodedError('AUDIT_KEY_PATH_INVALID', `${label} path must not contain a literal ~`);
   }
   if (!path.isAbsolute(filePath)) {
     throw createCodedError('AUDIT_KEY_PATH_INVALID', `${label} path must be absolute`);
   }
 
+  const canonicalPath = path.normalize(filePath);
+  if (
+    canonicalPath !== filePath ||
+    canonicalPath === path.sep ||
+    canonicalPath.endsWith(path.sep) ||
+    canonicalPath.split(path.sep).includes('..')
+  ) {
+    throw createCodedError(
+      'AUDIT_KEY_PATH_INVALID',
+      `${label} path must be canonical and free of traversal segments`,
+    );
+  }
+
+  const segments = canonicalPath.split(path.sep);
+  let current = '';
+  for (let i = 1; i < segments.length; i++) {
+    current += path.sep + segments[i];
+    let stats: fs.Stats;
+    try {
+      stats = fs.lstatSync(current);
+    } catch (cause: unknown) {
+      const code = (cause as { code?: string } | null)?.code;
+      if (code === 'ENOENT') {
+        throw createCodedError('AUDIT_KEY_FILE_MISSING', `${label} does not exist`);
+      }
+      throw createCodedError(
+        'AUDIT_KEY_FILE_UNAVAILABLE',
+        `${label} could not be inspected safely`,
+        { cause },
+      );
+    }
+    if (stats.isSymbolicLink()) {
+      throw createCodedError(
+        'SYMLINK_DETECTED',
+        `${label} path contains a symbolic link component`,
+      );
+    }
+  }
+
+  // Redundant with the walk above, and deliberately so: it is the filesystem's
+  // own answer to "where does this path actually lead", and any disagreement
+  // means the path is not the stable, canonical location the rules require.
+  let realPath: string;
+  try {
+    realPath = fs.realpathSync(canonicalPath);
+  } catch (cause: unknown) {
+    const code = (cause as { code?: string } | null)?.code;
+    if (code === 'ENOENT') {
+      throw createCodedError('AUDIT_KEY_FILE_MISSING', `${label} does not exist`);
+    }
+    throw createCodedError('AUDIT_KEY_FILE_UNAVAILABLE', `${label} could not be resolved safely`, {
+      cause,
+    });
+  }
+  if (realPath !== canonicalPath) {
+    throw createCodedError(
+      'AUDIT_KEY_PATH_INVALID',
+      `${label} path is not a stable canonical location`,
+    );
+  }
+
+  return canonicalPath;
+}
+
+/**
+ * Opens a canonical key path and proves the descriptor and the pathname are the
+ * same object.
+ *
+ * The caller must close the returned descriptor. The `dev`/`ino` comparison is
+ * what closes the window between "this path is authoritative" and "this is the
+ * file being read": a pathname swapped for another regular file after the
+ * authority check satisfies every pathname-level rule while handing back a
+ * different inode.
+ */
+function openAuthoritativeKeyFile(
+  canonicalPath: string,
+  expectedUid: number,
+  label: string,
+): { fd: number; stats: fs.Stats } {
   let fd: number;
   try {
-    fd = fs.openSync(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    fd = fs.openSync(canonicalPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
   } catch (err: unknown) {
     const code = (err as { code?: string } | null)?.code;
     if (code === 'ELOOP') {
@@ -153,6 +266,30 @@ function openKeyFile(
     // fstat on the validated descriptor: regular file, mode exactly 0600, real
     // UID, nlink 1. A symlink never reaches here because O_NOFOLLOW refused it.
     const stats = validateFileDescriptorAuthority(fd, 0o600, expectedUid);
+
+    let pathStats: fs.Stats;
+    try {
+      pathStats = fs.lstatSync(canonicalPath);
+    } catch (cause: unknown) {
+      throw createCodedError(
+        'AUDIT_KEY_FILE_UNAVAILABLE',
+        `${label} path could not be re-inspected after opening`,
+        { cause },
+      );
+    }
+    if (pathStats.isSymbolicLink()) {
+      throw createCodedError('SYMLINK_DETECTED', `${label} is a symbolic link`);
+    }
+    if (
+      Number(pathStats.dev) !== Number(stats.dev) ||
+      Number(pathStats.ino) !== Number(stats.ino)
+    ) {
+      throw createCodedError(
+        'AUDIT_KEY_PATH_INVALID',
+        `${label} path does not identify the opened file`,
+      );
+    }
+
     return { fd, stats };
   } catch (err) {
     fs.closeSync(fd);
@@ -188,36 +325,80 @@ function readBoundedKeyBytes(fd: number, label: string): { buffer: Buffer; byteL
   return { buffer, byteLength: offset };
 }
 
+/** True when every byte in `[from, to)` is permitted surrounding whitespace. */
+function isPemWhitespace(bytes: Buffer, from: number, to: number): boolean {
+  for (let i = from; i < to; i++) {
+    if (!PEM_WHITESPACE_BYTES.has(bytes[i])) return false;
+  }
+  return true;
+}
+
 /**
- * Requires the PEM text to contain exactly one block with the expected label.
+ * Requires the file to be exactly one PEM block of the expected label, plus
+ * optional surrounding ASCII whitespace, and returns its byte span.
  *
- * This is what keeps a certificate, an OpenSSH key, a PKCS#1 RSA key or a
- * nested PEM bundle from being accepted as "a public key": `createPublicKey`
- * happily extracts a key out of a certificate, so the encoding has to be
- * checked before parsing rather than inferred from the parse succeeding.
+ * Counting labels is not enough. `node:crypto` extracts a key from a PEM block
+ * embedded in arbitrary text — an unrelated prefix, an unrelated suffix, or both
+ * are all accepted, and two concatenated blocks are accepted by taking the
+ * first. So "the file contains one `PUBLIC KEY` block" says nothing about what
+ * else the file contains, and a file that carries an attacker-chosen preamble is
+ * not the artifact the key authority rules describe.
+ *
+ * The whole file is therefore accounted for: exactly one `BEGIN`, exactly one
+ * `END`, the expected label on both, and nothing but ASCII whitespace outside
+ * the span. Only the span is handed to `node:crypto`, so even a future parser
+ * that tolerated framing could not widen the accepted input.
+ *
+ * The check is byte-oriented so a private key is never materialized as a
+ * long-lived immutable JavaScript string.
  */
-function assertSinglePemBlock(text: string, expectedLabel: string, label: string): void {
-  const labels: string[] = [];
-  PEM_BLOCK_REGEX.lastIndex = 0;
-  let match = PEM_BLOCK_REGEX.exec(text);
-  while (match !== null) {
-    labels.push(match[1]);
-    match = PEM_BLOCK_REGEX.exec(text);
+function assertExactPemFile(
+  bytes: Buffer,
+  expectedLabel: string,
+  label: string,
+): { start: number; end: number } {
+  const beginMarker = Buffer.from(`-----BEGIN ${expectedLabel}-----`, 'latin1');
+  const endMarker = Buffer.from(`-----END ${expectedLabel}-----`, 'latin1');
+  const anyBeginMarker = Buffer.from(PEM_BEGIN_PREFIX, 'latin1');
+  const anyEndMarker = Buffer.from(PEM_END_PREFIX, 'latin1');
+
+  const forbidden = (reason: string): never => {
+    throw createCodedError('AUDIT_KEY_ENCODING_FORBIDDEN', `${label} ${reason}`);
+  };
+
+  const begin = bytes.indexOf(beginMarker);
+  if (begin === -1) {
+    forbidden(`must be exactly one ${expectedLabel} PEM block`);
   }
 
-  if (labels.length !== 1 || labels[0] !== expectedLabel) {
-    throw createCodedError(
-      'AUDIT_KEY_ENCODING_FORBIDDEN',
-      `${label} must be exactly one ${expectedLabel} PEM block`,
-    );
+  // Exactly one BEGIN in the whole file, and it is ours. A BEGIN of another
+  // label before ours shifts the first match; one after ours is a second block.
+  if (bytes.indexOf(anyBeginMarker) !== begin) {
+    forbidden('must contain no PEM block other than its own');
+  }
+  if (bytes.indexOf(anyBeginMarker, begin + beginMarker.length) !== -1) {
+    forbidden('must contain exactly one PEM block');
   }
 
-  if (!text.includes(`-----END ${expectedLabel}-----`)) {
-    throw createCodedError(
-      'AUDIT_KEY_ENCODING_FORBIDDEN',
-      `${label} is a truncated ${expectedLabel} PEM block`,
-    );
+  const end = bytes.indexOf(endMarker, begin + beginMarker.length);
+  if (end === -1) {
+    forbidden(`is a truncated ${expectedLabel} PEM block`);
   }
+  if (bytes.indexOf(anyEndMarker) !== end) {
+    forbidden('must contain no PEM end marker other than its own');
+  }
+  if (bytes.indexOf(anyEndMarker, end + endMarker.length) !== -1) {
+    forbidden('must contain exactly one PEM block');
+  }
+
+  if (!isPemWhitespace(bytes, 0, begin)) {
+    forbidden(`${expectedLabel} PEM block must not be preceded by other content`);
+  }
+  if (!isPemWhitespace(bytes, end + endMarker.length, bytes.length)) {
+    forbidden(`${expectedLabel} PEM block must not be followed by other content`);
+  }
+
+  return { start: begin, end: end + endMarker.length };
 }
 
 /* -------------------------------------------------------------------------- *
@@ -256,15 +437,19 @@ export function loadEd25519TrustRootFile(
   const expectedUid = options.expectedUid ?? getProcessUid();
   const label = options.purpose === 'ANCHOR_RECEIPT' ? 'anchor receipt public key' : 'public key';
 
-  const { fd } = openKeyFile(filePath, expectedUid, label);
+  const canonicalPath = resolveCanonicalKeyPath(filePath, label);
+  const { fd } = openAuthoritativeKeyFile(canonicalPath, expectedUid, label);
   try {
     const { buffer, byteLength } = readBoundedKeyBytes(fd, label);
-    const text = buffer.subarray(0, byteLength).toString('utf8');
-    assertSinglePemBlock(text, PUBLIC_KEY_PEM_LABEL, label);
+    const view = buffer.subarray(0, byteLength);
+    const span = assertExactPemFile(view, PUBLIC_KEY_PEM_LABEL, label);
 
     let publicKey: crypto.KeyObject;
     try {
-      publicKey = crypto.createPublicKey({ key: buffer.subarray(0, byteLength), format: 'pem' });
+      publicKey = crypto.createPublicKey({
+        key: view.subarray(span.start, span.end),
+        format: 'pem',
+      });
     } catch (cause) {
       throw createCodedError('AUDIT_KEY_MALFORMED', `${label} is not a parseable public key`, {
         cause,
@@ -316,12 +501,21 @@ export function computeTrustRootFingerprintFromFile(
  */
 export function loadEd25519SigningKeyFile(
   filePath: string,
-  options: { expectedUid?: number } = {},
+  options: { expectedUid?: number; workspacePaths?: readonly string[] } = {},
 ): LoadedSigningKey {
   const expectedUid = options.expectedUid ?? getProcessUid();
   const label = 'signing key';
+  const workspacePaths = options.workspacePaths ?? [];
 
-  const { fd } = openKeyFile(filePath, expectedUid, label);
+  // Canonicalize, then establish workspace non-overlap, then open, then bind the
+  // descriptor to the validated path — and only then read key bytes. The
+  // ordering is enforced here rather than left to the caller, so no code path
+  // can consume a private key before the workspace rule has been applied to the
+  // location it actually came from.
+  const canonicalPath = resolveCanonicalKeyPath(filePath, label);
+  assertCanonicalOutsideWorkspaces(canonicalPath, workspacePaths);
+
+  const { fd } = openAuthoritativeKeyFile(canonicalPath, expectedUid, label);
   try {
     const { buffer, byteLength } = readBoundedKeyBytes(fd, label);
     try {
@@ -329,13 +523,13 @@ export function loadEd25519SigningKeyFile(
         privateKeyLoadCount++;
       }
 
-      const text = buffer.subarray(0, byteLength).toString('utf8');
-      assertSinglePemBlock(text, PRIVATE_KEY_PEM_LABEL, label);
+      const view = buffer.subarray(0, byteLength);
+      const span = assertExactPemFile(view, PRIVATE_KEY_PEM_LABEL, label);
 
       let privateKey: crypto.KeyObject;
       try {
         privateKey = crypto.createPrivateKey({
-          key: buffer.subarray(0, byteLength),
+          key: view.subarray(span.start, span.end),
           format: 'pem',
         });
       } catch (cause) {
@@ -388,14 +582,40 @@ export function assertSigningKeyOutsideWorkspaces(
   signingKeyPath: string,
   workspacePaths: readonly string[],
 ): void {
-  const keyPath = path.resolve(signingKeyPath);
+  const canonicalKeyPath = resolveCanonicalKeyPath(signingKeyPath, 'signing key');
+  assertCanonicalOutsideWorkspaces(canonicalKeyPath, workspacePaths);
+}
 
+/**
+ * Compares two already-canonical locations.
+ *
+ * Both sides are canonical filesystem locations, which is what makes the
+ * comparison a statement about where the key really is. Comparing lexical paths
+ * would let a symlinked alias make a key inside a workspace look like a key
+ * outside one — the containment test would pass on the alias while the
+ * filesystem resolved it straight back into the workspace.
+ *
+ * A workspace that cannot be resolved is compared at its lexical location: an
+ * unresolvable workspace boundary cannot be shown to contain anything, and
+ * failing the whole load because an unrelated workspace is absent would make the
+ * rule unusable without making it safer.
+ */
+function assertCanonicalOutsideWorkspaces(
+  canonicalKeyPath: string,
+  workspacePaths: readonly string[],
+): void {
   for (const workspacePath of workspacePaths) {
-    const workspace = path.resolve(workspacePath);
+    let workspace: string;
+    try {
+      workspace = fs.realpathSync(workspacePath);
+    } catch {
+      workspace = path.resolve(workspacePath);
+    }
+
     if (
-      keyPath === workspace ||
-      keyPath.startsWith(workspace + path.sep) ||
-      workspace.startsWith(keyPath + path.sep)
+      canonicalKeyPath === workspace ||
+      canonicalKeyPath.startsWith(workspace + path.sep) ||
+      workspace.startsWith(canonicalKeyPath + path.sep)
     ) {
       throw createCodedError(
         'AUDIT_SIGNING_KEY_WORKSPACE_OVERLAP',
