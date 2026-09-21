@@ -1708,6 +1708,34 @@ describe('CesSpace ARC — RC-06 Task 1: Persistent Append Storage Foundation', 
       assert.strictEqual(dtsContent.includes('createTestPersistentAuditStorage'), false);
       assert.strictEqual(dtsContent.includes('STORAGE_TEST_TOKEN'), false);
       assert.strictEqual(dtsContent.includes('RECOVERY_HANDOFF_TOKEN'), false);
+      assert.strictEqual(dtsContent.includes('VerifiedRecoveryHandoff'), false);
+      assert.strictEqual(dtsContent.includes('_fromVerifiedRecovery'), false);
+    });
+
+    test('Generated storage.d.ts declaration strips internal recovery bootstrap and test symbols while preserving public API', () => {
+      const storageDtsPath = path.resolve('packages/audit/dist/storage.d.ts');
+      const dtsContent = fs.readFileSync(storageDtsPath, 'utf8');
+
+      // Negative assertions: internal bootstrap, test hooks, capability tokens must be stripped
+      assert.strictEqual(dtsContent.includes('_fromVerifiedRecovery'), false);
+      assert.strictEqual(dtsContent.includes('StorageTestHooks'), false);
+      assert.strictEqual(dtsContent.includes('StorageTestFaults'), false);
+      assert.strictEqual(dtsContent.includes('createTestPersistentAuditStorage'), false);
+      assert.strictEqual(dtsContent.includes('STORAGE_TEST_TOKEN'), false);
+      assert.strictEqual(dtsContent.includes('RECOVERY_HANDOFF_TOKEN'), false);
+      assert.strictEqual(dtsContent.includes('VerifiedRecoveryHandoff'), false);
+
+      // Positive assertions: legitimate public API surface must be preserved
+      assert.strictEqual(dtsContent.includes('PersistentAuditStorage'), true);
+      assert.strictEqual(dtsContent.includes('PersistentAuditStorageConfig'), true);
+      assert.strictEqual(
+        dtsContent.includes('constructor(config: PersistentAuditStorageConfig)'),
+        true,
+      );
+      assert.strictEqual(dtsContent.includes('append('), true);
+      assert.strictEqual(dtsContent.includes('close()'), true);
+      assert.strictEqual(dtsContent.includes('getCurrentSequence()'), true);
+      assert.strictEqual(dtsContent.includes('getLastRecordHash()'), true);
     });
 
     test('PersistentAuditStorage constructor rejects unexpected test hook arguments without internal capability', () => {
