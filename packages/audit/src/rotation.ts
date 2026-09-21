@@ -46,6 +46,7 @@ import {
 } from './recovery.js';
 import { MAX_TORN_TAIL_BYTES, classifyTrailingBytes } from './internal/torn-tail.js';
 import { assertPathIdentity } from './internal/file-identity.js';
+import { CHECKPOINT_FILENAME } from './internal/checkpoint-constants.js';
 import {
   ROTATION_CAPABILITY_TOKEN,
   type FileIdentity,
@@ -369,6 +370,14 @@ interface StoreEntry {
 function classifyStoreEntry(filename: string): StoreEntryKind {
   if (filename === ACTIVE_SEGMENT_FILENAME) return 'ACTIVE';
   if (filename === LOCK_FILENAME || filename === METADATA_FILENAME) return 'AUXILIARY';
+  // The Tier-2 checkpoint artifact is a durable auxiliary artifact (rc06 §51): it
+  // is enumerated and authority-checked like every other entry, and it counts
+  // toward the physical storage budget, but it is not a rotated primary segment,
+  // it is not part of the primary hash chain, and it never appears in the
+  // bounded archive inventory. Recognizing it by exact name — rather than
+  // teaching the rotated-filename parser about it — keeps a checkpoint from ever
+  // being mistaken for primary evidence.
+  if (filename === CHECKPOINT_FILENAME) return 'AUXILIARY';
   if (TORN_SIDECAR_REGEX.test(filename)) return 'AUXILIARY';
   if (ROTATION_SCRATCH_REGEX.test(filename)) return 'SCRATCH';
   if (parseRotatedSegmentFilename(filename) !== null) return 'ROTATED';
@@ -612,7 +621,40 @@ export interface SegmentDigest {
   identity: { dev: number; ino: number };
 }
 
+/**
+ * One primary record that a scan accepted as verified chain evidence.
+ *
+ * A fact is emitted only after the whole V1 contract has been enforced on the
+ * record: it parsed, its sequence is contiguous with its predecessor, its
+ * `previousRecordHash` links to the record before it, and its own `recordHash`
+ * is the one the chain now stands on. A fact therefore never describes a
+ * partially-validated record, and never describes a torn tail.
+ *
+ * @internal
+ */
+export interface VerifiedPrimaryCheckpointFact {
+  /** Sequence of the verified record. */
+  sequenceNumber: number;
+  /** Its `recordHash`, as verified. */
+  recordHash: string;
+}
+
 interface ScanOptions {
+  /**
+   * Internal observer invoked once per verified record, in chain order.
+   *
+   * This is the seam that lets the checkpoint verifier compare a checkpoint
+   * stream against real primary evidence without buffering either. It is
+   * `@internal`, it is not exported from the package root, and it is only ever
+   * populated by the checkpoint module — no caller can use it to change what a
+   * scan verifies, only to observe what a scan has already verified.
+   *
+   * It is deliberately NOT propagated to the throwaway secondary pass of a
+   * dual-representation archive: that pass exists to prove the two physical
+   * representations agree, and letting it report facts too would double-count
+   * every record in the range.
+   */
+  onVerifiedRecord?: (fact: VerifiedPrimaryCheckpointFact) => void | Promise<void>;
   /**
    * Expected sequence of the first record in this segment.
    *
@@ -732,8 +774,15 @@ async function scanSegmentStream(
     throw createCodedError('AUDIT_CORRUPTION_DETECTED', `[${options.label}] ${detail}`);
   };
 
-  /** Returns false when the line is not parseable (a torn-tail candidate). */
-  const tryAcceptLine = (lineBytes: Buffer): boolean => {
+  /**
+   * Returns false when the line is not parseable (a torn-tail candidate).
+   *
+   * Asynchronous because the optional verified-record observer may be
+   * asynchronous. The observer runs only after the record has been fully
+   * validated and the scan state has advanced past it, and nothing it returns can
+   * alter acceptance: it observes the chain, it does not participate in it.
+   */
+  const tryAcceptLine = async (lineBytes: Buffer): Promise<boolean> => {
     if (lineBytes.length > MAX_RECORD_BYTES) {
       corrupt(`record line exceeds MAX_RECORD_BYTES (${MAX_RECORD_BYTES})`);
     }
@@ -816,6 +865,13 @@ async function scanSegmentStream(
       options.recentRecords.splice(0, options.recentRecords.length - RECENT_RECORDS_CACHE_LIMIT);
     }
 
+    if (options.onVerifiedRecord !== undefined) {
+      await options.onVerifiedRecord({
+        sequenceNumber: record.sequenceNumber,
+        recordHash: record.integrity.recordHash,
+      });
+    }
+
     return true;
   };
 
@@ -861,7 +917,8 @@ async function scanSegmentStream(
       const lineBytes = accumulated.subarray(0, newlineIdx + 1);
       const remaining = accumulated.subarray(newlineIdx + 1);
 
-      if (!tryAcceptLine(lineBytes)) {
+      const accepted = await tryAcceptLine(lineBytes);
+      if (!accepted) {
         malformedCandidate = Buffer.from(lineBytes);
         accumulated = Buffer.from(remaining);
         break;
@@ -1048,6 +1105,17 @@ export interface RetainedPrimaryHistoryVerificationOptions {
   trustedBoundary?: { sequenceNumber: number; recordHash: string };
   /** Overrides the recent-record cache size. Never larger than the frozen limit. */
   recentRecordsLimit?: number;
+  /**
+   * Internal observer invoked once per verified record, in chain order.
+   *
+   * See {@link ScanOptions.onVerifiedRecord}. This is the checkpoint verifier's
+   * streaming seam: it allows a caller to compare an artifact stream against the
+   * real retained primary evidence, record by record, without either side ever
+   * being buffered.
+   *
+   * @internal
+   */
+  onVerifiedRecord?: (fact: VerifiedPrimaryCheckpointFact) => void | Promise<void>;
 }
 
 /**
@@ -1204,6 +1272,7 @@ export async function verifyRetainedPrimaryHistory(
         sequenceEnd: entry.sequenceEnd,
       },
       trustedBoundary: options.trustedBoundary,
+      onVerifiedRecord: options.onVerifiedRecord,
     };
 
     const secondary = representations[1] ?? null;
@@ -1219,6 +1288,9 @@ export async function verifyRetainedPrimaryHistory(
         ...shared,
         lifecycleMap: new Map(),
         recentRecords: [],
+        // The throwaway pass proves the two representations agree; it reports no
+        // facts, so a crash pair is never counted twice.
+        onVerifiedRecord: undefined,
         label: secondary.filename,
       });
     }
@@ -1258,6 +1330,7 @@ export async function verifyRetainedPrimaryHistory(
       expectedPreviousRecordHash,
       allowTornTail: true,
       trustedBoundary: options.trustedBoundary,
+      onVerifiedRecord: options.onVerifiedRecord,
       lifecycleMap,
       recentRecords,
       label: activeEntry.filename,
