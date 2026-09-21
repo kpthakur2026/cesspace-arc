@@ -1612,6 +1612,10 @@ describe('CesSpace ARC — RC-06 Task 2: Restart Recovery, Torn Tails & Dangling
       assert.strictEqual(auditPublic.TestAuditRecoveryOptions, undefined);
       assert.strictEqual(auditPublic.recoverPersistentAuditStorageForTest, undefined);
       assert.strictEqual(auditPublic.executeAuditRecoveryInternal, undefined);
+      assert.strictEqual(auditPublic.StorageTestFaults, undefined);
+      assert.strictEqual(auditPublic.StorageTestHooks, undefined);
+      assert.strictEqual(auditPublic.createTestPersistentAuditStorage, undefined);
+      assert.strictEqual(auditPublic.STORAGE_TEST_TOKEN, undefined);
     });
 
     test('PersistentAuditStorage._fromVerifiedRecovery rejects unauthorized invocation without internal symbol', async () => {

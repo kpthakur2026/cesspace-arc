@@ -1,4 +1,5 @@
-import type { StorageTestFaults, PersistentAuditStorageConfig } from '../storage.js';
+import type { StorageTestFaults } from './storage-capability.js';
+import type { PersistentAuditStorageConfig } from '../storage.js';
 import type { TrustedPrimaryChainBoundary, AuditRecoveryResult } from '../recovery.js';
 import { executeAuditRecoveryInternal } from '../recovery.js';
 

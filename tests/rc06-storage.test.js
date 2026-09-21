@@ -25,7 +25,6 @@ import { MAX_RECORD_BYTES } from '../packages/protocol/dist/index.js';
 
 import {
   PersistentAuditStorage,
-  createTestPersistentAuditStorage,
   canonicalJsonV1,
   computeRecordHashPreimageV1,
   computeRecordHashV1,
@@ -45,6 +44,8 @@ import {
   METADATA_FILENAME,
   UUID_V4_REGEX,
 } from '../packages/audit/dist/index.js';
+
+import { createTestPersistentAuditStorage } from '../packages/audit/dist/internal/storage-testing.js';
 
 function createSampleRecordCandidate() {
   return {
@@ -1682,6 +1683,113 @@ describe('CesSpace ARC — RC-06 Task 1: Persistent Append Storage Foundation', 
             anchorMode: 'ENABLED',
           }),
         (err) => err.code === 'INVALID_METADATA_CONFIG',
+      );
+    });
+  });
+
+  describe('Public API Surface & Storage Capability Boundary Invariants', () => {
+    test('Root public API does not expose storage test facilities or internal tokens', async () => {
+      const auditPublic = await import('../packages/audit/dist/index.js');
+      assert.strictEqual(auditPublic.StorageTestFaults, undefined);
+      assert.strictEqual(auditPublic.StorageTestHooks, undefined);
+      assert.strictEqual(auditPublic.createTestPersistentAuditStorage, undefined);
+      assert.strictEqual(auditPublic.STORAGE_TEST_TOKEN, undefined);
+      assert.strictEqual(auditPublic.RECOVERY_HANDOFF_TOKEN, undefined);
+      assert.strictEqual(auditPublic.recoverPersistentAuditStorageForTest, undefined);
+      assert.strictEqual(auditPublic.executeAuditRecoveryInternal, undefined);
+    });
+
+    test('Root index.d.ts declaration does not expose internal test interfaces or tokens', () => {
+      const dtsPath = path.resolve('packages/audit/dist/index.d.ts');
+      const dtsContent = fs.readFileSync(dtsPath, 'utf8');
+      assert.strictEqual(dtsContent.includes('StorageTestFaults'), false);
+      assert.strictEqual(dtsContent.includes('StorageTestHooks'), false);
+      assert.strictEqual(dtsContent.includes('createTestPersistentAuditStorage'), false);
+      assert.strictEqual(dtsContent.includes('STORAGE_TEST_TOKEN'), false);
+      assert.strictEqual(dtsContent.includes('RECOVERY_HANDOFF_TOKEN'), false);
+    });
+
+    test('PersistentAuditStorage constructor rejects unexpected test hook arguments without internal capability', () => {
+      const config = {
+        directory: path.join(tempBaseDir, 'pub-constructor-test'),
+        createIfMissing: true,
+        metadata: {
+          checkpointPublicKeyFingerprint: '1'.repeat(64),
+          anchorMode: 'DISABLED',
+        },
+      };
+
+      // Passing unexpected extra arguments without the unforgeable internal capability token is rejected
+      assert.throws(
+        () => {
+          new PersistentAuditStorage(config, {
+            writeFault: 'error',
+            beforeFinalOpen: () => {},
+          });
+        },
+        (err) =>
+          err.code === 'AUDIT_STORAGE_INVALID_CONFIG' &&
+          err.message.includes('Unexpected constructor arguments'),
+      );
+
+      // Passing a foreign forged symbol is also rejected
+      assert.throws(
+        () => {
+          new PersistentAuditStorage(config, Symbol('STORAGE_TEST_TOKEN'), {
+            testFaults: { writeFault: 'error' },
+          });
+        },
+        (err) =>
+          err.code === 'AUDIT_STORAGE_INVALID_CONFIG' &&
+          err.message.includes('Unexpected constructor arguments'),
+      );
+
+      // Normal single-argument production constructor succeeds cleanly
+      const storage = new PersistentAuditStorage(config);
+      assert.strictEqual(storage.getState(), 'UNINITIALIZED');
+    });
+
+    test('Package deep-import subpath protection for internal modules', async () => {
+      await assert.rejects(
+        async () => {
+          await import('@cesspace-arc/audit/internal/storage-testing');
+        },
+        (err) => err.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED',
+      );
+
+      await assert.rejects(
+        async () => {
+          await import('@cesspace-arc/audit/internal/recovery-testing');
+        },
+        (err) => err.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED',
+      );
+
+      await assert.rejects(
+        async () => {
+          await import('@cesspace-arc/audit/internal/storage-capability');
+        },
+        (err) => err.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED',
+      );
+
+      await assert.rejects(
+        async () => {
+          await import('@cesspace-arc/audit/internal/recovery-capability');
+        },
+        (err) => err.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED',
+      );
+
+      await assert.rejects(
+        async () => {
+          await import('@cesspace-arc/audit/storage');
+        },
+        (err) => err.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED',
+      );
+
+      await assert.rejects(
+        async () => {
+          await import('@cesspace-arc/audit/recovery');
+        },
+        (err) => err.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED',
       );
     });
   });

@@ -514,7 +514,40 @@ export class AuditLogger implements IAuditLogger {
 
 export type { AuditRecord };
 
-export * from './storage.js';
+export {
+  DEFAULT_AUDIT_DIR,
+  ACTIVE_SEGMENT_FILENAME,
+  UUID_V4_REGEX,
+  PERSISTENT_RECORD_V1_ALLOWED_KEYS,
+  ACTOR_ALLOWED_KEYS,
+  TARGET_ALLOWED_KEYS,
+  INVOCATION_ALLOWED_KEYS,
+  POLICY_ALLOWED_KEYS,
+  EXECUTION_ALLOWED_KEYS,
+  ERROR_ALLOWED_KEYS,
+  LIFECYCLE_ALLOWED_KEYS,
+  APPROVAL_ALLOWED_KEYS,
+  GATEWAY_ALLOWED_KEYS,
+  INTEGRITY_ALLOWED_KEYS,
+  type CodedError,
+  createCodedError,
+  getProcessUid,
+  type PlatformCapabilities,
+  detectPlatformCapabilities,
+  validatePlatformCapabilities,
+  validateAuditDirectory,
+  validateFileDescriptorAuthority,
+  canonicalJsonV1,
+  validateIntegrityObjectV1,
+  computeRecordHashPreimageV1,
+  computeRecordHashV1,
+  serializeRecordV1,
+  validatePersistentRecordV1,
+  parseAndValidateRecordLineV1,
+  type StorageState,
+  type PersistentAuditStorageConfig,
+  PersistentAuditStorage,
+} from './storage.js';
 export * from './metadata.js';
 export * from './lock.js';
 export {

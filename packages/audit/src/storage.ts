@@ -949,16 +949,6 @@ export function parseAndValidateRecordLineV1(line: string): {
 
 export type StorageState = 'UNINITIALIZED' | 'ACTIVE' | 'FAILED' | 'CLOSED';
 
-export interface StorageTestFaults {
-  writeFault?: 'error' | 'partial';
-  fdatasyncFault?: boolean;
-}
-
-export interface StorageTestHooks {
-  beforeFinalOpen?: () => void;
-  testFaults?: StorageTestFaults;
-}
-
 export interface PersistentAuditStorageConfig {
   directory?: string;
   metadata: {
@@ -976,6 +966,11 @@ import {
   RECOVERY_HANDOFF_TOKEN,
   type VerifiedRecoveryHandoff,
 } from './internal/recovery-capability.js';
+import {
+  STORAGE_TEST_TOKEN,
+  type StorageTestFaults,
+  type StorageTestHooks,
+} from './internal/storage-capability.js';
 
 export class PersistentAuditStorage {
   /** @internal Package-private recovery bootstrap */
@@ -988,7 +983,15 @@ export class PersistentAuditStorage {
     if (token !== RECOVERY_HANDOFF_TOKEN) {
       throw createCodedError('AUDIT_STORAGE_INVALID_STATE', 'unauthorized recovery handoff');
     }
-    const storage = new PersistentAuditStorage(config, internalHooks);
+    const storage = new (
+      PersistentAuditStorage as unknown as {
+        new (
+          config: PersistentAuditStorageConfig,
+          token: symbol,
+          hooks?: StorageTestHooks,
+        ): PersistentAuditStorage;
+      }
+    )(config, STORAGE_TEST_TOKEN, internalHooks);
     storage.lock = handoff.lock;
     storage.metadata = handoff.metadata;
     storage.activeFd = handoff.activeFd;
@@ -1011,13 +1014,24 @@ export class PersistentAuditStorage {
   private readonly _testFaults?: StorageTestFaults;
   private readonly _testHooks?: StorageTestHooks;
 
-  constructor(config: PersistentAuditStorageConfig, internalHooks?: StorageTestHooks) {
+  constructor(config: PersistentAuditStorageConfig);
+  constructor(config: PersistentAuditStorageConfig, ...rest: unknown[]) {
+    if (rest.length > 0) {
+      const [token, internalHooks] = rest;
+      if (token !== STORAGE_TEST_TOKEN) {
+        throw createCodedError(
+          'AUDIT_STORAGE_INVALID_CONFIG',
+          'Unexpected constructor arguments; test hooks require internal capability',
+        );
+      }
+      const hooks = internalHooks as StorageTestHooks | undefined;
+      this._testFaults = hooks?.testFaults;
+      this._testHooks = hooks;
+    }
     this.config = config;
     this.expectedUid = config.expectedUid ?? getProcessUid();
     this.auditDir = config.directory ?? DEFAULT_AUDIT_DIR;
     this.activePath = path.join(this.auditDir, ACTIVE_SEGMENT_FILENAME);
-    this._testFaults = internalHooks?.testFaults;
-    this._testHooks = internalHooks;
   }
 
   public getState(): StorageState {
@@ -1324,14 +1338,4 @@ export class PersistentAuditStorage {
       });
     }
   }
-}
-
-export function createTestPersistentAuditStorage(
-  config: PersistentAuditStorageConfig,
-  testHooks?: StorageTestHooks | StorageTestFaults,
-): PersistentAuditStorage {
-  if (testHooks && ('writeFault' in testHooks || 'fdatasyncFault' in testHooks)) {
-    return new PersistentAuditStorage(config, { testFaults: testHooks as StorageTestFaults });
-  }
-  return new PersistentAuditStorage(config, testHooks as StorageTestHooks);
 }
