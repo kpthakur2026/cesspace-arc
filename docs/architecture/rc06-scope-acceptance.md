@@ -669,6 +669,24 @@ audit-<YYYYMMDDTHHMMSSZ>-seq<startSeq>-seq<endSeq>.jsonl.gz
 - The first record in the next segment contains `sequenceNumber = endSeq + 1` and
   `integrity.previousRecordHash` equal to the `recordHash` of the terminal record in the rotated segment.
 
+#### 10.3.1 Staging Clarification: Mandatory Rotation-Sealing Dependency
+
+The checkpoint-before-close requirement above is the FINAL PRODUCTION invariant. Implementation
+staging does NOT weaken it; it satisfies it in two stages:
+
+- **Task 3** invokes an abstract, MANDATORY rotation-sealing dependency before a non-empty segment
+  rotation may be finalized. Task 3 defines the dependency and its ordering; it does not implement
+  cryptography.
+- **Task-3 tests** use a synthetic sealer solely to prove ordering and failure behavior. That sealer
+  is not cryptographic, is not a Tier 2 implementation, persists no checkpoint artifact, and is
+  structurally unavailable from production configuration or runtime wiring.
+- **Task 4** supplies the real Tier 2 `RotationCheckpointSealer` implementation.
+- **Task 6** wires the complete production startup/runtime composition.
+- Production runtime MUST NOT finalize a segment rotation using the synthetic test sealer, and no
+  production configuration may select a no-op sealer.
+
+The exact boundary, ordering, and failure semantics are frozen in §34.2.
+
 ### 10.4 Streaming Compression & Deletion Contract
 
 - Rotated segments are compressed using streaming `gzip` (`node:zlib`).
@@ -736,6 +754,11 @@ export interface AuditCheckpointV1 {
 - If the 1,000-record interval coincides with segment rotation, exactly ONE checkpoint is emitted.
 - `sequenceStart`: sequence of first primary record covered (1 for genesis, or previous `sequenceEnd + 1`).
 - `sequenceEnd`: sequence of terminal primary record covered.
+- **Staging of the coincidence rule:** Task 3 does NOT implement the interval/rotation coincidence
+  deduplication cryptographically. The rotation-sealing boundary (§34.2) supplies the terminal
+  sequence and terminal record hash of the rotated segment, which is sufficient for Task 4 to decide
+  the coincidence case above without Task 3 understanding checkpoint internals. Task 4 MUST honor
+  this already-frozen cadence when it implements the real sealer.
 
 ### 12.3 Exact Signature & Hash Preimage Construction
 
@@ -1594,6 +1617,102 @@ All 108 controls are contiguous, mandatory, and directly testable:
   - Task 2 owns exactly: `RC06-NEG-30..39` and `RC06-NEG-46..47`.
   - Task 6 owns: `RC06-NEG-40..45`.
   - Task 3 owns: `RC06-NEG-48..63`.
+
+### 34.2 Task 3 Rotation-Sealing Staging Contract, Scope Boundaries & Control Ownership
+
+§10.3 requires that a Tier 2 checkpoint artifact seal a segment before it is closed. The Task
+breakdown assigns the physical rotation engine to Task 3 and the real Tier 2 checkpoint
+implementation to Task 4, so the dependency between them is frozen here explicitly rather than left
+ambiguous.
+
+- **Frozen Rotation-Sealing Dependency:**
+
+  ```typescript
+  interface RotationSealBoundary {
+    sequenceStart: number;
+    sequenceEnd: number;
+    terminalRecordHash: string;
+  }
+
+  interface RotationCheckpointSealer {
+    sealRotation(boundary: RotationSealBoundary): Promise<void>;
+  }
+  ```
+
+  - `RotationSealBoundary` carries ONLY verified primary-chain facts required to seal the segment:
+    the first and last sequence numbers covered and the terminal record hash. It is NOT a checkpoint,
+    a signature, or a checkpoint identifier.
+  - Task 3 MUST NOT know about: Ed25519, private keys, public keys, signatures, `checkpointId`,
+    `checkpointHash`, `previousCheckpointHash`, `audit-checkpoints.jsonl` encoding, key loading, or
+    key permissions. Those remain Task 4.
+
+- **Task-3 Staging Semantics:**
+  - Task 3 implements the physical rotation/compression engine and requires a rotation-sealing
+    authority BEFORE finalizing any non-empty segment rotation.
+  - Task 3 MAY use a synthetic test sealer solely in Task-3 tests. That synthetic sealer is not
+    cryptographic, is not a Tier 2 implementation, persists no checkpoint artifact, exists only to
+    prove ordering and failure behavior, and is structurally unavailable from production
+    configuration or runtime wiring.
+  - Task 4 later supplies the real Tier 2 `RotationCheckpointSealer`.
+  - Task 6 later wires the complete production startup/runtime composition.
+
+- **Frozen Rotation Ordering:** For a non-empty active segment whose rotation trigger fires, the
+  architectural order is:
+
+  ```text
+  durable terminal primary record already present
+  → freeze rotation boundary (sequenceStart, sequenceEnd, terminalRecordHash)
+  → invoke RotationCheckpointSealer
+  → sealing succeeds
+  → close/fdatasync active segment as required
+  → rename/create deterministic rotated .jsonl
+  → fsync parent directory
+  → create new active segment securely
+  → preserve next sequence / previousRecordHash continuity
+  → compress rotated .jsonl through streaming gzip
+  → stream-decompress and verify resulting .jsonl.gz
+  → only after successful archive verification may uncompressed rotated .jsonl be removed
+  → fsync parent directory after removal
+  ```
+
+  Where the existing durability ordering elsewhere in this document requires slightly different
+  close/rename mechanics, those existing filesystem guarantees are preserved. The critical invariant
+  is: **no segment becomes a finalized rotated segment before the sealing authority has succeeded.**
+
+- **Seal Failure Semantics:** If the rotation sealer fails:
+  - rotation is NOT finalized;
+  - no new active chain boundary is accepted;
+  - no historical evidence is deleted;
+  - storage fails closed.
+
+  Task-3 tests may exercise this with a synthetic failing sealer. Task 3 does NOT define Tier 2
+  cryptographic error details; Task 4 owns real checkpoint-generation and signing failures.
+
+- **Task-3 Production-Use Boundary:** Until Task 4 supplies the real checkpoint sealer:
+  - Task-3 rotation primitives are reusable infrastructure only;
+  - Task-3 synthetic sealing MUST NEVER be wired into production server configuration;
+  - Task 3 must not claim complete Tier 2 checkpoint compliance;
+  - Task 3 must not expose a production "disable checkpoint sealing" option;
+  - Task 3 must not permit a no-op sealer in production.
+
+  Task 6 remains responsible for complete production composition.
+
+- **Full-History Verification Scope (Staging):**
+  - Task 3 introduces reusable primary-chain verification across rotated `.jsonl` segments, rotated
+    `.jsonl.gz` archives, and the active segment, including chain continuity across physical segment
+    boundaries.
+  - Task 3 does NOT verify checkpoint signatures, the checkpoint hash chain, anchor receipts, or
+    anchor spool state.
+  - Task 6 later composes all retained-primary, checkpoint, receipt, spool, torn-tail, and lifecycle
+    verification into the exact production startup sequence frozen in §22.1.
+  - This staging is consistent with §22 and with the Task-2 staging contract in §34.1.
+
+- **Strict Control Ownership:**
+  - Task 3 owns exactly: `RC06-NEG-48..63`.
+  - Task 4 owns exactly: `RC06-NEG-64..83`.
+  - No control is moved by this staging contract.
+  - For Task-3 controls requiring rotation behavior, synthetic sealing is permitted only as a staging
+    test dependency. **No Task-3 test may claim cryptographic checkpoint validity.**
 
 ---
 
