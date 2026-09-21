@@ -43,6 +43,7 @@ import {
   validateStoreMetadataConsistency,
   ACTIVE_SEGMENT_FILENAME,
   METADATA_FILENAME,
+  UUID_V4_REGEX,
 } from '../packages/audit/dist/index.js';
 
 function createSampleRecordCandidate() {
@@ -1023,6 +1024,77 @@ describe('CesSpace ARC — RC-06 Task 1: Persistent Append Storage Foundation', 
         () => validatePersistentRecordV1(badPhase),
         (err) => err.code === 'INVALID_RECORD',
       );
+
+      const unknownKey = {
+        ...createSampleRecordCandidate(),
+        schemaVersion: 1,
+        sequenceNumber: 1,
+        lifecycle: {
+          operationId: 'f47ac10b-58cc-4372-a567-0e02b2c3d479',
+          phase: 'STARTED',
+          unknownField: 'bad',
+        },
+        integrity: { previousRecordHash: '0'.repeat(64), recordHash: 'a'.repeat(64) },
+      };
+      assert.throws(
+        () => validatePersistentRecordV1(unknownKey),
+        (err) => err.code === 'UNKNOWN_FIELD',
+      );
+    });
+
+    test('Lifecycle operationId requires valid UUIDv4; valid UUIDv4 accepted', () => {
+      const validOpId = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
+      assert.ok(UUID_V4_REGEX.test(validOpId));
+
+      const validLifecycleRecord = {
+        ...createSampleRecordCandidate(),
+        schemaVersion: 1,
+        sequenceNumber: 1,
+        lifecycle: {
+          operationId: validOpId,
+          phase: 'STARTED',
+        },
+        integrity: { previousRecordHash: '0'.repeat(64), recordHash: 'a'.repeat(64) },
+      };
+      assert.doesNotThrow(() => validatePersistentRecordV1(validLifecycleRecord));
+    });
+
+    test('Syntactically valid non-v4 UUIDs (v1, v3, v5) rejected in lifecycle.operationId with INVALID_RECORD', () => {
+      const nonV4Uuids = [
+        { version: 'v1', id: 'f47ac10b-58cc-1372-a567-0e02b2c3d479' },
+        { version: 'v3', id: 'f47ac10b-58cc-3372-a567-0e02b2c3d479' },
+        { version: 'v5', id: 'f47ac10b-58cc-5372-a567-0e02b2c3d479' },
+      ];
+
+      for (const { version, id } of nonV4Uuids) {
+        assert.ok(!UUID_V4_REGEX.test(id), `UUID${version} must not match UUID_V4_REGEX`);
+        const candidate = {
+          ...createSampleRecordCandidate(),
+          schemaVersion: 1,
+          sequenceNumber: 1,
+          lifecycle: {
+            operationId: id,
+            phase: 'STARTED',
+          },
+          integrity: { previousRecordHash: '0'.repeat(64), recordHash: 'a'.repeat(64) },
+        };
+        assert.throws(
+          () => validatePersistentRecordV1(candidate),
+          (err) => err.code === 'INVALID_RECORD',
+          `UUID${version} must be rejected with INVALID_RECORD`,
+        );
+      }
+    });
+
+    test('Generic eventId preserves v1..v5 UUID support while lifecycle.operationId requires v4', () => {
+      const v1EventRecord = {
+        ...createSampleRecordCandidate(),
+        eventId: 'f47ac10b-58cc-1372-a567-0e02b2c3d479', // UUIDv1
+        schemaVersion: 1,
+        sequenceNumber: 1,
+        integrity: { previousRecordHash: '0'.repeat(64), recordHash: 'a'.repeat(64) },
+      };
+      assert.doesNotThrow(() => validatePersistentRecordV1(v1EventRecord));
     });
 
     test('Invalid execution status, duration, or non-string changedFiles rejected with INVALID_RECORD', () => {

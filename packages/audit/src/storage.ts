@@ -29,6 +29,8 @@ export const DEFAULT_AUDIT_DIR = path.join(os.homedir(), '.cesspace-arc', 'audit
 export const ACTIVE_SEGMENT_FILENAME = 'audit-active.jsonl';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+export const UUID_V4_REGEX =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const HEX64_REGEX = /^[0-9a-f]{64}$/;
 const HEX32_REGEX = /^[0-9a-f]{32}$/;
 const PRINTABLE_ASCII_128_REGEX = /^[\x20-\x7e]{1,128}$/;
@@ -739,8 +741,8 @@ export function validatePersistentRecordV1(input: unknown, requireRecordHash = t
         throw createCodedError('UNKNOWN_FIELD', `unknown field "${k}" in lifecycle`);
       }
     }
-    if (typeof lc.operationId !== 'string' || !UUID_REGEX.test(lc.operationId)) {
-      throw createCodedError('INVALID_RECORD', 'lifecycle.operationId must be a valid UUID');
+    if (typeof lc.operationId !== 'string' || !UUID_V4_REGEX.test(lc.operationId)) {
+      throw createCodedError('INVALID_RECORD', 'lifecycle.operationId must be a valid UUIDv4');
     }
     if (typeof lc.phase !== 'string' || !LIFECYCLE_PHASE_SET.has(lc.phase)) {
       throw createCodedError('INVALID_RECORD', 'lifecycle.phase has invalid value');
