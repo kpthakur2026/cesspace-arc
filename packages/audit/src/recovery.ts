@@ -77,13 +77,15 @@ export interface StreamVerificationOptions {
   trustedBoundary?: TrustedPrimaryChainBoundary;
 }
 
-interface LifecycleTrackingEntry {
+/** @internal Lifecycle state carried across segment boundaries by rotation. */
+export interface LifecycleTrackingEntry {
   phase: 'STARTED' | 'COMPLETED' | 'DENIED' | 'RECOVERY_INDETERMINATE';
   startedSequenceNumber?: number;
   startedRecordContext?: DanglingOperation;
 }
 
-function updateLifecycle(
+/** @internal Shared lifecycle transition rules, used by the rotation verifier. */
+export function updateLifecycle(
   lifecycleMap: Map<string, LifecycleTrackingEntry>,
   record: PersistentAuditRecordV1,
 ): void {
@@ -167,7 +169,8 @@ function updateLifecycle(
   );
 }
 
-function extractDanglingOperations(
+/** @internal Shared dangling-operation extraction, used by the rotation verifier. */
+export function extractDanglingOperations(
   lifecycleMap: Map<string, LifecycleTrackingEntry>,
 ): DanglingOperation[] {
   const dangling: DanglingOperation[] = [];

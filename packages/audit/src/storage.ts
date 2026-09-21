@@ -971,6 +971,11 @@ import {
   type StorageTestFaults,
   type StorageTestHooks,
 } from './internal/storage-capability.js';
+import {
+  ROTATION_CAPABILITY_TOKEN,
+  type RotationStorageCapability,
+} from './internal/rotation-capability.js';
+import { isValidRotatedSegmentFilename } from './rotation-filename.js';
 
 export class PersistentAuditStorage {
   /** @internal Package-private recovery bootstrap */
@@ -1219,37 +1224,19 @@ export class PersistentAuditStorage {
 
     this.appendInProgress = true;
     try {
-      const candidate: PersistentAuditRecordV1 = {
-        ...(recordCandidate as AuditRecord),
-        schemaVersion: 1,
-        sequenceNumber: this.currentSequence,
-        integrity: {
-          previousRecordHash: this.lastRecordHash,
-          recordHash: '0000000000000000000000000000000000000000000000000000000000000000',
-        },
-      };
-
-      validatePersistentRecordV1(candidate, false);
-
-      const recordHash = computeRecordHashV1(candidate);
-      candidate.integrity.recordHash = recordHash;
-
-      validatePersistentRecordV1(candidate, true);
-
-      const line = serializeRecordV1(candidate);
-      const byteLen = Buffer.byteLength(line, 'utf8');
-      if (byteLen > MAX_RECORD_BYTES) {
-        throw createCodedError(
-          'RECORD_TOO_LARGE',
-          `record line (${byteLen} bytes) exceeds MAX_RECORD_BYTES (${MAX_RECORD_BYTES})`,
-        );
-      }
-
-      const buf = Buffer.from(line, 'utf8');
+      const { candidate, recordHash, buf } = this.buildSignedRecord(recordCandidate);
 
       if (this._testFaults?.writeFault === 'error') {
         this.state = 'FAILED';
         throw createCodedError('SIMULATED_WRITE_FAILURE', 'disk write failed');
+      }
+
+      if (this._testFaults?.writeFault === 'enospc') {
+        // The cursor is deliberately NOT advanced: the record never became
+        // durable, so the in-memory chain must not claim it did. The storage
+        // moves to FAILED, which is fail-closed for every subsequent append.
+        this.state = 'FAILED';
+        throw createCodedError('ENOSPC', 'no space left on device');
       }
 
       let offset = 0;
@@ -1289,6 +1276,211 @@ export class PersistentAuditStorage {
       return JSON.parse(JSON.stringify(candidate)) as PersistentAuditRecordV1;
     } finally {
       this.appendInProgress = false;
+    }
+  }
+
+  /**
+   * Builds, hashes and serializes the record the next append would write,
+   * without mutating any cursor and without writing any byte.
+   *
+   * Shared by `append()` and by the rotation coordinator's capacity preflight,
+   * so the projected byte length and the written byte length can never diverge.
+   */
+  private buildSignedRecord(
+    recordCandidate: Omit<
+      PersistentAuditRecordV1,
+      'sequenceNumber' | 'integrity' | 'schemaVersion'
+    >,
+  ): { candidate: PersistentAuditRecordV1; recordHash: string; buf: Buffer } {
+    const candidate: PersistentAuditRecordV1 = {
+      ...(recordCandidate as AuditRecord),
+      schemaVersion: 1,
+      sequenceNumber: this.currentSequence,
+      integrity: {
+        previousRecordHash: this.lastRecordHash,
+        recordHash: '0000000000000000000000000000000000000000000000000000000000000000',
+      },
+    };
+
+    validatePersistentRecordV1(candidate, false);
+
+    const recordHash = computeRecordHashV1(candidate);
+    candidate.integrity.recordHash = recordHash;
+
+    validatePersistentRecordV1(candidate, true);
+
+    const line = serializeRecordV1(candidate);
+    const byteLen = Buffer.byteLength(line, 'utf8');
+    if (byteLen > MAX_RECORD_BYTES) {
+      throw createCodedError(
+        'RECORD_TOO_LARGE',
+        `record line (${byteLen} bytes) exceeds MAX_RECORD_BYTES (${MAX_RECORD_BYTES})`,
+      );
+    }
+
+    return { candidate, recordHash, buf: Buffer.from(line, 'utf8') };
+  }
+
+  /**
+   * @internal Package-private rotation capability.
+   *
+   * Returns a narrow, descriptor-level authority for the rotation coordinator.
+   * It is NOT a cursor setter: rotation preserves `currentSequence` and
+   * `lastRecordHash` by construction, so the next append continues the chain
+   * across the segment boundary (rc06 §73). The token is unforgeable and is
+   * never exported from the package root or any public package subpath.
+   */
+  public _rotationCapability(token: symbol): RotationStorageCapability {
+    if (token !== ROTATION_CAPABILITY_TOKEN) {
+      throw createCodedError('AUDIT_STORAGE_INVALID_STATE', 'unauthorized rotation capability');
+    }
+
+    return {
+      auditDir: this.auditDir,
+      activePath: this.activePath,
+      expectedUid: this.expectedUid,
+
+      isActive: () => this.state === 'ACTIVE',
+      isClosed: () => this.state === 'CLOSED',
+      isFailed: () => this.state === 'FAILED',
+
+      getActiveFd: () => this.activeFd,
+      getActiveByteSize: () => {
+        if (this.activeFd === null) return null;
+        const stats = validateFileDescriptorAuthority(this.activeFd, 0o600, this.expectedUid);
+        return stats.size;
+      },
+
+      projectSerializedBytes: (candidate) =>
+        this.buildSignedRecord(
+          candidate as Omit<
+            PersistentAuditRecordV1,
+            'sequenceNumber' | 'integrity' | 'schemaVersion'
+          >,
+        ).buf.byteLength,
+
+      markRotationFailed: () => {
+        this.state = 'FAILED';
+      },
+
+      rotateActiveSegmentPhysical: (archiveName: string) =>
+        this.rotateActiveSegmentPhysical(archiveName),
+    };
+  }
+
+  /**
+   * The single synchronous physical rotation critical section.
+   *
+   * Ordering is load-bearing and matches the frozen rotation order:
+   *
+   *   1. finalize the active descriptor (fdatasync, then close);
+   *   2. install the finalized bytes under `archiveName` WITHOUT overwriting;
+   *   3. fsync the parent directory so the new name is durable;
+   *   4. create the fresh active segment with `O_CREAT | O_EXCL` and validate
+   *      descriptor authority;
+   *   5. fsync the parent directory again.
+   *
+   * `link()` + `unlink()` is used instead of `rename()` because Node exposes no
+   * `renameat2(RENAME_NOREPLACE)`: `rename()` would silently clobber an
+   * existing archive, which RC06-NEG-53 forbids outright. `link()` fails with
+   * `EEXIST` when the target exists, so the no-overwrite guarantee is provided
+   * by the kernel rather than by a check-then-act race.
+   *
+   * The transient window in which the archived inode has `nlink === 2` is a
+   * fail-closed state, not a correctness hazard: `validateFileDescriptorAuthority`
+   * requires `nlink === 1`, so no reader can mistake that inode for a canonical
+   * artifact while both names exist, and the source name is removed before this
+   * method returns.
+   *
+   * `currentSequence` and `lastRecordHash` are intentionally left untouched.
+   */
+  private rotateActiveSegmentPhysical(archiveName: string): {
+    archivedPath: string;
+    newActiveFd: number;
+  } {
+    if (this.state !== 'ACTIVE' || this.activeFd === null) {
+      throw createCodedError('AUDIT_STORAGE_INVALID_STATE', 'storage is not active');
+    }
+    if (!isValidRotatedSegmentFilename(archiveName)) {
+      throw createCodedError(
+        'AUDIT_ROTATION_INVALID_TARGET',
+        `refusing to install a non-canonical rotated segment name: ${archiveName}`,
+      );
+    }
+
+    const archivedPath = path.join(this.auditDir, archiveName);
+
+    const previousFd = this.activeFd;
+    this.activeFd = null;
+
+    try {
+      fs.fdatasyncSync(previousFd);
+      fs.closeSync(previousFd);
+
+      // No-overwrite installation. `EEXIST` propagates and aborts rotation with
+      // the source segment still intact and still named as the active segment.
+      fs.linkSync(this.activePath, archivedPath);
+      fs.unlinkSync(this.activePath);
+    } catch (err) {
+      this.state = 'FAILED';
+      throw err;
+    }
+
+    try {
+      this.syncDirectory();
+    } catch (err) {
+      this.state = 'FAILED';
+      throw err;
+    }
+
+    let fd: number;
+    try {
+      fd = fs.openSync(
+        this.activePath,
+        fsConstants.O_CREAT | fsConstants.O_APPEND | fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW,
+        0o600,
+      );
+    } catch (err: unknown) {
+      const errCode =
+        typeof err === 'object' && err !== null && 'code' in err
+          ? (err as { code: unknown }).code
+          : undefined;
+
+      this.state = 'FAILED';
+      if (errCode === 'ELOOP') {
+        throw createCodedError('SYMLINK_DETECTED', 'active segment is a symbolic link');
+      }
+      throw err;
+    }
+
+    try {
+      const stats = validateFileDescriptorAuthority(fd, 0o600, this.expectedUid);
+      if (stats.size !== 0) {
+        throw createCodedError(
+          'AUDIT_ROTATION_TARGET_NOT_EMPTY',
+          'freshly created active segment is not empty',
+        );
+      }
+      this.activeFd = fd;
+      this.syncDirectory();
+    } catch (err) {
+      if (this.activeFd === null) {
+        fs.closeSync(fd);
+      }
+      this.state = 'FAILED';
+      throw err;
+    }
+
+    return { archivedPath, newActiveFd: fd };
+  }
+
+  /** fsyncs the audit directory so a name creation/removal is durable. */
+  private syncDirectory(): void {
+    const parentFd = fs.openSync(this.auditDir, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY);
+    try {
+      fs.fsyncSync(parentFd);
+    } finally {
+      fs.closeSync(parentFd);
     }
   }
 
