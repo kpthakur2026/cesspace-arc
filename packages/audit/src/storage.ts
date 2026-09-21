@@ -972,7 +972,37 @@ export interface PersistentAuditStorageConfig {
   platformProbe?: Partial<PlatformCapabilities>;
 }
 
+export const RECOVERY_HANDOFF_TOKEN = Symbol('RECOVERY_HANDOFF_TOKEN');
+
+export interface VerifiedRecoveryHandoff {
+  lock: AuditLockAcquisition;
+  metadata: AuditStoreMetadataV1;
+  activeFd: number;
+  terminalSequence: number;
+  terminalRecordHash: string;
+  verifiedActiveIdentity: { dev: number; ino: number };
+}
+
 export class PersistentAuditStorage {
+  /** @internal Package-private recovery bootstrap */
+  public static _fromVerifiedRecovery(
+    token: symbol,
+    config: PersistentAuditStorageConfig,
+    handoff: VerifiedRecoveryHandoff,
+    internalHooks?: StorageTestHooks,
+  ): PersistentAuditStorage {
+    if (token !== RECOVERY_HANDOFF_TOKEN) {
+      throw createCodedError('AUDIT_STORAGE_INVALID_STATE', 'unauthorized recovery handoff');
+    }
+    const storage = new PersistentAuditStorage(config, internalHooks);
+    storage.lock = handoff.lock;
+    storage.metadata = handoff.metadata;
+    storage.activeFd = handoff.activeFd;
+    storage.currentSequence = handoff.terminalSequence > 0 ? handoff.terminalSequence + 1 : 1;
+    storage.lastRecordHash = handoff.terminalRecordHash;
+    storage.state = 'ACTIVE';
+    return storage;
+  }
   private readonly auditDir: string;
   private readonly activePath: string;
   private readonly config: PersistentAuditStorageConfig;
