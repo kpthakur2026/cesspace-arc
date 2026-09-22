@@ -135,6 +135,7 @@ audit options (local operator only):
   --checkpoint-key <path> PUBLIC Ed25519 checkpoint key (status, verify, export)
   --anchor-key <path>     PUBLIC Ed25519 anchor receipt key (anchor mode only)
   --workspace <path>      Authoritative agent workspace root (repeatable)
+  --no-workspaces         Authoritatively assert this host has NO workspaces
   --from <seq>            First sequence, inclusive (inspect, export)
   --to <seq>              Last sequence, inclusive (inspect, export)
   --limit <n>             Maximum records to display (inspect, max 100)

@@ -66,7 +66,17 @@ interface ParsedAuditOptions {
   dir: string;
   checkpointKeyPath?: string;
   anchorKeyPath?: string;
-  workspacePaths: string[];
+  /**
+   * The authoritative workspace roots, or `undefined` when the operator has not
+   * said anything about them.
+   *
+   * The distinction is the whole point: "no --workspace was given" is NOT the
+   * same statement as "there are no workspaces". Only an explicit
+   * `--no-workspaces` (or at least one `--workspace`) makes the set
+   * authoritative, and anything else leaves it unknown so the export can fail
+   * closed rather than manufacture an empty list nobody asserted.
+   */
+  workspacePaths?: string[];
   from?: number;
   to?: number;
   limit?: number;
@@ -111,7 +121,8 @@ function parseAuditOptions(
   argv: readonly string[],
   accepted: readonly string[],
 ): ParsedAuditOptions {
-  const parsed: ParsedAuditOptions = { dir: DEFAULT_AUDIT_DIR, workspacePaths: [] };
+  const parsed: ParsedAuditOptions = { dir: DEFAULT_AUDIT_DIR };
+  let declaredNoWorkspaces = false;
 
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -125,8 +136,12 @@ function parseAuditOptions(
       parsed.anchorKeyPath = takeValue(argv, i, '--anchor-key');
       i += 1;
     } else if (arg === '--workspace' && accepted.includes('workspace')) {
-      parsed.workspacePaths.push(takeValue(argv, i, '--workspace'));
+      parsed.workspacePaths = [...(parsed.workspacePaths ?? []), takeValue(argv, i, '--workspace')];
       i += 1;
+    } else if (arg === '--no-workspaces' && accepted.includes('workspace')) {
+      // A value-less flag: it must NOT consume the following token, or the next
+      // option's own value would be swallowed as a positional.
+      declaredNoWorkspaces = true;
     } else if (arg === '--output' && accepted.includes('output')) {
       parsed.output = takeValue(argv, i, '--output');
       i += 1;
@@ -142,6 +157,15 @@ function parseAuditOptions(
     } else {
       throw new AuditUsageError(`Unknown option for this audit command: ${arg}`);
     }
+  }
+
+  if (declaredNoWorkspaces) {
+    if (parsed.workspacePaths !== undefined) {
+      throw new AuditUsageError('--no-workspaces cannot be combined with --workspace.');
+    }
+    // An explicit, authoritative assertion that this host has no agent
+    // workspaces. Only this makes an empty set a statement rather than a default.
+    parsed.workspacePaths = [];
   }
 
   return parsed;
@@ -169,7 +193,7 @@ async function runStatus(io: AuditCommandIo, argv: readonly string[]): Promise<n
   const parsed = parseAuditOptions(argv, ['dir', 'checkpoint-key', 'anchor-key', 'workspace']);
   const status = await readOfflineAuditStatus({
     directory: parsed.dir,
-    workspacePaths: parsed.workspacePaths,
+    workspacePaths: parsed.workspacePaths ?? [],
     ...verificationKeys(parsed),
     ...(parsed.anchorKeyPath === undefined
       ? {}
@@ -202,7 +226,7 @@ async function runVerify(io: AuditCommandIo, argv: readonly string[]): Promise<n
   const parsed = parseAuditOptions(argv, ['dir', 'checkpoint-key', 'anchor-key', 'workspace']);
   const result = await verifyOfflineStore({
     directory: parsed.dir,
-    workspacePaths: parsed.workspacePaths,
+    workspacePaths: parsed.workspacePaths ?? [],
     ...verificationKeys(parsed),
     ...(parsed.anchorKeyPath === undefined
       ? {}
@@ -234,7 +258,7 @@ async function runInspect(io: AuditCommandIo, argv: readonly string[]): Promise<
   const parsed = parseAuditOptions(argv, ['dir', 'workspace', 'from', 'to', 'limit']);
   const records = await inspectRetainedRecords({
     directory: parsed.dir,
-    workspacePaths: parsed.workspacePaths,
+    workspacePaths: parsed.workspacePaths ?? [],
     ...(parsed.from === undefined ? {} : { from: parsed.from }),
     ...(parsed.to === undefined ? {} : { to: parsed.to }),
     ...(parsed.limit === undefined ? {} : { limit: parsed.limit }),
@@ -271,6 +295,9 @@ async function runExport(io: AuditCommandIo, argv: readonly string[]): Promise<n
   const result = await exportEvidenceBundle({
     directory: parsed.dir,
     outputDirectory: parsed.output,
+    // Deliberately NOT defaulted to []: an absent set means "unknown", and the
+    // export refuses on that. Only an explicit operator statement reaches here
+    // as an authoritative list.
     workspacePaths: parsed.workspacePaths,
     ...verificationKeys(parsed),
     ...(parsed.anchorKeyPath === undefined
@@ -310,10 +337,15 @@ audit options:
   --checkpoint-key <path> PUBLIC Ed25519 checkpoint key (status, verify, export)
   --anchor-key <path>     PUBLIC Ed25519 anchor receipt key (anchor mode only)
   --workspace <path>      Authoritative agent workspace root (repeatable)
+  --no-workspaces         Authoritatively assert this host has NO workspaces
   --from <seq>            First sequence, inclusive (inspect, export)
   --to <seq>              Last sequence, inclusive (inspect, export)
   --limit <n>             Maximum records to display (inspect, max 100)
   --output <dir>          New evidence bundle directory (export)
+
+  \`export\` refuses to run unless the workspace roots are authoritatively
+  known: supply --workspace (repeatable) or --no-workspaces. An unstated set is
+  treated as unknown, never as empty.
 
   These commands are LOCAL ONLY. They read filesystem evidence directly and
   never open the admin channel: --admin-socket and --admin-key-fd are not

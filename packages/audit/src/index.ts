@@ -695,6 +695,9 @@ export {
  * -------------------------------------------------------------------------- */
 export {
   MAX_INSPECT_RECORDS,
+  type EvidenceIdentity,
+  snapshotEvidenceInventory,
+  assertInventoryUnchanged,
   type RetainedSegmentSource,
   listRetainedSegmentSources,
   streamRetainedRecords,

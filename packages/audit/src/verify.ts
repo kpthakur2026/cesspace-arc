@@ -219,6 +219,7 @@ function captureIdentity(fd: number): ArtifactIdentity {
 async function* streamSegmentRecords(
   source: RetainedSegmentSource,
   expectedUid: number,
+  strictFraming: boolean,
 ): AsyncGenerator<PersistentAuditRecordV1> {
   const fd = openArtifactFd(source.filePath, source.label, expectedUid);
   let stream: NodeJS.ReadableStream = fs.createReadStream(null as unknown as fs.PathLike, {
@@ -227,6 +228,32 @@ async function* streamSegmentRecords(
   });
   if (source.compressed) {
     stream = stream.pipe(zlib.createGunzip());
+  }
+
+  if (strictFraming) {
+    // A line reader that strips terminators would accept an unterminated final
+    // fragment as a perfectly good record. Where the framing itself is part of
+    // the contract — bundle verification — the bytes are framed here instead,
+    // and a fragment with no terminator is a corruption rather than a record.
+    let carry: Buffer = Buffer.alloc(0);
+    for await (const chunk of stream as AsyncIterable<Buffer>) {
+      carry = carry.length === 0 ? Buffer.from(chunk) : Buffer.concat([carry, chunk]);
+      for (;;) {
+        const index = carry.indexOf(0x0a);
+        if (index === -1) break;
+        const line = carry.subarray(0, index).toString('utf8');
+        carry = Buffer.from(carry.subarray(index + 1));
+        if (line.length === 0) continue;
+        yield parseAndValidateRecordLineV1(`${line}\n`).record;
+      }
+    }
+    if (carry.length > 0) {
+      throw createCodedError(
+        'AUDIT_CORRUPTION_DETECTED',
+        `${source.label} ends in an unterminated record line`,
+      );
+    }
+    return;
   }
 
   const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
@@ -249,17 +276,132 @@ async function* streamSegmentRecords(
  */
 export async function* streamRetainedRecords(
   sources: readonly RetainedSegmentSource[],
-  options: { from?: number; to?: number; expectedUid?: number } = {},
+  options: {
+    from?: number;
+    to?: number;
+    expectedUid?: number;
+    /**
+     * Require every artifact to be LF-terminated.
+     *
+     * Off for inspection, where a torn active tail is a legitimate state to stop
+     * at; ON wherever a missing terminator would silently turn a truncated
+     * artifact into apparently-valid evidence.
+     */
+    strictFraming?: boolean;
+  } = {},
 ): AsyncGenerator<PersistentAuditRecordV1> {
-  const { from = 1, to = Number.MAX_SAFE_INTEGER, expectedUid = getProcessUid() } = options;
+  const {
+    from = 1,
+    to = Number.MAX_SAFE_INTEGER,
+    expectedUid = getProcessUid(),
+    strictFraming = false,
+  } = options;
   for (const source of sources) {
     if (source.sequenceEnd < from) continue;
     if (source.sequenceStart > to) return;
-    for await (const record of streamSegmentRecords(source, expectedUid)) {
+    for await (const record of streamSegmentRecords(source, expectedUid, strictFraming)) {
       const sequence = record.sequenceNumber;
       if (sequence < from) continue;
       if (sequence > to) return;
       yield record;
+    }
+  }
+}
+
+/* -------------------------------------------------------------------------- *
+ * Evidence inventory — source stability
+ * -------------------------------------------------------------------------- */
+
+/** Descriptor-level identity of one evidence artifact. */
+export interface EvidenceIdentity {
+  dev: number;
+  ino: number;
+  size: number;
+  mtimeMs: number;
+}
+
+/**
+ * An authoritative inventory of every artifact that carries evidence.
+ *
+ * Device and inode are what make this a *stability* check rather than a size
+ * check: a same-size replacement of a file keeps its length but not its inode,
+ * so a swap cannot hide behind an unchanged byte count.
+ */
+export type EvidenceInventory = Map<string, EvidenceIdentity>;
+
+function identityOf(filePath: string): EvidenceIdentity | null {
+  try {
+    const stats = fs.lstatSync(filePath);
+    if (stats.isSymbolicLink()) return null;
+    return {
+      dev: Number(stats.dev),
+      ino: Number(stats.ino),
+      size: Number(stats.size),
+      mtimeMs: stats.mtimeMs,
+    };
+  } catch (cause) {
+    if ((cause as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw cause;
+  }
+}
+
+/**
+ * Snapshots the identity of every retained primary artifact, the store
+ * metadata, and the checkpoint and receipt ledgers.
+ *
+ * Read only: it `lstat`s names and never opens a file for writing.
+ */
+export function snapshotEvidenceInventory(
+  directory: string,
+  expectedUid: number = getProcessUid(),
+): EvidenceInventory {
+  const inventory: EvidenceInventory = new Map();
+
+  for (const name of fs.readdirSync(directory).sort()) {
+    const full = path.join(directory, name);
+    const identity = identityOf(full);
+    if (identity !== null) inventory.set(name, identity);
+  }
+
+  void expectedUid;
+  return inventory;
+}
+
+/**
+ * Proves the evidence did not change between two snapshots.
+ *
+ * A source that is appended to, replaced — even by a file of exactly the same
+ * size — added, or removed between the two observations fails here, so a
+ * result can never describe a mixture of two generations of evidence.
+ */
+export function assertInventoryUnchanged(
+  before: EvidenceInventory,
+  after: EvidenceInventory,
+  operation: string,
+): void {
+  const beforeNames = [...before.keys()].sort();
+  const afterNames = [...after.keys()].sort();
+  if (beforeNames.length !== afterNames.length) {
+    throw createCodedError(
+      'AUDIT_SOURCE_UNSTABLE',
+      `${operation}: the evidence set changed while it was being read`,
+    );
+  }
+  for (let index = 0; index < beforeNames.length; index += 1) {
+    const name = beforeNames[index];
+    if (name !== afterNames[index]) {
+      throw createCodedError(
+        'AUDIT_SOURCE_UNSTABLE',
+        `${operation}: the evidence set changed while it was being read`,
+      );
+    }
+    const was = before.get(name) as EvidenceIdentity;
+    const now = after.get(name) as EvidenceIdentity;
+    if (was.dev !== now.dev || was.ino !== now.ino || was.size !== now.size) {
+      throw createCodedError(
+        'AUDIT_SOURCE_UNSTABLE',
+        `${operation}: ${name} changed while it was being read`,
+      );
     }
   }
 }
@@ -573,6 +715,14 @@ export async function verifyOfflineStore(
   validateAuditDirectory(options.directory, { expectedUid, workspacePaths });
   const metadata = loadStoreMetadataFile(options.directory, expectedUid);
 
+  // The three passes below are independent filesystem reads. Without this
+  // bracket they could each observe a different generation of the evidence and
+  // still be reported as one VERIFIED result. The inventory is taken before and
+  // after, and any change — an appended active segment, a replaced rotated
+  // archive, a same-size pathname swap, a new checkpoint or receipt ledger —
+  // fails the whole verification.
+  const inventoryBefore = snapshotEvidenceInventory(options.directory, expectedUid);
+
   const primary = await verifyRetainedPrimaryHistory(options.directory, expectedUid);
   if (primary.status !== 'VERIFIED') {
     throw createCodedError(
@@ -603,6 +753,12 @@ export async function verifyOfflineStore(
     checkpointsInOrder,
     expectedUid,
   });
+
+  assertInventoryUnchanged(
+    inventoryBefore,
+    snapshotEvidenceInventory(options.directory, expectedUid),
+    'offline verification',
+  );
 
   const tiers: OfflineVerificationResult['tiers'] = {
     primary: 'VERIFIED',
