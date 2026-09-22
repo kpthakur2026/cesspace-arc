@@ -19,33 +19,36 @@
  *
  * ## What this module refuses to do
  *
- * - It never opens the checkpoint signing key. Only public verification keys
- *   are copied, and there is no parameter through which a private key could
- *   arrive.
+ * - It never opens the checkpoint signing key. Only public verification keys are
+ *   copied, and there is no parameter through which a private key could arrive.
  * - It never rewrites a record. Each emitted artifact is a byte-for-byte copy of
- *   authentic source evidence (or, for the line-oriented checkpoint and receipt
- *   ledgers, a byte-identical subset of their canonical lines). No hash is
- *   recomputed to manufacture a prettier partial range.
+ *   authentic source evidence (or a byte-identical subset of a signed ledger's
+ *   canonical lines). No hash is recomputed to manufacture a prettier range.
  * - It never merges into an existing destination and never replaces a file.
+ *
+ * ## Success is bound to the exact bytes that were verified
+ *
+ * Device, inode and size are useful race signals but they are not the
+ * cryptographic identity of a byte sequence: an in-place rewrite preserves all
+ * three. Export therefore binds success to content, not to a stat:
+ *
+ *   - every primary artifact copied is required to reproduce the digest the
+ *     authenticated verification pass computed for its range;
+ *   - the public key bytes written are the bytes whose fingerprint matched the
+ *     store's durable pin;
+ *   - the selected checkpoint and receipt lines are authenticated with the same
+ *     Task-4/Task-5 rules the store verifier uses;
+ *   - and the finished bundle is re-verified end to end before this call
+ *     reports success.
  *
  * ## Destination authority is descriptor-bound, not pathname-bound
  *
- * `lstat`-ing the parent components and later calling `mkdir` on a pathname
- * proves nothing: the hierarchy that was checked is not the hierarchy that
- * receives the bundle, so a component can be swapped for a symlink in between.
- * The destination is therefore resolved and created entirely through
- * descriptors — each ancestor is opened `O_DIRECTORY | O_NOFOLLOW` by its
- * parent's own descriptor, and both the destination and every file inside it are
- * created by name relative to a descriptor this process already holds. A
- * substitution anywhere in the chain cannot redirect the write.
- *
- * ## Emitted bytes are the verified bytes
- *
- * The artifacts copied into a bundle are the ones whose authenticity the
- * preceding verification authenticated. Each copy re-opens its source, proves
- * the descriptor still carries the device, inode and size recorded at selection
- * time, and copies from that descriptor — so a same-size pathname replacement
- * cannot smuggle different bytes into a bundle that reports success.
+ * Each ancestor is opened `O_DIRECTORY | O_NOFOLLOW` by its parent's own
+ * descriptor, and both the destination and every file inside it are created by
+ * name relative to a descriptor this process holds. Cleanup is equally
+ * descriptor-bound: the destination is deleted through a name resolved from the
+ * retained parent descriptor, only after the leaf is proven to still be the
+ * directory this call created.
  *
  * @packageDocumentation
  */
@@ -54,6 +57,7 @@ import fs from 'node:fs';
 import fsConstants from 'node:constants';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import zlib from 'node:zlib';
 
 import {
   ACTIVE_SEGMENT_FILENAME,
@@ -66,13 +70,12 @@ import {
   computeCheckpointHash,
   parseAndValidateCheckpointLineV1,
   verifyCheckpointSignature,
+  type AuditCheckpointV1,
 } from './checkpoint.js';
 import { loadStoreMetadataFile } from './metadata.js';
 import {
-  listLogicalArchiveInventory,
   verifyRetainedPrimaryHistory,
-  type LogicalArchiveEntry,
-  type PhysicalArchiveRepresentation,
+  type RetainedPrimaryHistoryVerificationResult,
 } from './rotation.js';
 import { parseRotatedSegmentFilename } from './rotation-filename.js';
 import { ANCHOR_RECEIPT_FILENAME } from './internal/anchor-constants.js';
@@ -81,11 +84,16 @@ import {
   assertDescriptorPinnedTraversalAvailable,
   pinnedChildPath,
 } from './internal/anchor-paths.js';
-import { parseAndValidateAnchorReceiptLineV1, verifyAnchorReceiptSignature } from './anchor.js';
+import {
+  parseAndValidateAnchorReceiptLineV1,
+  verifyAnchorReceiptSignature,
+  type AnchorReceiptV1,
+} from './anchor.js';
 import {
   listRetainedSegmentSources,
   snapshotEvidenceInventory,
   assertInventoryUnchanged,
+  streamLedgerLines,
   streamRetainedRecords,
   validateSequenceRange,
   type EvidenceIdentity,
@@ -101,8 +109,7 @@ import {
  *
  * This bounds the EMITTED BUNDLE — every byte written into the destination,
  * including the public keys and the manifest itself — not merely the primary
- * evidence. Fixed by the architecture, not configurable: no flag, environment
- * variable or configuration file may raise it.
+ * evidence. Fixed by the architecture, not configurable.
  */
 export const MAX_EXPORT_BYTES = 1_073_741_824;
 
@@ -115,6 +122,9 @@ export const BUNDLE_PUBLIC_KEYS_DIRNAME = 'public-keys';
 /** Purpose-named bundled keys, so a reviewer never has to guess which is which. */
 export const BUNDLE_CHECKPOINT_KEY_FILENAME = 'checkpoint-public.pem';
 export const BUNDLE_ANCHOR_KEY_FILENAME = 'anchor-receipt-public.pem';
+
+/** The predecessor hash of the first checkpoint and the first record. */
+const ZERO_HASH = '0'.repeat(64);
 
 /* -------------------------------------------------------------------------- *
  * Manifest
@@ -142,7 +152,7 @@ export interface ExportEvidenceOptions {
   outputDirectory: string;
   /** Ed25519 PUBLIC checkpoint key to include in the bundle. */
   checkpointPublicKeyPath: string;
-  /** Ed25519 PUBLIC anchor receipt key. Required only when anchor mode is ENABLED. */
+  /** Ed25519 PUBLIC anchor receipt key. Required when anchor mode is ENABLED. */
   anchorReceiptPublicKeyPath?: string;
   /**
    * Authoritative agent workspace roots.
@@ -151,8 +161,8 @@ export interface ExportEvidenceOptions {
    * is ABSENT the export refuses, because an exporter that cannot be told where
    * the agent workspaces are cannot prove the destination is outside them, and
    * treating "not supplied" as "there are none" is exactly the assumption an
-   * attacker would want. Passing an explicit empty array is a different act: it
-   * is the operator authoritatively saying there are none.
+   * attacker would want. An explicit empty array is a different act: it is the
+   * operator authoritatively saying there are none.
    */
   workspacePaths?: readonly string[];
   from?: number;
@@ -215,8 +225,7 @@ function assertPathShape(target: string, noun: string): string {
  * Component-wise containment: is `child` inside (or equal to) `parent`?
  *
  * Deliberately not a string-prefix test. `/work/a` is not inside `/work/abc`,
- * and `/work/a/../abc` is not inside `/work/a`. Both paths are normalized and
- * compared segment by segment, so lexical siblings never collide.
+ * and `/work/a/../abc` is not inside `/work/a`.
  */
 function isInsideOrEqual(child: string, parent: string): boolean {
   const childSegments = path
@@ -283,13 +292,8 @@ function openDirectoryNoFollow(target: string, label: string): number {
  * the descriptor for the immediate parent.
  *
  * Each component is opened by name RELATIVE TO ITS PARENT'S DESCRIPTOR, with
- * `O_DIRECTORY | O_NOFOLLOW`. A component that is a symlink therefore fails at
- * the moment it is traversed, and — critically — a component swapped for a
- * symlink after it was opened cannot affect the next traversal, because the next
- * traversal never re-resolves the earlier component by pathname.
- *
- * Ancestors are not created: an operator who names a destination below a
- * directory that does not exist gets an error, not a manufactured tree.
+ * `O_DIRECTORY | O_NOFOLLOW`, so a component swapped for a symlink after it was
+ * opened cannot affect a later traversal that never re-resolves it by pathname.
  */
 function openPinnedParent(destination: string): { parentFd: number; leafName: string } {
   assertDescriptorPinnedTraversalAvailable('evidence export');
@@ -316,6 +320,13 @@ function openPinnedParent(destination: string): { parentFd: number; leafName: st
 /** Tracks what this invocation created, so partial failure can be undone. */
 interface BundleWriter {
   root: string;
+  /**
+   * The descriptor of the directory the destination was created in, and the name
+   * it was created under. Cleanup needs both: neither the held root descriptor
+   * nor the pathname alone can prove the other still refers to the same object.
+   */
+  parentFd: number;
+  leafName: string;
   rootFd: number;
   rootIdentity: { dev: number; ino: number };
   dirFds: Map<string, number>;
@@ -323,14 +334,6 @@ interface BundleWriter {
   totalBytes: number;
 }
 
-/**
- * Creates the destination relative to its pinned parent descriptor and returns
- * an open descriptor for it.
- *
- * `mkdir` on a descriptor-relative name is the atomic create: it either creates
- * the directory or fails, so an existing destination — empty, populated, or a
- * symlink to either — is rejected rather than merged into.
- */
 function createBundleRoot(parentFd: number, leafName: string, destination: string): BundleWriter {
   const childPath = pinnedChildPath(parentFd, leafName);
   try {
@@ -348,13 +351,14 @@ function createBundleRoot(parentFd: number, leafName: string, destination: strin
     }
     throw createCodedError('EXPORT_FAILED', 'export destination could not be created', { cause });
   }
-  // `mode` is masked by the process umask, so the mode is applied again.
   fs.chmodSync(childPath, 0o700);
 
   const rootFd = openDirectoryNoFollow(childPath, 'export destination');
   const stats = fs.fstatSync(rootFd);
   return {
     root: destination,
+    parentFd,
+    leafName,
     rootFd,
     rootIdentity: { dev: Number(stats.dev), ino: Number(stats.ino) },
     dirFds: new Map(),
@@ -371,11 +375,8 @@ function createBundleDirectory(writer: BundleWriter, name: string): void {
 }
 
 /**
- * Enforces the frozen ceiling against what has actually been written.
- *
- * The projection is checked before any byte is written; this is the second,
- * cumulative guard, so a source that grows between projection and copy cannot
- * carry the emitted bundle past the limit.
+ * Enforces the frozen ceiling against what has actually been written, so a
+ * source that grows between projection and copy cannot carry the bundle past it.
  */
 function assertWithinBudget(written: number): void {
   if (written > MAX_EXPORT_BYTES) {
@@ -386,81 +387,133 @@ function assertWithinBudget(written: number): void {
   }
 }
 
-/**
- * Writes a file directly into the bundle root, relative to the root descriptor.
- *
- * `manifest.json` lives beside the four subdirectories, so it cannot go through
- * `writeBundleFile`, which addresses a file inside one of them.
- */
-function writeBundleRootFile(writer: BundleWriter, fileName: string, contents: Buffer): void {
-  const fd = fs.openSync(
-    pinnedChildPath(writer.rootFd, fileName),
-    fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
-    0o600,
-  );
-  try {
-    fs.writeSync(fd, contents);
-    fs.fchmodSync(fd, 0o600);
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
-  }
-  writer.fileHashes.set(fileName, {
-    sha256: crypto.createHash('sha256').update(contents).digest('hex'),
-    bytes: contents.byteLength,
-  });
-  writer.totalBytes += contents.byteLength;
-  assertWithinBudget(writer.totalBytes);
+/** An open bundle file being written incrementally. */
+interface BundleFileHandle {
+  fd: number;
+  hash: crypto.Hash;
+  bytes: number;
 }
 
-function writeBundleFile(writer: BundleWriter, relativePath: string, contents: Buffer): void {
-  const slash = relativePath.indexOf('/');
-  const dirName = relativePath.slice(0, slash);
-  const fileName = relativePath.slice(slash + 1);
+function openBundleFile(writer: BundleWriter, dirName: string, fileName: string): BundleFileHandle {
   const dirFd = writer.dirFds.get(dirName);
   if (dirFd === undefined) {
     throw createCodedError('EXPORT_FAILED', `bundle directory ${dirName}/ was never created`);
   }
-
   const fd = fs.openSync(
     pinnedChildPath(dirFd, fileName),
     fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
     0o600,
   );
-  try {
-    fs.writeSync(fd, contents);
-    fs.fchmodSync(fd, 0o600);
-    fs.fsyncSync(fd);
-  } finally {
-    fs.closeSync(fd);
-  }
-
-  writer.fileHashes.set(relativePath, {
-    sha256: crypto.createHash('sha256').update(contents).digest('hex'),
-    bytes: contents.byteLength,
-  });
-  writer.totalBytes += contents.byteLength;
-  assertWithinBudget(writer.totalBytes);
+  return { fd, hash: crypto.createHash('sha256'), bytes: 0 };
 }
 
-/**
- * Copies one verified source artifact into the bundle.
- *
- * The copy is bound to the identity recorded when the artifact was selected —
- * which is the identity that participated in verification. The source is
- * re-opened `O_NOFOLLOW`, its descriptor is required to still carry that same
- * device, inode and size, and the bytes are read from THAT descriptor. A
- * pathname swapped for a different file, even one of exactly the same length,
- * fails rather than contributing unverified bytes to a bundle that reports
- * success.
- */
-function copyVerifiedArtifact(
+function appendToBundleFile(handle: BundleFileHandle, chunk: Buffer): void {
+  fs.writeSync(handle.fd, chunk);
+  handle.hash.update(chunk);
+  handle.bytes += chunk.byteLength;
+}
+
+function closeBundleFile(
   writer: BundleWriter,
   dirName: string,
   fileName: string,
-  sourcePath: string,
-  verified: EvidenceIdentity,
+  handle: BundleFileHandle,
 ): void {
+  fs.fchmodSync(handle.fd, 0o600);
+  fs.fsyncSync(handle.fd);
+  fs.closeSync(handle.fd);
+  writer.fileHashes.set(`${dirName}/${fileName}`, {
+    sha256: handle.hash.digest('hex'),
+    bytes: handle.bytes,
+  });
+  writer.totalBytes += handle.bytes;
+  assertWithinBudget(writer.totalBytes);
+}
+
+function openRootBundleFile(writer: BundleWriter, fileName: string): BundleFileHandle {
+  const fd = fs.openSync(
+    pinnedChildPath(writer.rootFd, fileName),
+    fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+    0o600,
+  );
+  return { fd, hash: crypto.createHash('sha256'), bytes: 0 };
+}
+
+function writeBundleFile(
+  writer: BundleWriter,
+  dirName: string,
+  fileName: string,
+  contents: Buffer,
+): void {
+  const handle = openBundleFile(writer, dirName, fileName);
+  try {
+    appendToBundleFile(handle, contents);
+  } finally {
+    closeBundleFile(writer, dirName, fileName, handle);
+  }
+}
+
+function writeBundleRootFile(writer: BundleWriter, fileName: string, contents: Buffer): void {
+  const handle = openRootBundleFile(writer, fileName);
+  try {
+    appendToBundleFile(handle, contents);
+  } finally {
+    fs.fchmodSync(handle.fd, 0o600);
+    fs.fsyncSync(handle.fd);
+    fs.closeSync(handle.fd);
+    writer.fileHashes.set(fileName, {
+      sha256: handle.hash.digest('hex'),
+      bytes: handle.bytes,
+    });
+    writer.totalBytes += handle.bytes;
+    assertWithinBudget(writer.totalBytes);
+  }
+}
+
+/**
+ * The digest of an artifact's LOGICAL content.
+ *
+ * A rotated artifact is stored compressed, and the verification pass digests the
+ * decompressed stream — so the binding has to be made in that same form, or a
+ * `.jsonl.gz` could never be compared with what was authenticated for it.
+ */
+async function logicalDigestOf(filePath: string, compressed: boolean): Promise<string> {
+  const fd = fs.openSync(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  let stream: NodeJS.ReadableStream = fs.createReadStream(null as unknown as fs.PathLike, {
+    fd,
+    autoClose: true,
+  });
+  if (compressed) stream = stream.pipe(zlib.createGunzip());
+
+  const hash = crypto.createHash('sha256');
+  try {
+    for await (const chunk of stream as AsyncIterable<Buffer>) {
+      hash.update(chunk);
+    }
+  } catch (cause) {
+    throw createCodedError(
+      'AUDIT_CORRUPTION_DETECTED',
+      `${path.basename(filePath)} could not be read as retained evidence`,
+      { cause },
+    );
+  }
+  return hash.digest('hex');
+}
+
+/**
+ * Copies one verified source artifact into the bundle and binds the emitted
+ * bytes to the digest the authenticated pass computed for its range.
+ *
+ * The copy is bound to the identity recorded when the artifact was selected, and
+ * the emitted artifact is then digested in the same logical form the verifier
+ * used. An in-place rewrite preserves device, inode and size, so nothing short
+ * of this content comparison would catch it.
+ */
+async function copyVerifiedArtifact(
+  writer: BundleWriter,
+  artifact: SelectedArtifact,
+): Promise<void> {
+  const { dirName, fileName, sourcePath, identity, verifiedDigest } = artifact;
   const dirFd = writer.dirFds.get(dirName);
   if (dirFd === undefined) {
     throw createCodedError('EXPORT_FAILED', `bundle directory ${dirName}/ was never created`);
@@ -478,26 +531,19 @@ function copyVerifiedArtifact(
     });
   }
 
-  let destFd: number;
-  try {
-    destFd = fs.openSync(
-      pinnedChildPath(dirFd, fileName),
-      fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
-      0o600,
-    );
-  } catch (err) {
-    fs.closeSync(sourceFd);
-    throw err;
-  }
+  const destFd = fs.openSync(
+    pinnedChildPath(dirFd, fileName),
+    fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
+    0o600,
+  );
 
-  const hash = crypto.createHash('sha256');
-  let total = 0;
+  const handle: BundleFileHandle = { fd: destFd, hash: crypto.createHash('sha256'), bytes: 0 };
   try {
     const opened = fs.fstatSync(sourceFd);
     if (
-      Number(opened.dev) !== verified.dev ||
-      Number(opened.ino) !== verified.ino ||
-      Number(opened.size) !== verified.size
+      Number(opened.dev) !== identity.dev ||
+      Number(opened.ino) !== identity.ino ||
+      Number(opened.size) !== identity.size
     ) {
       throw createCodedError(
         'EXPORT_SOURCE_CHANGED',
@@ -510,20 +556,16 @@ function copyVerifiedArtifact(
       const read = fs.readSync(sourceFd, buffer, 0, buffer.length, null);
       if (read === 0) break;
       const slice = buffer.subarray(0, read);
-      hash.update(slice);
-      fs.writeSync(destFd, slice);
-      total += read;
-      assertWithinBudget(writer.totalBytes + total);
+      appendToBundleFile(handle, slice);
+      assertWithinBudget(writer.totalBytes + handle.bytes);
     }
-    fs.fchmodSync(destFd, 0o600);
-    fs.fsyncSync(destFd);
 
     const settled = fs.fstatSync(sourceFd);
     if (
-      Number(settled.dev) !== verified.dev ||
-      Number(settled.ino) !== verified.ino ||
-      Number(settled.size) !== verified.size ||
-      total !== verified.size
+      Number(settled.dev) !== identity.dev ||
+      Number(settled.ino) !== identity.ino ||
+      Number(settled.size) !== identity.size ||
+      handle.bytes !== identity.size
     ) {
       throw createCodedError(
         'EXPORT_SOURCE_CHANGED',
@@ -531,13 +573,22 @@ function copyVerifiedArtifact(
       );
     }
   } finally {
-    fs.closeSync(destFd);
     fs.closeSync(sourceFd);
+    closeBundleFile(writer, dirName, fileName, handle);
   }
 
-  writer.fileHashes.set(`${dirName}/${fileName}`, { sha256: hash.digest('hex'), bytes: total });
-  writer.totalBytes += total;
-  assertWithinBudget(writer.totalBytes);
+  // The emitted artifact must reproduce the digest the authenticated pass
+  // computed. This is the binding that survives an in-place rewrite.
+  const emittedDigest = await logicalDigestOf(
+    path.join(writer.root, dirName, fileName),
+    fileName.endsWith('.gz'),
+  );
+  if (verifiedDigest !== null && emittedDigest !== verifiedDigest) {
+    throw createCodedError(
+      'EXPORT_SOURCE_CHANGED',
+      `${fileName} does not reproduce the evidence digest that was verified`,
+    );
+  }
 }
 
 function closeBundleWriter(writer: BundleWriter): void {
@@ -549,44 +600,50 @@ function closeBundleWriter(writer: BundleWriter): void {
     }
   }
   writer.dirFds.clear();
-  try {
-    fs.closeSync(writer.rootFd);
-  } catch {
-    // already closed
+  for (const fd of [writer.rootFd, writer.parentFd]) {
+    try {
+      fs.closeSync(fd);
+    } catch {
+      // already closed
+    }
   }
 }
 
 /**
- * Removes only what this invocation created.
+ * Removes only what this invocation created, and only while that is provable.
  *
- * The destination is removed only while it is still the very directory this call
- * created — same device and inode, re-checked against a live descriptor — so a
- * destination that was swapped, replaced or turned into a symlink after creation
- * is left strictly alone. Data whose identity cannot be proven is never deleted.
+ * The held root descriptor proves what it references; it does NOT prove that the
+ * destination PATHNAME still names the same object. So the leaf is re-resolved
+ * through the retained parent descriptor, refused if it is a symlink, and
+ * required to carry the very device and inode this call created. If any of that
+ * cannot be proven, no recursive pathname cleanup happens at all — a partial
+ * bundle left behind is strictly better than deleting somebody else's directory.
  */
 function cleanupBundleRoot(writer: BundleWriter): void {
+  let leafIsOurs: boolean;
   try {
-    const held = fs.fstatSync(writer.rootFd);
-    if (
-      Number(held.dev) !== writer.rootIdentity.dev ||
-      Number(held.ino) !== writer.rootIdentity.ino
-    ) {
-      return;
-    }
+    const leafPath = pinnedChildPath(writer.parentFd, writer.leafName);
+    const stats = fs.lstatSync(leafPath);
+    leafIsOurs =
+      !stats.isSymbolicLink() &&
+      Number(stats.dev) === writer.rootIdentity.dev &&
+      Number(stats.ino) === writer.rootIdentity.ino;
   } catch {
+    leafIsOurs = false;
+  }
+
+  if (!leafIsOurs) {
+    closeBundleWriter(writer);
     return;
   }
+
   closeBundleWriter(writer);
   try {
-    // `rmSync` follows the pathname, so it runs only after the descriptor above
-    // proved the directory is still ours. The entries inside it are ours by
-    // construction: the destination was created by this call and never merged
-    // into.
     fs.rmSync(writer.root, { recursive: true, force: false });
   } catch {
-    // Cleanup is best-effort by design. A failure to tidy up must never mask the
-    // original export failure, and must never escalate into deleting something
-    // whose identity was not proven.
+    // Best-effort by design: a failure to tidy up must never mask the original
+    // export failure, and must never escalate into deleting an object whose
+    // identity was not proven.
   }
 }
 
@@ -599,41 +656,16 @@ interface SelectedArtifact {
   fileName: string;
   sourcePath: string;
   identity: EvidenceIdentity;
+  /** Logical digest the authenticated pass computed, or null when unbound. */
+  verifiedDigest: string | null;
 }
 
 interface SelectedEvidence {
   artifacts: SelectedArtifact[];
-  checkpointLineBytes: Buffer;
-  receiptLineBytes: Buffer;
   checkpointHashes: string[];
   anchorReceiptIds: string[];
-  /** Sum of every selected evidence byte, including the public keys. */
-  projectedBytes: number;
   checkpointKeyBytes: Buffer;
   anchorKeyBytes: Buffer | null;
-}
-
-function readFileLines(filePath: string): string[] {
-  const raw = fs.readFileSync(filePath, 'utf8');
-  if (raw.length === 0) return [];
-  if (!raw.endsWith('\n')) {
-    throw createCodedError(
-      'AUDIT_CORRUPTION_DETECTED',
-      `${path.basename(filePath)} is not LF-terminated`,
-    );
-  }
-  return raw.slice(0, -1).split('\n');
-}
-
-function physicalForArchive(entry: LogicalArchiveEntry): PhysicalArchiveRepresentation {
-  const chosen = entry.gzip ?? entry.plain;
-  if (chosen === undefined) {
-    throw createCodedError(
-      'AUDIT_CORRUPTION_DETECTED',
-      `rotated range ${entry.sequenceStart}..${entry.sequenceEnd} has no physical representation`,
-    );
-  }
-  return chosen;
 }
 
 function identityFor(filePath: string, label: string): EvidenceIdentity {
@@ -650,17 +682,40 @@ function identityFor(filePath: string, label: string): EvidenceIdentity {
 }
 
 /**
+ * Digests of every verified primary artifact, keyed by its on-disk filename.
+ *
+ * A rotated range may be represented physically by a plain or a compressed
+ * artifact; both carry the same logical content, so both names map to the one
+ * digest the verification pass computed for that range.
+ */
+function verifiedPrimaryDigests(
+  primary: RetainedPrimaryHistoryVerificationResult,
+): Map<string, string> {
+  const digests = new Map<string, string>();
+  for (const segment of primary.segments) {
+    for (const name of segment.filenames) digests.set(name, segment.digest.sha256);
+  }
+  if (primary.active !== null) {
+    digests.set(ACTIVE_SEGMENT_FILENAME, primary.active.sha256);
+  }
+  return digests;
+}
+
+/** True when two inclusive ranges share at least one sequence. */
+function rangesIntersect(aStart: number, aEnd: number, bStart: number, bEnd: number): boolean {
+  return aEnd >= bStart && aStart <= bEnd;
+}
+
+/**
  * Chooses the authentic evidence that covers `[from, to]`.
  *
- * Whole primary artifacts are selected — never a synthesized partial segment —
- * so every emitted record keeps the exact bytes, and therefore the exact hash,
- * that the store produced. The checkpoint and receipt ledgers are line-oriented
- * signed artifacts, so the selected *lines* are copied byte-for-byte.
+ * Only artifacts whose physical sequence range INTERSECTS the required interval
+ * are selected. The active segment is no exception: including it for a purely
+ * historical range would splice a discontinuous tail onto an earlier archive and
+ * create a sequence gap inside the bundle.
  *
- * The bundle must be able to authenticate its own evidence boundary: when the
- * first bundled primary artifact does not start at sequence 1, the checkpoint
- * that seals the range immediately before it is included too, so a reviewer can
- * prove the history *before* the bundle without trusting it.
+ * Whole artifacts are copied byte-for-byte; the checkpoint and receipt ledgers
+ * contribute byte-identical signed lines.
  */
 function selectEvidence(options: {
   directory: string;
@@ -668,101 +723,177 @@ function selectEvidence(options: {
   from: number;
   to: number;
   expectedUid: number;
+  primary: RetainedPrimaryHistoryVerificationResult;
   checkpointKeyBytes: Buffer;
   anchorKeyBytes: Buffer | null;
 }): SelectedEvidence {
-  const { directory, metadata, from, to, expectedUid } = options;
+  const { directory, from, to, expectedUid } = options;
+  const digests = verifiedPrimaryDigests(options.primary);
 
-  const archiveEntries = listLogicalArchiveInventory(directory, expectedUid);
-  const intersecting = archiveEntries.filter(
-    (entry) => entry.sequenceEnd >= from && entry.sequenceStart <= to,
-  );
-
-  const sources: RetainedSegmentSource[] = listRetainedSegmentSources(
-    directory,
-    expectedUid,
-  ).filter(
-    (source) =>
-      source.kind === 'ACTIVE' || (source.sequenceEnd >= from && source.sequenceStart <= to),
-  );
+  const allSources = listRetainedSegmentSources(directory, expectedUid);
+  const lastArchive = allSources.filter((source) => source.kind === 'ARCHIVE').pop();
+  const activeStart = lastArchive === undefined ? 1 : lastArchive.sequenceEnd + 1;
+  const activeEnd = options.primary.terminalSequence;
 
   const artifacts: SelectedArtifact[] = [];
-  let projectedBytes = 0;
-
-  for (const source of sources) {
-    const identity = identityFor(source.filePath, source.label);
+  for (const source of allSources) {
+    const start = source.kind === 'ACTIVE' ? activeStart : source.sequenceStart;
+    const end = source.kind === 'ACTIVE' ? activeEnd : source.sequenceEnd;
+    if (!rangesIntersect(start, end, from, to)) continue;
     artifacts.push({
       dirName: BUNDLE_AUDIT_DIRNAME,
       fileName: source.label,
       sourcePath: source.filePath,
-      identity,
+      identity: identityFor(source.filePath, source.label),
+      verifiedDigest: digests.get(source.label) ?? null,
     });
-    projectedBytes += identity.size;
   }
-  for (const entry of intersecting) {
-    // The projection uses the PHYSICAL size of the representation that will be
-    // copied, which `listRetainedSegmentSources` already selected.
-    void physicalForArchive(entry);
-  }
-
-  const boundarySequence = sources.reduce(
-    (lowest, source) => Math.min(lowest, source.sequenceStart),
-    Number.MAX_SAFE_INTEGER,
-  );
-
-  const checkpointPath = path.join(directory, CHECKPOINT_FILENAME);
-  const checkpointLines: string[] = [];
-  const checkpointHashes: string[] = [];
-  if (fs.existsSync(checkpointPath)) {
-    for (const line of readFileLines(checkpointPath)) {
-      if (line.length === 0) continue;
-      const { checkpoint } = parseAndValidateCheckpointLineV1(`${line}\n`);
-      // A checkpoint belongs in the bundle when it covers part of the selected
-      // range, or when it seals the range immediately before the bundle's own
-      // evidence boundary.
-      const coversRange = checkpoint.sequenceEnd >= from && checkpoint.sequenceStart <= to;
-      const sealsBoundary =
-        boundarySequence !== Number.MAX_SAFE_INTEGER &&
-        boundarySequence > 1 &&
-        checkpoint.sequenceEnd === boundarySequence - 1;
-      if (!coversRange && !sealsBoundary) continue;
-      checkpointLines.push(line);
-      checkpointHashes.push(checkpoint.checkpointHash);
-      projectedBytes += Buffer.byteLength(`${line}\n`, 'utf8');
-    }
-  }
-
-  const receiptLines: string[] = [];
-  const anchorReceiptIds: string[] = [];
-  if (metadata.anchorMode === 'ENABLED') {
-    const receiptPath = path.join(directory, ANCHOR_RECEIPT_FILENAME);
-    if (fs.existsSync(receiptPath)) {
-      const included = new Set(checkpointHashes);
-      for (const line of readFileLines(receiptPath)) {
-        if (line.length === 0) continue;
-        const receipt = parseAndValidateAnchorReceiptLineV1(`${line}\n`);
-        if (!included.has(receipt.checkpointHash)) continue;
-        receiptLines.push(line);
-        anchorReceiptIds.push(receipt.receiptId);
-        projectedBytes += Buffer.byteLength(`${line}\n`, 'utf8');
-      }
-    }
-  }
-
-  projectedBytes += options.checkpointKeyBytes.byteLength;
-  if (options.anchorKeyBytes !== null) projectedBytes += options.anchorKeyBytes.byteLength;
 
   return {
     artifacts,
-    checkpointLineBytes: Buffer.from(checkpointLines.map((line) => `${line}\n`).join(''), 'utf8'),
-    receiptLineBytes: Buffer.from(receiptLines.map((line) => `${line}\n`).join(''), 'utf8'),
-    checkpointHashes,
-    anchorReceiptIds,
-    projectedBytes,
+    checkpointHashes: [],
+    anchorReceiptIds: [],
     checkpointKeyBytes: options.checkpointKeyBytes,
     anchorKeyBytes: options.anchorKeyBytes,
   };
 }
+
+/* -------------------------------------------------------------------------- *
+ * Checkpoint and receipt authentication (shared with the bundle verifier)
+ * -------------------------------------------------------------------------- */
+
+interface CheckpointAuthContext {
+  storeId: string;
+  keyFingerprint: string;
+  /** The PUBLIC verification key the checkpoints must be signed by. */
+  publicKey: crypto.KeyObject;
+  /** recordHash by sequence, for terminal binding. */
+  chainBySequence: ReadonlyMap<number, string>;
+}
+
+/**
+ * Applies every Task-4 rule that binds a checkpoint to a store, a key, a range
+ * and its predecessor.
+ *
+ * Shared by the exporter (over the selected SOURCE lines, before anything is
+ * written) and by the bundle verifier (over the emitted lines), so the two
+ * cannot drift into disagreeing about what an authentic checkpoint is.
+ */
+function authenticateCheckpointSequence(
+  checkpoints: readonly AuditCheckpointV1[],
+  context: CheckpointAuthContext,
+): void {
+  let previousHash = ZERO_HASH;
+  let previousSequenceEnd: number | null = null;
+
+  for (const checkpoint of checkpoints) {
+    if (checkpoint.storeId !== context.storeId) {
+      throw createCodedError(
+        'BUNDLE_CHECKPOINT_STORE_MISMATCH',
+        'a checkpoint names a different store',
+      );
+    }
+    if (checkpoint.publicKeyFingerprint !== context.keyFingerprint) {
+      throw createCodedError(
+        'BUNDLE_CHECKPOINT_KEY_MISMATCH',
+        'a checkpoint is bound to a different public key than the one configured',
+      );
+    }
+    if (
+      !Number.isSafeInteger(checkpoint.sequenceStart) ||
+      !Number.isSafeInteger(checkpoint.sequenceEnd) ||
+      checkpoint.sequenceStart <= 0 ||
+      checkpoint.sequenceStart > checkpoint.sequenceEnd
+    ) {
+      throw createCodedError(
+        'BUNDLE_CHECKPOINT_RANGE_INVALID',
+        'a checkpoint declares an invalid sequence range',
+      );
+    }
+    if (checkpoint.previousCheckpointHash !== previousHash) {
+      throw createCodedError(
+        'BUNDLE_CHECKPOINT_CHAIN_BROKEN',
+        'checkpoints do not form one unbroken chain',
+      );
+    }
+    // Task-4 coverage continuity: checkpoints cover the primary sequence without
+    // a gap and without overlapping.
+    if (previousSequenceEnd !== null && checkpoint.sequenceStart !== previousSequenceEnd + 1) {
+      throw createCodedError(
+        'BUNDLE_CHECKPOINT_CHAIN_BROKEN',
+        'checkpoints do not cover the primary sequence contiguously',
+      );
+    }
+    if (!verifyCheckpointSignature(checkpoint, context.publicKey)) {
+      throw createCodedError(
+        'BUNDLE_CHECKPOINT_SIGNATURE_INVALID',
+        'a checkpoint signature does not verify',
+      );
+    }
+    if (computeCheckpointHash(checkpoint) !== checkpoint.checkpointHash) {
+      throw createCodedError(
+        'BUNDLE_CHECKPOINT_HASH_INVALID',
+        'a checkpoint hash is not the hash of its own contents',
+      );
+    }
+    const covered = context.chainBySequence.get(checkpoint.sequenceEnd);
+    if (covered !== undefined && covered !== checkpoint.terminalRecordHash) {
+      throw createCodedError(
+        'BUNDLE_CHECKPOINT_TERMINAL_MISMATCH',
+        'a checkpoint does not bind to the primary record it covers',
+      );
+    }
+    previousHash = checkpoint.checkpointHash;
+    previousSequenceEnd = checkpoint.sequenceEnd;
+  }
+}
+
+/**
+ * Applies every Task-5 rule that binds a receipt to a store, a key and a
+ * checkpoint, including the ordering and duplicate rules.
+ */
+function authenticateReceiptSequence(
+  receipts: readonly AnchorReceiptV1[],
+  context: {
+    storeId: string;
+    anchorFingerprint: string;
+    publicKey: crypto.KeyObject;
+    checkpointHashes: ReadonlySet<string>;
+  },
+): void {
+  const seen = new Set<string>();
+  for (const receipt of receipts) {
+    if (!verifyAnchorReceiptSignature(receipt, context.publicKey)) {
+      throw createCodedError(
+        'BUNDLE_RECEIPT_SIGNATURE_INVALID',
+        'an anchor receipt signature does not verify',
+      );
+    }
+    if (receipt.anchorKeyFingerprint !== context.anchorFingerprint) {
+      throw createCodedError(
+        'BUNDLE_RECEIPT_KEY_MISMATCH',
+        'a receipt is bound to a different key than the one pinned',
+      );
+    }
+    if (receipt.storeId !== context.storeId) {
+      throw createCodedError('BUNDLE_RECEIPT_STORE_MISMATCH', 'a receipt names a different store');
+    }
+    if (!context.checkpointHashes.has(receipt.checkpointHash)) {
+      throw createCodedError(
+        'BUNDLE_RECEIPT_ORPHAN',
+        'an anchor receipt references a checkpoint that is not in the evidence',
+      );
+    }
+    if (seen.has(receipt.receiptId)) {
+      throw createCodedError('BUNDLE_RECEIPT_DUPLICATE', 'a receipt id appears more than once');
+    }
+    seen.add(receipt.receiptId);
+  }
+}
+
+/* -------------------------------------------------------------------------- *
+ * Manifest sizing
+ * -------------------------------------------------------------------------- */
 
 /**
  * The exact serialized size of the manifest that will be written.
@@ -792,6 +923,8 @@ function predictManifestBytes(
  *
  * The manifest is the determinism contract: sorted file keys, checkpoint hashes
  * and receipt ids in authenticated order, and a digest over every emitted file.
+ * Nothing is reported as successful until the emitted bundle has been verified
+ * end to end from its own contents.
  */
 export async function exportEvidenceBundle(
   options: ExportEvidenceOptions,
@@ -816,17 +949,11 @@ export async function exportEvidenceBundle(
   const metadata = loadStoreMetadataFile(options.directory, expectedUid);
 
   // The inventory bracket opens BEFORE verification, not after it. If it opened
-  // afterwards, a source replaced while verification was reading it would be
-  // invisible to the comparison while the copy went on to emit the replacement
-  // — bytes that were never authenticated. Opening it here means every byte the
-  // bundle receives was stable across the whole operation, verification
-  // included.
+  // afterwards, a source rewritten while verification was reading it would be
+  // invisible to the comparison while the copy went on to emit the rewrite —
+  // bytes that were never authenticated.
   const inventoryBefore = snapshotEvidenceInventory(options.directory, expectedUid);
 
-  // The declared range must be the range the bundle actually covers, so `--to`
-  // is clamped to the verified terminal sequence rather than left at an
-  // open-ended sentinel. A range that starts past the end of the store is not a
-  // range at all, and is rejected rather than silently exported empty.
   const primary = await verifyRetainedPrimaryHistory(options.directory, expectedUid);
   if (primary.status !== 'VERIFIED') {
     throw createCodedError(
@@ -842,8 +969,10 @@ export async function exportEvidenceBundle(
   }
   const rangeEnd = Math.min(to, primary.terminalSequence);
 
-  // A bundle whose public key does not match the store's durable pin is a bundle
-  // nobody can ever verify. Refuse to emit one.
+  // ---- Public keys: read the bytes ONCE, then prove they are the validated
+  // bytes by fingerprint before those exact bytes are copied. A key-path
+  // substitution between validation and copy would otherwise let the bundle
+  // carry a different key than the one the store pins.
   const checkpointTrustRoot = loadEd25519TrustRootFile(options.checkpointPublicKeyPath, {
     purpose: 'CHECKPOINT',
     expectedUid,
@@ -854,28 +983,51 @@ export async function exportEvidenceBundle(
       'checkpoint public key does not match audit-store.json.checkpointPublicKeyFingerprint',
     );
   }
-  const anchorTrustRoot =
-    metadata.anchorMode === 'ENABLED' && options.anchorReceiptPublicKeyPath !== undefined
-      ? loadEd25519TrustRootFile(options.anchorReceiptPublicKeyPath, {
-          purpose: 'ANCHOR_RECEIPT',
-          expectedUid,
-        })
-      : null;
-  if (
-    anchorTrustRoot !== null &&
-    anchorTrustRoot.fingerprint !== metadata.anchorReceiptPublicKeyFingerprint
-  ) {
+  const checkpointKeyBytes = fs.readFileSync(options.checkpointPublicKeyPath);
+  if (fingerprintOfPem(checkpointKeyBytes, 'CHECKPOINT') !== checkpointTrustRoot.fingerprint) {
     throw createCodedError(
-      'EXPORT_KEY_MISMATCH',
-      'anchor receipt public key does not match audit-store.json.anchorReceiptPublicKeyFingerprint',
+      'EXPORT_KEY_CHANGED',
+      'the checkpoint public key changed after it was validated',
     );
   }
 
-  const checkpointKeyBytes = fs.readFileSync(options.checkpointPublicKeyPath);
-  const anchorKeyBytes =
-    anchorTrustRoot !== null && options.anchorReceiptPublicKeyPath !== undefined
-      ? fs.readFileSync(options.anchorReceiptPublicKeyPath)
-      : null;
+  // An enabled store MUST carry the anchor public key: without it the bundled
+  // receipts could never be checked by anyone, so the bundle would assert an
+  // external witness it does not let a reviewer confirm.
+  const anchorRequired = metadata.anchorMode === 'ENABLED';
+  if (
+    anchorRequired &&
+    (options.anchorReceiptPublicKeyPath === undefined ||
+      options.anchorReceiptPublicKeyPath.length === 0)
+  ) {
+    throw createCodedError(
+      'ANCHOR_PUBLIC_KEY_REQUIRED',
+      'anchor mode is ENABLED: the anchor receipt public key is required to export verifiable receipts',
+    );
+  }
+
+  let anchorKeyBytes: Buffer | null = null;
+  let anchorFingerprint: string | null = null;
+  if (options.anchorReceiptPublicKeyPath !== undefined) {
+    const anchorTrustRoot = loadEd25519TrustRootFile(options.anchorReceiptPublicKeyPath, {
+      purpose: 'ANCHOR_RECEIPT',
+      expectedUid,
+    });
+    if (anchorTrustRoot.fingerprint !== metadata.anchorReceiptPublicKeyFingerprint) {
+      throw createCodedError(
+        'EXPORT_KEY_MISMATCH',
+        'anchor receipt public key does not match audit-store.json.anchorReceiptPublicKeyFingerprint',
+      );
+    }
+    anchorKeyBytes = fs.readFileSync(options.anchorReceiptPublicKeyPath);
+    if (fingerprintOfPem(anchorKeyBytes, 'ANCHOR_RECEIPT') !== anchorTrustRoot.fingerprint) {
+      throw createCodedError(
+        'EXPORT_KEY_CHANGED',
+        'the anchor receipt public key changed after it was validated',
+      );
+    }
+    anchorFingerprint = anchorTrustRoot.fingerprint;
+  }
 
   assertDestinationContainment({
     destination,
@@ -889,24 +1041,107 @@ export async function exportEvidenceBundle(
     from,
     to: rangeEnd,
     expectedUid,
+    primary,
     checkpointKeyBytes,
     anchorKeyBytes,
   });
+  if (evidence.artifacts.length === 0) {
+    throw createCodedError(
+      'BUNDLE_RANGE_NOT_COVERED',
+      'no retained primary artifact covers the requested sequence range',
+    );
+  }
 
-  // The projection covers EVERY emitted file: primary artifacts, both ledgers,
-  // the public keys, and the manifest itself.
+  // ---- Authenticate the selected SOURCE checkpoint and receipt evidence before
+  // a single byte is written. This reuses the same reviewed Task-4/Task-5 rules
+  // the store verifier applies; nothing weaker is restated here.
+  const chainBySequence = new Map<number, string>();
+  for (const segment of primary.segments) {
+    chainBySequence.set(segment.digest.terminalSequence, segment.digest.terminalRecordHash);
+  }
+  if (primary.active !== null) {
+    chainBySequence.set(primary.active.terminalSequence, primary.active.terminalRecordHash);
+  }
+
+  const checkpointLines: string[] = [];
+  const checkpointObjects: AuditCheckpointV1[] = [];
+  const checkpointLedgerPath = path.join(options.directory, CHECKPOINT_FILENAME);
+  if (fs.existsSync(checkpointLedgerPath)) {
+    for await (const line of streamLedgerLines(
+      checkpointLedgerPath,
+      CHECKPOINT_FILENAME,
+      expectedUid,
+    )) {
+      const { checkpoint } = parseAndValidateCheckpointLineV1(`${line}\n`);
+      // The complete checkpoint prefix through the range end: a bundle that
+      // begins mid-history must be able to walk its checkpoint chain from
+      // genesis, rather than being handed an ancestor-less fragment.
+      if (checkpoint.sequenceStart > rangeEnd) continue;
+      checkpointLines.push(line);
+      checkpointObjects.push(checkpoint);
+    }
+  }
+  const checkpointHashes = checkpointObjects.map((checkpoint) => checkpoint.checkpointHash);
+  const receiptLines: string[] = [];
+  const receiptObjects: AnchorReceiptV1[] = [];
+  if (metadata.anchorMode === 'ENABLED') {
+    const receiptLedgerPath = path.join(options.directory, ANCHOR_RECEIPT_FILENAME);
+    if (fs.existsSync(receiptLedgerPath)) {
+      const included = new Set(checkpointHashes);
+      for await (const line of streamLedgerLines(
+        receiptLedgerPath,
+        ANCHOR_RECEIPT_FILENAME,
+        expectedUid,
+      )) {
+        const receipt = parseAndValidateAnchorReceiptLineV1(`${line}\n`);
+        if (!included.has(receipt.checkpointHash)) continue;
+        receiptLines.push(line);
+        receiptObjects.push(receipt);
+      }
+    }
+  }
+
+  authenticateCheckpointSequence(checkpointObjects, {
+    storeId: metadata.storeId,
+    keyFingerprint: checkpointTrustRoot.fingerprint,
+    publicKey: checkpointTrustRoot.publicKey,
+    chainBySequence,
+  });
+  if (receiptObjects.length > 0) {
+    if (anchorKeyBytes === null || anchorFingerprint === null) {
+      throw createCodedError(
+        'ANCHOR_PUBLIC_KEY_REQUIRED',
+        'receipts are present: the anchor receipt public key is required to export them',
+      );
+    }
+    const anchorTrustRoot = loadEd25519TrustRootFile(options.anchorReceiptPublicKeyPath as string, {
+      purpose: 'ANCHOR_RECEIPT',
+      expectedUid,
+    });
+    authenticateReceiptSequence(receiptObjects, {
+      storeId: metadata.storeId,
+      anchorFingerprint,
+      publicKey: anchorTrustRoot.publicKey,
+      checkpointHashes: new Set(checkpointHashes),
+    });
+  }
+
+  const checkpointByteLength = checkpointLines.reduce(
+    (total, line) => total + Buffer.byteLength(`${line}\n`, 'utf8'),
+    0,
+  );
+  const receiptByteLength = receiptLines.reduce(
+    (total, line) => total + Buffer.byteLength(`${line}\n`, 'utf8'),
+    0,
+  );
+
+  // ---- The projection covers EVERY emitted file.
   const emittedBytes = new Map<string, number>();
   for (const artifact of evidence.artifacts) {
     emittedBytes.set(`${artifact.dirName}/${artifact.fileName}`, artifact.identity.size);
   }
-  emittedBytes.set(
-    `${BUNDLE_CHECKPOINTS_DIRNAME}/${CHECKPOINT_FILENAME}`,
-    evidence.checkpointLineBytes.byteLength,
-  );
-  emittedBytes.set(
-    `${BUNDLE_ANCHORS_DIRNAME}/${ANCHOR_RECEIPT_FILENAME}`,
-    evidence.receiptLineBytes.byteLength,
-  );
+  emittedBytes.set(`${BUNDLE_CHECKPOINTS_DIRNAME}/${CHECKPOINT_FILENAME}`, checkpointByteLength);
+  emittedBytes.set(`${BUNDLE_ANCHORS_DIRNAME}/${ANCHOR_RECEIPT_FILENAME}`, receiptByteLength);
   emittedBytes.set(
     `${BUNDLE_PUBLIC_KEYS_DIRNAME}/${BUNDLE_CHECKPOINT_KEY_FILENAME}`,
     checkpointKeyBytes.byteLength,
@@ -922,18 +1157,21 @@ export async function exportEvidenceBundle(
     version: 1 as const,
     storeId: metadata.storeId,
     sequenceRange: { start: from, end: rangeEnd },
-    checkpointHashes: evidence.checkpointHashes,
-    anchorReceiptIds: evidence.anchorReceiptIds,
+    checkpointHashes,
+    anchorReceiptIds: receiptObjects.map((receipt) => receipt.receiptId),
   };
   const manifestBytes = predictManifestBytes(manifestHeader, emittedBytes);
-  assertExportWithinBudget(evidence.projectedBytes + manifestBytes);
+  assertExportWithinBudget(
+    [...emittedBytes.values()].reduce((total, bytes) => total + bytes, 0) + manifestBytes,
+  );
 
   const { parentFd, leafName } = openPinnedParent(destination);
   let writer: BundleWriter;
   try {
     writer = createBundleRoot(parentFd, leafName, destination);
-  } finally {
+  } catch (err) {
     fs.closeSync(parentFd);
+    throw err;
   }
 
   try {
@@ -942,35 +1180,31 @@ export async function exportEvidenceBundle(
     createBundleDirectory(writer, BUNDLE_ANCHORS_DIRNAME);
     createBundleDirectory(writer, BUNDLE_PUBLIC_KEYS_DIRNAME);
 
-    for (const artifact of evidence.artifacts) {
-      copyVerifiedArtifact(
-        writer,
-        artifact.dirName,
-        artifact.fileName,
-        artifact.sourcePath,
-        artifact.identity,
-      );
-    }
+    for (const artifact of evidence.artifacts) await copyVerifiedArtifact(writer, artifact);
 
     writeBundleFile(
       writer,
-      `${BUNDLE_CHECKPOINTS_DIRNAME}/${CHECKPOINT_FILENAME}`,
-      evidence.checkpointLineBytes,
+      BUNDLE_CHECKPOINTS_DIRNAME,
+      CHECKPOINT_FILENAME,
+      Buffer.from(checkpointLines.map((line) => `${line}\n`).join(''), 'utf8'),
     );
     writeBundleFile(
       writer,
-      `${BUNDLE_ANCHORS_DIRNAME}/${ANCHOR_RECEIPT_FILENAME}`,
-      evidence.receiptLineBytes,
+      BUNDLE_ANCHORS_DIRNAME,
+      ANCHOR_RECEIPT_FILENAME,
+      Buffer.from(receiptLines.map((line) => `${line}\n`).join(''), 'utf8'),
     );
     writeBundleFile(
       writer,
-      `${BUNDLE_PUBLIC_KEYS_DIRNAME}/${BUNDLE_CHECKPOINT_KEY_FILENAME}`,
+      BUNDLE_PUBLIC_KEYS_DIRNAME,
+      BUNDLE_CHECKPOINT_KEY_FILENAME,
       checkpointKeyBytes,
     );
     if (anchorKeyBytes !== null) {
       writeBundleFile(
         writer,
-        `${BUNDLE_PUBLIC_KEYS_DIRNAME}/${BUNDLE_ANCHOR_KEY_FILENAME}`,
+        BUNDLE_PUBLIC_KEYS_DIRNAME,
+        BUNDLE_ANCHOR_KEY_FILENAME,
         anchorKeyBytes,
       );
     }
@@ -986,7 +1220,6 @@ export async function exportEvidenceBundle(
     for (const key of [...writer.fileHashes.keys()].sort()) {
       files[key] = writer.fileHashes.get(key) as ManifestFileEntry;
     }
-
     const manifest: ExportManifest = { ...manifestHeader, files };
     writeBundleRootFile(
       writer,
@@ -997,11 +1230,43 @@ export async function exportEvidenceBundle(
     const totalBytes = writer.totalBytes;
     const fileCount = writer.fileHashes.size;
     closeBundleWriter(writer);
+
+    // Success is bound to the emitted bytes: the bundle must authenticate end to
+    // end, from its own contents and public material alone, before this call
+    // reports success.
+    await verifyEvidenceBundle(destination);
+
     return { outputDirectory: destination, manifest, fileCount, totalBytes };
   } catch (err) {
     cleanupBundleRoot(writer);
     throw err;
   }
+}
+
+/** The SPKI fingerprint of a PEM public key held in memory. */
+function fingerprintOfPem(pem: Buffer, purpose: 'CHECKPOINT' | 'ANCHOR_RECEIPT'): string {
+  if (/PRIVATE KEY/.test(pem.toString('utf8'))) {
+    throw createCodedError(
+      'PRIVATE_KEY_REJECTED',
+      `${purpose.toLowerCase()} key file contains private key material`,
+    );
+  }
+  let publicKey: crypto.KeyObject;
+  try {
+    publicKey = crypto.createPublicKey(pem);
+  } catch (cause) {
+    throw createCodedError(
+      'INVALID_KEY_MATERIAL',
+      `${purpose.toLowerCase()} public key is unreadable`,
+      {
+        cause,
+      },
+    );
+  }
+  return crypto
+    .createHash('sha256')
+    .update(publicKey.export({ type: 'spki', format: 'der' }))
+    .digest('hex');
 }
 
 /* -------------------------------------------------------------------------- *
@@ -1022,7 +1287,7 @@ export interface VerifyBundleResult {
 }
 
 /**
- * Streams a manifest-listed file, hashing it without materializing it.
+ * Streams a file, hashing it without materializing it.
  *
  * A 10 MiB uncompressed segment must never be read wholly into memory merely to
  * be digested, so the digest is computed chunk by chunk.
@@ -1046,33 +1311,13 @@ function digestFile(filePath: string): { sha256: string; bytes: number } {
 }
 
 /**
- * Splits a ledger into its canonical lines with STRICT LF framing.
- *
- * A line-oriented reader that strips terminators would silently accept an
- * unterminated final record as a valid one. Here a final fragment with no
- * terminator is a corruption, never a record.
- */
-function strictLines(raw: string, label: string): string[] {
-  if (raw.length === 0) return [];
-  if (!raw.endsWith('\n')) {
-    throw createCodedError('BUNDLE_LINE_FRAMING_INVALID', `${label} ends in an unterminated line`);
-  }
-  const body = raw.slice(0, -1);
-  if (body.includes('\r')) {
-    throw createCodedError('BUNDLE_LINE_FRAMING_INVALID', `${label} contains a CR`);
-  }
-  if (body.length === 0) return [];
-  return body.split('\n');
-}
-
-/**
  * Re-verifies a bundle from its own contents and public material only.
  *
  * Every manifest digest is recomputed against the emitted bytes, checkpoint and
- * receipt signatures are checked against the bundled public keys with the same
- * Task-4 and Task-5 rules the store verifier uses, and the bundled primary
- * artifacts are streamed to prove they form one contiguous chain that covers the
- * declared range and can authenticate its own evidence boundary.
+ * receipt signatures are checked with the shared Task-4/Task-5 rules, and the
+ * bundled primary artifacts are streamed to prove they form one contiguous
+ * sequence-ordered chain that covers the declared range and can authenticate its
+ * own evidence boundary.
  */
 export async function verifyEvidenceBundle(bundleDirectory: string): Promise<VerifyBundleResult> {
   const root = assertPathShape(bundleDirectory, 'bundle directory');
@@ -1109,82 +1354,27 @@ export async function verifyEvidenceBundle(bundleDirectory: string): Promise<Ver
     throw createCodedError('BUNDLE_KEY_MISSING', 'the bundle carries no checkpoint public key');
   }
   const checkpointKey = loadEd25519TrustRootFile(checkpointKeyPath, { purpose: 'CHECKPOINT' });
-  // The loader's fingerprint is the SHA-256 of the key's SPKI DER — exactly the
-  // value a checkpoint carries in `publicKeyFingerprint`.
-  const checkpointFingerprint = checkpointKey.fingerprint;
 
-  // 2. The primary chain: streamed, strictly framed, contiguous.
+  // 2. The primary chain: streamed, strictly framed, in SEQUENCE order.
   const chain = await verifyBundledChain(
     path.join(root, BUNDLE_AUDIT_DIRNAME),
     manifest.sequenceRange,
   );
 
-  // 3. Checkpoints: every Task-4 rule that binds one to this store and range.
-  const checkpointRaw = fs.readFileSync(
-    path.join(root, BUNDLE_CHECKPOINTS_DIRNAME, CHECKPOINT_FILENAME),
-    'utf8',
-  );
-  const checkpoints = strictLines(checkpointRaw, CHECKPOINT_FILENAME).map(
-    (line) => parseAndValidateCheckpointLineV1(`${line}\n`).checkpoint,
-  );
-
-  let previousHash = '0'.repeat(64);
-  for (const checkpoint of checkpoints) {
-    if (checkpoint.storeId !== manifest.storeId) {
-      throw createCodedError(
-        'BUNDLE_CHECKPOINT_STORE_MISMATCH',
-        'a bundled checkpoint names a different store than the manifest',
-      );
-    }
-    if (checkpoint.publicKeyFingerprint !== checkpointFingerprint) {
-      throw createCodedError(
-        'BUNDLE_CHECKPOINT_KEY_MISMATCH',
-        'a bundled checkpoint is bound to a different public key than the bundle carries',
-      );
-    }
-    if (
-      !Number.isSafeInteger(checkpoint.sequenceStart) ||
-      !Number.isSafeInteger(checkpoint.sequenceEnd) ||
-      checkpoint.sequenceStart > checkpoint.sequenceEnd
-    ) {
-      throw createCodedError(
-        'BUNDLE_CHECKPOINT_RANGE_INVALID',
-        'a bundled checkpoint declares an invalid sequence range',
-      );
-    }
-    if (checkpoint.previousCheckpointHash !== previousHash) {
-      throw createCodedError(
-        'BUNDLE_CHECKPOINT_CHAIN_BROKEN',
-        'bundled checkpoints do not form one unbroken chain',
-      );
-    }
-    if (!verifyCheckpointSignature(checkpoint, checkpointKey.publicKey)) {
-      throw createCodedError(
-        'BUNDLE_CHECKPOINT_SIGNATURE_INVALID',
-        'a bundled checkpoint signature does not verify',
-      );
-    }
-    if (computeCheckpointHash(checkpoint) !== checkpoint.checkpointHash) {
-      throw createCodedError(
-        'BUNDLE_CHECKPOINT_HASH_INVALID',
-        'a bundled checkpoint hash is not the hash of its own contents',
-      );
-    }
-    previousHash = checkpoint.checkpointHash;
-  }
-
-  // Every checkpoint that covers a sequence present in the bundle must bind to
-  // the record the bundled chain actually carries there.
-  for (const checkpoint of checkpoints) {
-    const covered = chain.bySequence.get(checkpoint.sequenceEnd);
-    if (covered === undefined) continue; // outside this bundle's evidence
-    if (covered !== checkpoint.terminalRecordHash) {
-      throw createCodedError(
-        'BUNDLE_CHECKPOINT_TERMINAL_MISMATCH',
-        'a bundled checkpoint does not bind to the bundled primary record it covers',
-      );
+  // 3. Checkpoints, by the shared Task-4 rule set.
+  const checkpointLedgerPath = path.join(root, BUNDLE_CHECKPOINTS_DIRNAME, CHECKPOINT_FILENAME);
+  const checkpoints: AuditCheckpointV1[] = [];
+  if (fs.existsSync(checkpointLedgerPath)) {
+    for await (const line of streamLedgerLines(checkpointLedgerPath, CHECKPOINT_FILENAME)) {
+      checkpoints.push(parseAndValidateCheckpointLineV1(`${line}\n`).checkpoint);
     }
   }
+  authenticateCheckpointSequence(checkpoints, {
+    storeId: manifest.storeId,
+    keyFingerprint: checkpointKey.fingerprint,
+    publicKey: checkpointKey.publicKey,
+    chainBySequence: chain.bySequence,
+  });
 
   const manifestHashes = checkpoints.map((checkpoint) => checkpoint.checkpointHash);
   if (
@@ -1197,9 +1387,9 @@ export async function verifyEvidenceBundle(bundleDirectory: string): Promise<Ver
     );
   }
 
-  // 4. The evidence boundary must be authenticated. Sequence 1 is genesis;
-  //    a bundle that begins later must be sealed by a bundled checkpoint that
-  //    binds to the record immediately before its first record.
+  // 4. The evidence boundary must be authenticated. Sequence 1 is genesis; a
+  //    bundle that begins later must be sealed by a bundled checkpoint that binds
+  //    to the record immediately before its first record.
   if (chain.coveredSequenceStart > 1) {
     const boundarySeal = checkpoints.find(
       (checkpoint) => checkpoint.sequenceEnd === chain.coveredSequenceStart - 1,
@@ -1210,10 +1400,9 @@ export async function verifyEvidenceBundle(bundleDirectory: string): Promise<Ver
         'the bundle begins mid-history without a checkpoint sealing the evidence before it',
       );
     }
-    const boundaryPredecessor = chain.boundaryPredecessorHash;
     if (
-      boundaryPredecessor === undefined ||
-      boundarySeal.terminalRecordHash !== boundaryPredecessor
+      chain.boundaryPredecessorHash === undefined ||
+      boundarySeal.terminalRecordHash !== chain.boundaryPredecessorHash
     ) {
       throw createCodedError(
         'BUNDLE_BOUNDARY_UNVERIFIED',
@@ -1222,60 +1411,28 @@ export async function verifyEvidenceBundle(bundleDirectory: string): Promise<Ver
     }
   }
 
-  // 5. Receipts: signature, key, store and checkpoint binding, no duplicates.
-  const anchorRaw = fs.readFileSync(
-    path.join(root, BUNDLE_ANCHORS_DIRNAME, ANCHOR_RECEIPT_FILENAME),
-    'utf8',
-  );
-  const receiptLines = strictLines(anchorRaw, ANCHOR_RECEIPT_FILENAME);
-  const seenReceiptIds: string[] = [];
-  if (receiptLines.length > 0) {
+  // 5. Receipts, by the shared Task-5 rule set.
+  const anchorLedgerPath = path.join(root, BUNDLE_ANCHORS_DIRNAME, ANCHOR_RECEIPT_FILENAME);
+  const receipts: AnchorReceiptV1[] = [];
+  if (fs.existsSync(anchorLedgerPath)) {
+    for await (const line of streamLedgerLines(anchorLedgerPath, ANCHOR_RECEIPT_FILENAME)) {
+      receipts.push(parseAndValidateAnchorReceiptLineV1(`${line}\n`));
+    }
+  }
+  if (receipts.length > 0) {
     const anchorKeyPath = path.join(root, BUNDLE_PUBLIC_KEYS_DIRNAME, BUNDLE_ANCHOR_KEY_FILENAME);
     if (!fs.existsSync(anchorKeyPath)) {
       throw createCodedError('BUNDLE_KEY_MISSING', 'the bundle carries receipts but no anchor key');
     }
     const anchorKey = loadEd25519TrustRootFile(anchorKeyPath, { purpose: 'ANCHOR_RECEIPT' });
-    const checkpointSet = new Set(manifestHashes);
-    const seen = new Set<string>();
-    for (const line of receiptLines) {
-      const receipt = parseAndValidateAnchorReceiptLineV1(`${line}\n`);
-      if (!verifyAnchorReceiptSignature(receipt, anchorKey.publicKey)) {
-        throw createCodedError(
-          'BUNDLE_RECEIPT_SIGNATURE_INVALID',
-          'a bundled anchor receipt signature does not verify',
-        );
-      }
-      if (receipt.anchorKeyFingerprint !== anchorKey.fingerprint) {
-        throw createCodedError(
-          'BUNDLE_RECEIPT_KEY_MISMATCH',
-          'a bundled receipt is bound to a different key than the bundle carries',
-        );
-      }
-      // A receipt proves something about THIS store. A validly signed receipt
-      // from another store must not verify merely because its checkpoint hash
-      // looks well-formed.
-      if (receipt.storeId !== manifest.storeId) {
-        throw createCodedError(
-          'BUNDLE_RECEIPT_STORE_MISMATCH',
-          'a bundled receipt names a different store than the manifest',
-        );
-      }
-      if (!checkpointSet.has(receipt.checkpointHash)) {
-        throw createCodedError(
-          'BUNDLE_RECEIPT_ORPHAN',
-          'a bundled anchor receipt references a checkpoint the bundle does not carry',
-        );
-      }
-      if (seen.has(receipt.receiptId)) {
-        throw createCodedError(
-          'BUNDLE_RECEIPT_DUPLICATE',
-          'a bundled receipt id appears more than once',
-        );
-      }
-      seen.add(receipt.receiptId);
-      seenReceiptIds.push(receipt.receiptId);
-    }
+    authenticateReceiptSequence(receipts, {
+      storeId: manifest.storeId,
+      anchorFingerprint: anchorKey.fingerprint,
+      publicKey: anchorKey.publicKey,
+      checkpointHashes: new Set(manifestHashes),
+    });
   }
+  const seenReceiptIds = receipts.map((receipt) => receipt.receiptId);
   if (
     seenReceiptIds.length !== manifest.anchorReceiptIds.length ||
     seenReceiptIds.some((id, index) => id !== manifest.anchorReceiptIds[index])
@@ -1303,33 +1460,68 @@ interface BundledChain {
   coveredSequenceEnd: number;
   /** recordHash of every bundled record, by sequence. */
   bySequence: Map<number, string>;
-  /**
-   * `previousRecordHash` of the bundle's first record.
-   *
-   * For a bundle that does not start at sequence 1 this is the hash the evidence
-   * BEFORE the bundle must terminate at, and it is what a boundary checkpoint
-   * has to bind to.
-   */
+  /** `previousRecordHash` of the bundle's first record. */
   boundaryPredecessorHash: string | undefined;
 }
 
 /**
- * Streams the bundled primary artifacts as one chain.
+ * Streams the bundled primary artifacts as one chain, in SEQUENCE order.
  *
- * The chain must be contiguous from its first record onward, and it must cover
- * the whole declared inclusive range. A bundle that reaches `start` but stops
- * before `end` is under-covering evidence and fails.
- *
- * A bundle whose range begins mid-history legitimately does not start at
- * sequence 1; its boundary is authenticated separately, against a bundled
- * checkpoint, rather than by disabling continuity checking.
+ * The rotation timestamp embedded in a rotated filename is explicitly
+ * non-authoritative — RC-06 permits wall-clock rollback — so artifacts are
+ * parsed and ordered by their sequence range, never by their names. Overlapping,
+ * duplicated or gapped ranges are rejected rather than silently reconciled.
  */
 async function verifyBundledChain(
   auditDir: string,
   sequenceRange: { start: number; end: number },
 ): Promise<BundledChain> {
-  const names = fs.readdirSync(auditDir).sort();
-  if (names.length === 0) {
+  const names = fs.readdirSync(auditDir);
+
+  const activeNames: string[] = [];
+  const archives: Array<{ name: string; sequenceStart: number; sequenceEnd: number }> = [];
+  for (const name of names) {
+    if (name === ACTIVE_SEGMENT_FILENAME) {
+      activeNames.push(name);
+      continue;
+    }
+    const parsed = parseRotatedSegmentFilename(name);
+    if (parsed === null) {
+      throw createCodedError('BUNDLE_MANIFEST_INVALID', `unrecognized bundle artifact ${name}`);
+    }
+    archives.push({
+      name,
+      sequenceStart: parsed.sequenceStart,
+      sequenceEnd: parsed.sequenceEnd,
+    });
+  }
+
+  archives.sort((a, b) =>
+    a.sequenceStart === b.sequenceStart
+      ? a.sequenceEnd - b.sequenceEnd
+      : a.sequenceStart - b.sequenceStart,
+  );
+
+  let previousEnd = 0;
+  for (const archive of archives) {
+    if (archive.sequenceStart <= previousEnd) {
+      throw createCodedError(
+        'BUNDLE_CHAIN_BROKEN',
+        `bundled artifacts overlap or duplicate the range ending at ${previousEnd}`,
+      );
+    }
+    previousEnd = archive.sequenceEnd;
+  }
+
+  const ordered: Array<{ name: string; compressed: boolean }> = archives.map((archive) => ({
+    name: archive.name,
+    compressed: archive.name.endsWith('.gz'),
+  }));
+  // The active segment follows the archives because its sequences do; it is
+  // never placed by filename, which carries no ordering authority.
+  for (const name of activeNames) ordered.push({ name, compressed: false });
+
+  if (ordered.length === 0) {
     throw createCodedError('BUNDLE_RANGE_NOT_COVERED', 'the bundle carries no primary evidence');
   }
 
@@ -1338,26 +1530,20 @@ async function verifyBundledChain(
   let previousHash = null;
   let boundaryPredecessorHash;
 
-  for (const name of names) {
-    const parsed = name === ACTIVE_SEGMENT_FILENAME ? null : parseRotatedSegmentFilename(name);
-    if (name !== ACTIVE_SEGMENT_FILENAME && parsed === null) {
-      throw createCodedError('BUNDLE_MANIFEST_INVALID', `unrecognized bundle artifact ${name}`);
-    }
+  for (const entry of ordered) {
     const source: RetainedSegmentSource = {
-      kind: parsed === null ? 'ACTIVE' : 'ARCHIVE',
-      label: name,
-      filePath: path.join(auditDir, name),
-      compressed: name.endsWith('.gz'),
-      sequenceStart: parsed === null ? 0 : parsed.sequenceStart,
-      sequenceEnd: parsed === null ? Number.MAX_SAFE_INTEGER : parsed.sequenceEnd,
+      kind: entry.name === ACTIVE_SEGMENT_FILENAME ? 'ACTIVE' : 'ARCHIVE',
+      label: entry.name,
+      filePath: path.join(auditDir, entry.name),
+      compressed: entry.compressed,
+      sequenceStart: 0,
+      sequenceEnd: Number.MAX_SAFE_INTEGER,
     };
 
     for await (const record of streamRetainedRecords([source], { strictFraming: true })) {
       if (expectedSequence === null) {
         expectedSequence = record.sequenceNumber;
         boundaryPredecessorHash = record.integrity.previousRecordHash;
-        previousHash =
-          record.sequenceNumber === 1 ? '0'.repeat(64) : record.integrity.previousRecordHash;
       }
       if (record.sequenceNumber !== expectedSequence) {
         throw createCodedError(
@@ -1365,7 +1551,7 @@ async function verifyBundledChain(
           `bundled primary history is not contiguous at sequence ${expectedSequence}`,
         );
       }
-      if (record.integrity.previousRecordHash !== previousHash) {
+      if (previousHash !== null && record.integrity.previousRecordHash !== previousHash) {
         throw createCodedError(
           'BUNDLE_CHAIN_BROKEN',
           `bundled primary hash link is broken at sequence ${record.sequenceNumber}`,
@@ -1380,7 +1566,6 @@ async function verifyBundledChain(
   const coveredSequenceStart = Math.min(...bySequence.keys());
   const coveredSequenceEnd = Math.max(...bySequence.keys());
 
-  // The declared range must be fully covered. Reaching the start is not enough.
   if (coveredSequenceStart > sequenceRange.start) {
     throw createCodedError(
       'BUNDLE_RANGE_NOT_COVERED',

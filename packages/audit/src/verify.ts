@@ -46,8 +46,10 @@ import path from 'node:path';
 import readline from 'node:readline';
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
+import { Readable } from 'node:stream';
 
 import type { AuditStoreMetadataV1, PersistentAuditRecordV1 } from '@cesspace-arc/protocol';
+import { MAX_RECORD_BYTES } from '@cesspace-arc/protocol';
 
 import {
   ACTIVE_SEGMENT_FILENAME,
@@ -236,7 +238,10 @@ async function* streamSegmentRecords(
     // the contract — bundle verification — the bytes are framed here instead,
     // and a fragment with no terminator is a corruption rather than a record.
     let carry: Buffer = Buffer.alloc(0);
-    for await (const chunk of stream as AsyncIterable<Buffer>) {
+    for await (const chunk of consumeDecompressible(
+      stream,
+      source.label,
+    ) as AsyncIterable<Buffer>) {
       carry = carry.length === 0 ? Buffer.from(chunk) : Buffer.concat([carry, chunk]);
       for (;;) {
         const index = carry.indexOf(0x0a);
@@ -245,6 +250,16 @@ async function* streamSegmentRecords(
         carry = Buffer.from(carry.subarray(index + 1));
         if (line.length === 0) continue;
         yield parseAndValidateRecordLineV1(`${line}\n`).record;
+      }
+      // A pathological artifact with no terminator must fail on the bounded
+      // record limit, not grow the framing buffer until the process dies. The
+      // ceiling is the frozen per-record maximum, so a whole 10 MiB segment can
+      // never be buffered merely because it contains no LF.
+      if (carry.length > MAX_RECORD_BYTES) {
+        throw createCodedError(
+          'AUDIT_CORRUPTION_DETECTED',
+          `${source.label} contains a record longer than ${MAX_RECORD_BYTES} bytes`,
+        );
       }
     }
     if (carry.length > 0) {
@@ -256,7 +271,10 @@ async function* streamSegmentRecords(
     return;
   }
 
-  const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
+  const lines = readline.createInterface({
+    input: Readable.from(consumeDecompressible(stream, source.label)),
+    crlfDelay: Infinity,
+  });
   try {
     for await (const line of lines) {
       if (line.length === 0) continue;
@@ -264,6 +282,29 @@ async function* streamSegmentRecords(
     }
   } finally {
     lines.close();
+  }
+}
+
+/**
+ * Re-labels a decompression failure as bounded corruption.
+ *
+ * A truncated or corrupted `.jsonl.gz` makes `zlib` throw its own `Z_*` error.
+ * That is not a vocabulary this package publishes, and letting it escape would
+ * hand a caller an unbounded implementation detail instead of a coded refusal.
+ */
+async function* consumeDecompressible(
+  stream: NodeJS.ReadableStream,
+  label: string,
+): AsyncGenerator<Buffer> {
+  try {
+    for await (const chunk of stream as AsyncIterable<Buffer>) {
+      yield chunk;
+    }
+  } catch (cause) {
+    if ((cause as { code?: string })?.code === 'AUDIT_CORRUPTION_DETECTED') throw cause;
+    throw createCodedError('AUDIT_CORRUPTION_DETECTED', `${label} is not readable evidence`, {
+      cause,
+    });
   }
 }
 
@@ -403,6 +444,58 @@ export function assertInventoryUnchanged(
         `${operation}: ${name} changed while it was being read`,
       );
     }
+  }
+}
+
+/* -------------------------------------------------------------------------- *
+ * Bounded ledger streaming
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Streams a line-oriented signed ledger without materializing it.
+ *
+ * The whole ledger is never read into memory: it is opened with the hardened
+ * descriptor discipline, framed strictly on LF, and yielded one line at a time
+ * (terminator removed — the canonical parsers re-add it). A final fragment with
+ * no terminator is corruption, never a line, and an over-long fragment fails on
+ * the frozen per-record ceiling rather than growing the buffer.
+ */
+export async function* streamLedgerLines(
+  filePath: string,
+  label: string,
+  expectedUid: number = getProcessUid(),
+): AsyncGenerator<string> {
+  const fd = openArtifactFd(filePath, label, expectedUid);
+  const stream = fs.createReadStream(null as unknown as fs.PathLike, { fd, autoClose: true });
+
+  let carry: Buffer = Buffer.alloc(0);
+  try {
+    for await (const chunk of consumeDecompressible(stream, label) as AsyncIterable<Buffer>) {
+      carry = carry.length === 0 ? Buffer.from(chunk) : Buffer.concat([carry, chunk]);
+      for (;;) {
+        const index = carry.indexOf(0x0a);
+        if (index === -1) break;
+        const line = carry.subarray(0, index).toString('utf8');
+        carry = Buffer.from(carry.subarray(index + 1));
+        if (line.includes('\r')) {
+          throw createCodedError('AUDIT_CORRUPTION_DETECTED', `${label} contains a CR`);
+        }
+        if (line.length === 0) continue;
+        yield line;
+      }
+      if (carry.length > MAX_RECORD_BYTES) {
+        throw createCodedError(
+          'AUDIT_CORRUPTION_DETECTED',
+          `${label} contains a line longer than ${MAX_RECORD_BYTES} bytes`,
+        );
+      }
+    }
+  } finally {
+    // The stream owns the descriptor and closes it.
+  }
+
+  if (carry.length > 0) {
+    throw createCodedError('AUDIT_CORRUPTION_DETECTED', `${label} ends in an unterminated line`);
   }
 }
 

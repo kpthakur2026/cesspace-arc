@@ -32,6 +32,7 @@ import { fileURLToPath } from 'node:url';
 
 import {
   ANCHOR_IDEMPOTENCY_HEADER,
+  computeCheckpointHash,
   MAX_EXPORT_BYTES,
   METADATA_FILENAME,
   MAX_INSPECT_RECORDS,
@@ -1079,11 +1080,15 @@ describe('CesSpace ARC — RC-06 Task 7: Local Operator CLI & Standalone Offline
   });
 
   /* ====================================================================== *
-   * 6. Negative Controls: RC06-NEG-105..108
+   * 6. Negative Controls: RC06-NEG-106..108 (and the audit-CLI surface)
+   *
+   * RC06-NEG-105 is NOT here. It is a remote-control: it is exercised on the
+   * real mTLS call path in section 8, and appears under exactly one identity in
+   * this file.
    * ====================================================================== */
 
-  describe('6. Negative Controls: RC06-NEG-105..108', () => {
-    test('RC06-NEG-105: remote MCP attempts to delete, truncate or rotate audit evidence are UNKNOWN_TOOL', async () => {
+  describe('6. Negative Controls: RC06-NEG-106..108', () => {
+    test('RC06-T7-REG-56: the local CLI exposes no destructive audit subcommand', async () => {
       const { ArcMcpServer } = await import('../apps/mcp-server/dist/index.js');
       const fixture = await multiSegmentFixture('neg105');
       const before = snapshotTree(fixture.auditDir);
@@ -2025,6 +2030,446 @@ describe('CesSpace ARC — RC-06 Task 7: Local Operator CLI & Standalone Offline
         'AUDIT_CORRUPTION_DETECTED',
         'BUNDLE_LINE_FRAMING_INVALID',
       ]);
+    });
+  });
+
+  /* ====================================================================== *
+   * 10. Exact-byte binding and source authentication
+   * ====================================================================== */
+
+  describe('10. Exact-byte binding', () => {
+    test('RC06-T7-REG-45: an in-place same-inode same-size rewrite after verification cannot be exported', async () => {
+      const fixture = await multiSegmentFixture('reg45');
+      const active = path.join(fixture.auditDir, 'audit-active.jsonl');
+      const pristine = fs.readFileSync(active);
+      const inodeBefore = fs.statSync(active).ino;
+
+      const base = newRoot('reg45-out');
+      const pending = exportEvidenceBundle({
+        directory: fixture.auditDir,
+        outputDirectory: path.join(base, 'bundle'),
+        checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
+        workspacePaths: [],
+      });
+
+      // Rewrite bytes IN PLACE: same file, same inode, same length. Device,
+      // inode and size are all unchanged, so only a content binding can notice.
+      const fd = fs.openSync(active, 'r+');
+      const target = pristine.indexOf(Buffer.from('read_file'));
+      assert.ok(target > 0, 'the fixture must contain the field being rewritten');
+      fs.writeSync(fd, Buffer.from('read_filf'), 0, 9, target);
+      fs.closeSync(fd);
+
+      const after = fs.statSync(active);
+      assert.equal(after.ino, inodeBefore, 'the rewrite must preserve the inode');
+      assert.equal(after.size, pristine.length, 'the rewrite must preserve the size');
+
+      await assertRejectsWithCode(pending, [
+        'EXPORT_SOURCE_CHANGED',
+        'AUDIT_SOURCE_UNSTABLE',
+        'AUDIT_CORRUPTION_DETECTED',
+        'AUDIT_VERIFICATION_FAILED',
+      ]);
+      assert.equal(
+        fs.existsSync(path.join(base, 'bundle')),
+        false,
+        'no successful bundle may remain',
+      );
+      fs.writeFileSync(active, pristine);
+    });
+
+    test('RC06-T7-REG-46: a public key substituted after validation is never emitted', async () => {
+      const fixture = await multiSegmentFixture('reg46');
+      const keyPath = fixture.checkpoint.publicKeyPath;
+      const originalKeyBytes = fs.readFileSync(keyPath);
+      const other = writeKeyPair(newRoot('reg46-key'), 'other');
+      const otherKeyBytes = fs.readFileSync(other.publicKeyPath);
+      assert.equal(
+        otherKeyBytes.byteLength,
+        originalKeyBytes.byteLength,
+        'the substitute key must be the same length, so only content can distinguish it',
+      );
+
+      const base = newRoot('reg46-out');
+      const destination = path.join(base, 'bundle');
+      const pending = exportEvidenceBundle({
+        directory: fixture.auditDir,
+        outputDirectory: destination,
+        checkpointPublicKeyPath: keyPath,
+        workspacePaths: [],
+      });
+
+      // Substitute the key file in place while the export runs.
+      fs.writeFileSync(keyPath, otherKeyBytes);
+
+      let failure = null;
+      let result = null;
+      try {
+        result = await pending;
+      } catch (err) {
+        failure = err;
+      }
+
+      if (failure !== null) {
+        assert.ok(
+          ['EXPORT_KEY_MISMATCH', 'EXPORT_KEY_CHANGED', 'FINGERPRINT_MISMATCH'].includes(
+            failure.code,
+          ),
+          `unexpected failure: ${failure.code}`,
+        );
+      } else {
+        // If it succeeded, the bytes it emitted must be the VALIDATED key, never
+        // the substitute that appeared under the same pathname.
+        const emitted = fs.readFileSync(
+          path.join(result.outputDirectory, 'public-keys', 'checkpoint-public.pem'),
+        );
+        assert.equal(
+          emitted.equals(originalKeyBytes),
+          true,
+          'the bundle must carry the validated key bytes',
+        );
+        assert.equal(
+          emitted.equals(otherKeyBytes),
+          false,
+          'the bundle must never carry the substituted key',
+        );
+      }
+      fs.writeFileSync(keyPath, originalKeyBytes);
+    });
+
+    test('RC06-T7-REG-47: an anchor-enabled export without the anchor public key fails closed', async () => {
+      const fixture = makeAuditConfig('reg47', { anchor: true });
+      await buildStore(fixture, { records: 5, rotateAt: [3] });
+      assert.equal(
+        fs.existsSync(path.join(fixture.auditDir, 'audit-anchors.jsonl')),
+        true,
+        'the fixture must carry real receipts',
+      );
+
+      const base = newRoot('reg47-out');
+      const destination = path.join(base, 'bundle');
+      await assertRejectsWithCode(
+        exportEvidenceBundle({
+          directory: fixture.auditDir,
+          outputDirectory: destination,
+          checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
+          workspacePaths: [],
+        }),
+        'ANCHOR_PUBLIC_KEY_REQUIRED',
+      );
+      assert.equal(fs.existsSync(destination), false, 'no bundle may be created');
+
+      // The CLI path refuses too: without --anchor-key the receipts could never
+      // be checked by a reviewer.
+      const cli = await runAudit(fixture, [
+        'export',
+        '--output',
+        path.join(base, 'cli'),
+        '--no-workspaces',
+        '--checkpoint-key',
+        fixture.checkpoint.publicKeyPath,
+      ]);
+      assert.equal(cli.exitCode, EXIT_FAILURE);
+      assert.match(cli.err, /ANCHOR_PUBLIC_KEY_REQUIRED/);
+    });
+
+    test('RC06-T7-REG-48: a source checkpoint with an invalid signature cannot be exported', async () => {
+      const fixture = await multiSegmentFixture('reg48');
+      const ledgerPath = path.join(fixture.auditDir, 'audit-checkpoints.jsonl');
+      const lines = fs.readFileSync(ledgerPath, 'utf8').slice(0, -1).split('\n');
+      const checkpoint = JSON.parse(lines[0]);
+
+      // Re-sign nothing: flip the signature, then repair the checkpoint's own
+      // hash so the line still parses and only the SIGNATURE rule can refuse it.
+      const raw = Buffer.from(checkpoint.signature, 'base64url');
+      raw[0] ^= 0xff;
+      checkpoint.signature = raw.toString('base64url');
+      checkpoint.checkpointHash = computeCheckpointHash(checkpoint);
+      lines[0] = JSON.stringify(checkpoint);
+      fs.writeFileSync(ledgerPath, `${lines.join('\n')}\n`);
+
+      const base = newRoot('reg48-out');
+      const destination = path.join(base, 'bundle');
+      await assertRejectsWithCode(
+        exportEvidenceBundle({
+          directory: fixture.auditDir,
+          outputDirectory: destination,
+          checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
+          workspacePaths: [],
+        }),
+        ['BUNDLE_CHECKPOINT_SIGNATURE_INVALID', 'AUDIT_CORRUPTION_DETECTED'],
+      );
+      assert.equal(
+        fs.existsSync(destination),
+        false,
+        'the export must refuse before creating a bundle',
+      );
+    });
+
+    test('RC06-T7-REG-49: a source receipt with an invalid signature cannot be exported', async () => {
+      const fixture = makeAuditConfig('reg49', { anchor: true });
+      await buildStore(fixture, { records: 5, rotateAt: [3] });
+
+      const ledgerPath = path.join(fixture.auditDir, 'audit-anchors.jsonl');
+      const lines = fs.readFileSync(ledgerPath, 'utf8').slice(0, -1).split('\n');
+      const receipt = JSON.parse(lines[0]);
+      const raw = Buffer.from(receipt.signature, 'base64url');
+      raw[0] ^= 0xff;
+      receipt.signature = raw.toString('base64url');
+      lines[0] = JSON.stringify(receipt);
+      fs.writeFileSync(ledgerPath, `${lines.join('\n')}\n`);
+
+      const base = newRoot('reg49-out');
+      const destination = path.join(base, 'bundle');
+      await assertRejectsWithCode(
+        exportEvidenceBundle({
+          directory: fixture.auditDir,
+          outputDirectory: destination,
+          checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
+          anchorReceiptPublicKeyPath: fixture.anchorMaterial.publicKeyPath,
+          workspacePaths: [],
+        }),
+        ['BUNDLE_RECEIPT_SIGNATURE_INVALID', 'AUDIT_CORRUPTION_DETECTED'],
+      );
+      assert.equal(
+        fs.existsSync(destination),
+        false,
+        'the export must refuse before creating a bundle',
+      );
+    });
+  });
+
+  /* ====================================================================== *
+   * 11. Cleanup safety, range selection and ancestry
+   * ====================================================================== */
+
+  describe('11. Cleanup safety and range selection', () => {
+    test('RC06-T7-REG-50: cleanup never recursively deletes a replacement at the destination pathname', async () => {
+      const fixture = await multiSegmentFixture('reg50');
+      const base = newRoot('reg50-out');
+      const destination = path.join(base, 'bundle');
+
+      const pending = exportEvidenceBundle({
+        directory: fixture.auditDir,
+        outputDirectory: destination,
+        checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
+        workspacePaths: [],
+      });
+
+      // Wait until the bundle exists (the export still has to verify it), then
+      // move the legitimate root away and stand an unrelated directory in its
+      // place.
+      for (let attempt = 0; attempt < 20000; attempt += 1) {
+        if (fs.existsSync(path.join(destination, 'manifest.json'))) break;
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+      assert.equal(
+        fs.existsSync(path.join(destination, 'manifest.json')),
+        true,
+        'the bundle must have been written before it could be replaced',
+      );
+
+      const original = path.join(base, 'bundle-original');
+      fs.renameSync(destination, original);
+      fs.mkdirSync(destination, { mode: 0o700 });
+      fs.writeFileSync(path.join(destination, 'unrelated.txt'), 'do not delete me\n', {
+        mode: 0o600,
+      });
+
+      // The specific refusal depends on where the replacement lands relative to
+      // the in-flight verification; the assertion under test is the cleanup.
+      await assert.rejects(pending);
+
+      // The unrelated directory must survive untouched. A cleanup that deleted
+      // by pathname would have taken it with it.
+      assert.equal(
+        fs.readFileSync(path.join(destination, 'unrelated.txt'), 'utf8'),
+        'do not delete me\n',
+        'the unrelated replacement must survive',
+      );
+    });
+
+    test('RC06-T7-REG-51: an old range inside a single archive contains no discontinuous active tail', async () => {
+      const fixture = makeAuditConfig('reg51');
+      await buildStore(fixture, { records: 9, rotateAt: [3, 6] });
+
+      const base = newRoot('reg51-out');
+      const result = await exportEvidenceBundle({
+        directory: fixture.auditDir,
+        outputDirectory: path.join(base, 'bundle'),
+        checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
+        workspacePaths: [],
+        from: 1,
+        to: 2,
+      });
+
+      const emitted = fs.readdirSync(path.join(result.outputDirectory, 'audit')).sort();
+      assert.equal(emitted.length, 1, `only archive A may be emitted, got ${emitted.join(', ')}`);
+      assert.equal(
+        emitted.includes('audit-active.jsonl'),
+        false,
+        'the active tail must not be spliced onto an earlier archive',
+      );
+
+      const verified = await verifyEvidenceBundle(result.outputDirectory);
+      assert.equal(verified.status, 'VERIFIED');
+      assert.equal(verified.coveredSequenceStart, 1);
+      assert.equal(verified.coveredSequenceEnd, 3);
+      assert.deepEqual(verified.sequenceRange, { start: 1, end: 2 });
+    });
+
+    test('RC06-T7-REG-52: a later range authenticates back through its full checkpoint ancestry', async () => {
+      const fixture = makeAuditConfig('reg52');
+      await buildStore(fixture, { records: 9, rotateAt: [3, 6] });
+
+      const base = newRoot('reg52-out');
+      const result = await exportEvidenceBundle({
+        directory: fixture.auditDir,
+        outputDirectory: path.join(base, 'bundle'),
+        checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
+        workspacePaths: [],
+        from: 8,
+        to: 9,
+      });
+
+      // Two checkpoints seal 1..3 and 4..6; the selected range begins at 7, so
+      // BOTH must be bundled or the chain cannot be walked from genesis.
+      assert.equal(
+        result.manifest.checkpointHashes.length,
+        2,
+        'the complete checkpoint prefix must be bundled',
+      );
+      const verified = await verifyEvidenceBundle(result.outputDirectory);
+      assert.equal(verified.checkpointCount, 2);
+      assert.equal(verified.coveredSequenceStart, 7);
+      assert.ok(verified.coveredSequenceEnd >= 9);
+
+      // The chain is unbroken from checkpoint genesis: the first bundled
+      // checkpoint's predecessor is the zero hash and the second names the first.
+      const ledgerPath = path.join(
+        result.outputDirectory,
+        'checkpoints',
+        'audit-checkpoints.jsonl',
+      );
+      const checkpoints = fs
+        .readFileSync(ledgerPath, 'utf8')
+        .slice(0, -1)
+        .split('\n')
+        .map((line) => JSON.parse(line));
+      assert.equal(checkpoints[0].previousCheckpointHash, '0'.repeat(64));
+      assert.equal(checkpoints[1].previousCheckpointHash, checkpoints[0].checkpointHash);
+      assert.equal(checkpoints[0].sequenceEnd + 1, checkpoints[1].sequenceStart);
+    });
+
+    test('RC06-T7-REG-53: bundled artifacts are ordered by sequence, not by rotation timestamp', async () => {
+      const fixture = makeAuditConfig('reg53');
+      await buildStore(fixture, { records: 9, rotateAt: [3, 6] });
+
+      // Simulate a wall-clock rollback: give archive A a LATER timestamp than
+      // archive B, so lexical filename order is the reverse of sequence order.
+      const archives = fs
+        .readdirSync(fixture.auditDir)
+        .filter((name) => name.endsWith('.jsonl.gz'))
+        .sort();
+      assert.equal(archives.length, 2);
+      fs.renameSync(
+        path.join(fixture.auditDir, archives[0]),
+        path.join(fixture.auditDir, 'audit-20991231T235959Z-seq1-seq3.jsonl.gz'),
+      );
+      fs.renameSync(
+        path.join(fixture.auditDir, archives[1]),
+        path.join(fixture.auditDir, 'audit-20200101T000000Z-seq4-seq6.jsonl.gz'),
+      );
+
+      const lexical = fs
+        .readdirSync(fixture.auditDir)
+        .filter((name) => name.endsWith('.jsonl.gz'))
+        .sort();
+      assert.equal(
+        lexical[0].includes('seq4-seq6'),
+        true,
+        'lexical order is the reverse of sequence order',
+      );
+
+      const base = newRoot('reg53-out');
+      const result = await exportEvidenceBundle({
+        directory: fixture.auditDir,
+        outputDirectory: path.join(base, 'bundle'),
+        checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
+        workspacePaths: [],
+      });
+
+      const verified = await verifyEvidenceBundle(result.outputDirectory);
+      assert.equal(verified.status, 'VERIFIED');
+      assert.equal(verified.coveredSequenceStart, 1);
+      assert.equal(verified.coveredSequenceEnd, 9);
+    });
+  });
+
+  /* ====================================================================== *
+   * 12. Bounded framing and streaming
+   * ====================================================================== */
+
+  describe('12. Bounded framing and streaming', () => {
+    const MAX_RECORD_BYTES = 65_536;
+
+    test('RC06-T7-REG-54: a newline-free artifact larger than MAX_RECORD_BYTES fails on a bounded buffer', async () => {
+      const fixture = await multiSegmentFixture('reg54');
+      const base = newRoot('reg54-out');
+      const result = await exportEvidenceBundle({
+        directory: fixture.auditDir,
+        outputDirectory: path.join(base, 'bundle'),
+        checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
+        workspacePaths: [],
+      });
+
+      // Replace a bundled artifact with a newline-free blob far larger than one
+      // record, and repair the digest so framing is what fails.
+      const relative = 'audit/audit-active.jsonl';
+      const blob = Buffer.alloc(MAX_RECORD_BYTES * 4, 0x41);
+      blob.write('still-not-json', 0, 'utf8');
+      rewriteBundleFile(result.outputDirectory, relative, blob);
+
+      const started = Date.now();
+      await assertRejectsWithCode(verifyEvidenceBundle(result.outputDirectory), [
+        'AUDIT_CORRUPTION_DETECTED',
+        'BUNDLE_LINE_FRAMING_INVALID',
+      ]);
+      // Bounded and prompt: it failed on the record ceiling rather than trying to
+      // buffer a whole artifact.
+      assert.ok(Date.now() - started < 10_000, 'framing must fail promptly');
+    });
+
+    test('RC06-T7-REG-55: checkpoint and receipt full-history paths stream rather than reading whole ledgers', async () => {
+      const compiled = fs.readFileSync(
+        path.join(REPO_ROOT, 'packages/audit/dist/export.js'),
+        'utf8',
+      );
+
+      // The ledgers must go through the bounded streaming reader...
+      assert.match(compiled, /streamLedgerLines/, 'ledgers must be streamed');
+      // ...and never be materialized with a whole-file read.
+      assert.equal(
+        /readFileSync\([^)]*CHECKPOINT_FILENAME/.test(compiled),
+        false,
+        'the checkpoint ledger must not be read wholly',
+      );
+      assert.equal(
+        /readFileSync\([^)]*ANCHOR_RECEIPT_FILENAME/.test(compiled),
+        false,
+        'the receipt ledger must not be read wholly',
+      );
+
+      // The strict primary framing path is bounded by the frozen record ceiling.
+      const verifyCompiled = fs.readFileSync(
+        path.join(REPO_ROOT, 'packages/audit/dist/verify.js'),
+        'utf8',
+      );
+      assert.match(
+        verifyCompiled,
+        /MAX_RECORD_BYTES/,
+        'primary framing must enforce the record ceiling',
+      );
     });
   });
 });
