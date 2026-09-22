@@ -621,28 +621,17 @@ function closeBundleWriter(writer: BundleWriter): void {
  * bundle left behind is strictly better than deleting somebody else's directory.
  */
 function cleanupBundleRoot(writer: BundleWriter): void {
-  // Deletion authority is consumed while the pinned parent is STILL OPEN, and
-  // through the descriptor-pinned leaf path — never through `writer.root`, which
-  // is a mutable name that may since have been pointed at somebody else's
-  // directory. Identity is proven first; if it cannot be, the partial bundle is
-  // deliberately left behind.
-  try {
-    const leafPath = pinnedChildPath(writer.parentFd, writer.leafName);
-    const stats = fs.lstatSync(leafPath);
-    if (
-      !stats.isSymbolicLink() &&
-      Number(stats.dev) === writer.rootIdentity.dev &&
-      Number(stats.ino) === writer.rootIdentity.ino
-    ) {
-      fs.rmSync(leafPath, { recursive: true, force: false });
-    }
-  } catch {
-    // Best-effort by design: a failure to tidy up must never mask the original
-    // export failure, and must never escalate into deleting an object whose
-    // identity was not proven.
-  } finally {
-    closeBundleWriter(writer);
-  }
+  // FAIL SAFE: no recursive deletion is performed.
+  //
+  // Cleanup would have to decide on the leaf's identity and then consume that
+  // decision with a SEPARATE, still-mutable leaf lookup — an `lstat` followed by
+  // a pathname-based `rmSync` makes a security decision on one resolution and
+  // acts on another, and Node offers no atomic, descriptor-relative,
+  // identity-bound recursive delete. The frozen rule permits cleanup only when
+  // it is safely proven; it does not outrank avoiding the deletion of unrelated
+  // data. A fresh partial bundle is therefore left behind, and the caller
+  // reports the original failure.
+  closeBundleWriter(writer);
 }
 
 /* -------------------------------------------------------------------------- *

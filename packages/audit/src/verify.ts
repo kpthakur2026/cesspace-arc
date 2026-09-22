@@ -76,11 +76,7 @@ import {
   assertDescriptorPinnedTraversalAvailable,
   pinnedChildPath,
 } from './internal/anchor-paths.js';
-import {
-  parseAndValidateAnchorReceiptLineV1,
-  verifyAnchorReceiptSignature,
-  type AnchorReceiptV1,
-} from './anchor.js';
+import { parseAndValidateAnchorReceiptLineV1, walkReceiptEvidence } from './anchor.js';
 
 /* -------------------------------------------------------------------------- *
  * Frozen bounds (rc06 §24.1)
@@ -636,107 +632,54 @@ async function readAndVerifyLedger(options: {
   const { ledgerPath, metadata, trustRoot, checkpointsInOrder, expectedUid } = options;
   const fd = openArtifactFd(ledgerPath, ANCHOR_RECEIPT_FILENAME, expectedUid);
   const startIdentity = captureIdentity(fd);
-  const anchored = new Set<string>();
-  let receiptCount = 0;
 
   const stream = fs.createReadStream(null as unknown as fs.PathLike, { fd, autoClose: false });
   const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
-
-  /** Reads the next receipt, or null at end of ledger. */
   const iterator = lines[Symbol.asyncIterator]();
-  const readNext = async (): Promise<AnchorReceiptV1 | null> => {
-    for (;;) {
-      const step = await iterator.next();
-      if (step.done === true) return null;
-      const line = step.value;
-      if (line.length === 0) continue;
-      const receipt = parseAndValidateAnchorReceiptLineV1(`${line}\n`);
-      assertReceiptBindings(receipt, {
-        metadata,
-        publicKey: trustRoot.publicKey,
-        anchorKeyFingerprint: trustRoot.fingerprint,
-      });
-      receiptCount += 1;
-      return receipt;
-    }
-  };
 
-  let head: AnchorReceiptV1 | null;
   try {
-    head = await readNext();
-    for (const checkpoint of checkpointsInOrder) {
-      if (head !== null && head.checkpointHash === checkpoint.checkpointHash) {
-        anchored.add(checkpoint.checkpointHash);
-        head = await readNext();
-      }
+    // The Task-5 receipt authority, not a second copy of it. This path holds the
+    // descriptor open for the whole walk and streams the ledger one receipt at a
+    // time, exactly as the exporter and the bundle verifier do.
+    const outcome = await walkReceiptEvidence({
+      storeId: metadata.storeId,
+      anchorFingerprint: trustRoot.fingerprint,
+      publicKey: trustRoot.publicKey,
+      checkpointHashes: checkpointsInOrder.map((checkpoint) => checkpoint.checkpointHash),
+      nextReceipt: async () => {
+        for (;;) {
+          const step = await iterator.next();
+          if (step.done === true) return null;
+          if (step.value.length === 0) continue;
+          return parseAndValidateAnchorReceiptLineV1(`${step.value}\n`);
+        }
+      },
+    });
+
+    // The ledger must still be the artifact whose bytes were read.
+    const finalStats = fs.fstatSync(fd);
+    const consumingStream = stream as unknown as { bytesRead: number };
+    if (
+      Number(finalStats.dev) !== startIdentity.dev ||
+      Number(finalStats.ino) !== startIdentity.ino ||
+      Number(finalStats.size) !== startIdentity.size ||
+      consumingStream.bytesRead !== startIdentity.size
+    ) {
+      throw createCodedError(
+        'ANCHOR_RECEIPT_FILE_RACE',
+        `${ANCHOR_RECEIPT_FILENAME} changed while its history was being verified`,
+      );
     }
+
+    return {
+      configured: true,
+      receiptCount: outcome.receiptCount,
+      publicKeyFingerprint: trustRoot.fingerprint,
+      anchoredCheckpointHashes: [...outcome.anchoredCheckpointHashes],
+    };
   } finally {
     lines.close();
-  }
-
-  // Anything left at the head after the walk is a receipt the authenticated
-  // primary evidence never produced.
-  if (head !== null) {
-    throw createCodedError(
-      'ANCHOR_ORPHAN_RECEIPT',
-      'anchor receipt references a checkpoint that the verified checkpoint history never produced',
-    );
-  }
-
-  // The ledger must still be the artifact whose bytes were read.
-  const finalStats = fs.fstatSync(fd);
-  const consumingStream = stream as unknown as { bytesRead: number };
-  if (
-    Number(finalStats.dev) !== startIdentity.dev ||
-    Number(finalStats.ino) !== startIdentity.ino ||
-    Number(finalStats.size) !== startIdentity.size ||
-    consumingStream.bytesRead !== startIdentity.size
-  ) {
     fs.closeSync(fd);
-    throw createCodedError(
-      'ANCHOR_RECEIPT_FILE_RACE',
-      `${ANCHOR_RECEIPT_FILENAME} changed while its history was being verified`,
-    );
-  }
-  fs.closeSync(fd);
-
-  return {
-    configured: true,
-    receiptCount,
-    publicKeyFingerprint: trustRoot.fingerprint,
-    anchoredCheckpointHashes: [...anchored].sort(),
-  };
-}
-
-/**
- * The three bindings every receipt must satisfy, matching the production
- * engine's `assertReceiptBinding` rule-for-rule and in the same order.
- */
-function assertReceiptBindings(
-  receipt: AnchorReceiptV1,
-  context: {
-    metadata: AuditStoreMetadataV1;
-    publicKey: crypto.KeyObject;
-    anchorKeyFingerprint: string;
-  },
-): void {
-  if (receipt.storeId !== context.metadata.storeId) {
-    throw createCodedError(
-      'ANCHOR_RECEIPT_BINDING_INVALID',
-      'receipt storeId does not match audit-store.json',
-    );
-  }
-  if (receipt.anchorKeyFingerprint !== context.anchorKeyFingerprint) {
-    throw createCodedError(
-      'ANCHOR_RECEIPT_KEY_MISMATCH',
-      'receipt anchorKeyFingerprint does not match the pinned anchor trust root',
-    );
-  }
-  if (!verifyAnchorReceiptSignature(receipt, context.publicKey)) {
-    throw createCodedError(
-      'ANCHOR_RECEIPT_SIGNATURE_INVALID',
-      'receipt signature does not verify against the pinned anchor trust root',
-    );
   }
 }
 

@@ -33,7 +33,10 @@ import { fileURLToPath } from 'node:url';
 import {
   ANCHOR_IDEMPOTENCY_HEADER,
   computeCheckpointHash,
+  computeCheckpointSignaturePreimage,
+  parseAndValidateCheckpointLineV1,
   serializeAnchorReceiptV1,
+  serializeCheckpointV1,
   MAX_EXPORT_BYTES,
   METADATA_FILENAME,
   MAX_INSPECT_RECORDS,
@@ -2781,6 +2784,132 @@ describe('CesSpace ARC — RC-06 Task 7: Local Operator CLI & Standalone Offline
 
       await assert.rejects(pending);
       fs.writeFileSync(ledgerPath, pristine, { mode: 0o600 });
+    });
+  });
+
+  /* ====================================================================== *
+   * 15. Exact-sequence terminal binding and fail-safe cleanup
+   * ====================================================================== */
+
+  describe('15. Exact-sequence binding and fail-safe cleanup', () => {
+    test('RC06-T7-REG-59: a mandatory interval checkpoint with a wrong terminalRecordHash is refused', async () => {
+      const fixture = makeAuditConfig('reg59');
+      // 1000 records with NO rotation: the interval cadence makes a checkpoint
+      // mandatory at sequence 1000, which lies INSIDE the active segment — not
+      // on a rotated-segment terminal.
+      await buildStore(fixture, { records: 1000 });
+
+      const ledgerPath = path.join(fixture.auditDir, 'audit-checkpoints.jsonl');
+      const lines = fs.readFileSync(ledgerPath, 'utf8').slice(0, -1).split('\n');
+      assert.equal(lines.length, 1, 'the interval cadence must have sealed exactly one checkpoint');
+      const sealed = JSON.parse(lines[0]);
+      assert.equal(sealed.sequenceEnd, 1000, 'the checkpoint ends inside the active segment');
+      assert.equal(
+        fs.readdirSync(fixture.auditDir).filter((n) => n.endsWith('.jsonl.gz')).length,
+        0,
+        'no rotation may have occurred, so 1000 is not a rotated-segment terminal',
+      );
+
+      // Re-mint the SAME coverage with a genuinely valid signature but a WRONG
+      // terminal record hash. Every other field is untouched, and both the
+      // signature and the checkpoint's own canonical hash are recomputed with the
+      // store's real signing key — so nothing about this artifact is malformed.
+      // The only thing wrong with it is the one thing under test.
+      const unsigned = { ...JSON.parse(lines[0]) };
+      delete unsigned.signature;
+      delete unsigned.checkpointHash;
+      unsigned.terminalRecordHash = 'c'.repeat(64);
+      const signature = crypto
+        .sign(null, computeCheckpointSignaturePreimage(unsigned), fixture.checkpoint.privateKey)
+        .toString('base64url');
+      const resigned = { ...unsigned, signature };
+      const checkpointLine = serializeCheckpointV1({
+        ...resigned,
+        checkpointHash: computeCheckpointHash(resigned),
+      });
+      fs.writeFileSync(ledgerPath, checkpointLine, { mode: 0o600 });
+
+      // Sanity: the re-minted checkpoint parses and its own hash matches.
+      const parsed = parseAndValidateCheckpointLineV1(checkpointLine).checkpoint;
+      assert.equal(parsed.terminalRecordHash, 'c'.repeat(64));
+      assert.equal(parsed.sequenceEnd, 1000);
+
+      const base = newRoot('reg59-out');
+      await assertRejectsWithCode(
+        exportEvidenceBundle({
+          directory: fixture.auditDir,
+          outputDirectory: path.join(base, 'bundle'),
+          checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
+          workspacePaths: [],
+        }),
+        // Specifically the exact-sequence binding, not a signature, cadence or
+        // rotation-terminal failure.
+        'AUDIT_CHECKPOINT_TERMINAL_MISMATCH',
+      );
+    });
+
+    test('RC06-T7-REG-62B: cleanup performs no recursive deletion after bundle creation', async () => {
+      const fixture = await multiSegmentFixture('reg62b');
+      const base = newRoot('reg62b-out');
+      const destination = path.join(base, 'bundle');
+
+      const pending = exportEvidenceBundle({
+        directory: fixture.auditDir,
+        outputDirectory: destination,
+        checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
+        workspacePaths: [],
+      });
+      for (let attempt = 0; attempt < 20000; attempt += 1) {
+        if (fs.existsSync(path.join(destination, 'manifest.json'))) break;
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+
+      const original = path.join(base, 'bundle-original');
+      fs.renameSync(destination, original);
+      fs.mkdirSync(destination, { mode: 0o700 });
+      fs.writeFileSync(path.join(destination, 'unrelated.txt'), 'survive\n', { mode: 0o600 });
+
+      await assert.rejects(pending);
+
+      // The fail-safe rule: no recursive deletion is performed at all, so an
+      // unrelated replacement at the destination can never be deleted, and the
+      // partial bundle this invocation created is deliberately left behind
+      // rather than removed through authority that cannot be proven.
+      assert.equal(
+        fs.readFileSync(path.join(destination, 'unrelated.txt'), 'utf8'),
+        'survive\n',
+        'an unrelated replacement must survive',
+      );
+      assert.equal(
+        fs.existsSync(path.join(original, 'manifest.json')),
+        true,
+        'the partial bundle is left behind rather than deleted through stale authority',
+      );
+    });
+
+    test('RC06-T7-REG-68: the offline verifier carries no second receipt rule set', async () => {
+      const compiled = fs.readFileSync(
+        path.join(REPO_ROOT, 'packages/audit/dist/verify.js'),
+        'utf8',
+      );
+
+      // The Task-5 authority is the shared walk...
+      assert.match(
+        compiled,
+        /walkReceiptEvidence/,
+        'offline verification must use the shared walk',
+      );
+      // ...and no local binding implementation survives alongside it.
+      assert.equal(
+        /function assertReceiptBindings/.test(compiled),
+        false,
+        'no second receipt-binding implementation may exist',
+      );
+      assert.equal(
+        /ANCHOR_RECEIPT_BINDING_INVALID/.test(compiled),
+        false,
+        'the receipt binding rule must not be restated in the offline verifier',
+      );
     });
   });
 });
