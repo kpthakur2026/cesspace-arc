@@ -45,6 +45,8 @@ import {
   MAX_MANIFEST_RECEIPT_REFS,
   assertManifestReferenceWithinBound,
   assertExportWithinBudget,
+  canonicalJsonV1,
+  predictManifestBytes,
   exportEvidenceBundle,
   inspectRetainedRecords,
   listRetainedSegmentSources,
@@ -2575,6 +2577,7 @@ describe('CesSpace ARC — RC-06 Task 7: Local Operator CLI & Standalone Offline
       );
 
       // The standalone bundle verifier applies the same ordering rule.
+      fs.writeFileSync(ledgerPath, `${lines[0]}\n${lines[1]}\n`, { mode: 0o600 });
       const good = path.join(newRoot('reg60-good'), 'bundle');
       await exportEvidenceBundle({
         directory: fixture.auditDir,
@@ -2582,23 +2585,16 @@ describe('CesSpace ARC — RC-06 Task 7: Local Operator CLI & Standalone Offline
         checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
         anchorReceiptPublicKeyPath: fixture.anchorMaterial.publicKeyPath,
         workspacePaths: [],
-        from: 1,
-        to: 3,
       });
       const goodLedger = path.join(good, 'anchors', 'audit-anchors.jsonl');
       const goodLines = fs.readFileSync(goodLedger, 'utf8').slice(0, -1).split('\n');
-      if (goodLines.length > 1) {
-        rewriteBundleFile(
-          good,
-          'anchors/audit-anchors.jsonl',
-          `${goodLines[1]}\n${goodLines[0]}\n`,
-        );
-        await assertRejectsWithCode(verifyEvidenceBundle(good), [
-          'ANCHOR_ORPHAN_RECEIPT',
-          'ANCHOR_RECEIPT_DUPLICATE',
-          'BUNDLE_RECEIPT_ORPHAN',
-        ]);
-      }
+      assert.equal(goodLines.length, 2);
+      rewriteBundleFile(good, 'anchors/audit-anchors.jsonl', `${goodLines[1]}\n${goodLines[0]}\n`);
+      await assertRejectsWithCode(verifyEvidenceBundle(good), [
+        'ANCHOR_ORPHAN_RECEIPT',
+        'ANCHOR_RECEIPT_DUPLICATE',
+        'BUNDLE_RECEIPT_ORPHAN',
+      ]);
     });
   });
 
@@ -3157,10 +3153,20 @@ describe('CesSpace ARC — RC-06 Task 7: Local Operator CLI & Standalone Offline
         false,
         'no joined Buffer from lines in production export',
       );
+      assert.equal(
+        /selectedCpHashes/.test(compiledExport),
+        false,
+        'no selectedCpHashes array in production export source-verification path',
+      );
+      assert.equal(
+        /includedCpHashes/.test(compiledExport),
+        false,
+        'no includedCpHashes Set in production export source-verification path',
+      );
 
       const fixture = makeAuditConfig('reg66');
-      const rotateAt = Array.from({ length: 10 }, (_, i) => (i + 1) * 2);
-      await buildStore(fixture, { records: 22, rotateAt });
+      const rotateAt = Array.from({ length: 25 }, (_, i) => (i + 1) * 2);
+      await buildStore(fixture, { records: 52, rotateAt });
 
       const base = newRoot('reg66-out');
       const result = await exportEvidenceBundle({
@@ -3170,10 +3176,10 @@ describe('CesSpace ARC — RC-06 Task 7: Local Operator CLI & Standalone Offline
         workspacePaths: [],
       });
 
-      assert.equal(result.manifest.checkpointHashes.length, 10);
+      assert.equal(result.manifest.checkpointHashes.length, 25);
       const verified = await verifyEvidenceBundle(result.outputDirectory);
       assert.equal(verified.status, 'VERIFIED');
-      assert.equal(verified.checkpointCount, 10);
+      assert.equal(verified.checkpointCount, 25);
     });
 
     test('RC06-T7-REG-67: large receipt history is processed incrementally with the same guarantees', async () => {
@@ -3197,9 +3203,24 @@ describe('CesSpace ARC — RC-06 Task 7: Local Operator CLI & Standalone Offline
         'no Buffer.from(receiptLines) in production export',
       );
 
+      const compiledAnchor = fs.readFileSync(
+        path.join(REPO_ROOT, 'packages/audit/dist/anchor.js'),
+        'utf8',
+      );
+      assert.equal(
+        /receiptIds\s*=\s*\[\]/.test(compiledAnchor),
+        false,
+        'ReceiptEvidenceWalk does not retain receiptIds array',
+      );
+      assert.equal(
+        /anchored\s*=\s*\[\]/.test(compiledAnchor),
+        false,
+        'walkReceiptEvidence does not retain anchored array',
+      );
+
       const fixture = makeAuditConfig('reg67', { anchor: true });
-      const rotateAt = Array.from({ length: 10 }, (_, i) => (i + 1) * 2);
-      await buildStore(fixture, { records: 22, rotateAt });
+      const rotateAt = Array.from({ length: 25 }, (_, i) => (i + 1) * 2);
+      await buildStore(fixture, { records: 52, rotateAt });
 
       const base = newRoot('reg67-out');
       const result = await exportEvidenceBundle({
@@ -3210,10 +3231,105 @@ describe('CesSpace ARC — RC-06 Task 7: Local Operator CLI & Standalone Offline
         workspacePaths: [],
       });
 
-      assert.equal(result.manifest.anchorReceiptIds.length, 10);
+      assert.equal(result.manifest.anchorReceiptIds.length, 25);
       const verified = await verifyEvidenceBundle(result.outputDirectory);
       assert.equal(verified.status, 'VERIFIED');
-      assert.equal(verified.anchorReceiptCount, 10);
+      assert.equal(verified.anchorReceiptCount, 25);
+    });
+
+    test('RC06-T7-REG-74: manifest larger than 64 KiB is accounted using exact serialized size and enforces pre-write budget', async () => {
+      // 4000 synthetic checkpoint hashes: 4000 * 64 chars plus quoting/formatting > 64 KiB (65,536 bytes)
+      const checkpointHashes = Array.from({ length: 4000 }, (_, i) =>
+        i.toString(16).padStart(64, '0'),
+      );
+      const manifestHeader = {
+        version: 1,
+        storeId: '00000000-0000-4000-8000-000000000001',
+        sequenceRange: { start: 1, end: 4000 },
+        checkpointHashes,
+        anchorReceiptIds: [],
+      };
+      const fileBytes = new Map([['checkpoints/audit-checkpoints.jsonl', 300_000]]);
+      const predicted = predictManifestBytes(manifestHeader, fileBytes);
+      assert.ok(
+        predicted > 65536,
+        `predicted manifest size (${predicted}) must exceed 64 KiB upper bound`,
+      );
+
+      // MAX_EXPORT_BYTES exactly -> accepted
+      assertExportWithinBudget(MAX_EXPORT_BYTES);
+
+      // MAX_EXPORT_BYTES + 1 -> refused before any write
+      assert.throws(
+        () => assertExportWithinBudget(MAX_EXPORT_BYTES + 1),
+        (err) => err?.code === 'EXPORT_TOO_LARGE',
+      );
+    });
+
+    test('RC06-T7-REG-75: standalone bundle verifier authenticates interval checkpoint terminalRecordHash in unrotated segment', async () => {
+      const fixture = makeAuditConfig('reg75');
+      // Build store with 1001 records and NO rotation:
+      // Active segment covers 1..1001.
+      // Checkpoint at interval 1000 covers 1..1000.
+      await buildStore(fixture, { records: 1001 });
+
+      const base = newRoot('reg75-out');
+      const destination = path.join(base, 'bundle');
+      await exportEvidenceBundle({
+        directory: fixture.auditDir,
+        outputDirectory: destination,
+        checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
+        workspacePaths: [],
+      });
+
+      // Verify pristine bundle first
+      const verifiedPristine = await verifyEvidenceBundle(destination);
+      assert.equal(verifiedPristine.status, 'VERIFIED');
+      assert.equal(verifiedPristine.checkpointCount, 1);
+
+      // Read bundled checkpoint ledger
+      const cpLedgerPath = path.join(destination, 'checkpoints', 'audit-checkpoints.jsonl');
+      const cpLine = fs.readFileSync(cpLedgerPath, 'utf8').trim();
+      const parsed = JSON.parse(cpLine);
+      assert.equal(parsed.sequenceEnd, 1000);
+
+      // Corrupt terminalRecordHash but re-sign with fixture's private key so signature is valid
+      const corrupted = { ...parsed };
+      delete corrupted.signature;
+      delete corrupted.checkpointHash;
+      corrupted.terminalRecordHash = 'f'.repeat(64);
+      const signature = crypto
+        .sign(null, computeCheckpointSignaturePreimage(corrupted), fixture.checkpoint.privateKey)
+        .toString('base64url');
+      const resigned = {
+        ...corrupted,
+        signature,
+      };
+      const resignedLine = serializeCheckpointV1({
+        ...resigned,
+        checkpointHash: computeCheckpointHash(resigned),
+      });
+
+      // Rewrite the bundled checkpoint ledger
+      fs.writeFileSync(cpLedgerPath, `${resignedLine}\n`, { mode: 0o600 });
+
+      // Update manifest.json so manifest digests/hashes match the new checkpoint line
+      const manifestPath = path.join(destination, 'manifest.json');
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+      manifest.checkpointHashes = [computeCheckpointHash(resigned)];
+      const cpBytes = Buffer.byteLength(`${resignedLine}\n`, 'utf8');
+      const cpSha256 = crypto.createHash('sha256').update(`${resignedLine}\n`).digest('hex');
+      manifest.files['checkpoints/audit-checkpoints.jsonl'] = {
+        sha256: cpSha256,
+        bytes: cpBytes,
+      };
+      fs.writeFileSync(manifestPath, `${canonicalJsonV1(manifest)}\n`, { mode: 0o600 });
+
+      // Standalone verifyEvidenceBundle MUST reject with BUNDLE_CHECKPOINT_TERMINAL_MISMATCH
+      await assertRejectsWithCode(
+        verifyEvidenceBundle(destination),
+        'BUNDLE_CHECKPOINT_TERMINAL_MISMATCH',
+      );
     });
   });
 });

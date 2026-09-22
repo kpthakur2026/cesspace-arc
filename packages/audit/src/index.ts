@@ -729,6 +729,7 @@ export {
   type BundleDirectoryAuthority,
   createBundleDirectoryAuthority,
   assertExportWithinBudget,
+  predictManifestBytes,
   MIN_CANONICAL_RECORD_BYTES,
   MAX_MANIFEST_CHECKPOINT_REFS,
   MAX_MANIFEST_RECEIPT_REFS,

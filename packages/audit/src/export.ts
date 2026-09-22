@@ -77,10 +77,7 @@ import {
   type AuditCheckpointV1,
 } from './checkpoint.js';
 import { loadStoreMetadataFile } from './metadata.js';
-import { CHECKPOINT_INTERVAL } from './checkpoint.js';
 import {
-  MAX_ARCHIVE_SEGMENTS,
-  TOTAL_AUDIT_BUDGET_BYTES,
   verifyRetainedPrimaryHistory,
   type RetainedPrimaryHistoryVerificationResult,
 } from './rotation.js';
@@ -142,54 +139,18 @@ export const BUNDLE_PUBLIC_KEYS_DIRNAME = 'public-keys';
  * ~950 bytes a real record occupies, so the derived bound below is an
  * over-estimate rather than an under-estimate.
  */
-export const MIN_CANONICAL_RECORD_BYTES = 256;
-
-/**
- * The finite maximum number of checkpoint references one manifest may carry.
- *
- * Derived from frozen limits, not chosen for convenience. A retained checkpoint
- * is mandatory at every rotation boundary — at most `MAX_ARCHIVE_SEGMENTS` —
- * and on the interval cadence, one per `CHECKPOINT_INTERVAL` records. The record
- * count is itself bounded by the frozen storage budget:
- *
- *   TOTAL_AUDIT_BUDGET_BYTES / MIN_CANONICAL_RECORD_BYTES / CHECKPOINT_INTERVAL
- *
- * plus the rotation boundaries. Worst-case manifest memory is therefore
- * MAX_MANIFEST_CHECKPOINT_REFS x (64 hex + JSON quoting and separator) — about
- * 285 KB, not something proportional to a 1 GiB history.
- */
-export const MAX_MANIFEST_CHECKPOINT_REFS =
-  MAX_ARCHIVE_SEGMENTS +
-  Math.ceil(TOTAL_AUDIT_BUDGET_BYTES / MIN_CANONICAL_RECORD_BYTES / CHECKPOINT_INTERVAL);
-
-/**
- * The finite maximum number of receipt references one manifest may carry.
- *
- * At most one receipt is consumed per checkpoint, so the checkpoint bound holds
- * here too. A receipt id is capped separately by the Task-5 receipt schema
- * (<= 256 UTF-8 bytes), so worst-case memory is likewise bounded.
- */
-export const MAX_MANIFEST_RECEIPT_REFS = MAX_MANIFEST_CHECKPOINT_REFS;
-
-/**
- * Refuses a manifest reference beyond the frozen bound.
- *
- * Called BEFORE a reference is accumulated, so memory cannot grow past the
- * documented maximum: the bound is enforced at the point of growth rather than
- * discovered after the fact.
- */
-export function assertManifestReferenceWithinBound(
-  count: number,
-  bound: number,
-  noun: string,
-): void {
-  if (count > bound) {
-    throw createCodedError(
-      'EXPORT_MANIFEST_LIMIT_EXCEEDED',
-      `the manifest cannot reference more than ${bound} ${noun}`,
-    );
-  }
-}
+import {
+  MIN_CANONICAL_RECORD_BYTES,
+  MAX_MANIFEST_CHECKPOINT_REFS,
+  MAX_MANIFEST_RECEIPT_REFS,
+  assertManifestReferenceWithinBound,
+} from './internal/manifest-bounds.js';
+export {
+  MIN_CANONICAL_RECORD_BYTES,
+  MAX_MANIFEST_CHECKPOINT_REFS,
+  MAX_MANIFEST_RECEIPT_REFS,
+  assertManifestReferenceWithinBound,
+};
 
 /** Purpose-named bundled keys, so a reviewer never has to guess which is which. */
 export const BUNDLE_CHECKPOINT_KEY_FILENAME = 'checkpoint-public.pem';
@@ -583,7 +544,8 @@ function openBundleFile(writer: BundleWriter, dirName: string, fileName: string)
   return { fd, hash: crypto.createHash('sha256'), bytes: 0 };
 }
 
-function appendToBundleFile(handle: BundleFileHandle, chunk: Buffer): void {
+function appendToBundleFile(writer: BundleWriter, handle: BundleFileHandle, chunk: Buffer): void {
+  assertWithinBudget(writer.totalBytes + handle.bytes + chunk.byteLength);
   fs.writeSync(handle.fd, chunk);
   handle.hash.update(chunk);
   handle.bytes += chunk.byteLength;
@@ -621,18 +583,20 @@ function writeBundleFile(
   fileName: string,
   contents: Buffer,
 ): void {
+  assertWithinBudget(writer.totalBytes + contents.byteLength);
   const handle = openBundleFile(writer, dirName, fileName);
   try {
-    appendToBundleFile(handle, contents);
+    appendToBundleFile(writer, handle, contents);
   } finally {
     closeBundleFile(writer, dirName, fileName, handle);
   }
 }
 
 function writeBundleRootFile(writer: BundleWriter, fileName: string, contents: Buffer): void {
+  assertWithinBudget(writer.totalBytes + contents.byteLength);
   const handle = openRootBundleFile(writer, fileName);
   try {
-    appendToBundleFile(handle, contents);
+    appendToBundleFile(writer, handle, contents);
   } finally {
     fs.fchmodSync(handle.fd, 0o600);
     fs.fsyncSync(handle.fd);
@@ -706,6 +670,7 @@ async function copyVerifiedArtifact(
     });
   }
 
+  assertWithinBudget(writer.totalBytes + artifact.identity.size);
   const destFd = fs.openSync(
     pinnedChildPath(dirFd, fileName),
     fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
@@ -731,7 +696,7 @@ async function copyVerifiedArtifact(
       const read = fs.readSync(sourceFd, buffer, 0, buffer.length, null);
       if (read === 0) break;
       const slice = buffer.subarray(0, read);
-      appendToBundleFile(handle, slice);
+      appendToBundleFile(writer, handle, slice);
       assertWithinBudget(writer.totalBytes + handle.bytes);
     }
 
@@ -944,6 +909,8 @@ interface CheckpointAuthContext {
   publicKey: crypto.KeyObject;
   /** recordHash by sequence, for terminal binding. */
   chainBySequence: ReadonlyMap<number, string>;
+  chainSequenceStart?: number;
+  chainSequenceEnd?: number;
 }
 
 /**
@@ -1021,7 +988,19 @@ export function authenticateCheckpointItem(
     );
   }
   const covered = context.chainBySequence.get(checkpoint.sequenceEnd);
-  if (covered !== undefined && covered !== checkpoint.terminalRecordHash) {
+  if (
+    context.chainSequenceStart !== undefined &&
+    context.chainSequenceEnd !== undefined &&
+    checkpoint.sequenceEnd >= context.chainSequenceStart &&
+    checkpoint.sequenceEnd <= context.chainSequenceEnd
+  ) {
+    if (covered === undefined || covered !== checkpoint.terminalRecordHash) {
+      throw createCodedError(
+        'BUNDLE_CHECKPOINT_TERMINAL_MISMATCH',
+        'a checkpoint does not bind to the primary record it covers',
+      );
+    }
+  } else if (covered !== undefined && covered !== checkpoint.terminalRecordHash) {
     throw createCodedError(
       'BUNDLE_CHECKPOINT_TERMINAL_MISMATCH',
       'a checkpoint does not bind to the primary record it covers',
@@ -1267,6 +1246,7 @@ export async function exportEvidenceBundle(
         fd: rFd,
         autoClose: false,
       });
+      rStream.on('error', () => {});
       rStream.on('data', (chunk: string | Buffer) => {
         rHasher.update(chunk);
         rBytesRead += typeof chunk === 'string' ? Buffer.byteLength(chunk) : chunk.length;
@@ -1274,37 +1254,33 @@ export async function exportEvidenceBundle(
       const rLines = readline.createInterface({ input: rStream, crlfDelay: Infinity });
       const rIter = rLines[Symbol.asyncIterator]();
 
-      const selectedCpHashes: string[] = [];
       const cpLedgerPath = path.join(options.directory, CHECKPOINT_FILENAME);
-      if (fs.existsSync(cpLedgerPath)) {
-        for await (const line of streamLedgerLines(
-          cpLedgerPath,
-          CHECKPOINT_FILENAME,
-          expectedUid,
-        )) {
-          const { checkpoint } = parseAndValidateCheckpointLineV1(`${line}\n`);
-          if (checkpoint.sequenceStart <= rangeEnd) {
-            selectedCpHashes.push(checkpoint.checkpointHash);
-          }
-        }
-      }
-      const includedCpHashes = new Set(selectedCpHashes);
+      const cpLines = fs.existsSync(cpLedgerPath)
+        ? streamLedgerLines(cpLedgerPath, CHECKPOINT_FILENAME, expectedUid)
+        : null;
+      const cpIter = cpLines !== null ? cpLines[Symbol.asyncIterator]() : null;
+      const nextCheckpoint =
+        cpIter !== null
+          ? async () => {
+              const step = await cpIter.next();
+              if (step.done === true) return null;
+              const { checkpoint } = parseAndValidateCheckpointLineV1(`${step.value}\n`);
+              return checkpoint.checkpointHash;
+            }
+          : undefined;
 
       try {
         await walkReceiptEvidence({
           storeId: metadata.storeId,
           anchorFingerprint: anchorTrustRoot.fingerprint,
           publicKey: anchorTrustRoot.publicKey,
-          checkpointHashes: selectedCpHashes,
+          ...(nextCheckpoint !== undefined ? { nextCheckpoint } : {}),
           nextReceipt: async () => {
             for (;;) {
               const step = await rIter.next();
               if (step.done === true) return null;
               if (step.value.length === 0) continue;
-              const receipt = parseAndValidateAnchorReceiptLineV1(`${step.value}\n`);
-              if (includedCpHashes.has(receipt.checkpointHash)) {
-                return receipt;
-              }
+              return parseAndValidateAnchorReceiptLineV1(`${step.value}\n`);
             }
           },
         });
@@ -1338,7 +1314,11 @@ export async function exportEvidenceBundle(
         };
       } finally {
         rLines.close();
-        fs.closeSync(rFd);
+        try {
+          fs.closeSync(rFd);
+        } catch {
+          // already closed
+        }
       }
 
       await options.hooks?.afterReceiptVerification?.();
@@ -1369,10 +1349,7 @@ export async function exportEvidenceBundle(
     );
   }
 
-  const projectedManifestBytes = 65536;
-  assertExportWithinBudget(
-    [...emittedBytes.values()].reduce((total, bytes) => total + bytes, 0) + projectedManifestBytes,
-  );
+  assertExportWithinBudget([...emittedBytes.values()].reduce((total, bytes) => total + bytes, 0));
 
   const { parentFd, leafName } = openPinnedParent(destination);
   let writer: BundleWriter;
@@ -1454,7 +1431,7 @@ export async function exportEvidenceBundle(
               'checkpoints',
             );
             checkpointHashes.push(checkpoint.checkpointHash);
-            appendToBundleFile(cpHandle, Buffer.from(`${line}\n`, 'utf8'));
+            appendToBundleFile(writer, cpHandle, Buffer.from(`${line}\n`, 'utf8'));
           }
         }
       }
@@ -1536,7 +1513,7 @@ export async function exportEvidenceBundle(
                   'anchor receipts',
                 );
                 anchorReceiptIds.push(receipt.receiptId);
-                appendToBundleFile(receiptHandle, Buffer.from(`${line}\n`, 'utf8'));
+                appendToBundleFile(writer, receiptHandle, Buffer.from(`${line}\n`, 'utf8'));
                 return receipt;
               }
             }
@@ -1571,15 +1548,24 @@ export async function exportEvidenceBundle(
     );
 
     const files: Record<string, ManifestFileEntry> = {};
+    const fileBytesMap = new Map<string, number>();
     for (const key of [...writer.fileHashes.keys()].sort()) {
-      files[key] = writer.fileHashes.get(key) as ManifestFileEntry;
+      const entry = writer.fileHashes.get(key) as ManifestFileEntry;
+      files[key] = entry;
+      fileBytesMap.set(key, entry.bytes);
     }
-    const manifest: ExportManifest = {
+    const manifestHeader: Omit<ExportManifest, 'files'> = {
       version: 1,
       storeId: metadata.storeId,
       sequenceRange: { start: from, end: rangeEnd },
       checkpointHashes,
       anchorReceiptIds,
+    };
+    const exactManifestBytes = predictManifestBytes(manifestHeader, fileBytesMap);
+    assertWithinBudget(writer.totalBytes + exactManifestBytes);
+
+    const manifest: ExportManifest = {
+      ...manifestHeader,
       files,
     };
     writeBundleRootFile(
@@ -1779,10 +1765,32 @@ export async function verifyEvidenceBundleAuthoritative(
     fs.closeSync(checkpointKeyFd);
   }
 
-  // 2. The primary chain: streamed, strictly framed, in SEQUENCE order.
-  const chain = await verifyBundledChainFromAuthority(authority, manifest.sequenceRange);
+  // 2. Pre-scan checkpoint sequence ends so interval checkpoints inside unrotated
+  // segments can have their terminal record hashes authenticated against the
+  // primary chain.
+  const checkpointSequenceEnds = new Set<number>();
+  if (authority.childFileExists(BUNDLE_CHECKPOINTS_DIRNAME, CHECKPOINT_FILENAME)) {
+    const cpFd = authority.openChildFile(BUNDLE_CHECKPOINTS_DIRNAME, CHECKPOINT_FILENAME);
+    for await (const line of streamLedgerLinesFromFd(cpFd, CHECKPOINT_FILENAME, true)) {
+      if (line.length === 0) continue;
+      const { checkpoint } = parseAndValidateCheckpointLineV1(`${line}\n`);
+      assertManifestReferenceWithinBound(
+        checkpointSequenceEnds.size + 1,
+        MAX_MANIFEST_CHECKPOINT_REFS,
+        'checkpoints',
+      );
+      checkpointSequenceEnds.add(checkpoint.sequenceEnd);
+    }
+  }
 
-  // 3. Checkpoints, streamed by Task-4 rule set.
+  // 3. The primary chain: streamed, strictly framed, in SEQUENCE order.
+  const chain = await verifyBundledChainFromAuthority(
+    authority,
+    manifest.sequenceRange,
+    checkpointSequenceEnds,
+  );
+
+  // 4. Checkpoints, streamed by Task-4 rule set.
   let checkpointCount = 0;
   let boundarySealFound = false;
   let boundarySealValid = false;
@@ -1805,6 +1813,8 @@ export async function verifyEvidenceBundleAuthoritative(
         keyFingerprint: checkpointKey.fingerprint,
         publicKey: checkpointKey.publicKey,
         chainBySequence: chain.terminalHashes,
+        chainSequenceStart: chain.coveredSequenceStart,
+        chainSequenceEnd: chain.coveredSequenceEnd,
       });
 
       if (
@@ -1959,6 +1969,7 @@ interface BundledChain {
 async function verifyBundledChainFromAuthority(
   authority: BundleDirectoryAuthority,
   sequenceRange: { start: number; end: number },
+  checkpointSequenceEnds?: ReadonlySet<number>,
 ): Promise<BundledChain> {
   const names = authority.listAuditArtifacts();
 
@@ -2048,6 +2059,13 @@ async function verifyBundledChainFromAuthority(
       segmentTerminalSequence = record.sequenceNumber;
       segmentTerminalHash = record.integrity.recordHash;
       expectedSequence += 1;
+
+      if (
+        checkpointSequenceEnds !== undefined &&
+        checkpointSequenceEnds.has(record.sequenceNumber)
+      ) {
+        terminalHashes.set(record.sequenceNumber, record.integrity.recordHash);
+      }
     }
 
     if (segmentTerminalSequence !== null && segmentTerminalHash !== null) {

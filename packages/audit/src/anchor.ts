@@ -91,6 +91,10 @@ import {
   computeTrustRootFingerprintFromFile,
   loadEd25519TrustRootFile,
 } from './internal/key-authority.js';
+import {
+  MAX_MANIFEST_RECEIPT_REFS,
+  assertManifestReferenceWithinBound,
+} from './internal/manifest-bounds.js';
 import { loadStoreMetadataFile } from './metadata.js';
 import { assertAuditStorageCapacity } from './rotation.js';
 import {
@@ -377,7 +381,6 @@ export function serializeAnchorReceiptV1(receipt: AnchorReceiptV1): string {
  */
 export class ReceiptEvidenceWalk {
   private receiptCount = 0;
-  private readonly receiptIds: string[] = [];
   private readonly seenReceiptIds = new Set<string>();
 
   constructor(
@@ -390,11 +393,6 @@ export class ReceiptEvidenceWalk {
 
   get verifiedReceiptCount(): number {
     return this.receiptCount;
-  }
-
-  /** The verified receipt ids, in ledger order. */
-  get ids(): readonly string[] {
-    return this.receiptIds;
   }
 
   /**
@@ -430,9 +428,13 @@ export class ReceiptEvidenceWalk {
         'a receipt id appears more than once in the ledger',
       );
     }
+    assertManifestReferenceWithinBound(
+      this.seenReceiptIds.size + 1,
+      MAX_MANIFEST_RECEIPT_REFS,
+      'seen receipt ids',
+    );
     this.seenReceiptIds.add(receipt.receiptId);
     this.receiptCount += 1;
-    this.receiptIds.push(receipt.receiptId);
     void checkpointIndex;
     return true;
   }
@@ -470,11 +472,13 @@ export interface WalkReceiptEvidenceOptions {
   nextReceipt: () => Promise<AnchorReceiptV1 | null>;
   /** Optional callback fired when a receipt is verified and consumed */
   onVerifiedReceipt?: (receipt: AnchorReceiptV1) => Promise<void> | void;
+  /** Optional callback fired when a checkpoint is anchored */
+  onAnchoredCheckpoint?: (checkpointHash: string) => Promise<void> | void;
 }
 
 export async function walkReceiptEvidence(
   options: WalkReceiptEvidenceOptions,
-): Promise<{ receiptCount: number; receiptIds: string[]; anchoredCheckpointHashes: string[] }> {
+): Promise<{ receiptCount: number; anchoredCount: number }> {
   const walk = new ReceiptEvidenceWalk({
     storeId: options.storeId,
     anchorFingerprint: options.anchorFingerprint,
@@ -494,8 +498,8 @@ export async function walkReceiptEvidence(
           return async () => (idx < hashes.length ? hashes[idx++] : null);
         })();
 
-  const anchored: string[] = [];
   let head = 0;
+  let anchoredCount = 0;
   let current = await options.nextReceipt();
 
   for (;;) {
@@ -507,7 +511,10 @@ export async function walkReceiptEvidence(
     if (options.onVerifiedReceipt !== undefined) {
       await options.onVerifiedReceipt(current);
     }
-    anchored.push(checkpointHash);
+    if (options.onAnchoredCheckpoint !== undefined) {
+      await options.onAnchoredCheckpoint(checkpointHash);
+    }
+    anchoredCount += 1;
     head += 1;
     current = await options.nextReceipt();
   }
@@ -521,8 +528,7 @@ export async function walkReceiptEvidence(
 
   return {
     receiptCount: walk.verifiedReceiptCount,
-    receiptIds: [...walk.ids],
-    anchoredCheckpointHashes: anchored,
+    anchoredCount,
   };
 }
 

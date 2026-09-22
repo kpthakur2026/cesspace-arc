@@ -67,11 +67,16 @@ import {
 } from './rotation.js';
 import {
   CHECKPOINT_FILENAME,
-  verifyCheckpointHistoryWithObserver,
+  parseAndValidateCheckpointLineV1,
+  verifyCheckpointHistory,
   type AuditCheckpointV1,
 } from './checkpoint.js';
 import { ANCHOR_RECEIPT_FILENAME, ANCHOR_SPOOL_DIRNAME } from './internal/anchor-constants.js';
 import { loadEd25519TrustRootFile } from './internal/key-authority.js';
+import {
+  MAX_MANIFEST_CHECKPOINT_REFS,
+  assertManifestReferenceWithinBound,
+} from './internal/manifest-bounds.js';
 import {
   assertDescriptorPinnedTraversalAvailable,
   pinnedChildPath,
@@ -563,8 +568,23 @@ export interface VerifyAnchorLedgerOfflineOptions {
 export async function verifyAnchorLedgerOffline(
   options: VerifyAnchorLedgerOfflineOptions,
 ): Promise<OfflineAnchorOutcome> {
-  const { directory, metadata, checkpointsInOrder, nextCheckpoint } = options;
+  const { directory, metadata, checkpointsInOrder } = options;
   const expectedUid = options.expectedUid ?? getProcessUid();
+
+  let nextCheckpoint = options.nextCheckpoint;
+  if (nextCheckpoint === undefined && checkpointsInOrder === undefined) {
+    const cpPath = path.join(directory, CHECKPOINT_FILENAME);
+    if (fs.existsSync(cpPath)) {
+      const cpLines = streamLedgerLines(cpPath, CHECKPOINT_FILENAME, expectedUid);
+      const cpIter = cpLines[Symbol.asyncIterator]();
+      nextCheckpoint = async () => {
+        const step = await cpIter.next();
+        if (step.done === true) return null;
+        const { checkpoint } = parseAndValidateCheckpointLineV1(`${step.value}\n`);
+        return checkpoint.checkpointHash;
+      };
+    }
+  }
 
   if (metadata.anchorMode === 'DISABLED') {
     // A store whose durable metadata says anchoring is off must not be silently
@@ -670,17 +690,30 @@ async function readAndVerifyLedger(options: {
     // The Task-5 receipt authority, not a second copy of it. This path holds the
     // descriptor open for the whole walk and streams the ledger one receipt at a
     // time, exactly as the exporter and the bundle verifier do.
+    const anchoredCheckpointHashes: string[] = [];
     const outcome = await walkReceiptEvidence({
       storeId: metadata.storeId,
       anchorFingerprint: trustRoot.fingerprint,
       publicKey: trustRoot.publicKey,
       ...(options.nextCheckpoint !== undefined
         ? { nextCheckpoint: options.nextCheckpoint }
-        : {
-            checkpointHashes: (options.checkpointsInOrder ?? []).map(
-              (checkpoint) => checkpoint.checkpointHash,
-            ),
-          }),
+        : options.checkpointsInOrder !== undefined
+          ? {
+              nextCheckpoint: (() => {
+                let idx = 0;
+                const cps = options.checkpointsInOrder;
+                return async () => (idx < cps.length ? cps[idx++].checkpointHash : null);
+              })(),
+            }
+          : {}),
+      onAnchoredCheckpoint: (hash) => {
+        assertManifestReferenceWithinBound(
+          anchoredCheckpointHashes.length + 1,
+          MAX_MANIFEST_CHECKPOINT_REFS,
+          'anchored checkpoints',
+        );
+        anchoredCheckpointHashes.push(hash);
+      },
       nextReceipt: async () => {
         for (;;) {
           const step = await iterator.next();
@@ -710,7 +743,7 @@ async function readAndVerifyLedger(options: {
       configured: true,
       receiptCount: outcome.receiptCount,
       publicKeyFingerprint: trustRoot.fingerprint,
-      anchoredCheckpointHashes: [...outcome.anchoredCheckpointHashes],
+      anchoredCheckpointHashes,
       artifactState: {
         kind: 'PRESENT',
         dev: startIdentity.dev,
@@ -810,26 +843,32 @@ export async function verifyOfflineStore(
     );
   }
 
-  // The authenticated checkpoint walk. The observer fires once per checkpoint,
-  // in order, only after every Task-4 check on that checkpoint has passed, so
-  // the collected list is authenticated evidence rather than mere file order.
-  const checkpointsInOrder: AuditCheckpointV1[] = [];
-  const checkpoints = await verifyCheckpointHistoryWithObserver(
-    {
-      directory: options.directory,
-      publicKeyPath: options.checkpointPublicKeyPath,
-      workspacePaths,
-    },
-    (checkpoint) => {
-      checkpointsInOrder.push(checkpoint);
-    },
-  );
+  const checkpoints = await verifyCheckpointHistory({
+    directory: options.directory,
+    publicKeyPath: options.checkpointPublicKeyPath,
+    workspacePaths,
+  });
+
+  const cpPath = path.join(options.directory, CHECKPOINT_FILENAME);
+  const cpLines = fs.existsSync(cpPath)
+    ? streamLedgerLines(cpPath, CHECKPOINT_FILENAME, expectedUid)
+    : null;
+  const cpIter = cpLines !== null ? cpLines[Symbol.asyncIterator]() : null;
+  const nextCheckpoint =
+    cpIter !== null
+      ? async () => {
+          const step = await cpIter.next();
+          if (step.done === true) return null;
+          const { checkpoint } = parseAndValidateCheckpointLineV1(`${step.value}\n`);
+          return checkpoint.checkpointHash;
+        }
+      : undefined;
 
   const anchor = await verifyAnchorLedgerOffline({
     directory: options.directory,
     metadata,
     anchorReceiptPublicKeyPath: options.anchorReceiptPublicKeyPath,
-    checkpointsInOrder,
+    ...(nextCheckpoint !== undefined ? { nextCheckpoint } : {}),
     expectedUid,
   });
 
