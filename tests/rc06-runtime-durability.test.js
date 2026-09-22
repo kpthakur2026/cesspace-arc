@@ -957,29 +957,88 @@ describe('CesSpace ARC — RC-06 Task 6: Universal Lifecycle & Full-History Star
 
       await parts.server.dispatchToolCall('read_file', { path: 'README.md', workspaceId: 'ws' });
 
-      const after = readActiveRecords(fixture.auditDir);
-      const appended = after.slice(seeded.length);
+      // The resumed record is located by its ABSOLUTE sequence, never by an
+      // offset into whatever the active segment happens to hold right now.
+      //
+      // A restart does not make a segment young: the store restores an existing
+      // active segment's origin from its FIRST record's timestamp, so once this
+      // fixture is older than the frozen 24-hour rotation interval the very
+      // first append after restart legitimately seals the seeded records into a
+      // rotated archive BEFORE sequence 4 is written. Both outcomes are correct
+      // production behavior — the chain and the cursor are identical either
+      // way, and only the segment the seeded records live in differs — so this
+      // assertion must hold under either one.
+      const resumedSequence = terminal.sequenceNumber + 1;
+      const active = readActiveRecords(fixture.auditDir);
+      const resumed = active.find((record) => record.sequenceNumber === resumedSequence);
+      assert.ok(
+        resumed,
+        `the active segment must carry sequence ${resumedSequence} after the restart`,
+      );
+      assert.equal(
+        resumed.sequenceNumber,
+        resumedSequence,
+        'the resumed chain must continue at the next sequence',
+      );
+      assert.equal(
+        resumed.integrity.previousRecordHash,
+        terminal.integrity.recordHash,
+        'the resumed chain must be bound to the last VERIFIED record hash',
+      );
+
+      // Full-history verification is the authority for "one chain, from
+      // genesis, nothing reused" — it spans the rotated archives and the active
+      // segment alike, whichever side of the rotation boundary they fall on.
+      const verification = await verifyRetainedPrimaryHistory(fixture.auditDir, EXPECTED_UID);
+      assert.equal(verification.status, 'VERIFIED');
+
+      // The records this call appended, read from the verified whole-history
+      // view rather than from any single segment.
+      const appended = verification.recentRecords.filter(
+        (record) => record.sequenceNumber >= resumedSequence,
+      );
+      assert.ok(appended.length > 0, 'the tool call must have appended durable records');
       assert.equal(
         appended[0].sequenceNumber,
-        terminal.sequenceNumber + 1,
-        'the resumed chain must continue at the next sequence',
+        resumedSequence,
+        'the first appended record must be the resumed STARTED record',
+      );
+      assert.deepEqual(
+        appended.map((record) => record.sequenceNumber),
+        appended.map((_, index) => resumedSequence + index),
+        'the appended records must be contiguous, with no sequence reused or skipped',
       );
       assert.equal(
         appended[0].integrity.previousRecordHash,
         terminal.integrity.recordHash,
-        'the resumed chain must be bound to the last VERIFIED record hash',
+        'the verified chain binds the resumed record to the pre-restart terminal hash',
       );
       assert.equal(
-        after.filter((record) => record.sequenceNumber === 1).length,
+        verification.recordCount,
+        seeded.length + appended.length,
+        'the retained history is exactly the seeded records plus the appended ones',
+      );
+      assert.equal(
+        verification.recentRecords.length,
+        verification.recordCount,
+        'the whole retained chain must fit the verification cache for the checks below',
+      );
+      assert.equal(
+        verification.recentRecords.filter((record) => record.sequenceNumber === 1).length,
         1,
         'no sequence may be reused and no second genesis record may appear',
       );
-      // The whole chain, seeded history included, still verifies end to end.
-      const verification = await verifyRetainedPrimaryHistory(fixture.auditDir, EXPECTED_UID);
-      assert.equal(verification.status, 'VERIFIED');
-      assert.equal(verification.recordCount, after.length);
-      assert.equal(verification.terminalSequence, after[after.length - 1].sequenceNumber);
-      assert.equal(verification.nextSequence, after[after.length - 1].sequenceNumber + 1);
+      assert.equal(
+        verification.terminalSequence,
+        appended[appended.length - 1].sequenceNumber,
+        'the retained chain terminates at the last record the tool call appended',
+      );
+      assert.equal(
+        verification.nextSequence,
+        verification.terminalSequence + 1,
+        'the next append must continue one past the terminal record',
+      );
+      assert.equal(verification.previousRecordHash, verification.terminalRecordHash);
     });
   });
 
