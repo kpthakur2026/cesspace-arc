@@ -3246,7 +3246,7 @@ describe('CesSpace ARC — RC-06 Task 6: Universal Lifecycle & Full-History Star
       return parsed;
     }
 
-    test('RC06-NEG-46: a schema denial whose durable DENIED append fails answers with the bounded audit persistence failure', async () => {
+    test('RC06-T6-REG-33: a schema denial whose durable DENIED append fails answers with the bounded audit persistence failure', async () => {
       const control = await schemaDenialControl();
       assert.equal(control.code, 'PAYLOAD_TOO_LARGE');
 
@@ -3259,7 +3259,7 @@ describe('CesSpace ARC — RC-06 Task 6: Universal Lifecycle & Full-History Star
       );
     });
 
-    test('RC06-NEG-47: a policy denial whose durable DENIED append fails answers with the bounded audit persistence failure', async () => {
+    test('RC06-T6-REG-34: a policy denial whose durable DENIED append fails answers with the bounded audit persistence failure', async () => {
       const controlFixture = makeAuditConfig('neg47-control');
       const controlParts = buildServer(controlFixture);
       await startServer(controlParts);
