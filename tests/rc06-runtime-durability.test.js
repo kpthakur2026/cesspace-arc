@@ -2281,7 +2281,7 @@ describe('CesSpace ARC — RC-06 Task 6: Universal Lifecycle & Full-History Star
    * ======================================================================== */
 
   describe('Task-7 absence and frozen public surface', () => {
-    test('RC06-T6-REG-22: Task-7 audit CLI and offline verifier surfaces remain absent', async () => {
+    test('RC06-T6-REG-22: the audit CLI is local-only and exposes no remote surface', async () => {
       const serverPackage = await import('../apps/mcp-server/dist/index.js');
       const auditPackage = await import('../packages/audit/dist/index.js');
       const forbidden =
@@ -2293,23 +2293,96 @@ describe('CesSpace ARC — RC-06 Task 6: Universal Lifecycle & Full-History Star
         assert.equal(forbidden.test(name), false, `audit package must not export ${name}`);
       }
 
-      // The CLI has no `audit` command head: invoking one is a usage error and
-      // never reaches the admin channel.
+      // Task 7 supplies the `audit` head. The Task-6 invariant it must still
+      // uphold is the one this control always protected: audit administration is
+      // LOCAL OPERATOR ONLY. The command therefore has to work with NO admin
+      // channel configured at all — no `--admin-socket`, no `--admin-key-fd`,
+      // no running server — which is only possible if it never touches admin
+      // IPC. A command that required the admin channel would fail here.
+      // Task 7 supplies the `audit` head. The Task-6 invariant it must still
+      // uphold is the one this control always protected: audit administration is
+      // LOCAL OPERATOR ONLY. The command therefore has to run to its evidence
+      // layer with NO admin channel configured at all — no `--admin-socket`, no
+      // `--admin-key-fd`, no running server — which is only possible if it never
+      // touches admin IPC.
+      const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-rc06-t6-reg22-'));
+      const publicKeyPath = path.join(scratch, 'checkpoint-public.pem');
+      fs.writeFileSync(
+        publicKeyPath,
+        crypto.generateKeyPairSync('ed25519').publicKey.export({ type: 'spki', format: 'pem' }),
+        { mode: 0o600 },
+      );
+
       let cliFailure = null;
       try {
         execFileSync(
           process.execPath,
-          [path.join(REPO_ROOT, 'apps/cli/dist/index.js'), 'audit', 'status'],
-          { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
+          [
+            path.join(REPO_ROOT, 'apps/cli/dist/index.js'),
+            'audit',
+            'status',
+            '--dir',
+            scratch,
+            '--checkpoint-key',
+            publicKeyPath,
+          ],
+          { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: {} },
         );
       } catch (err) {
         cliFailure = err;
+      } finally {
+        fs.rmSync(scratch, { recursive: true, force: true });
       }
-      assert.notEqual(cliFailure, null, 'the CLI must reject an unknown `audit` command');
-      assert.match(
-        `${cliFailure.stdout ?? ''}${cliFailure.stderr ?? ''}`,
-        /usage|unknown|unrecognized|expected/i,
+
+      // The store is absent, so the command MUST fail — but it must fail at the
+      // evidence layer, having needed no admin configuration to get there.
+      assert.notEqual(cliFailure, null, 'an absent store must fail');
+      const output = `${cliFailure.stdout ?? ''}${cliFailure.stderr ?? ''}`;
+      assert.equal(
+        /admin-socket|admin-key-fd|Admin channel is not configured/i.test(output),
+        false,
+        'the audit CLI must not require or mention the admin channel',
       );
+      assert.match(
+        output,
+        /METADATA|AUDIT_|audit-store|missing/i,
+        'the command must reach the evidence layer with no admin channel configured',
+      );
+
+      // The admin options are not part of the audit syntax at all.
+      let adminOptionFailure = null;
+      try {
+        execFileSync(
+          process.execPath,
+          [
+            path.join(REPO_ROOT, 'apps/cli/dist/index.js'),
+            'audit',
+            'status',
+            '--admin-socket',
+            '/tmp/does-not-exist.sock',
+          ],
+          { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: {} },
+        );
+      } catch (err) {
+        adminOptionFailure = err;
+      }
+      assert.notEqual(adminOptionFailure, null, 'audit must reject --admin-socket');
+      assert.equal(adminOptionFailure.status, 2, 'an unknown option is a usage error');
+      assert.match(
+        `${adminOptionFailure.stdout ?? ''}${adminOptionFailure.stderr ?? ''}`,
+        /Unknown option/,
+      );
+
+      // And the local-only surface is not a remote one: no MCP tool name is an
+      // audit-management verb.
+      const advertised = serverPackage.ArcMcpServer?.ALL_TOOL_DEFINITIONS ?? [];
+      for (const tool of advertised) {
+        assert.equal(
+          /^audit/i.test(tool.name),
+          false,
+          `no advertised MCP tool may be an audit surface: ${tool.name}`,
+        );
+      }
     });
 
     test('RC06-T6-REG-23: the public RC version and stage are unchanged by Task 6', async () => {

@@ -684,3 +684,45 @@ export {
   type AuditRuntime,
   type AuditStartupStage,
 } from './startup.js';
+
+/* -------------------------------------------------------------------------- *
+ * RC-06 Task 7 — the local operator verifier and evidence exporter.
+ *
+ * Both are READ ONLY and PUBLIC-KEY ONLY: neither opens the store for writing,
+ * takes the writer lock, repairs evidence, or reads a private signing key. The
+ * names here are deliberately distinct from any runtime/administrative surface,
+ * so a consumer can never mistake an offline observation for a live operation.
+ * -------------------------------------------------------------------------- */
+export {
+  MAX_INSPECT_RECORDS,
+  type RetainedSegmentSource,
+  listRetainedSegmentSources,
+  streamRetainedRecords,
+  type OfflineAnchorOutcome,
+  type OfflineVerificationOptions,
+  type OfflineVerificationResult,
+  verifyOfflineStore,
+  type OfflineAuditStatus,
+  readOfflineAuditStatus,
+  type InspectOptions,
+  inspectRetainedRecords,
+  validateInspectRange,
+} from './verify.js';
+export {
+  MAX_EXPORT_BYTES,
+  BUNDLE_MANIFEST_FILENAME,
+  BUNDLE_AUDIT_DIRNAME,
+  BUNDLE_CHECKPOINTS_DIRNAME,
+  BUNDLE_ANCHORS_DIRNAME,
+  BUNDLE_PUBLIC_KEYS_DIRNAME,
+  BUNDLE_CHECKPOINT_KEY_FILENAME,
+  BUNDLE_ANCHOR_KEY_FILENAME,
+  type ManifestFileEntry,
+  type ExportManifest,
+  type ExportEvidenceOptions,
+  type ExportEvidenceResult,
+  assertExportWithinBudget,
+  exportEvidenceBundle,
+  type VerifyBundleResult,
+  verifyEvidenceBundle,
+} from './export.js';
