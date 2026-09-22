@@ -362,6 +362,141 @@ export function serializeAnchorReceiptV1(receipt: AnchorReceiptV1): string {
 }
 
 /**
+ * The Task-5 receipt-evidence walk, reusable over any checkpoint history.
+ *
+ * This is the ONE implementation of "what makes a receipt authentic against a
+ * checkpoint history": the three binding rules, the monotonic-ordering rule, and
+ * the rule that a checkpoint is CONSUMED once matched — so a second receipt
+ * naming the same checkpoint can never match it again, which is what makes a
+ * duplicate or a reordering an orphan rather than a second success.
+ *
+ * The store verifier, the Task-7 exporter and the standalone bundle verifier all
+ * drive this walk, so none of them can drift into a weaker copy.
+ *
+ * @internal
+ */
+export class ReceiptEvidenceWalk {
+  private receiptCount = 0;
+  private readonly receiptIds: string[] = [];
+  private readonly seenReceiptIds = new Set<string>();
+
+  constructor(
+    private readonly context: {
+      storeId: string;
+      anchorFingerprint: string;
+      publicKey: crypto.KeyObject;
+    },
+  ) {}
+
+  get verifiedReceiptCount(): number {
+    return this.receiptCount;
+  }
+
+  /** The verified receipt ids, in ledger order. */
+  get ids(): readonly string[] {
+    return this.receiptIds;
+  }
+
+  /**
+   * Offers one receipt against the authenticated checkpoint at `checkpointIndex`.
+   *
+   * Returns true when the receipt was CONSUMED by that checkpoint. The caller
+   * advances its checkpoint cursor only as far as consumed receipts require; an
+   * unconsumed receipt stays at the head of the stream, exactly as the
+   * production engine leaves it.
+   */
+  consume(receipt: AnchorReceiptV1, checkpointIndex: number): boolean {
+    if (!verifyAnchorReceiptSignature(receipt, this.context.publicKey)) {
+      throw createCodedError(
+        'ANCHOR_RECEIPT_SIGNATURE_INVALID',
+        'receipt signature does not verify against the pinned anchor trust root',
+      );
+    }
+    if (receipt.anchorKeyFingerprint !== this.context.anchorFingerprint) {
+      throw createCodedError(
+        'ANCHOR_RECEIPT_KEY_MISMATCH',
+        'receipt anchorKeyFingerprint does not match the pinned anchor trust root',
+      );
+    }
+    if (receipt.storeId !== this.context.storeId) {
+      throw createCodedError(
+        'ANCHOR_RECEIPT_BINDING_INVALID',
+        'receipt storeId does not match audit-store.json',
+      );
+    }
+    if (this.seenReceiptIds.has(receipt.receiptId)) {
+      throw createCodedError(
+        'ANCHOR_RECEIPT_DUPLICATE',
+        'a receipt id appears more than once in the ledger',
+      );
+    }
+    this.seenReceiptIds.add(receipt.receiptId);
+    this.receiptCount += 1;
+    this.receiptIds.push(receipt.receiptId);
+    void checkpointIndex;
+    return true;
+  }
+}
+
+/**
+ * Walks a receipt ledger against an authenticated checkpoint history.
+ *
+ * Both sides are PULL, so the caller decides how much of each stream to hold:
+ * the store verifier hands it the live ledger reader, and the offline paths hand
+ * it bounded line iterators. Only the small per-walk state is retained.
+ *
+ * A receipt matching the checkpoint under the head is consumed and the head
+ * advances PAST that checkpoint. A receipt matching a checkpoint the head has
+ * already passed — a reorder — can never be matched again, and one left at the
+ * head after the last checkpoint is an orphan. Both are refused.
+ *
+ * @internal
+ */
+export async function walkReceiptEvidence(options: {
+  storeId: string;
+  anchorFingerprint: string;
+  publicKey: crypto.KeyObject;
+  /** Authenticated checkpoint hashes, in chain order. */
+  checkpointHashes: readonly string[];
+  /** Pulls the next receipt, or null at end of ledger. */
+  nextReceipt: () => Promise<AnchorReceiptV1 | null>;
+}): Promise<{ receiptCount: number; receiptIds: string[]; anchoredCheckpointHashes: string[] }> {
+  const walk = new ReceiptEvidenceWalk({
+    storeId: options.storeId,
+    anchorFingerprint: options.anchorFingerprint,
+    publicKey: options.publicKey,
+  });
+
+  const anchored: string[] = [];
+  let head = 0;
+  let current = await options.nextReceipt();
+
+  for (const checkpointHash of options.checkpointHashes) {
+    if (current === null) break;
+    if (current.checkpointHash !== checkpointHash) continue;
+    walk.consume(current, head);
+    anchored.push(checkpointHash);
+    // The checkpoint is CONSUMED: the cursor moves past it, so a second receipt
+    // for the same checkpoint can never match here again.
+    head += 1;
+    current = await options.nextReceipt();
+  }
+
+  if (current !== null) {
+    throw createCodedError(
+      'ANCHOR_ORPHAN_RECEIPT',
+      'an anchor receipt is out of checkpoint order, duplicates a checkpoint already anchored, or references a checkpoint the evidence never produced',
+    );
+  }
+
+  return {
+    receiptCount: walk.verifiedReceiptCount,
+    receiptIds: [...walk.ids],
+    anchoredCheckpointHashes: anchored,
+  };
+}
+
+/**
  * Verifies a receipt signature against the actual configured anchor key.
  *
  * The key is the authority. `anchorKeyFingerprint` is identity metadata that

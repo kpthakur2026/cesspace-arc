@@ -644,6 +644,8 @@ export {
   validateAnchorReceiptV1,
   computeAnchorReceiptSignaturePreimage,
   verifyAnchorReceiptSignature,
+  ReceiptEvidenceWalk,
+  walkReceiptEvidence,
   serializeAnchorReceiptV1,
   parseAndValidateAnchorReceiptLineV1,
   computeAnchorReceiptPublicKeyFingerprint,

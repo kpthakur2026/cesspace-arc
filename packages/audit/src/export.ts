@@ -87,7 +87,7 @@ import {
 } from './internal/anchor-paths.js';
 import {
   parseAndValidateAnchorReceiptLineV1,
-  verifyAnchorReceiptSignature,
+  walkReceiptEvidence,
   type AnchorReceiptV1,
 } from './anchor.js';
 import {
@@ -621,30 +621,27 @@ function closeBundleWriter(writer: BundleWriter): void {
  * bundle left behind is strictly better than deleting somebody else's directory.
  */
 function cleanupBundleRoot(writer: BundleWriter): void {
-  let leafIsOurs: boolean;
+  // Deletion authority is consumed while the pinned parent is STILL OPEN, and
+  // through the descriptor-pinned leaf path — never through `writer.root`, which
+  // is a mutable name that may since have been pointed at somebody else's
+  // directory. Identity is proven first; if it cannot be, the partial bundle is
+  // deliberately left behind.
   try {
     const leafPath = pinnedChildPath(writer.parentFd, writer.leafName);
     const stats = fs.lstatSync(leafPath);
-    leafIsOurs =
+    if (
       !stats.isSymbolicLink() &&
       Number(stats.dev) === writer.rootIdentity.dev &&
-      Number(stats.ino) === writer.rootIdentity.ino;
-  } catch {
-    leafIsOurs = false;
-  }
-
-  if (!leafIsOurs) {
-    closeBundleWriter(writer);
-    return;
-  }
-
-  closeBundleWriter(writer);
-  try {
-    fs.rmSync(writer.root, { recursive: true, force: false });
+      Number(stats.ino) === writer.rootIdentity.ino
+    ) {
+      fs.rmSync(leafPath, { recursive: true, force: false });
+    }
   } catch {
     // Best-effort by design: a failure to tidy up must never mask the original
     // export failure, and must never escalate into deleting an object whose
     // identity was not proven.
+  } finally {
+    closeBundleWriter(writer);
   }
 }
 
@@ -862,60 +859,6 @@ function authenticateCheckpointSequence(
   }
 }
 
-/**
- * Applies every Task-5 rule that binds a receipt to a store, a key and a
- * checkpoint, including the ORDERING rule.
- *
- * The ledger is a monotonic subsequence of authenticated checkpoint order: a
- * receipt is consumed against the checkpoint currently under the head, and the
- * head only ever advances. A receipt whose checkpoint lies BEHIND the head —
- * which is exactly what a reordered pair looks like — can therefore never be
- * matched again, and is refused as an orphan, just as the production engine
- * refuses it.
- */
-function authenticateReceiptSequence(
-  receipts: readonly AnchorReceiptV1[],
-  context: {
-    storeId: string;
-    anchorFingerprint: string;
-    publicKey: crypto.KeyObject;
-    /** Authenticated checkpoint hashes, in chain order. */
-    checkpointHashes: readonly string[];
-  },
-): void {
-  const seen = new Set<string>();
-  let head = 0;
-  for (const receipt of receipts) {
-    if (!verifyAnchorReceiptSignature(receipt, context.publicKey)) {
-      throw createCodedError(
-        'BUNDLE_RECEIPT_SIGNATURE_INVALID',
-        'an anchor receipt signature does not verify',
-      );
-    }
-    if (receipt.anchorKeyFingerprint !== context.anchorFingerprint) {
-      throw createCodedError(
-        'BUNDLE_RECEIPT_KEY_MISMATCH',
-        'a receipt is bound to a different key than the one pinned',
-      );
-    }
-    if (receipt.storeId !== context.storeId) {
-      throw createCodedError('BUNDLE_RECEIPT_STORE_MISMATCH', 'a receipt names a different store');
-    }
-    const at = context.checkpointHashes.indexOf(receipt.checkpointHash, head);
-    if (at === -1) {
-      throw createCodedError(
-        'BUNDLE_RECEIPT_ORPHAN',
-        'an anchor receipt is out of checkpoint order, or references a checkpoint that is not in the evidence',
-      );
-    }
-    head = at;
-    if (seen.has(receipt.receiptId)) {
-      throw createCodedError('BUNDLE_RECEIPT_DUPLICATE', 'a receipt id appears more than once');
-    }
-    seen.add(receipt.receiptId);
-  }
-}
-
 /* -------------------------------------------------------------------------- *
  * Manifest sizing
  * -------------------------------------------------------------------------- */
@@ -1102,6 +1045,18 @@ export async function exportEvidenceBundle(
     chainBySequence.set(primary.active.terminalSequence, primary.active.terminalRecordHash);
   }
 
+  // Content binding for the ledgers. Device, inode and size cannot see an
+  // in-place rewrite, so the exact bytes of each source ledger are digested
+  // before authentication and re-digested once the bundle is written.
+  const checkpointLedgerDigest = fs.existsSync(path.join(options.directory, CHECKPOINT_FILENAME))
+    ? await digestFileAt(path.join(options.directory, CHECKPOINT_FILENAME))
+    : null;
+  const receiptLedgerPath = path.join(options.directory, ANCHOR_RECEIPT_FILENAME);
+  const receiptLedgerDigest =
+    metadata.anchorMode === 'ENABLED' && fs.existsSync(receiptLedgerPath)
+      ? await digestFileAt(receiptLedgerPath)
+      : null;
+
   const checkpointLines: string[] = [];
   const checkpointObjects: AuditCheckpointV1[] = [];
   const checkpointLedgerPath = path.join(options.directory, CHECKPOINT_FILENAME);
@@ -1157,11 +1112,15 @@ export async function exportEvidenceBundle(
       purpose: 'ANCHOR_RECEIPT',
       expectedUid,
     });
-    authenticateReceiptSequence(receiptObjects, {
+    await walkReceiptEvidence({
       storeId: metadata.storeId,
       anchorFingerprint,
       publicKey: anchorTrustRoot.publicKey,
       checkpointHashes,
+      nextReceipt: (() => {
+        let index = 0;
+        return async () => (index < receiptObjects.length ? receiptObjects[index++] : null);
+      })(),
     });
   }
 
@@ -1266,20 +1225,84 @@ export async function exportEvidenceBundle(
       Buffer.from(`${canonicalJsonV1(manifest)}\n`, 'utf8'),
     );
 
+    // The ledgers must still be the bytes that were authenticated.
+    if (
+      checkpointLedgerDigest !== null &&
+      (await digestFileAt(path.join(options.directory, CHECKPOINT_FILENAME))) !==
+        checkpointLedgerDigest
+    ) {
+      throw createCodedError(
+        'EXPORT_SOURCE_CHANGED',
+        'the checkpoint ledger changed after its evidence was authenticated',
+      );
+    }
+    if (
+      receiptLedgerDigest !== null &&
+      (await digestFileAt(receiptLedgerPath)) !== receiptLedgerDigest
+    ) {
+      throw createCodedError(
+        'EXPORT_SOURCE_CHANGED',
+        'the anchor receipt ledger changed after its evidence was authenticated',
+      );
+    }
+
     const totalBytes = writer.totalBytes;
     const fileCount = writer.fileHashes.size;
-    closeBundleWriter(writer);
 
-    // Success is bound to the emitted bytes: the bundle must authenticate end to
-    // end, from its own contents and public material alone, before this call
-    // reports success.
+    // Success is bound to the EXACT directory this invocation created: the
+    // pinned descriptors stay open across the verification, and the leaf is
+    // proven to still name rootIdentity both BEFORE and AFTER it. A swap that
+    // lands before or during verification therefore fails the trailing proof
+    // rather than letting success be reported for a different object.
+    const leafBefore = fs.lstatSync(pinnedChildPath(writer.parentFd, writer.leafName));
+    if (
+      leafBefore.isSymbolicLink() ||
+      Number(leafBefore.dev) !== writer.rootIdentity.dev ||
+      Number(leafBefore.ino) !== writer.rootIdentity.ino
+    ) {
+      throw createCodedError(
+        'EXPORT_DESTINATION_REPLACED',
+        'the export destination no longer names the bundle this invocation created',
+      );
+    }
+
     await verifyEvidenceBundle(destination);
 
+    const leaf = fs.lstatSync(pinnedChildPath(writer.parentFd, writer.leafName));
+    if (
+      leaf.isSymbolicLink() ||
+      Number(leaf.dev) !== writer.rootIdentity.dev ||
+      Number(leaf.ino) !== writer.rootIdentity.ino
+    ) {
+      throw createCodedError(
+        'EXPORT_DESTINATION_REPLACED',
+        'the export destination no longer names the bundle this invocation created',
+      );
+    }
+
+    closeBundleWriter(writer);
     return { outputDirectory: destination, manifest, fileCount, totalBytes };
   } catch (err) {
     cleanupBundleRoot(writer);
     throw err;
   }
+}
+
+/** A streamed digest of one source file's exact bytes. */
+async function digestFileAt(filePath: string): Promise<string> {
+  const fd = fs.openSync(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  const hash = crypto.createHash('sha256');
+  const buffer = Buffer.allocUnsafe(65_536);
+  try {
+    for (;;) {
+      const read = fs.readSync(fd, buffer, 0, buffer.length, null);
+      if (read === 0) break;
+      hash.update(buffer.subarray(0, read));
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  return hash.digest('hex');
 }
 
 /** The SPKI fingerprint of a PEM public key held in memory. */
@@ -1464,11 +1487,15 @@ export async function verifyEvidenceBundle(bundleDirectory: string): Promise<Ver
       throw createCodedError('BUNDLE_KEY_MISSING', 'the bundle carries receipts but no anchor key');
     }
     const anchorKey = loadEd25519TrustRootFile(anchorKeyPath, { purpose: 'ANCHOR_RECEIPT' });
-    authenticateReceiptSequence(receipts, {
+    await walkReceiptEvidence({
       storeId: manifest.storeId,
       anchorFingerprint: anchorKey.fingerprint,
       publicKey: anchorKey.publicKey,
       checkpointHashes: manifestHashes,
+      nextReceipt: (() => {
+        let index = 0;
+        return async () => (index < receipts.length ? receipts[index++] : null);
+      })(),
     });
   }
   const seenReceiptIds = receipts.map((receipt) => receipt.receiptId);

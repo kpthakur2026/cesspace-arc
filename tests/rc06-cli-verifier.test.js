@@ -33,6 +33,7 @@ import { fileURLToPath } from 'node:url';
 import {
   ANCHOR_IDEMPOTENCY_HEADER,
   computeCheckpointHash,
+  serializeAnchorReceiptV1,
   MAX_EXPORT_BYTES,
   METADATA_FILENAME,
   MAX_INSPECT_RECORDS,
@@ -1947,6 +1948,8 @@ describe('CesSpace ARC — RC-06 Task 7: Local Operator CLI & Standalone Offline
           }),
         ),
         [
+          'ANCHOR_RECEIPT_BINDING_INVALID',
+          'ANCHOR_RECEIPT_SIGNATURE_INVALID',
           'BUNDLE_RECEIPT_STORE_MISMATCH',
           'BUNDLE_RECEIPT_SIGNATURE_INVALID',
           'AUDIT_CORRUPTION_DETECTED',
@@ -1960,6 +1963,8 @@ describe('CesSpace ARC — RC-06 Task 7: Local Operator CLI & Standalone Offline
           }),
         ),
         [
+          'ANCHOR_RECEIPT_KEY_MISMATCH',
+          'ANCHOR_RECEIPT_SIGNATURE_INVALID',
           'BUNDLE_RECEIPT_KEY_MISMATCH',
           'BUNDLE_RECEIPT_SIGNATURE_INVALID',
           'AUDIT_CORRUPTION_DETECTED',
@@ -2233,7 +2238,11 @@ describe('CesSpace ARC — RC-06 Task 7: Local Operator CLI & Standalone Offline
           anchorReceiptPublicKeyPath: fixture.anchorMaterial.publicKeyPath,
           workspacePaths: [],
         }),
-        ['BUNDLE_RECEIPT_SIGNATURE_INVALID', 'AUDIT_CORRUPTION_DETECTED'],
+        [
+          'ANCHOR_RECEIPT_SIGNATURE_INVALID',
+          'BUNDLE_RECEIPT_SIGNATURE_INVALID',
+          'AUDIT_CORRUPTION_DETECTED',
+        ],
       );
       assert.equal(
         fs.existsSync(destination),
@@ -2555,7 +2564,7 @@ describe('CesSpace ARC — RC-06 Task 7: Local Operator CLI & Standalone Offline
           anchorReceiptPublicKeyPath: fixture.anchorMaterial.publicKeyPath,
           workspacePaths: [],
         }),
-        ['BUNDLE_RECEIPT_ORPHAN', 'BUNDLE_RECEIPT_DUPLICATE'],
+        ['ANCHOR_ORPHAN_RECEIPT', 'ANCHOR_RECEIPT_DUPLICATE', 'BUNDLE_RECEIPT_ORPHAN'],
       );
 
       // The standalone bundle verifier applies the same ordering rule.
@@ -2578,10 +2587,200 @@ describe('CesSpace ARC — RC-06 Task 7: Local Operator CLI & Standalone Offline
           `${goodLines[1]}\n${goodLines[0]}\n`,
         );
         await assertRejectsWithCode(verifyEvidenceBundle(good), [
+          'ANCHOR_ORPHAN_RECEIPT',
+          'ANCHOR_RECEIPT_DUPLICATE',
           'BUNDLE_RECEIPT_ORPHAN',
-          'BUNDLE_RECEIPT_DUPLICATE',
         ]);
       }
+    });
+  });
+
+  /* ====================================================================== *
+   * 14. Descriptor-bound authority and ledger content binding
+   * ====================================================================== */
+
+  describe('14. Descriptor-bound authority', () => {
+    test('RC06-T7-REG-61: two validly signed receipts for the SAME checkpoint are refused', async () => {
+      const fixture = makeAuditConfig('reg61', { anchor: true });
+      await buildStore(fixture, { records: 5, rotateAt: [3] });
+
+      const ledgerPath = path.join(fixture.auditDir, 'audit-anchors.jsonl');
+      const lines = fs.readFileSync(ledgerPath, 'utf8').slice(0, -1).split('\n');
+      assert.equal(lines.length, 1, 'the fixture must carry one receipt');
+
+      // A SECOND, differently-idd genuinly signed receipt for the SAME
+      // checkpoint. Every binding rule passes on it in isolation; what is wrong
+      // is that the checkpoint it names has already been consumed.
+      const original = JSON.parse(lines[0]);
+      const second = signTestAnchorReceipt(
+        {
+          version: 1,
+          storeId: original.storeId,
+          receiptId: crypto.randomUUID(),
+          checkpointHash: original.checkpointHash,
+          anchorTimestamp: original.anchorTimestamp,
+          anchorKeyFingerprint: original.anchorKeyFingerprint,
+        },
+        fixture.anchorMaterial.privateKey,
+      );
+      assert.notEqual(second.receiptId, original.receiptId);
+      // The ledger requires canonical JSON, so the line is produced by the
+      // package's own serializer rather than by JSON.stringify.
+      const secondLine = serializeAnchorReceiptV1(second).trimEnd();
+      fs.writeFileSync(ledgerPath, `${lines[0]}\n${secondLine}\n`, { mode: 0o600 });
+
+      const base = newRoot('reg61-out');
+      await assertRejectsWithCode(
+        exportEvidenceBundle({
+          directory: fixture.auditDir,
+          outputDirectory: path.join(base, 'bundle'),
+          checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
+          anchorReceiptPublicKeyPath: fixture.anchorMaterial.publicKeyPath,
+          workspacePaths: [],
+        }),
+        ['ANCHOR_ORPHAN_RECEIPT', 'ANCHOR_RECEIPT_DUPLICATE'],
+      );
+
+      // The standalone bundle verifier refuses it too.
+      await assertRejectsWithCode(
+        verifyEvidenceBundle(
+          await (async () => {
+            fs.writeFileSync(ledgerPath, `${lines[0]}\n`, { mode: 0o600 });
+            const good = path.join(newRoot('reg61-good'), 'bundle');
+            await exportEvidenceBundle({
+              directory: fixture.auditDir,
+              outputDirectory: good,
+              checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
+              anchorReceiptPublicKeyPath: fixture.anchorMaterial.publicKeyPath,
+              workspacePaths: [],
+            });
+            rewriteBundleFile(good, 'anchors/audit-anchors.jsonl', `${lines[0]}\n${secondLine}\n`);
+            return good;
+          })(),
+        ),
+        ['ANCHOR_ORPHAN_RECEIPT', 'ANCHOR_RECEIPT_DUPLICATE'],
+      );
+    });
+
+    test('RC06-T7-REG-62: cleanup never deletes through a substituted destination pathname', async () => {
+      const fixture = await multiSegmentFixture('reg62');
+      const base = newRoot('reg62-out');
+      const destination = path.join(base, 'bundle');
+
+      const pending = exportEvidenceBundle({
+        directory: fixture.auditDir,
+        outputDirectory: destination,
+        checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
+        workspacePaths: [],
+      });
+      for (let attempt = 0; attempt < 20000; attempt += 1) {
+        if (fs.existsSync(path.join(destination, 'manifest.json'))) break;
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+
+      const original = path.join(base, 'bundle-original');
+      fs.renameSync(destination, original);
+      fs.mkdirSync(destination, { mode: 0o700 });
+      fs.writeFileSync(path.join(destination, 'unrelated.txt'), 'survive\n', { mode: 0o600 });
+
+      await assert.rejects(pending);
+
+      // Deletion authority is consumed through the pinned parent, where the leaf
+      // is proven NOT to be the created bundle, so nothing is removed.
+      assert.equal(
+        fs.readFileSync(path.join(destination, 'unrelated.txt'), 'utf8'),
+        'survive\n',
+        'the unrelated replacement must survive untouched',
+      );
+    });
+
+    test('RC06-T7-REG-63: a destination replaced before final verification never yields success', async () => {
+      const fixture = await multiSegmentFixture('reg63');
+      const base = newRoot('reg63-out');
+      const destination = path.join(base, 'bundle');
+
+      const pending = exportEvidenceBundle({
+        directory: fixture.auditDir,
+        outputDirectory: destination,
+        checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
+        workspacePaths: [],
+      });
+      for (let attempt = 0; attempt < 20000; attempt += 1) {
+        if (fs.existsSync(path.join(destination, 'manifest.json'))) break;
+        await new Promise((resolve) => setImmediate(resolve));
+      }
+
+      // Replace the visible destination with a DIFFERENT directory that also
+      // carries a manifest, so only the descriptor-bound identity proof can tell
+      // it is not this invocation's bundle.
+      const original = path.join(base, 'bundle-original');
+      fs.renameSync(destination, original);
+      fs.mkdirSync(destination, { mode: 0o700 });
+      fs.mkdirSync(path.join(destination, 'audit'), { mode: 0o700 });
+      fs.mkdirSync(path.join(destination, 'checkpoints'), { mode: 0o700 });
+      fs.mkdirSync(path.join(destination, 'anchors'), { mode: 0o700 });
+      fs.mkdirSync(path.join(destination, 'public-keys'), { mode: 0o700 });
+      fs.copyFileSync(
+        path.join(original, 'manifest.json'),
+        path.join(destination, 'manifest.json'),
+      );
+
+      let succeeded = false;
+      try {
+        await pending;
+        succeeded = true;
+      } catch {
+        // expected
+      }
+      assert.equal(succeeded, false, 'export must never report success for a replacement object');
+    });
+
+    test('RC06-T7-REG-64: a same-inode same-size checkpoint-ledger rewrite cannot be exported', async () => {
+      const fixture = await multiSegmentFixture('reg64');
+      const ledgerPath = path.join(fixture.auditDir, 'audit-checkpoints.jsonl');
+      const pristine = fs.readFileSync(ledgerPath);
+      const inode = fs.statSync(ledgerPath).ino;
+
+      const base = newRoot('reg64-out');
+      const pending = exportEvidenceBundle({
+        directory: fixture.auditDir,
+        outputDirectory: path.join(base, 'bundle'),
+        checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
+        workspacePaths: [],
+      });
+
+      // Rewrite IN PLACE: same inode, same length.
+      const fd = fs.openSync(ledgerPath, 'r+');
+      fs.writeSync(fd, Buffer.from('X'), 0, 1, 40);
+      fs.closeSync(fd);
+      assert.equal(fs.statSync(ledgerPath).ino, inode, 'the inode must be preserved');
+      assert.equal(fs.statSync(ledgerPath).size, pristine.length, 'the size must be preserved');
+
+      await assert.rejects(pending);
+      fs.writeFileSync(ledgerPath, pristine, { mode: 0o600 });
+    });
+
+    test('RC06-T7-REG-65: a same-inode same-size receipt-ledger rewrite cannot be exported', async () => {
+      const fixture = makeAuditConfig('reg65', { anchor: true });
+      await buildStore(fixture, { records: 5, rotateAt: [3] });
+      const ledgerPath = path.join(fixture.auditDir, 'audit-anchors.jsonl');
+      const pristine = fs.readFileSync(ledgerPath);
+
+      const base = newRoot('reg65-out');
+      const pending = exportEvidenceBundle({
+        directory: fixture.auditDir,
+        outputDirectory: path.join(base, 'bundle'),
+        checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
+        anchorReceiptPublicKeyPath: fixture.anchorMaterial.publicKeyPath,
+        workspacePaths: [],
+      });
+
+      const fd = fs.openSync(ledgerPath, 'r+');
+      fs.writeSync(fd, Buffer.from('Y'), 0, 1, 20);
+      fs.closeSync(fd);
+
+      await assert.rejects(pending);
+      fs.writeFileSync(ledgerPath, pristine, { mode: 0o600 });
     });
   });
 });
