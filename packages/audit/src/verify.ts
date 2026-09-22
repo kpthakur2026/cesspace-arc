@@ -76,7 +76,11 @@ import {
   assertDescriptorPinnedTraversalAvailable,
   pinnedChildPath,
 } from './internal/anchor-paths.js';
-import { parseAndValidateAnchorReceiptLineV1, walkReceiptEvidence } from './anchor.js';
+import {
+  parseAndValidateAnchorReceiptLineV1,
+  walkReceiptEvidence,
+  type AuthenticatedCheckpointFact,
+} from './anchor.js';
 
 /* -------------------------------------------------------------------------- *
  * Frozen bounds (rc06 §24.1)
@@ -173,7 +177,7 @@ export function listRetainedSegmentSources(
  * validation, so a symlink or a foreign-owned or over-linked artifact fails the
  * read rather than being followed.
  */
-function openArtifactFd(filePath: string, label: string, expectedUid: number): number {
+export function openArtifactFd(filePath: string, label: string, expectedUid: number): number {
   let fd: number;
   try {
     fd = fs.openSync(filePath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
@@ -195,13 +199,13 @@ function openArtifactFd(filePath: string, label: string, expectedUid: number): n
 }
 
 /** Identity of an artifact whose bytes are being read. */
-interface ArtifactIdentity {
+export interface ArtifactIdentity {
   dev: number;
   ino: number;
   size: number;
 }
 
-function captureIdentity(fd: number): ArtifactIdentity {
+export function captureIdentity(fd: number): ArtifactIdentity {
   const stats = fs.fstatSync(fd);
   return { dev: Number(stats.dev), ino: Number(stats.ino), size: Number(stats.size) };
 }
@@ -214,30 +218,24 @@ function captureIdentity(fd: number): ArtifactIdentity {
  * materialized. Only LF-terminated lines are yielded — an unterminated trailing
  * line is a torn tail, which verification reports rather than repairs.
  */
-async function* streamSegmentRecords(
-  source: RetainedSegmentSource,
-  expectedUid: number,
-  strictFraming: boolean,
+export async function* streamSegmentRecordsFromFd(
+  fd: number,
+  label: string,
+  compressed: boolean,
+  strictFraming: boolean = true,
+  autoClose: boolean = true,
 ): AsyncGenerator<PersistentAuditRecordV1> {
-  const fd = openArtifactFd(source.filePath, source.label, expectedUid);
   let stream: NodeJS.ReadableStream = fs.createReadStream(null as unknown as fs.PathLike, {
     fd,
-    autoClose: true,
+    autoClose,
   });
-  if (source.compressed) {
+  if (compressed) {
     stream = stream.pipe(zlib.createGunzip());
   }
 
   if (strictFraming) {
-    // A line reader that strips terminators would accept an unterminated final
-    // fragment as a perfectly good record. Where the framing itself is part of
-    // the contract — bundle verification — the bytes are framed here instead,
-    // and a fragment with no terminator is a corruption rather than a record.
     let carry: Buffer = Buffer.alloc(0);
-    for await (const chunk of consumeDecompressible(
-      stream,
-      source.label,
-    ) as AsyncIterable<Buffer>) {
+    for await (const chunk of consumeDecompressible(stream, label) as AsyncIterable<Buffer>) {
       carry = carry.length === 0 ? Buffer.from(chunk) : Buffer.concat([carry, chunk]);
       for (;;) {
         const index = carry.indexOf(0x0a);
@@ -247,28 +245,24 @@ async function* streamSegmentRecords(
         if (line.length === 0) continue;
         yield parseAndValidateRecordLineV1(`${line}\n`).record;
       }
-      // A pathological artifact with no terminator must fail on the bounded
-      // record limit, not grow the framing buffer until the process dies. The
-      // ceiling is the frozen per-record maximum, so a whole 10 MiB segment can
-      // never be buffered merely because it contains no LF.
       if (carry.length > MAX_RECORD_BYTES) {
         throw createCodedError(
           'AUDIT_CORRUPTION_DETECTED',
-          `${source.label} contains a record longer than ${MAX_RECORD_BYTES} bytes`,
+          `${label} contains a record longer than ${MAX_RECORD_BYTES} bytes`,
         );
       }
     }
     if (carry.length > 0) {
       throw createCodedError(
         'AUDIT_CORRUPTION_DETECTED',
-        `${source.label} ends in an unterminated record line`,
+        `${label} ends in an unterminated record line`,
       );
     }
     return;
   }
 
   const lines = readline.createInterface({
-    input: Readable.from(consumeDecompressible(stream, source.label)),
+    input: Readable.from(consumeDecompressible(stream, label)),
     crlfDelay: Infinity,
   });
   try {
@@ -279,6 +273,15 @@ async function* streamSegmentRecords(
   } finally {
     lines.close();
   }
+}
+
+async function* streamSegmentRecords(
+  source: RetainedSegmentSource,
+  expectedUid: number,
+  strictFraming: boolean,
+): AsyncGenerator<PersistentAuditRecordV1> {
+  const fd = openArtifactFd(source.filePath, source.label, expectedUid);
+  yield* streamSegmentRecordsFromFd(fd, source.label, source.compressed, strictFraming, true);
 }
 
 /**
@@ -456,13 +459,12 @@ export function assertInventoryUnchanged(
  * no terminator is corruption, never a line, and an over-long fragment fails on
  * the frozen per-record ceiling rather than growing the buffer.
  */
-export async function* streamLedgerLines(
-  filePath: string,
+export async function* streamLedgerLinesFromFd(
+  fd: number,
   label: string,
-  expectedUid: number = getProcessUid(),
+  autoClose: boolean = false,
 ): AsyncGenerator<string> {
-  const fd = openArtifactFd(filePath, label, expectedUid);
-  const stream = fs.createReadStream(null as unknown as fs.PathLike, { fd, autoClose: true });
+  const stream = fs.createReadStream(null as unknown as fs.PathLike, { fd, autoClose });
 
   let carry: Buffer = Buffer.alloc(0);
   try {
@@ -487,7 +489,7 @@ export async function* streamLedgerLines(
       }
     }
   } finally {
-    // The stream owns the descriptor and closes it.
+    // The stream autoClose handles closing if requested.
   }
 
   if (carry.length > 0) {
@@ -495,19 +497,33 @@ export async function* streamLedgerLines(
   }
 }
 
+export async function* streamLedgerLines(
+  filePath: string,
+  label: string,
+  expectedUid: number = getProcessUid(),
+): AsyncGenerator<string> {
+  const fd = openArtifactFd(filePath, label, expectedUid);
+  yield* streamLedgerLinesFromFd(fd, label, true);
+}
+
 /* -------------------------------------------------------------------------- *
  * Anchor receipt ledger — offline verification
  * -------------------------------------------------------------------------- */
 
+export type VerifiedReceiptArtifactState =
+  | { kind: 'ABSENT' }
+  | { kind: 'PRESENT'; dev: number; ino: number; size: number; bytes: number; sha256: string };
+
 /** The outcome of checking the Tier-3 receipt ledger. */
 export type OfflineAnchorOutcome =
-  | { configured: false }
+  | { configured: false; artifactState?: VerifiedReceiptArtifactState }
   | {
       configured: true;
       receiptCount: number;
       publicKeyFingerprint: string;
       /** Checkpoint hashes that carry at least one verified receipt. */
       anchoredCheckpointHashes: string[];
+      artifactState: VerifiedReceiptArtifactState;
     };
 
 function lstatOrNull(target: string): fs.Stats | null {
@@ -517,6 +533,15 @@ function lstatOrNull(target: string): fs.Stats | null {
     if ((cause as NodeJS.ErrnoException).code === 'ENOENT') return null;
     throw cause;
   }
+}
+
+export interface VerifyAnchorLedgerOfflineOptions {
+  directory: string;
+  metadata: AuditStoreMetadataV1;
+  anchorReceiptPublicKeyPath: string | undefined;
+  checkpointsInOrder?: readonly AuditCheckpointV1[];
+  nextCheckpoint?: () => Promise<AuthenticatedCheckpointFact | string | null>;
+  expectedUid?: number;
 }
 
 /**
@@ -535,14 +560,11 @@ function lstatOrNull(target: string): fs.Stats | null {
  * out-of-order line, neither of which can advance the head again — is left
  * unmatched at the end of the walk and fails as an orphan.
  */
-async function verifyAnchorLedgerOffline(options: {
-  directory: string;
-  metadata: AuditStoreMetadataV1;
-  anchorReceiptPublicKeyPath: string | undefined;
-  checkpointsInOrder: readonly AuditCheckpointV1[];
-  expectedUid: number;
-}): Promise<OfflineAnchorOutcome> {
-  const { directory, metadata, checkpointsInOrder, expectedUid } = options;
+export async function verifyAnchorLedgerOffline(
+  options: VerifyAnchorLedgerOfflineOptions,
+): Promise<OfflineAnchorOutcome> {
+  const { directory, metadata, checkpointsInOrder, nextCheckpoint } = options;
+  const expectedUid = options.expectedUid ?? getProcessUid();
 
   if (metadata.anchorMode === 'DISABLED') {
     // A store whose durable metadata says anchoring is off must not be silently
@@ -562,7 +584,7 @@ async function verifyAnchorLedgerOffline(options: {
         `${ANCHOR_RECEIPT_FILENAME} exists in a store whose metadata records anchorMode DISABLED`,
       );
     }
-    return { configured: false };
+    return { configured: false, artifactState: { kind: 'ABSENT' } };
   }
 
   const keyPath = options.anchorReceiptPublicKeyPath;
@@ -602,13 +624,15 @@ async function verifyAnchorLedgerOffline(options: {
         receiptCount: 0,
         publicKeyFingerprint: trustRoot.fingerprint,
         anchoredCheckpointHashes: [],
+        artifactState: { kind: 'ABSENT' },
       };
     }
     return await readAndVerifyLedger({
       ledgerPath,
       metadata,
       trustRoot,
-      checkpointsInOrder,
+      ...(checkpointsInOrder !== undefined ? { checkpointsInOrder } : {}),
+      ...(nextCheckpoint !== undefined ? { nextCheckpoint } : {}),
       expectedUid,
     });
   } finally {
@@ -626,14 +650,19 @@ async function readAndVerifyLedger(options: {
   ledgerPath: string;
   metadata: AuditStoreMetadataV1;
   trustRoot: { publicKey: crypto.KeyObject; fingerprint: string };
-  checkpointsInOrder: readonly AuditCheckpointV1[];
+  checkpointsInOrder?: readonly AuditCheckpointV1[];
+  nextCheckpoint?: () => Promise<AuthenticatedCheckpointFact | string | null>;
   expectedUid: number;
 }): Promise<OfflineAnchorOutcome> {
-  const { ledgerPath, metadata, trustRoot, checkpointsInOrder, expectedUid } = options;
+  const { ledgerPath, metadata, trustRoot, expectedUid } = options;
   const fd = openArtifactFd(ledgerPath, ANCHOR_RECEIPT_FILENAME, expectedUid);
   const startIdentity = captureIdentity(fd);
 
+  const hasher = crypto.createHash('sha256');
   const stream = fs.createReadStream(null as unknown as fs.PathLike, { fd, autoClose: false });
+  stream.on('data', (chunk: string | Buffer) => {
+    hasher.update(chunk);
+  });
   const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
   const iterator = lines[Symbol.asyncIterator]();
 
@@ -645,7 +674,13 @@ async function readAndVerifyLedger(options: {
       storeId: metadata.storeId,
       anchorFingerprint: trustRoot.fingerprint,
       publicKey: trustRoot.publicKey,
-      checkpointHashes: checkpointsInOrder.map((checkpoint) => checkpoint.checkpointHash),
+      ...(options.nextCheckpoint !== undefined
+        ? { nextCheckpoint: options.nextCheckpoint }
+        : {
+            checkpointHashes: (options.checkpointsInOrder ?? []).map(
+              (checkpoint) => checkpoint.checkpointHash,
+            ),
+          }),
       nextReceipt: async () => {
         for (;;) {
           const step = await iterator.next();
@@ -676,6 +711,14 @@ async function readAndVerifyLedger(options: {
       receiptCount: outcome.receiptCount,
       publicKeyFingerprint: trustRoot.fingerprint,
       anchoredCheckpointHashes: [...outcome.anchoredCheckpointHashes],
+      artifactState: {
+        kind: 'PRESENT',
+        dev: startIdentity.dev,
+        ino: startIdentity.ino,
+        size: startIdentity.size,
+        bytes: consumingStream.bytesRead,
+        sha256: hasher.digest('hex'),
+      },
     };
   } finally {
     lines.close();

@@ -452,32 +452,62 @@ export class ReceiptEvidenceWalk {
  *
  * @internal
  */
-export async function walkReceiptEvidence(options: {
+/** Authenticated checkpoint fact offered to the streaming receipt walk. */
+export interface AuthenticatedCheckpointFact {
+  checkpointHash: string;
+  sequenceStart?: number;
+  sequenceEnd?: number;
+}
+
+export interface WalkReceiptEvidenceOptions {
   storeId: string;
   anchorFingerprint: string;
   publicKey: crypto.KeyObject;
-  /** Authenticated checkpoint hashes, in chain order. */
-  checkpointHashes: readonly string[];
+  /** Authenticated checkpoint hashes, in chain order (array or pull cursor). */
+  checkpointHashes?: readonly string[];
+  nextCheckpoint?: () => Promise<AuthenticatedCheckpointFact | string | null>;
   /** Pulls the next receipt, or null at end of ledger. */
   nextReceipt: () => Promise<AnchorReceiptV1 | null>;
-}): Promise<{ receiptCount: number; receiptIds: string[]; anchoredCheckpointHashes: string[] }> {
+  /** Optional callback fired when a receipt is verified and consumed */
+  onVerifiedReceipt?: (receipt: AnchorReceiptV1) => Promise<void> | void;
+}
+
+export async function walkReceiptEvidence(
+  options: WalkReceiptEvidenceOptions,
+): Promise<{ receiptCount: number; receiptIds: string[]; anchoredCheckpointHashes: string[] }> {
   const walk = new ReceiptEvidenceWalk({
     storeId: options.storeId,
     anchorFingerprint: options.anchorFingerprint,
     publicKey: options.publicKey,
   });
 
+  const pullCheckpoint: () => Promise<string | null> =
+    options.nextCheckpoint !== undefined
+      ? async () => {
+          const res = await options.nextCheckpoint!();
+          if (res === null) return null;
+          return typeof res === 'string' ? res : res.checkpointHash;
+        }
+      : (() => {
+          let idx = 0;
+          const hashes = options.checkpointHashes ?? [];
+          return async () => (idx < hashes.length ? hashes[idx++] : null);
+        })();
+
   const anchored: string[] = [];
   let head = 0;
   let current = await options.nextReceipt();
 
-  for (const checkpointHash of options.checkpointHashes) {
+  for (;;) {
     if (current === null) break;
+    const checkpointHash = await pullCheckpoint();
+    if (checkpointHash === null) break;
     if (current.checkpointHash !== checkpointHash) continue;
     walk.consume(current, head);
+    if (options.onVerifiedReceipt !== undefined) {
+      await options.onVerifiedReceipt(current);
+    }
     anchored.push(checkpointHash);
-    // The checkpoint is CONSUMED: the cursor moves past it, so a second receipt
-    // for the same checkpoint can never match here again.
     head += 1;
     current = await options.nextReceipt();
   }

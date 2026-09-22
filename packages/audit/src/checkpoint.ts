@@ -535,8 +535,16 @@ export function parseAndValidateCheckpointLineV1(line: string): {
  *
  * @internal
  */
-type VerifiedCheckpointArtifactState =
-  { kind: 'ABSENT' } | { kind: 'PRESENT'; dev: number; ino: number; size: number };
+export type VerifiedCheckpointArtifactState =
+  | { kind: 'ABSENT' }
+  | {
+      kind: 'PRESENT';
+      dev: number;
+      ino: number;
+      size: number;
+      bytes: number;
+      sha256: string;
+    };
 
 /** Opens an existing checkpoint artifact with `O_NOFOLLOW` and validates it. */
 async function openExistingCheckpointFile(
@@ -594,7 +602,7 @@ function syncAuditDirectory(auditDir: string): void {
  */
 async function* readCheckpointLines(
   handle: FileHandle,
-  consumed: { bytes: number },
+  consumed: { bytes: number; hasher?: crypto.Hash },
 ): AsyncGenerator<Buffer> {
   const chunk = Buffer.allocUnsafe(CHECKPOINT_READ_CHUNK_BYTES);
   let carry = Buffer.alloc(0);
@@ -605,6 +613,7 @@ async function* readCheckpointLines(
     consumed.bytes += bytesRead;
 
     const slice = chunk.subarray(0, bytesRead);
+    consumed.hasher?.update(slice);
     carry = carry.length === 0 ? Buffer.from(slice) : Buffer.concat([carry, slice]);
 
     let newlineIndex = carry.indexOf(0x0a);
@@ -741,7 +750,7 @@ function checkpointRaceError(
  *
  * @internal
  */
-interface CheckpointVerificationOutcome extends CheckpointHistoryVerificationResult {
+export interface CheckpointVerificationOutcome extends CheckpointHistoryVerificationResult {
   /** Identity of the artifact the history was verified from. */
   artifactState: VerifiedCheckpointArtifactState;
 }
@@ -911,7 +920,11 @@ export class CheckpointEvidenceWalk {
  * Memory stays bounded: one checkpoint line, one chain cursor, the bounded
  * archive inventory, and one `KeyObject`.
  */
-async function verifyCheckpointHistoryCore(
+/**
+ * Core checkpoint verification shared by internal and public callers.
+ * @internal
+ */
+export async function verifyCheckpointHistoryCore(
   core: CheckpointVerificationCore,
 ): Promise<CheckpointVerificationOutcome> {
   const { auditDir, expectedUid, publicKey, storeId, fingerprint } = core;
@@ -947,7 +960,8 @@ async function verifyCheckpointHistoryCore(
   const verificationStartIdentity =
     checkpointHandle === null ? null : captureCheckpointArtifactIdentity(checkpointHandle.fd);
 
-  const consumed = { bytes: 0 };
+  const hasher = crypto.createHash('sha256');
+  const consumed = { bytes: 0, hasher };
   const iterator =
     checkpointHandle === null
       ? null
@@ -1051,6 +1065,8 @@ async function verifyCheckpointHistoryCore(
         dev: verificationStartIdentity.dev,
         ino: verificationStartIdentity.ino,
         size: verificationStartIdentity.size,
+        bytes: consumed.bytes,
+        sha256: hasher.digest('hex'),
       };
     }
   } finally {

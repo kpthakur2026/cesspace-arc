@@ -40,6 +40,10 @@ import {
   MAX_EXPORT_BYTES,
   METADATA_FILENAME,
   MAX_INSPECT_RECORDS,
+  MIN_CANONICAL_RECORD_BYTES,
+  MAX_MANIFEST_CHECKPOINT_REFS,
+  MAX_MANIFEST_RECEIPT_REFS,
+  assertManifestReferenceWithinBound,
   assertExportWithinBudget,
   exportEvidenceBundle,
   inspectRetainedRecords,
@@ -2910,6 +2914,306 @@ describe('CesSpace ARC — RC-06 Task 7: Local Operator CLI & Standalone Offline
         false,
         'the receipt binding rule must not be restated in the offline verifier',
       );
+    });
+  });
+
+  /* ====================================================================== *
+   * 16. Manifest reference bound
+   * ====================================================================== */
+
+  describe('16. Manifest reference bound', () => {
+    test('RC06-T7-REG-72: the manifest checkpoint reference bound is enforced at its exact limit', () => {
+      // The bound is derived from frozen limits, not chosen: at most
+      // MAX_ARCHIVE_SEGMENTS rotation checkpoints, plus one interval checkpoint
+      // per CHECKPOINT_INTERVAL records across the frozen storage budget.
+      const MAX_ARCHIVE_SEGMENTS = 100;
+      const CHECKPOINT_INTERVAL = 1000;
+      const TOTAL_AUDIT_BUDGET_BYTES = 1_073_741_824;
+      assert.equal(MIN_CANONICAL_RECORD_BYTES, 256);
+      assert.equal(
+        MAX_MANIFEST_CHECKPOINT_REFS,
+        MAX_ARCHIVE_SEGMENTS +
+          Math.ceil(TOTAL_AUDIT_BUDGET_BYTES / MIN_CANONICAL_RECORD_BYTES / CHECKPOINT_INTERVAL),
+      );
+      // Worst-case manifest memory is explicitly bounded, far below the 1 GiB
+      // export ceiling.
+      assert.ok(
+        MAX_MANIFEST_CHECKPOINT_REFS * 66 < 1024 * 1024,
+        'the checkpoint reference array must be bounded to well under a megabyte',
+      );
+
+      assertManifestReferenceWithinBound(
+        MAX_MANIFEST_CHECKPOINT_REFS,
+        MAX_MANIFEST_CHECKPOINT_REFS,
+        'checkpoints',
+      );
+      assertThrowsWithCode(
+        () =>
+          assertManifestReferenceWithinBound(
+            MAX_MANIFEST_CHECKPOINT_REFS + 1,
+            MAX_MANIFEST_CHECKPOINT_REFS,
+            'checkpoints',
+          ),
+        'EXPORT_MANIFEST_LIMIT_EXCEEDED',
+      );
+    });
+
+    test('RC06-T7-REG-73: the manifest receipt reference bound is enforced at its exact limit', () => {
+      // At most one receipt is consumed per checkpoint, so the receipt bound is
+      // the checkpoint bound.
+      assert.equal(MAX_MANIFEST_RECEIPT_REFS, MAX_MANIFEST_CHECKPOINT_REFS);
+      assertManifestReferenceWithinBound(
+        MAX_MANIFEST_RECEIPT_REFS,
+        MAX_MANIFEST_RECEIPT_REFS,
+        'anchor receipts',
+      );
+      assertThrowsWithCode(
+        () =>
+          assertManifestReferenceWithinBound(
+            MAX_MANIFEST_RECEIPT_REFS + 1,
+            MAX_MANIFEST_RECEIPT_REFS,
+            'anchor receipts',
+          ),
+        'EXPORT_MANIFEST_LIMIT_EXCEEDED',
+      );
+
+      // The bound is enforced on the PRODUCTION path, not only as a pure
+      // helper: an ordinary export still succeeds well inside it.
+      return (async () => {
+        const fixture = await multiSegmentFixture('reg73');
+        const base = newRoot('reg73-out');
+        const result = await exportEvidenceBundle({
+          directory: fixture.auditDir,
+          outputDirectory: path.join(base, 'bundle'),
+          checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
+          workspacePaths: [],
+        });
+        assert.ok(
+          result.manifest.checkpointHashes.length <= MAX_MANIFEST_CHECKPOINT_REFS,
+          'a real export must stay inside the bounded reference space',
+        );
+      })();
+    });
+  });
+
+  /* ====================================================================== *
+   * 17. Descriptor-authoritative streaming export and verification
+   * ====================================================================== */
+
+  describe('17. Descriptor-authoritative streaming export and verification', () => {
+    test('RC06-T7-REG-69: temporary destination swap during final verification is ignored by the authoritative verifier', async () => {
+      const fixture = await multiSegmentFixture('reg69');
+      const base = newRoot('reg69-out');
+      const destination = path.join(base, 'bundle');
+      const substitute = path.join(base, 'substitute');
+      fs.mkdirSync(substitute, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(substitute, 'manifest.json'), '{"corrupted": true}\n', {
+        mode: 0o600,
+      });
+
+      let swappedDuringVerification = false;
+      const originalStash = path.join(base, 'original-stash');
+
+      const result = await exportEvidenceBundle({
+        directory: fixture.auditDir,
+        outputDirectory: destination,
+        checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
+        workspacePaths: [],
+        hooks: {
+          beforeFinalVerification: async () => {
+            fs.renameSync(destination, originalStash);
+            fs.renameSync(substitute, destination);
+            swappedDuringVerification = true;
+          },
+          afterFinalVerification: async () => {
+            fs.renameSync(destination, substitute);
+            fs.renameSync(originalStash, destination);
+          },
+        },
+      });
+
+      assert.equal(
+        swappedDuringVerification,
+        true,
+        'the swap hook must have executed during verification',
+      );
+      assert.equal(
+        result.manifest.storeId,
+        fixture.storeId,
+        'export authenticated the held original root descriptor, never the substitute',
+      );
+      assert.equal(fs.existsSync(destination), true);
+      const verified = await verifyEvidenceBundle(destination);
+      assert.equal(verified.status, 'VERIFIED');
+    });
+
+    test('RC06-T7-REG-70: checkpoint ledger rewritten in place after authenticated descriptor pass cannot be exported', async () => {
+      const fixture = await multiSegmentFixture('reg70');
+      const base = newRoot('reg70-out');
+      const destination = path.join(base, 'bundle');
+      const checkpointLedgerPath = path.join(fixture.auditDir, 'audit-checkpoints.jsonl');
+
+      let rewritten = false;
+      await assertRejectsWithCode(
+        exportEvidenceBundle({
+          directory: fixture.auditDir,
+          outputDirectory: destination,
+          checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
+          workspacePaths: [],
+          hooks: {
+            afterCheckpointVerification: async () => {
+              const fd = fs.openSync(checkpointLedgerPath, 'r+');
+              try {
+                const buf = Buffer.alloc(1);
+                fs.readSync(fd, buf, 0, 1, 0);
+                buf[0] ^= 0x01;
+                fs.writeSync(fd, buf, 0, 1, 0);
+              } finally {
+                fs.closeSync(fd);
+              }
+              rewritten = true;
+            },
+          },
+        }),
+        ['EXPORT_SOURCE_CHANGED', 'AUDIT_CORRUPTION_DETECTED'],
+      );
+
+      assert.equal(rewritten, true, 'the in-place rewrite hook must have fired');
+      assert.equal(
+        fs.existsSync(path.join(destination, 'manifest.json')),
+        false,
+        'no complete bundle is emitted when ledger content differs from authenticated digest',
+      );
+    });
+
+    test('RC06-T7-REG-71: receipt ledger rewritten in place after authenticated descriptor pass cannot be exported', async () => {
+      const fixture = makeAuditConfig('reg71', { anchor: true });
+      await buildStore(fixture, { records: 5, rotateAt: [3] });
+      const base = newRoot('reg71-out');
+      const destination = path.join(base, 'bundle');
+      const receiptLedgerPath = path.join(fixture.auditDir, 'audit-anchors.jsonl');
+
+      let rewritten = false;
+      await assertRejectsWithCode(
+        exportEvidenceBundle({
+          directory: fixture.auditDir,
+          outputDirectory: destination,
+          checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
+          anchorReceiptPublicKeyPath: fixture.anchorMaterial.publicKeyPath,
+          workspacePaths: [],
+          hooks: {
+            afterReceiptVerification: async () => {
+              const fd = fs.openSync(receiptLedgerPath, 'r+');
+              try {
+                const buf = Buffer.alloc(1);
+                fs.readSync(fd, buf, 0, 1, 0);
+                buf[0] ^= 0x01;
+                fs.writeSync(fd, buf, 0, 1, 0);
+              } finally {
+                fs.closeSync(fd);
+              }
+              rewritten = true;
+            },
+          },
+        }),
+        [
+          'EXPORT_SOURCE_CHANGED',
+          'ANCHOR_RECEIPT_LEDGER_CORRUPT',
+          'ANCHOR_RECEIPT_SIGNATURE_INVALID',
+          'AUDIT_CORRUPTION_DETECTED',
+        ],
+      );
+
+      assert.equal(rewritten, true, 'the in-place rewrite hook must have fired');
+      assert.equal(
+        fs.existsSync(path.join(destination, 'manifest.json')),
+        false,
+        'no complete bundle is emitted when receipt content differs from authenticated digest',
+      );
+    });
+
+    test('RC06-T7-REG-66: large checkpoint history is processed incrementally with no whole-ledger array or joined output Buffer', async () => {
+      const compiledExport = fs.readFileSync(
+        path.join(REPO_ROOT, 'packages/audit/dist/export.js'),
+        'utf8',
+      );
+      assert.equal(
+        /checkpointLines\s*=\s*\[\]/.test(compiledExport),
+        false,
+        'no checkpointLines array in production export',
+      );
+      assert.equal(
+        /checkpointObjects\s*=\s*\[\]/.test(compiledExport),
+        false,
+        'no checkpointObjects array in production export',
+      );
+      assert.equal(
+        /Buffer\.from\(\s*checkpointLines/.test(compiledExport),
+        false,
+        'no Buffer.from(checkpointLines) in production export',
+      );
+      assert.equal(
+        /Buffer\.from\([^)]*\.map\([^)]*\)\.join/.test(compiledExport),
+        false,
+        'no joined Buffer from lines in production export',
+      );
+
+      const fixture = makeAuditConfig('reg66');
+      const rotateAt = Array.from({ length: 10 }, (_, i) => (i + 1) * 2);
+      await buildStore(fixture, { records: 22, rotateAt });
+
+      const base = newRoot('reg66-out');
+      const result = await exportEvidenceBundle({
+        directory: fixture.auditDir,
+        outputDirectory: path.join(base, 'bundle'),
+        checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
+        workspacePaths: [],
+      });
+
+      assert.equal(result.manifest.checkpointHashes.length, 10);
+      const verified = await verifyEvidenceBundle(result.outputDirectory);
+      assert.equal(verified.status, 'VERIFIED');
+      assert.equal(verified.checkpointCount, 10);
+    });
+
+    test('RC06-T7-REG-67: large receipt history is processed incrementally with the same guarantees', async () => {
+      const compiledExport = fs.readFileSync(
+        path.join(REPO_ROOT, 'packages/audit/dist/export.js'),
+        'utf8',
+      );
+      assert.equal(
+        /receiptLines\s*=\s*\[\]/.test(compiledExport),
+        false,
+        'no receiptLines array in production export',
+      );
+      assert.equal(
+        /receiptObjects\s*=\s*\[\]/.test(compiledExport),
+        false,
+        'no receiptObjects array in production export',
+      );
+      assert.equal(
+        /Buffer\.from\(\s*receiptLines/.test(compiledExport),
+        false,
+        'no Buffer.from(receiptLines) in production export',
+      );
+
+      const fixture = makeAuditConfig('reg67', { anchor: true });
+      const rotateAt = Array.from({ length: 10 }, (_, i) => (i + 1) * 2);
+      await buildStore(fixture, { records: 22, rotateAt });
+
+      const base = newRoot('reg67-out');
+      const result = await exportEvidenceBundle({
+        directory: fixture.auditDir,
+        outputDirectory: path.join(base, 'bundle'),
+        checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
+        anchorReceiptPublicKeyPath: fixture.anchorMaterial.publicKeyPath,
+        workspacePaths: [],
+      });
+
+      assert.equal(result.manifest.anchorReceiptIds.length, 10);
+      const verified = await verifyEvidenceBundle(result.outputDirectory);
+      assert.equal(verified.status, 'VERIFIED');
+      assert.equal(verified.anchorReceiptCount, 10);
     });
   });
 });

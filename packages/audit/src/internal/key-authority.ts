@@ -714,6 +714,52 @@ export function computePublicKeyFingerprint(publicKey: crypto.KeyObject): string
  * Reusable by Task 5 for the anchor receipt trust root: the purpose label
  * selects only the wording, never the authority rules or the accepted algorithm.
  */
+/**
+ * Loads, validates and fingerprints an Ed25519 public trust root from an open descriptor.
+ *
+ * Validates descriptor authority (mode 0600, expectedUid, regular file, nlink 1),
+ * bounds file size, asserts exact PEM format with no surrounding content, and requires
+ * Ed25519 algorithm. Does NOT close fd; caller owns fd.
+ */
+export function loadEd25519TrustRootFromDescriptor(
+  fd: number,
+  options: { purpose: TrustRootPurpose; expectedUid?: number },
+): LoadedTrustRoot {
+  const expectedUid = options.expectedUid ?? getProcessUid();
+  const label = options.purpose === 'ANCHOR_RECEIPT' ? 'anchor receipt public key' : 'public key';
+
+  validateFileDescriptorAuthority(fd, 0o600, expectedUid);
+  const { buffer, byteLength } = readBoundedKeyBytes(fd, label);
+  const view = buffer.subarray(0, byteLength);
+  const span = assertExactPemFile(view, PUBLIC_KEY_PEM_LABEL, label);
+
+  let publicKey: crypto.KeyObject;
+  try {
+    publicKey = crypto.createPublicKey({
+      key: view.subarray(span.start, span.end),
+      format: 'pem',
+    });
+  } catch (cause) {
+    throw createCodedError('AUDIT_KEY_MALFORMED', `${label} is not a parseable public key`, {
+      cause,
+    });
+  }
+
+  if (publicKey.asymmetricKeyType !== 'ed25519') {
+    throw createCodedError(
+      'AUDIT_KEY_ALGORITHM_FORBIDDEN',
+      `${label} must be Ed25519 (got ${String(publicKey.asymmetricKeyType)})`,
+    );
+  }
+
+  const spkiDer = Buffer.from(publicKey.export({ type: 'spki', format: 'der' }) as Buffer);
+  return {
+    publicKey,
+    spkiDer,
+    fingerprint: crypto.createHash('sha256').update(spkiDer).digest('hex'),
+  };
+}
+
 export function loadEd25519TrustRootFile(
   filePath: string,
   options: { purpose: TrustRootPurpose; expectedUid?: number },
@@ -724,35 +770,7 @@ export function loadEd25519TrustRootFile(
   const canonicalPath = assertKeyPathShape(filePath, label);
   const { fd } = openAuthoritativeKeyFile(canonicalPath, expectedUid, label);
   try {
-    const { buffer, byteLength } = readBoundedKeyBytes(fd, label);
-    const view = buffer.subarray(0, byteLength);
-    const span = assertExactPemFile(view, PUBLIC_KEY_PEM_LABEL, label);
-
-    let publicKey: crypto.KeyObject;
-    try {
-      publicKey = crypto.createPublicKey({
-        key: view.subarray(span.start, span.end),
-        format: 'pem',
-      });
-    } catch (cause) {
-      throw createCodedError('AUDIT_KEY_MALFORMED', `${label} is not a parseable public key`, {
-        cause,
-      });
-    }
-
-    if (publicKey.asymmetricKeyType !== 'ed25519') {
-      throw createCodedError(
-        'AUDIT_KEY_ALGORITHM_FORBIDDEN',
-        `${label} must be Ed25519 (got ${String(publicKey.asymmetricKeyType)})`,
-      );
-    }
-
-    const spkiDer = Buffer.from(publicKey.export({ type: 'spki', format: 'der' }) as Buffer);
-    return {
-      publicKey,
-      spkiDer,
-      fingerprint: crypto.createHash('sha256').update(spkiDer).digest('hex'),
-    };
+    return loadEd25519TrustRootFromDescriptor(fd, options);
   } finally {
     fs.closeSync(fd);
   }
