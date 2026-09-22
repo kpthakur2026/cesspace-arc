@@ -700,6 +700,8 @@ export {
   type EvidenceIdentity,
   snapshotEvidenceInventory,
   assertInventoryUnchanged,
+  assertOfflineEvidenceContentGenerationUnchanged,
+  streamDigestLogicalSegment,
   type RetainedSegmentSource,
   listRetainedSegmentSources,
   streamRetainedRecords,

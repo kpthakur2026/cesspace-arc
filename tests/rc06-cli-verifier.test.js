@@ -3332,4 +3332,153 @@ describe('CesSpace ARC — RC-06 Task 7: Local Operator CLI & Standalone Offline
       );
     });
   });
+
+  /* ====================================================================== *
+   * 18. Offline evidence content-generation binding
+   * ====================================================================== */
+
+  describe('18. Offline evidence content-generation binding', () => {
+    test('RC06-T7-REG-76: checkpoint ledger rewritten in place preserving inode and size after checkpoint verification causes offline verification to reject', async () => {
+      const fixture = await multiSegmentFixture('reg76');
+      const cpPath = path.join(fixture.auditDir, 'audit-checkpoints.jsonl');
+      assert.ok(fs.existsSync(cpPath), 'checkpoint ledger must exist');
+      const statBefore = fs.statSync(cpPath);
+
+      let hookRan = false;
+      const promise = verifyOfflineStore({
+        directory: fixture.auditDir,
+        checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
+        workspacePaths: [],
+        hooks: {
+          afterCheckpointVerification: () => {
+            hookRan = true;
+            const content = fs.readFileSync(cpPath);
+            const mutated = Buffer.from(content);
+            const sigIdx = mutated.indexOf('"signature":"');
+            assert.ok(sigIdx !== -1, 'signature field must be found in checkpoint line');
+            mutated[sigIdx + 15] = mutated[sigIdx + 15] === 0x41 ? 0x42 : 0x41;
+            assert.equal(mutated.length, content.length, 'byte length must be identical');
+
+            const fd = fs.openSync(cpPath, 'r+');
+            fs.writeSync(fd, mutated, 0, mutated.length, 0);
+            fs.closeSync(fd);
+
+            const statAfter = fs.statSync(cpPath);
+            assert.equal(statAfter.ino, statBefore.ino, 'inode must be preserved');
+            assert.equal(statAfter.size, statBefore.size, 'size must be preserved');
+          },
+        },
+      });
+
+      await assertRejectsWithCode(promise, 'AUDIT_SOURCE_UNSTABLE');
+      assert.ok(hookRan, 'afterCheckpointVerification hook must have executed');
+    });
+
+    test('RC06-T7-REG-77: active segment rewritten in place preserving inode and size after primary verification causes offline verification to reject', async () => {
+      const fixture = await multiSegmentFixture('reg77');
+      const activePath = path.join(fixture.auditDir, 'audit-active.jsonl');
+      assert.ok(fs.existsSync(activePath), 'active segment must exist');
+      const statBefore = fs.statSync(activePath);
+
+      let hookRan = false;
+      const promise = verifyOfflineStore({
+        directory: fixture.auditDir,
+        checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
+        workspacePaths: [],
+        hooks: {
+          beforeFinalStabilityCheck: () => {
+            hookRan = true;
+            const content = fs.readFileSync(activePath);
+            const mutated = Buffer.from(content);
+            mutated[50] = mutated[50] === 0x30 ? 0x31 : 0x30;
+            assert.equal(mutated.length, content.length, 'byte length must be identical');
+
+            const fd = fs.openSync(activePath, 'r+');
+            fs.writeSync(fd, mutated, 0, mutated.length, 0);
+            fs.closeSync(fd);
+
+            const statAfter = fs.statSync(activePath);
+            assert.equal(statAfter.ino, statBefore.ino, 'inode must be preserved');
+            assert.equal(statAfter.size, statBefore.size, 'size must be preserved');
+          },
+        },
+      });
+
+      await assertRejectsWithCode(promise, 'AUDIT_SOURCE_UNSTABLE');
+      assert.ok(hookRan, 'beforeFinalStabilityCheck hook must have executed');
+    });
+
+    test('RC06-T7-REG-78: metadata audit-store.json rewritten in place with different same-length valid value after authoritative load causes offline verification to reject', async () => {
+      const fixture = await multiSegmentFixture('reg78');
+      const metaPath = path.join(fixture.auditDir, 'audit-store.json');
+      const statBefore = fs.statSync(metaPath);
+      const content = fs.readFileSync(metaPath, 'utf8');
+      const parsed = JSON.parse(content);
+      const originalStoreId = parsed.storeId;
+      assert.equal(typeof originalStoreId, 'string');
+      const substituteStoreId = '99999999-9999-4999-8999-999999999999';
+      assert.equal(substituteStoreId.length, originalStoreId.length);
+      const mutatedStr = content.replace(originalStoreId, substituteStoreId);
+      assert.equal(Buffer.byteLength(mutatedStr), Buffer.byteLength(content));
+
+      let hookRan = false;
+      const promise = verifyOfflineStore({
+        directory: fixture.auditDir,
+        checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
+        workspacePaths: [],
+        hooks: {
+          beforeFinalStabilityCheck: () => {
+            hookRan = true;
+            const fd = fs.openSync(metaPath, 'r+');
+            const buf = Buffer.from(mutatedStr, 'utf8');
+            fs.writeSync(fd, buf, 0, buf.length, 0);
+            fs.closeSync(fd);
+
+            const statAfter = fs.statSync(metaPath);
+            assert.equal(statAfter.ino, statBefore.ino, 'inode must be preserved');
+            assert.equal(statAfter.size, statBefore.size, 'size must be preserved');
+          },
+        },
+      });
+
+      await assertRejectsWithCode(promise, 'AUDIT_SOURCE_UNSTABLE');
+      assert.ok(hookRan, 'beforeFinalStabilityCheck hook must have executed');
+    });
+
+    test('RC06-T7-REG-79: receipt ledger rewritten in place preserving inode and size after receipt verification causes offline verification to reject', async () => {
+      const fixture = makeAuditConfig('reg79', { anchor: true });
+      await buildStore(fixture, { records: 5, rotateAt: [3] });
+      const receiptPath = path.join(fixture.auditDir, 'audit-anchors.jsonl');
+      assert.ok(fs.existsSync(receiptPath), 'receipt ledger must exist in anchor-enabled fixture');
+      const statBefore = fs.statSync(receiptPath);
+
+      let hookRan = false;
+      const promise = verifyOfflineStore({
+        directory: fixture.auditDir,
+        checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
+        anchorReceiptPublicKeyPath: fixture.anchorMaterial.publicKeyPath,
+        workspacePaths: [],
+        hooks: {
+          afterReceiptVerification: () => {
+            hookRan = true;
+            const content = fs.readFileSync(receiptPath);
+            const mutated = Buffer.from(content);
+            mutated[mutated.length - 20] = mutated[mutated.length - 20] === 0x41 ? 0x42 : 0x41;
+            assert.equal(mutated.length, content.length, 'byte length must be identical');
+
+            const fd = fs.openSync(receiptPath, 'r+');
+            fs.writeSync(fd, mutated, 0, mutated.length, 0);
+            fs.closeSync(fd);
+
+            const statAfter = fs.statSync(receiptPath);
+            assert.equal(statAfter.ino, statBefore.ino, 'inode must be preserved');
+            assert.equal(statAfter.size, statBefore.size, 'size must be preserved');
+          },
+        },
+      });
+
+      await assertRejectsWithCode(promise, 'AUDIT_SOURCE_UNSTABLE');
+      assert.ok(hookRan, 'afterReceiptVerification hook must have executed');
+    });
+  });
 });

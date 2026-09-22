@@ -59,17 +59,19 @@ import {
   validateFileDescriptorAuthority,
   parseAndValidateRecordLineV1,
 } from './storage.js';
-import { loadStoreMetadataFile } from './metadata.js';
+import { loadStoreMetadataFile, METADATA_FILENAME } from './metadata.js';
 import {
   listLogicalArchiveInventory,
   verifyRetainedPrimaryHistory,
   type LogicalArchiveEntry,
+  type RetainedPrimaryHistoryVerificationResult,
 } from './rotation.js';
 import {
   CHECKPOINT_FILENAME,
   parseAndValidateCheckpointLineV1,
   verifyCheckpointHistory,
   type AuditCheckpointV1,
+  type CheckpointHistoryVerificationResult,
 } from './checkpoint.js';
 import { ANCHOR_RECEIPT_FILENAME, ANCHOR_SPOOL_DIRNAME } from './internal/anchor-constants.js';
 import { loadEd25519TrustRootFile } from './internal/key-authority.js';
@@ -774,6 +776,17 @@ export interface OfflineVerificationOptions {
   workspacePaths?: readonly string[];
   /** Expected owner of the audit artifacts. Defaults to this process's uid. */
   expectedUid?: number;
+  /**
+   * Internal test seams (RC-06 Task 7).
+   * @internal
+   */
+  hooks?: {
+    afterMetadataLoad?: () => void | Promise<void>;
+    afterPrimaryVerification?: () => void | Promise<void>;
+    afterCheckpointVerification?: () => void | Promise<void>;
+    afterReceiptVerification?: () => void | Promise<void>;
+    beforeFinalStabilityCheck?: () => void | Promise<void>;
+  };
 }
 
 export interface OfflineVerificationResult {
@@ -811,6 +824,220 @@ export interface OfflineVerificationResult {
 }
 
 /**
+ * Streams an artifact and calculates the SHA-256 of its logical representation.
+ *
+ * For uncompressed artifacts (e.g. metadata, active segment, checkpoints, receipts,
+ * uncompressed segments), this is the SHA-256 of the raw byte stream.
+ * For compressed segments (.jsonl.gz), this is the SHA-256 of the decompressed byte stream,
+ * exactly matching the logical digest produced by `verifyRetainedPrimaryHistory`.
+ */
+export async function streamDigestLogicalSegment(
+  filePath: string,
+  label: string,
+  compressed: boolean,
+  expectedUid: number,
+): Promise<{ sha256: string; identity: ArtifactIdentity }> {
+  let fd: number | null = null;
+  try {
+    try {
+      fd = openArtifactFd(filePath, label, expectedUid);
+    } catch (cause) {
+      throw createCodedError(
+        'AUDIT_SOURCE_UNSTABLE',
+        `offline verification: ${label} could not be opened (${(cause as Error)?.message})`,
+        { cause },
+      );
+    }
+
+    const identity = captureIdentity(fd);
+    const hasher = crypto.createHash('sha256');
+    const readStream = fs.createReadStream(filePath, {
+      fd,
+      autoClose: true,
+      highWaterMark: 64 * 1024,
+    });
+    // Ownership of fd transfers to readStream, which closes it exactly once.
+    fd = null;
+    readStream.on('error', () => {});
+
+    let source: AsyncIterable<Buffer>;
+    let gunzip: zlib.Gunzip | null = null;
+    if (compressed) {
+      gunzip = zlib.createGunzip();
+      readStream.on('error', (err) => gunzip?.destroy(err));
+      readStream.pipe(gunzip);
+      source = gunzip;
+    } else {
+      source = readStream;
+    }
+
+    try {
+      for await (const chunk of source) {
+        const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        hasher.update(buf);
+      }
+    } catch (cause) {
+      throw createCodedError(
+        'AUDIT_SOURCE_UNSTABLE',
+        `offline verification: ${label} stream failed while it was being read`,
+        { cause },
+      );
+    } finally {
+      if (gunzip !== null) {
+        gunzip.destroy();
+      }
+    }
+
+    return { sha256: hasher.digest('hex'), identity };
+  } finally {
+    if (fd !== null) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // ignore
+      }
+    }
+  }
+}
+
+export type OfflineVerifiedCheckpoints = CheckpointHistoryVerificationResult & {
+  artifactState:
+    | { kind: 'ABSENT' }
+    | { kind: 'PRESENT'; dev: number; ino: number; size: number; bytes: number; sha256: string };
+};
+
+export interface ContentGenerationBaseline {
+  directory: string;
+  expectedUid: number;
+  inventoryBefore: EvidenceInventory;
+  metadataDigest: { sha256: string; identity: ArtifactIdentity };
+  primary: RetainedPrimaryHistoryVerificationResult;
+  checkpoints: OfflineVerifiedCheckpoints;
+  anchor: OfflineAnchorOutcome;
+}
+
+/**
+ * Proves that the filesystem evidence observed at the final stability boundary
+ * is byte-for-byte and logical-for-logical the exact same generation authenticated
+ * across all independent verification passes.
+ */
+export async function assertOfflineEvidenceContentGenerationUnchanged(
+  baseline: ContentGenerationBaseline,
+): Promise<void> {
+  const { directory, expectedUid, inventoryBefore, metadataDigest, primary, checkpoints, anchor } =
+    baseline;
+
+  // 1. Content-bind audit-store.json
+  const currentMetadata = await streamDigestLogicalSegment(
+    path.join(directory, METADATA_FILENAME),
+    METADATA_FILENAME,
+    false,
+    expectedUid,
+  );
+  if (
+    currentMetadata.identity.dev !== metadataDigest.identity.dev ||
+    currentMetadata.identity.ino !== metadataDigest.identity.ino ||
+    currentMetadata.identity.size !== metadataDigest.identity.size ||
+    currentMetadata.sha256 !== metadataDigest.sha256
+  ) {
+    throw createCodedError(
+      'AUDIT_SOURCE_UNSTABLE',
+      'offline verification: audit-store.json changed while it was being read',
+    );
+  }
+
+  // 2. Content-bind every retained primary archive
+  for (const segment of primary.segments) {
+    for (const fn of segment.filenames) {
+      const fullPath = path.join(directory, fn);
+      const compressed = fn.endsWith('.gz');
+      const current = await streamDigestLogicalSegment(fullPath, fn, compressed, expectedUid);
+      const beforeId = inventoryBefore.get(fn);
+      if (
+        beforeId === undefined ||
+        current.identity.dev !== beforeId.dev ||
+        current.identity.ino !== beforeId.ino ||
+        current.identity.size !== beforeId.size ||
+        current.sha256 !== segment.digest.sha256
+      ) {
+        throw createCodedError(
+          'AUDIT_SOURCE_UNSTABLE',
+          `offline verification: ${fn} changed while it was being read`,
+        );
+      }
+    }
+  }
+
+  // 3. Content-bind active segment when present
+  if (primary.active !== null) {
+    const activePath = path.join(directory, ACTIVE_SEGMENT_FILENAME);
+    const current = await streamDigestLogicalSegment(
+      activePath,
+      ACTIVE_SEGMENT_FILENAME,
+      false,
+      expectedUid,
+    );
+    const beforeId = inventoryBefore.get(ACTIVE_SEGMENT_FILENAME);
+    if (
+      beforeId === undefined ||
+      current.identity.dev !== beforeId.dev ||
+      current.identity.ino !== beforeId.ino ||
+      current.identity.size !== beforeId.size ||
+      current.sha256 !== primary.active.sha256
+    ) {
+      throw createCodedError(
+        'AUDIT_SOURCE_UNSTABLE',
+        `offline verification: ${ACTIVE_SEGMENT_FILENAME} changed while it was being read`,
+      );
+    }
+  }
+
+  // 4. Content-bind checkpoint ledger when present
+  if (checkpoints.artifactState.kind === 'PRESENT') {
+    const cpPath = path.join(directory, CHECKPOINT_FILENAME);
+    const current = await streamDigestLogicalSegment(
+      cpPath,
+      CHECKPOINT_FILENAME,
+      false,
+      expectedUid,
+    );
+    if (
+      current.identity.dev !== checkpoints.artifactState.dev ||
+      current.identity.ino !== checkpoints.artifactState.ino ||
+      current.identity.size !== checkpoints.artifactState.size ||
+      current.sha256 !== checkpoints.artifactState.sha256
+    ) {
+      throw createCodedError(
+        'AUDIT_SOURCE_UNSTABLE',
+        `offline verification: ${CHECKPOINT_FILENAME} changed while it was being read`,
+      );
+    }
+  }
+
+  // 5. Content-bind receipt ledger when present
+  if (anchor.artifactState?.kind === 'PRESENT') {
+    const receiptPath = path.join(directory, ANCHOR_RECEIPT_FILENAME);
+    const current = await streamDigestLogicalSegment(
+      receiptPath,
+      ANCHOR_RECEIPT_FILENAME,
+      false,
+      expectedUid,
+    );
+    if (
+      current.identity.dev !== anchor.artifactState.dev ||
+      current.identity.ino !== anchor.artifactState.ino ||
+      current.identity.size !== anchor.artifactState.size ||
+      current.sha256 !== anchor.artifactState.sha256
+    ) {
+      throw createCodedError(
+        'AUDIT_SOURCE_UNSTABLE',
+        `offline verification: ${ANCHOR_RECEIPT_FILENAME} changed while it was being read`,
+      );
+    }
+  }
+}
+
+/**
  * Verifies a retained audit store offline, from filesystem evidence alone.
  *
  * Throws a coded error with a bounded message on the first failure. Nothing is
@@ -825,15 +1052,20 @@ export async function verifyOfflineStore(
   // `createIfMissing` is deliberately left at its false default: an absent store
   // is an error, never something verification brings into existence.
   validateAuditDirectory(options.directory, { expectedUid, workspacePaths });
-  const metadata = loadStoreMetadataFile(options.directory, expectedUid);
 
-  // The three passes below are independent filesystem reads. Without this
-  // bracket they could each observe a different generation of the evidence and
-  // still be reported as one VERIFIED result. The inventory is taken before and
-  // after, and any change — an appended active segment, a replaced rotated
-  // archive, a same-size pathname swap, a new checkpoint or receipt ledger —
-  // fails the whole verification.
+  // The inventory is taken before and after, and any change — an appended active
+  // segment, a replaced rotated archive, a same-size pathname swap, a new
+  // checkpoint or receipt ledger — fails the whole verification.
   const inventoryBefore = snapshotEvidenceInventory(options.directory, expectedUid);
+
+  const metadata = loadStoreMetadataFile(options.directory, expectedUid);
+  const metadataDigest = await streamDigestLogicalSegment(
+    path.join(options.directory, METADATA_FILENAME),
+    METADATA_FILENAME,
+    false,
+    expectedUid,
+  );
+  await options.hooks?.afterMetadataLoad?.();
 
   const primary = await verifyRetainedPrimaryHistory(options.directory, expectedUid);
   if (primary.status !== 'VERIFIED') {
@@ -842,12 +1074,14 @@ export async function verifyOfflineStore(
       `primary history is not verified (${primary.status})`,
     );
   }
+  await options.hooks?.afterPrimaryVerification?.();
 
-  const checkpoints = await verifyCheckpointHistory({
+  const checkpoints = (await verifyCheckpointHistory({
     directory: options.directory,
     publicKeyPath: options.checkpointPublicKeyPath,
     workspacePaths,
-  });
+  })) as OfflineVerifiedCheckpoints;
+  await options.hooks?.afterCheckpointVerification?.();
 
   const cpPath = path.join(options.directory, CHECKPOINT_FILENAME);
   const cpLines = fs.existsSync(cpPath)
@@ -871,12 +1105,25 @@ export async function verifyOfflineStore(
     ...(nextCheckpoint !== undefined ? { nextCheckpoint } : {}),
     expectedUid,
   });
+  await options.hooks?.afterReceiptVerification?.();
+
+  await options.hooks?.beforeFinalStabilityCheck?.();
 
   assertInventoryUnchanged(
     inventoryBefore,
     snapshotEvidenceInventory(options.directory, expectedUid),
     'offline verification',
   );
+
+  await assertOfflineEvidenceContentGenerationUnchanged({
+    directory: options.directory,
+    expectedUid,
+    inventoryBefore,
+    metadataDigest,
+    primary,
+    checkpoints,
+    anchor,
+  });
 
   const tiers: OfflineVerificationResult['tiers'] = {
     primary: 'VERIFIED',
