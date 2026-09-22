@@ -1766,7 +1766,7 @@ describe('CesSpace ARC — RC-06 Task 7: Local Operator CLI & Standalone Offline
       const replacement = Buffer.from(pristine);
       replacement[Math.floor(replacement.length / 2)] ^= 0xff;
       fs.rmSync(full);
-      fs.writeFileSync(full, replacement);
+      fs.writeFileSync(full, replacement, { mode: 0o600 });
       assert.equal(fs.statSync(full).size, pristine.length, 'the replacement is the same size');
 
       await assertRejectsWithCode(pending, [
@@ -2197,7 +2197,11 @@ describe('CesSpace ARC — RC-06 Task 7: Local Operator CLI & Standalone Offline
           checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
           workspacePaths: [],
         }),
-        ['BUNDLE_CHECKPOINT_SIGNATURE_INVALID', 'AUDIT_CORRUPTION_DETECTED'],
+        [
+          'AUDIT_CHECKPOINT_SIGNATURE_INVALID',
+          'BUNDLE_CHECKPOINT_SIGNATURE_INVALID',
+          'AUDIT_CORRUPTION_DETECTED',
+        ],
       );
       assert.equal(
         fs.existsSync(destination),
@@ -2470,6 +2474,114 @@ describe('CesSpace ARC — RC-06 Task 7: Local Operator CLI & Standalone Offline
         /MAX_RECORD_BYTES/,
         'primary framing must enforce the record ceiling',
       );
+    });
+  });
+
+  /* ====================================================================== *
+   * 13. Reused Task-4 / Task-5 authority
+   * ====================================================================== */
+
+  describe('13. Reused Task-4 and Task-5 authority', () => {
+    test('RC06-T7-REG-57: a source with a required rotation checkpoint deleted cannot be exported', async () => {
+      const fixture = makeAuditConfig('reg57');
+      await buildStore(fixture, { records: 6, rotateAt: [3] });
+
+      const ledgerPath = path.join(fixture.auditDir, 'audit-checkpoints.jsonl');
+      const lines = fs.readFileSync(ledgerPath, 'utf8').slice(0, -1).split('\n');
+      assert.equal(lines.length, 1, 'the fixture must carry the rotation checkpoint sealing 1..3');
+      fs.writeFileSync(ledgerPath, '', { mode: 0o600 });
+
+      const base = newRoot('reg57-out');
+      const destination = path.join(base, 'bundle');
+      await assertRejectsWithCode(
+        exportEvidenceBundle({
+          directory: fixture.auditDir,
+          outputDirectory: destination,
+          checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
+          workspacePaths: [],
+        }),
+        // The mandatory rotation checkpoint at sequence 3 is gone, and the
+        // frozen cadence requires it.
+        ['AUDIT_CHECKPOINT_MISSING', 'AUDIT_CHECKPOINT_COVERAGE_MISMATCH'],
+      );
+      assert.equal(fs.existsSync(destination), false, 'nothing may be written');
+    });
+
+    test('RC06-T7-REG-58: a genuinely signed checkpoint outside the frozen cadence cannot be exported', async () => {
+      const fixture = makeAuditConfig('reg58');
+      await buildStore(fixture, { records: 6, rotateAt: [3] });
+
+      // Duplicate the checkpoint line. The copy is a real, validly signed
+      // checkpoint; what is wrong with it is its POSITION in the cadence, which
+      // is exactly the rule the shared Task-4 walk owns.
+      const ledgerPath = path.join(fixture.auditDir, 'audit-checkpoints.jsonl');
+      const raw = fs.readFileSync(ledgerPath, 'utf8');
+      fs.writeFileSync(ledgerPath, `${raw}${raw}`, { mode: 0o600 });
+
+      const base = newRoot('reg58-out');
+      const destination = path.join(base, 'bundle');
+      await assertRejectsWithCode(
+        exportEvidenceBundle({
+          directory: fixture.auditDir,
+          outputDirectory: destination,
+          checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
+          workspacePaths: [],
+        }),
+        [
+          'AUDIT_CHECKPOINT_CHAIN_BROKEN',
+          'AUDIT_CHECKPOINT_UNEXPECTED',
+          'AUDIT_CHECKPOINT_COVERAGE_MISMATCH',
+        ],
+      );
+      assert.equal(fs.existsSync(destination), false, 'nothing may be written');
+    });
+
+    test('RC06-T7-REG-60: validly signed receipts reordered against checkpoint order are refused', async () => {
+      const fixture = makeAuditConfig('reg60', { anchor: true });
+      await buildStore(fixture, { records: 9, rotateAt: [3, 6] });
+
+      const ledgerPath = path.join(fixture.auditDir, 'audit-anchors.jsonl');
+      const lines = fs.readFileSync(ledgerPath, 'utf8').slice(0, -1).split('\n');
+      assert.equal(lines.length, 2, 'the fixture must carry two genuine receipts');
+      // Both lines are validly signed. Only their ORDER is wrong.
+      fs.writeFileSync(ledgerPath, `${lines[1]}\n${lines[0]}\n`, { mode: 0o600 });
+
+      const base = newRoot('reg60-out');
+      await assertRejectsWithCode(
+        exportEvidenceBundle({
+          directory: fixture.auditDir,
+          outputDirectory: path.join(base, 'bundle'),
+          checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
+          anchorReceiptPublicKeyPath: fixture.anchorMaterial.publicKeyPath,
+          workspacePaths: [],
+        }),
+        ['BUNDLE_RECEIPT_ORPHAN', 'BUNDLE_RECEIPT_DUPLICATE'],
+      );
+
+      // The standalone bundle verifier applies the same ordering rule.
+      const good = path.join(newRoot('reg60-good'), 'bundle');
+      await exportEvidenceBundle({
+        directory: fixture.auditDir,
+        outputDirectory: good,
+        checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
+        anchorReceiptPublicKeyPath: fixture.anchorMaterial.publicKeyPath,
+        workspacePaths: [],
+        from: 1,
+        to: 3,
+      });
+      const goodLedger = path.join(good, 'anchors', 'audit-anchors.jsonl');
+      const goodLines = fs.readFileSync(goodLedger, 'utf8').slice(0, -1).split('\n');
+      if (goodLines.length > 1) {
+        rewriteBundleFile(
+          good,
+          'anchors/audit-anchors.jsonl',
+          `${goodLines[1]}\n${goodLines[0]}\n`,
+        );
+        await assertRejectsWithCode(verifyEvidenceBundle(good), [
+          'BUNDLE_RECEIPT_ORPHAN',
+          'BUNDLE_RECEIPT_DUPLICATE',
+        ]);
+      }
     });
   });
 });

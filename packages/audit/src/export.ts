@@ -69,6 +69,7 @@ import {
   CHECKPOINT_FILENAME,
   computeCheckpointHash,
   parseAndValidateCheckpointLineV1,
+  verifyCheckpointHistory,
   verifyCheckpointSignature,
   type AuditCheckpointV1,
 } from './checkpoint.js';
@@ -762,6 +763,19 @@ function selectEvidence(options: {
  * Checkpoint and receipt authentication (shared with the bundle verifier)
  * -------------------------------------------------------------------------- */
 
+/**
+ * The rule set for a BUNDLE's checkpoint window.
+ *
+ * A bundle carries a window of evidence, not a store: it does not carry the
+ * rotation history that made each checkpoint mandatory, so the frozen cadence
+ * cannot be re-derived from it. The cadence is therefore enforced where it is
+ * expressible — against the SOURCE, by the full Task-4 verifier above — and what
+ * remains here is what a window CAN be held to: one chain from checkpoint
+ * genesis, contiguous coverage, and every checkpoint bound to this store, this
+ * key, its own signature and its own canonical hash. Those are Task-4 rules
+ * (verifyCheckpointSignature, computeCheckpointHash), not a second crypto
+ * implementation.
+ */
 interface CheckpointAuthContext {
   storeId: string;
   keyFingerprint: string;
@@ -850,7 +864,14 @@ function authenticateCheckpointSequence(
 
 /**
  * Applies every Task-5 rule that binds a receipt to a store, a key and a
- * checkpoint, including the ordering and duplicate rules.
+ * checkpoint, including the ORDERING rule.
+ *
+ * The ledger is a monotonic subsequence of authenticated checkpoint order: a
+ * receipt is consumed against the checkpoint currently under the head, and the
+ * head only ever advances. A receipt whose checkpoint lies BEHIND the head —
+ * which is exactly what a reordered pair looks like — can therefore never be
+ * matched again, and is refused as an orphan, just as the production engine
+ * refuses it.
  */
 function authenticateReceiptSequence(
   receipts: readonly AnchorReceiptV1[],
@@ -858,10 +879,12 @@ function authenticateReceiptSequence(
     storeId: string;
     anchorFingerprint: string;
     publicKey: crypto.KeyObject;
-    checkpointHashes: ReadonlySet<string>;
+    /** Authenticated checkpoint hashes, in chain order. */
+    checkpointHashes: readonly string[];
   },
 ): void {
   const seen = new Set<string>();
+  let head = 0;
   for (const receipt of receipts) {
     if (!verifyAnchorReceiptSignature(receipt, context.publicKey)) {
       throw createCodedError(
@@ -878,12 +901,14 @@ function authenticateReceiptSequence(
     if (receipt.storeId !== context.storeId) {
       throw createCodedError('BUNDLE_RECEIPT_STORE_MISMATCH', 'a receipt names a different store');
     }
-    if (!context.checkpointHashes.has(receipt.checkpointHash)) {
+    const at = context.checkpointHashes.indexOf(receipt.checkpointHash, head);
+    if (at === -1) {
       throw createCodedError(
         'BUNDLE_RECEIPT_ORPHAN',
-        'an anchor receipt references a checkpoint that is not in the evidence',
+        'an anchor receipt is out of checkpoint order, or references a checkpoint that is not in the evidence',
       );
     }
+    head = at;
     if (seen.has(receipt.receiptId)) {
       throw createCodedError('BUNDLE_RECEIPT_DUPLICATE', 'a receipt id appears more than once');
     }
@@ -968,6 +993,20 @@ export async function exportEvidenceBundle(
     );
   }
   const rangeEnd = Math.min(to, primary.terminalSequence);
+
+  // The FULL Task-4 checkpoint authority over the source, before a byte is
+  // written. This is the same reviewed verifier `arc audit verify` runs, so the
+  // frozen cadence, mandatory rotation boundaries, required-interval detection,
+  // missing/unexpected checkpoint detection, coverage continuity, chain,
+  // storeId/key binding, terminal-record binding and Ed25519 signature are all
+  // authoritative here rather than restated. A source with a required checkpoint
+  // deleted — or with a validly signed checkpoint whose coverage the cadence does
+  // not permit — cannot be exported.
+  await verifyCheckpointHistory({
+    directory: options.directory,
+    publicKeyPath: options.checkpointPublicKeyPath,
+    workspacePaths: [...options.workspacePaths],
+  });
 
   // ---- Public keys: read the bytes ONCE, then prove they are the validated
   // bytes by fingerprint before those exact bytes are copied. A key-path
@@ -1122,7 +1161,7 @@ export async function exportEvidenceBundle(
       storeId: metadata.storeId,
       anchorFingerprint,
       publicKey: anchorTrustRoot.publicKey,
-      checkpointHashes: new Set(checkpointHashes),
+      checkpointHashes,
     });
   }
 
@@ -1429,7 +1468,7 @@ export async function verifyEvidenceBundle(bundleDirectory: string): Promise<Ver
       storeId: manifest.storeId,
       anchorFingerprint: anchorKey.fingerprint,
       publicKey: anchorKey.publicKey,
-      checkpointHashes: new Set(manifestHashes),
+      checkpointHashes: manifestHashes,
     });
   }
   const seenReceiptIds = receipts.map((receipt) => receipt.receiptId);

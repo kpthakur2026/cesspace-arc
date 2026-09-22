@@ -747,6 +747,151 @@ interface CheckpointVerificationOutcome extends CheckpointHistoryVerificationRes
 }
 
 /**
+ * The Task-4 checkpoint cadence walk, reusable over any primary fact stream.
+ *
+ * This is the ONE implementation of "what makes a checkpoint authentic". The
+ * store verifier drives it from a real store scan; the Task-7 exporter and
+ * bundle verifier drive it from the evidence they are working with. Because the
+ * cadence, coverage, chain, binding and signature rules all live here, none of
+ * those callers can drift into a weaker second rule set.
+ *
+ * The fact source is PUSH (a streaming scan reports each verified record) while
+ * the checkpoint source is PULL (a bounded line iterator), which is exactly the
+ * shape a streamed verification needs: neither side is buffered.
+ *
+ * @internal
+ */
+export class CheckpointEvidenceWalk {
+  private checkpointCount = 0;
+  private checkpointedThroughValue = 0;
+  private previousCheckpointHash = ZERO_HASH;
+  private lastCheckpointHash: string | null = null;
+  private lastCheckpointTerminalRecordHash: string | null = null;
+
+  constructor(
+    private readonly options: {
+      storeId: string;
+      fingerprint: string;
+      publicKey: crypto.KeyObject;
+      /** Sequences at which a rotation checkpoint is mandatory. */
+      rotationTerminals: ReadonlySet<number>;
+      /** Pulls the next checkpoint LINE, or null at end of stream. */
+      nextCheckpointLine: () => Promise<string | null>;
+      onVerifiedCheckpoint?: (checkpoint: AuditCheckpointV1) => void | Promise<void>;
+    },
+  ) {}
+
+  /** The sequence the next checkpoint must begin at. */
+  get checkpointedThrough(): number {
+    return this.checkpointedThroughValue;
+  }
+
+  get verifiedCheckpointCount(): number {
+    return this.checkpointCount;
+  }
+
+  get terminalCheckpointHash(): string | null {
+    return this.lastCheckpointHash;
+  }
+
+  get terminalCheckpointRecordHash(): string | null {
+    return this.lastCheckpointTerminalRecordHash;
+  }
+
+  /** Reports one verified primary record, driving the frozen cadence. */
+  async observeRecord(fact: VerifiedPrimaryCheckpointFact): Promise<void> {
+    const intervalDue = fact.sequenceNumber - this.checkpointedThroughValue === CHECKPOINT_INTERVAL;
+    const rotationDue = this.options.rotationTerminals.has(fact.sequenceNumber);
+    if (!intervalDue && !rotationDue) return;
+    // One checkpoint covers a coincident interval and rotation boundary, because
+    // the two causes resolve to the same single artifact.
+    await this.consumeRequiredCheckpoint(fact);
+  }
+
+  /**
+   * Proves no checkpoint exists at a sequence the frozen cadence does not
+   * require. Call once, after the last fact.
+   */
+  async finish(): Promise<void> {
+    const extra = await this.options.nextCheckpointLine();
+    if (extra !== null) {
+      throw createCodedError(
+        'AUDIT_CHECKPOINT_UNEXPECTED',
+        'checkpoint artifact stream contains a checkpoint at a sequence the frozen cadence does not require',
+      );
+    }
+  }
+
+  private async consumeRequiredCheckpoint(fact: VerifiedPrimaryCheckpointFact): Promise<void> {
+    const raw = await this.options.nextCheckpointLine();
+    if (raw === null) {
+      throw createCodedError(
+        'AUDIT_CHECKPOINT_MISSING',
+        `primary history requires a checkpoint ending at sequence ${fact.sequenceNumber}, but the checkpoint artifact stream ends first`,
+      );
+    }
+
+    const { checkpoint } = parseAndValidateCheckpointLineV1(raw);
+
+    if (checkpoint.storeId !== this.options.storeId) {
+      throw createCodedError(
+        'AUDIT_CHECKPOINT_LEDGER_MISMATCH',
+        'checkpoint storeId does not match audit-store.json',
+      );
+    }
+    if (checkpoint.publicKeyFingerprint !== this.options.fingerprint) {
+      throw createCodedError(
+        'AUDIT_CHECKPOINT_TRUST_ROOT_MISMATCH',
+        'checkpoint publicKeyFingerprint does not match the configured checkpoint trust root',
+      );
+    }
+    if (checkpoint.previousCheckpointHash !== this.previousCheckpointHash) {
+      throw createCodedError(
+        'AUDIT_CHECKPOINT_CHAIN_BROKEN',
+        `checkpoint previousCheckpointHash does not continue the chain at sequence ${checkpoint.sequenceEnd}`,
+      );
+    }
+    if (checkpoint.sequenceStart !== this.checkpointedThroughValue + 1) {
+      throw createCodedError(
+        'AUDIT_CORRUPTION_DETECTED',
+        `checkpoint coverage does not continue the previous range: expected sequenceStart ${this.checkpointedThroughValue + 1}, got ${checkpoint.sequenceStart}`,
+      );
+    }
+    if (checkpoint.sequenceEnd !== fact.sequenceNumber) {
+      throw createCodedError(
+        'AUDIT_CHECKPOINT_COVERAGE_MISMATCH',
+        `checkpoint coverage ends at sequence ${checkpoint.sequenceEnd}, but the cadence requires a checkpoint ending at ${fact.sequenceNumber}`,
+      );
+    }
+    if (checkpoint.terminalRecordHash !== fact.recordHash) {
+      throw createCodedError(
+        'AUDIT_CHECKPOINT_TERMINAL_MISMATCH',
+        `checkpoint terminalRecordHash does not match the primary record at sequence ${fact.sequenceNumber}`,
+      );
+    }
+    if (!verifyCheckpointSignature(checkpoint, this.options.publicKey)) {
+      throw createCodedError(
+        'AUDIT_CHECKPOINT_SIGNATURE_INVALID',
+        `checkpoint signature does not verify at sequence ${checkpoint.sequenceEnd}`,
+      );
+    }
+
+    this.checkpointCount++;
+    this.checkpointedThroughValue = checkpoint.sequenceEnd;
+    this.previousCheckpointHash = checkpoint.checkpointHash;
+    this.lastCheckpointHash = checkpoint.checkpointHash;
+    this.lastCheckpointTerminalRecordHash = checkpoint.terminalRecordHash;
+
+    // Every claim above holds, so this checkpoint is verified primary-derived
+    // evidence. The handoff runs last, so an observer never sees a checkpoint
+    // that a later check on the same checkpoint would have rejected.
+    if (this.options.onVerifiedCheckpoint !== undefined) {
+      await this.options.onVerifiedCheckpoint(checkpoint);
+    }
+  }
+}
+
+/**
  * Verifies the checkpoint history against the actual retained primary evidence.
  *
  * The two streams are walked together. The primary walk supplies the only
@@ -808,99 +953,36 @@ async function verifyCheckpointHistoryCore(
       ? null
       : readCheckpointLines(checkpointHandle, consumed)[Symbol.asyncIterator]();
 
-  let checkpointCount = 0;
-  let checkpointedThrough = 0;
-  let previousCheckpointHash = ZERO_HASH;
-  let lastCheckpointHash: string | null = null;
-  let lastCheckpointTerminalRecordHash: string | null = null;
-
-  /**
-   * Pulls the one checkpoint the cadence requires at this boundary and proves
-   * every claim it makes about the ledger.
-   */
-  const consumeRequiredCheckpoint = async (fact: VerifiedPrimaryCheckpointFact): Promise<void> => {
-    if (iterator === null) {
-      throw createCodedError(
-        'AUDIT_CHECKPOINT_MISSING',
-        `primary history requires a checkpoint ending at sequence ${fact.sequenceNumber}, but no checkpoint artifact exists`,
-      );
-    }
-
-    const next = await iterator.next();
-    if (next.done) {
-      throw createCodedError(
-        'AUDIT_CHECKPOINT_MISSING',
-        `primary history requires a checkpoint ending at sequence ${fact.sequenceNumber}, but the checkpoint artifact stream ends first`,
-      );
-    }
-
-    let text: string;
-    try {
-      text = new TextDecoder('utf-8', { fatal: true }).decode(next.value);
-    } catch (cause) {
-      throw createCodedError('AUDIT_CORRUPTION_DETECTED', 'checkpoint line is not valid UTF-8', {
-        cause,
-      });
-    }
-
-    const { checkpoint } = parseAndValidateCheckpointLineV1(text);
-
-    if (checkpoint.storeId !== storeId) {
-      throw createCodedError(
-        'AUDIT_CHECKPOINT_LEDGER_MISMATCH',
-        'checkpoint storeId does not match audit-store.json',
-      );
-    }
-    if (checkpoint.publicKeyFingerprint !== fingerprint) {
-      throw createCodedError(
-        'AUDIT_CHECKPOINT_TRUST_ROOT_MISMATCH',
-        'checkpoint publicKeyFingerprint does not match the configured checkpoint trust root',
-      );
-    }
-    if (checkpoint.previousCheckpointHash !== previousCheckpointHash) {
-      throw createCodedError(
-        'AUDIT_CHECKPOINT_CHAIN_BROKEN',
-        `checkpoint previousCheckpointHash does not continue the chain at sequence ${checkpoint.sequenceEnd}`,
-      );
-    }
-    if (checkpoint.sequenceStart !== checkpointedThrough + 1) {
-      throw createCodedError(
-        'AUDIT_CORRUPTION_DETECTED',
-        `checkpoint coverage does not continue the previous range: expected sequenceStart ${checkpointedThrough + 1}, got ${checkpoint.sequenceStart}`,
-      );
-    }
-    if (checkpoint.sequenceEnd !== fact.sequenceNumber) {
-      throw createCodedError(
-        'AUDIT_CHECKPOINT_COVERAGE_MISMATCH',
-        `checkpoint coverage ends at sequence ${checkpoint.sequenceEnd}, but the cadence requires a checkpoint ending at ${fact.sequenceNumber}`,
-      );
-    }
-    if (checkpoint.terminalRecordHash !== fact.recordHash) {
-      throw createCodedError(
-        'AUDIT_CHECKPOINT_TERMINAL_MISMATCH',
-        `checkpoint terminalRecordHash does not match the primary record at sequence ${fact.sequenceNumber}`,
-      );
-    }
-    if (!verifyCheckpointSignature(checkpoint, publicKey)) {
-      throw createCodedError(
-        'AUDIT_CHECKPOINT_SIGNATURE_INVALID',
-        `checkpoint signature does not verify at sequence ${checkpoint.sequenceEnd}`,
-      );
-    }
-
-    checkpointCount++;
-    checkpointedThrough = checkpoint.sequenceEnd;
-    previousCheckpointHash = checkpoint.checkpointHash;
-    lastCheckpointHash = checkpoint.checkpointHash;
-    lastCheckpointTerminalRecordHash = checkpoint.terminalRecordHash;
-
-    // Every claim above holds, so this checkpoint is verified primary-derived
-    // evidence. The handoff runs last, so an observer never sees a checkpoint
-    // that a later check on the same checkpoint would have rejected.
-    if (core.onVerifiedCheckpoint !== undefined) {
-      await core.onVerifiedCheckpoint(checkpoint);
-    }
-  };
+  // The ONE implementation of the checkpoint rule set. The store verifier,
+  // the Task-7 exporter and the bundle verifier all drive this same walk, so no
+  // caller can hold a weaker copy of the cadence, coverage, chain, binding or
+  // signature rules.
+  const walk = new CheckpointEvidenceWalk({
+    storeId,
+    fingerprint,
+    publicKey,
+    rotationTerminals,
+    nextCheckpointLine: async () => {
+      if (iterator === null) {
+        throw createCodedError(
+          'AUDIT_CHECKPOINT_MISSING',
+          'primary history requires a checkpoint, but no checkpoint artifact exists',
+        );
+      }
+      const step = await iterator.next();
+      if (step.done) return null;
+      try {
+        return new TextDecoder('utf-8', { fatal: true }).decode(step.value);
+      } catch (cause) {
+        throw createCodedError('AUDIT_CORRUPTION_DETECTED', 'checkpoint line is not valid UTF-8', {
+          cause,
+        });
+      }
+    },
+    ...(core.onVerifiedCheckpoint === undefined
+      ? {}
+      : { onVerifiedCheckpoint: core.onVerifiedCheckpoint }),
+  });
 
   // Identity of the artifact this history was verified from. Only a PRESENT
   // finding carries an identity, and it is established by accounting for the
@@ -910,26 +992,11 @@ async function verifyCheckpointHistoryCore(
 
   try {
     await verifyRetainedPrimaryHistory(auditDir, expectedUid, {
-      onVerifiedRecord: async (fact) => {
-        const intervalDue = fact.sequenceNumber - checkpointedThrough === CHECKPOINT_INTERVAL;
-        const rotationDue = rotationTerminals.has(fact.sequenceNumber);
-        if (!intervalDue && !rotationDue) {
-          return;
-        }
-        // One checkpoint covers a coincident interval and rotation boundary,
-        // because the two causes resolve to the same single artifact.
-        await consumeRequiredCheckpoint(fact);
-      },
+      onVerifiedRecord: (fact) => walk.observeRecord(fact),
     });
 
     if (iterator !== null) {
-      const extra = await iterator.next();
-      if (!extra.done) {
-        throw createCodedError(
-          'AUDIT_CHECKPOINT_UNEXPECTED',
-          'checkpoint artifact stream contains a checkpoint at a sequence the frozen cadence does not require',
-        );
-      }
+      await walk.finish();
     }
 
     if (checkpointHandle !== null && verificationStartIdentity !== null) {
@@ -994,17 +1061,17 @@ async function verifyCheckpointHistoryCore(
 
   return {
     artifactState,
-    checkpointCount,
-    lastCheckpointSequence: checkpointCount === 0 ? null : checkpointedThrough,
-    lastCheckpointHash,
-    lastCheckpointTerminalRecordHash,
+    checkpointCount: walk.verifiedCheckpointCount,
+    lastCheckpointSequence: walk.verifiedCheckpointCount === 0 ? null : walk.checkpointedThrough,
+    lastCheckpointHash: walk.terminalCheckpointHash,
+    lastCheckpointTerminalRecordHash: walk.terminalCheckpointRecordHash,
     publicKeyFingerprint: fingerprint,
-    ...(checkpointCount === 0 || lastCheckpointTerminalRecordHash === null
+    ...(walk.verifiedCheckpointCount === 0 || walk.terminalCheckpointRecordHash === null
       ? {}
       : {
           trustedPrimaryBoundary: {
-            sequenceNumber: checkpointedThrough,
-            recordHash: lastCheckpointTerminalRecordHash,
+            sequenceNumber: walk.checkpointedThrough,
+            recordHash: walk.terminalCheckpointRecordHash,
           },
         }),
   };
