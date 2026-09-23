@@ -282,8 +282,8 @@ fi
 echo "    [PASS] Verification script integrity confirmed (no error-masking fallback)."
 echo ""
 
-# Gate 21: Package Version Consistency
-echo "--> Gate 21: Package Version Consistency ($EXPECTED_VERSION)"
+# Gate 21: Package Version & Script Consistency
+echo "--> Gate 21: Package Version & Script Consistency ($EXPECTED_VERSION)"
 check_version() {
   local FILE="$1"
   if ! grep -q "\"version\": \"$EXPECTED_VERSION\"" "$FILE"; then
@@ -297,26 +297,59 @@ check_version "package.json"
 check_version "apps/mcp-server/package.json"
 check_version "apps/cli/package.json"
 
+if ! grep -q '"verify:rc06": "bash scripts/verify-rc06.sh"' "package.json"; then
+  echo "    [FAIL] package.json does not map verify:rc06 to bash scripts/verify-rc06.sh"
+  exit 1
+fi
+echo "    [PASS] package.json verify:rc06 maps to bash scripts/verify-rc06.sh"
+
 CLI_SRC="apps/cli/src/index.ts"
 if ! grep -q "CLI_VERSION = '$EXPECTED_VERSION'" "$CLI_SRC"; then
   echo "    [FAIL] $CLI_SRC does not declare CLI_VERSION $EXPECTED_VERSION"
   exit 1
 fi
 echo "    [PASS] $CLI_SRC declares CLI_VERSION $EXPECTED_VERSION"
+
+MCP_SRC="apps/mcp-server/src/index.ts"
+if ! grep -q "version: '$EXPECTED_VERSION'" "$MCP_SRC"; then
+  echo "    [FAIL] $MCP_SRC does not advertise version $EXPECTED_VERSION"
+  exit 1
+fi
+echo "    [PASS] $MCP_SRC advertises version $EXPECTED_VERSION"
 echo ""
 
-# Gate 22: Health Stage Consistency
-echo "--> Gate 22: Health Stage Consistency ($EXPECTED_STAGE)"
-MCP_SRC="apps/mcp-server/src/index.ts"
+# Gate 22: Health Version & Stage Consistency
+echo "--> Gate 22: Health Version & Stage Consistency ($EXPECTED_VERSION / $EXPECTED_STAGE)"
+if ! grep -q "version: '$EXPECTED_VERSION'" "$MCP_SRC"; then
+  echo "    [FAIL] Health response in $MCP_SRC does not report version '$EXPECTED_VERSION'"
+  exit 1
+fi
 if ! grep -q "stage: '$EXPECTED_STAGE'" "$MCP_SRC"; then
   echo "    [FAIL] Health response in $MCP_SRC does not report stage '$EXPECTED_STAGE'"
   exit 1
 fi
-echo "    [PASS] $MCP_SRC reports stage $EXPECTED_STAGE"
+echo "    [PASS] $MCP_SRC reports health.version $EXPECTED_VERSION and health.stage $EXPECTED_STAGE"
 echo ""
 
-# Gate 23: Final Integration Report Check
-echo "--> Gate 23: Final Integration Report Check ($FINAL_REPORT)"
+# Gate 23: Required Task-8 Files Check
+echo "--> Gate 23: Required Task-8 Files Check"
+TASK8_REQUIRED_FILES=(
+  "tests/rc06-negative-controls.test.js"
+  "tests/rc06-positive-flows.test.js"
+  "scripts/verify-rc06.sh"
+  "docs/architecture/rc06-final-integration-report.md"
+)
+for REQ_FILE in "${TASK8_REQUIRED_FILES[@]}"; do
+  if [[ ! -s "$REQ_FILE" ]]; then
+    echo "    [FAIL] Required Task-8 file '$REQ_FILE' does not exist or is empty"
+    exit 1
+  fi
+  echo "    [PASS] Required Task-8 file '$REQ_FILE' verified."
+done
+echo ""
+
+# Gate 24: Final Integration Report Check
+echo "--> Gate 24: Final Integration Report Check ($FINAL_REPORT)"
 if [[ ! -s "$FINAL_REPORT" ]]; then
   echo "    [FAIL] $FINAL_REPORT is missing or empty!"
   exit 1
@@ -328,8 +361,8 @@ fi
 echo "    [PASS] $FINAL_REPORT verified and non-empty."
 echo ""
 
-# Gate 24: Scope Document Check
-echo "--> Gate 24: Scope Document Check ($SCOPE_DOC)"
+# Gate 25: Scope Document Check
+echo "--> Gate 25: Scope Document Check ($SCOPE_DOC)"
 if [[ ! -s "$SCOPE_DOC" ]]; then
   echo "    [FAIL] $SCOPE_DOC is missing or empty!"
   exit 1
@@ -338,5 +371,5 @@ echo "    [PASS] $SCOPE_DOC verified and present."
 echo ""
 
 echo "========================================================================"
-echo "          RC-06 VERIFICATION SUCCESSFUL: ALL 24 GATES PASSED            "
+echo "          RC-06 VERIFICATION SUCCESSFUL: ALL 25 GATES PASSED            "
 echo "========================================================================"
