@@ -40,6 +40,8 @@ import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
 import https from 'node:https';
+import { once } from 'node:events';
+import zlib from 'node:zlib';
 import { fileURLToPath } from 'node:url';
 
 import {
@@ -77,11 +79,18 @@ import {
 } from '../packages/audit/dist/internal/key-authority.js';
 
 import { ArcMcpServer } from '../apps/mcp-server/dist/index.js';
+import { AdminIpcServer } from '../apps/mcp-server/dist/admin-ipc.js';
 import { RemoteExecutionBridge } from '../apps/mcp-server/dist/remote-execution.js';
 import { getGatewayAuditSink } from '../apps/mcp-server/dist/gateway-audit.js';
 import { EXIT_OK, runCli } from '../apps/cli/dist/index.js';
 
-import { GATEWAY_AUDIT_EVENT_TYPES } from '../packages/protocol/dist/index.js';
+import {
+  ADMIN_PROTOCOL_VERSION,
+  GATEWAY_AUDIT_EVENT_TYPES,
+  encodeAdminPayload,
+  exportPublicKeyB64,
+  signAdminPayload,
+} from '../packages/protocol/dist/index.js';
 import {
   DeviceTrustStore,
   deriveSpkiPin,
@@ -137,6 +146,76 @@ after(async () => {
   }
 });
 
+function readOneFrame(socket, maxBytes) {
+  return new Promise((resolve, reject) => {
+    let buffer = Buffer.alloc(0);
+    const onData = (chunk) => {
+      buffer = Buffer.concat([buffer, chunk]);
+      if (buffer.length > maxBytes) {
+        cleanup();
+        reject(new Error('frame exceeded bound'));
+        return;
+      }
+      const idx = buffer.indexOf(0x0a);
+      if (idx !== -1) {
+        cleanup();
+        resolve(buffer.subarray(0, idx));
+      }
+    };
+    const onEnd = () => {
+      cleanup();
+      reject(new Error('connection ended before a frame arrived'));
+    };
+    const cleanup = () => {
+      socket.removeListener('data', onData);
+      socket.removeListener('end', onEnd);
+      socket.removeListener('error', onEnd);
+    };
+    socket.on('data', onData);
+    socket.on('end', onEnd);
+    socket.on('error', onEnd);
+  });
+}
+
+async function connectAndChallenge(endpoint) {
+  const socket = net.createConnection(endpoint);
+  await once(socket, 'connect');
+  const frame = await readOneFrame(socket, 4096);
+  return { socket, challenge: JSON.parse(frame.toString('utf8')) };
+}
+
+function buildAdminEnvelope(privateKey, challenge, method, params = {}) {
+  const canonical = encodeAdminPayload({
+    protocol: ADMIN_PROTOCOL_VERSION,
+    challengeId: challenge.challengeId,
+    method,
+    params,
+  });
+  const payloadBytes = Buffer.from(canonical, 'utf8');
+  const signature = signAdminPayload(
+    privateKey,
+    challenge.challengeId,
+    challenge.nonce,
+    payloadBytes,
+  );
+  return {
+    payload: payloadBytes.toString('base64'),
+    signature: signature.toString('base64'),
+  };
+}
+
+async function exchangeAdmin(socket, envelope) {
+  socket.write(`${JSON.stringify(envelope)}\n`);
+  const frame = await readOneFrame(socket, 8 * 1024 * 1024);
+  socket.destroy();
+  return JSON.parse(frame.toString('utf8'));
+}
+
+async function adminRequest(endpoint, privateKey, method, params = {}) {
+  const { socket, challenge } = await connectAndChallenge(endpoint);
+  return exchangeAdmin(socket, buildAdminEnvelope(privateKey, challenge, method, params));
+}
+
 function createTestServer(fixture, options = {}) {
   const workspaceRegistry = new WorkspaceRegistry();
   workspaceRegistry.registerWorkspace('ws', options.workspaceDir ?? sharedWorkspaceDir);
@@ -146,6 +225,16 @@ function createTestServer(fixture, options = {}) {
   const filesystem = new FilesystemSubsystem();
   const git = new GitSubsystem();
   const approvals = new ApprovalStateManager();
+
+  let adminIpcServer = options.adminIpcServer;
+  if (!adminIpcServer && options.admin) {
+    adminIpcServer = new AdminIpcServer({
+      endpoint: options.admin.endpoint,
+      operatorPublicKeyB64: options.admin.operatorPublicKeyB64,
+      approvalStateManager: approvals,
+      auditLogger,
+    });
+  }
 
   const server = new ArcMcpServer(
     workspaceRegistry,
@@ -163,6 +252,7 @@ function createTestServer(fixture, options = {}) {
     undefined,
     processRegistry,
     approvals,
+    adminIpcServer,
   );
 
   return {
@@ -174,6 +264,7 @@ function createTestServer(fixture, options = {}) {
     git,
     approvals,
     processRegistry,
+    adminIpcServer,
   };
 }
 
@@ -378,7 +469,19 @@ describe('CesSpace ARC — RC-06 23 Positive Acceptance Flows (RC06-FLOW-01..23)
 
   test('RC06-FLOW-06: Operator Approval Lifecycle Persistence', async () => {
     const fixture = createAuditConfig(tempRoot, 'flow-06');
-    const { server } = createTestServer(fixture);
+    const adminDir = fs.mkdtempSync(path.join(tempRoot, 'admin-flow06-'));
+    fs.chmodSync(adminDir, 0o700);
+    const adminEndpoint = path.join(adminDir, 'admin.sock');
+
+    const operator = crypto.generateKeyPairSync('ed25519');
+    const operatorPublicKeyB64 = exportPublicKeyB64(operator.publicKey);
+
+    const { server } = createTestServer(fixture, {
+      admin: {
+        endpoint: adminEndpoint,
+        operatorPublicKeyB64,
+      },
+    });
     await server.start();
     startedServers.push(server);
 
@@ -394,18 +497,29 @@ describe('CesSpace ARC — RC-06 23 Positive Acceptance Flows (RC06-FLOW-01..23)
     const requestId = parsed1.details.approvalRequestId;
     assert.ok(requestId);
 
-    // 2. Operator approves via admin/internal state manager -> returns token
-    const grant = server.approvalStateManager.approve(requestId);
-    assert.ok(grant.token);
+    // 2. Operator approves via authenticated local Admin IPC (Unix socket, challenge, Ed25519 signing)
+    const adminResponse = await adminRequest(
+      adminEndpoint,
+      operator.privateKey,
+      'approval.approve',
+      { requestId },
+    );
+    assert.equal(
+      adminResponse.ok,
+      true,
+      `Admin approval must succeed: ${JSON.stringify(adminResponse)}`,
+    );
+    const approvalToken = adminResponse.result?.token;
+    assert.ok(approvalToken, 'Admin approval must return token');
 
-    // 3. Redeem and consume through production approval path
+    // 3. Redeem and consume through production approval path using _arcApproval
     const res2 = await server.dispatchToolCall('create_file', {
       path: 'sensitive.txt',
       content: 'sensitive file content',
       workspaceId: 'ws',
       _arcApproval: {
         requestId,
-        token: grant.token,
+        token: approvalToken,
       },
     });
     assert.equal(res2.isError, undefined);
@@ -567,15 +681,48 @@ describe('CesSpace ARC — RC-06 23 Positive Acceptance Flows (RC06-FLOW-01..23)
     assert.equal(toolRes.status, 200);
 
     // 3. Trigger rate-limit enforcement -> RATE_LIMITED
+    const rateLimitResponses = [];
     for (let i = 0; i < 35; i += 1) {
-      await doRequest({
+      const resp = await doRequest({
         body: JSON.stringify({ jsonrpc: '2.0', id: i + 10, method: 'ping' }),
       });
+      rateLimitResponses.push(resp);
     }
 
-    // 4. Supplemental coverage for remaining vocabulary entries
+    // Prove at least one real request is actually rate-limited (HTTP 429 or connection drop)
+    const rateLimitedResponses = rateLimitResponses.filter(
+      (r) => r.status === 429 || r.error === 'ECONNRESET',
+    );
+    assert.ok(
+      rateLimitedResponses.length > 0,
+      'At least one real request must be rate-limited by gateway rate limiting',
+    );
+
+    // Read durable JSONL BEFORE supplemental manual event emission
+    const activePath = path.join(fixture.directory, ACTIVE_SEGMENT_FILENAME);
+    const preSupplementalLines = fs.readFileSync(activePath, 'utf8').trim().split('\n');
+    const preSupplementalRecords = preSupplementalLines.map((l) => JSON.parse(l));
+
+    // Prove a production-generated RATE_LIMITED audit record already exists
+    const productionRateLimitRecord = preSupplementalRecords.find(
+      (r) => r.gateway?.eventType === 'RATE_LIMITED',
+    );
+    assert.ok(
+      productionRateLimitRecord,
+      'Production-generated RATE_LIMITED audit record must already exist in durable JSONL before supplemental emission',
+    );
+    assert.ok(
+      ['A', 'B', 'C'].includes(productionRateLimitRecord.gateway?.admissionLayer),
+      'Production RATE_LIMITED record must indicate valid admission layer',
+    );
+
+    // 4. Supplemental coverage for remaining vocabulary entries (excluding RATE_LIMITED)
     const sink = getGatewayAuditSink(auditLogger);
     for (const eventType of GATEWAY_AUDIT_EVENT_TYPES) {
+      if (eventType === 'RATE_LIMITED') {
+        // A manually emitted RATE_LIMITED event must not be able to satisfy the real rate-limit assertion
+        continue;
+      }
       sink.emit({
         eventType,
         mcpSessionId: sessionId,
@@ -590,7 +737,6 @@ describe('CesSpace ARC — RC-06 23 Positive Acceptance Flows (RC06-FLOW-01..23)
     // 5. Shutdown evidence -> GATEWAY_STOPPED
     await server.stop();
 
-    const activePath = path.join(fixture.directory, ACTIVE_SEGMENT_FILENAME);
     const lines = fs.readFileSync(activePath, 'utf8').trim().split('\n');
     const records = lines.map((l) => JSON.parse(l));
 
@@ -1724,13 +1870,20 @@ describe('CesSpace ARC — RC-06 23 Positive Acceptance Flows (RC06-FLOW-01..23)
     assert.equal(bundleVerification.coveredSequenceStart, 1);
     assert.equal(bundleVerification.coveredSequenceEnd, 2);
 
-    // 7. No private key material exists in bundle files
+    // 7. No private key material exists in bundle files (including decompressed .gz archives)
     function scanDir(dir) {
       for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
         const full = path.join(dir, ent.name);
-        if (ent.isDirectory()) scanDir(full);
-        else if (ent.isFile() && !ent.name.endsWith('.gz')) {
-          const text = fs.readFileSync(full, 'utf8');
+        if (ent.isDirectory()) {
+          scanDir(full);
+        } else if (ent.isFile()) {
+          let text;
+          if (ent.name.endsWith('.gz')) {
+            const compressed = fs.readFileSync(full);
+            text = zlib.gunzipSync(compressed).toString('utf8');
+          } else {
+            text = fs.readFileSync(full, 'utf8');
+          }
           assert.equal(
             text.includes('PRIVATE KEY'),
             false,
