@@ -12,10 +12,7 @@ import {
   validateStepExecutionAgainstPlan,
   enterCompositeInvocation,
 } from '../apps/mcp-server/dist/composite-framework.js';
-import {
-  buildPayloadToSign,
-  buildReviewPayload,
-} from '../apps/mcp-server/dist/approval-gate.js';
+import { buildPayloadToSign, buildReviewPayload } from '../apps/mcp-server/dist/approval-gate.js';
 import {
   ApprovalStateManager,
   SecurityKernel,
