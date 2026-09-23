@@ -20,6 +20,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 
+import { runAuditCommand } from './audit.js';
+
 import {
   RC03_MUTATION_TOOLS,
   WorkspaceRegistry,
@@ -40,7 +42,7 @@ import {
 import { AdminClientError, AdminIpcClient, readPrivateKeyFromFd } from './admin-client.js';
 
 export const CLI_NAME = 'arc';
-export const CLI_VERSION = '0.5.0-rc05';
+export const CLI_VERSION = '0.6.0-rc06';
 
 export const EXIT_OK = 0;
 export const EXIT_FAILURE = 1;
@@ -95,6 +97,7 @@ Usage:
   ${CLI_NAME} sessions list
   ${CLI_NAME} sessions revoke <sessionId>
   ${CLI_NAME} policy test <file> [options]
+  ${CLI_NAME} audit status|verify|inspect|export [options]
   ${CLI_NAME} --help
   ${CLI_NAME} --version
 
@@ -126,6 +129,21 @@ policy test options:
   --git-action <action>       Git action
 
   Without --tool, the policy is only validated, normalized, and hashed.
+
+audit options (local operator only):
+  --dir <path>            Audit store directory (default: ~/.cesspace-arc/audit)
+  --checkpoint-key <path> PUBLIC Ed25519 checkpoint key (status, verify, export)
+  --anchor-key <path>     PUBLIC Ed25519 anchor receipt key (anchor mode only)
+  --workspace <path>      Authoritative agent workspace root (repeatable)
+  --no-workspaces         Authoritatively assert this host has NO workspaces
+  --from <seq>            First sequence, inclusive (inspect, export)
+  --to <seq>              Last sequence, inclusive (inspect, export)
+  --limit <n>             Maximum records to display (inspect, max 100)
+  --output <dir>          New evidence bundle directory (export)
+
+  \`arc audit\` reads filesystem evidence directly. It opens no admin channel,
+  accepts no --admin-socket or --admin-key-fd, requires no running server, and
+  uses PUBLIC verification keys only. No private signing key is ever read.
 `;
 
 /**
@@ -1178,6 +1196,14 @@ export async function runCli(
       }
       const options = parsePolicyTestArgs(args.slice(2));
       return runPolicyTest(io, options);
+    }
+
+    // The audit group is local-only by construction: it is dispatched HERE,
+    // outside the admin gate above, so `resolveAdminConfig`, `stripAdminOptions`
+    // and `callAdmin` are never reached and no admin option is even parsed. The
+    // commands read filesystem evidence directly and require no running server.
+    if (command === 'audit') {
+      return await runAuditCommand(io, args.slice(1));
     }
 
     throw new UsageError(`Unknown command: ${command}`);

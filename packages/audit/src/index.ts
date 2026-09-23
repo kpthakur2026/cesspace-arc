@@ -38,8 +38,8 @@ export const SENSITIVE_KEY_PATTERNS = [
  * mistakenly pass a raw host path cannot leak it into a stored record.
  */
 export const ABSOLUTE_PATH_REGEXES = [
-  /\/(?:home|tmp|root|Users|var|private|opt|etc|usr|bin|sbin|lib|lib64|mnt|media|srv)(?:\/[^\s'",;:)\]]*)*/g,
-  /[a-zA-Z]:\\[^\s'",;:)\]]*/g,
+  /[a-zA-Z]:[\\/][^\s'",;:)\]]*/g,
+  /\/(?:home|tmp|root|Users|var|private|opt|etc|usr|bin|sbin|lib|lib64|mnt|media|srv|workspace|workspaces|project|projects)(?:\/[^\s'",;:)\]]*)*/g,
 ];
 
 export const ABSOLUTE_PATH_PLACEHOLDER = '[REDACTED_PATH]';
@@ -55,24 +55,18 @@ export function redactAbsolutePaths(value: string): string {
 
 /**
  * High-confidence secret shapes removed from ANY string that reaches a stored
- * record, whatever key it arrived under (rc05 §24, RC05-NEG-73).
+ * record, whatever key it arrived under (rc05 §24, RC05-NEG-73, RC-06 Task 8).
  *
- * Two families, both deterministic and both bounded:
- *
- * - Private-key blocks (`-----BEGIN [A-Z ]+PRIVATE KEY-----`), which cover RSA,
- *   EC, OPENSSH, and the unqualified `PRIVATE KEY` form.
- * - Certificate blocks (`-----BEGIN CERTIFICATE-----`), so a full PEM
- *   certificate blob cannot reach a record even when a caller puts it under an
- *   innocent key name such as `detail` or `notes`. The `cert(ificate)?` KEY
- *   pattern only helps when the field is honestly NAMED for what it holds; this
- *   covers the value wherever it lands.
+ * Deterministic and bounded secret patterns covering session tokens, authorization
+ * headers, bearer credentials, enrollment secrets, multiline PEM private keys,
+ * and certificates.
  *
  * Deliberately NOT included: a bare 64-character hexadecimal string. SHA-256
  * digests are intentional, safe audit references — the trust store's workspace
  * root digest, the session token DIGEST, and every SPKI pin are all exactly that
  * shape — so redacting that shape would destroy legitimate evidence rather than
  * protect anything. Secrets reach this layer as VALUES under a sensitive key
- * name (caught by {@link SENSITIVE_KEY_PATTERNS}) or as one of the block forms
+ * name (caught by {@link SENSITIVE_KEY_PATTERNS}) or as one of the pattern forms
  * above, never as a bare digest that ARC minted itself.
  */
 export const SENSITIVE_VALUE_REGEXES = [
@@ -80,11 +74,12 @@ export const SENSITIVE_VALUE_REGEXES = [
   /ghp_[a-zA-Z0-9]{36}/g,
   /gho_[a-zA-Z0-9]{36}/g,
   /sk-[a-zA-Z0-9]{20,}/g,
-  /Bearer\s+[a-zA-Z0-9._-]+/gi,
-  /Arc-Session-Token[:\s=]+[a-zA-Z0-9._-]+/gi,
-  /Authorization[:\s=]+[a-zA-Z0-9._-]+/gi,
+  /(?:Arc-Session-Token|session[_-]?token)[:\s=]+[a-zA-Z0-9._~+/-]+=*/gi,
+  /(?:Authorization[:\s=]+)(?:(?:Bearer|Basic)\s+)?[a-zA-Z0-9._~+/-]+=*/gi,
+  /(?:enrollment[_-]?secret|enrollment[_-]?token)[:\s=]+[a-zA-Z0-9._~+/-]+=*/gi,
+  /Bearer\s+[a-zA-Z0-9._~+/-]+=*/gi,
   /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g,
-  /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g,
+  /-----BEGIN [A-Z0-9 ]*CERTIFICATE-----[\s\S]*?-----END [A-Z0-9 ]*CERTIFICATE-----/g,
 ];
 
 export function redactValue(value: unknown): unknown {
@@ -343,10 +338,12 @@ export class AuditLogger implements IAuditLogger {
     const previousRecordHash = this.lastRecordHash;
 
     // Build the REDACTED/minimized parameter representation FIRST, then derive
-    // any fallback payload hash from it. A fallback hash must never be computed
-    // from raw content, patch text, environment values, or a token (rc04 §33).
+    // the authoritative payload hash from it. The persisted payloadHash MUST be
+    // derived centrally from sanitized bytes (rc06 Task 8). A caller-supplied hash
+    // is never trusted as authoritative because it could be derived from raw secret
+    // input and turn the audit trail into an offline secret oracle.
     const parametersRedacted = this.redact(recordData.invocation.parametersRedacted);
-    const fallbackPayloadHash = computeSha256(canonicalJson(parametersRedacted));
+    const payloadHash = computeSha256(canonicalJson(parametersRedacted));
 
     // Central defense-in-depth for the top-level error message. Redaction is
     // applied HERE, for every caller, so a writer that forgets cannot leak an
@@ -392,7 +389,7 @@ export class AuditLogger implements IAuditLogger {
       invocation: {
         toolName: recordData.invocation.toolName,
         parametersRedacted,
-        payloadHash: recordData.invocation.payloadHash || fallbackPayloadHash,
+        payloadHash,
       },
       policy: this.redact(
         recordData.policy as unknown as Record<string, unknown>,
@@ -446,7 +443,8 @@ export class AuditLogger implements IAuditLogger {
    * for every caller without anyone having to remember to redact it.
    */
   private minimizeTarget(target: AuditRecord['target']): AuditRecord['target'] {
-    const workspaceId = typeof target?.workspaceId === 'string' ? target.workspaceId : '';
+    const workspaceId =
+      typeof target?.workspaceId === 'string' ? redactString(target.workspaceId) : '';
     const workspacePath = typeof target?.workspacePath === 'string' ? target.workspacePath : '';
 
     // An explicitly supplied digest is always safe and is retained even when no
@@ -513,3 +511,231 @@ export class AuditLogger implements IAuditLogger {
 }
 
 export type { AuditRecord };
+
+export {
+  DEFAULT_AUDIT_DIR,
+  ACTIVE_SEGMENT_FILENAME,
+  UUID_V4_REGEX,
+  PERSISTENT_RECORD_V1_ALLOWED_KEYS,
+  ACTOR_ALLOWED_KEYS,
+  TARGET_ALLOWED_KEYS,
+  INVOCATION_ALLOWED_KEYS,
+  POLICY_ALLOWED_KEYS,
+  EXECUTION_ALLOWED_KEYS,
+  ERROR_ALLOWED_KEYS,
+  LIFECYCLE_ALLOWED_KEYS,
+  APPROVAL_ALLOWED_KEYS,
+  GATEWAY_ALLOWED_KEYS,
+  INTEGRITY_ALLOWED_KEYS,
+  type CodedError,
+  createCodedError,
+  getProcessUid,
+  type PlatformCapabilities,
+  detectPlatformCapabilities,
+  validatePlatformCapabilities,
+  validateAuditDirectory,
+  validateFileDescriptorAuthority,
+  canonicalJsonV1,
+  validateIntegrityObjectV1,
+  computeRecordHashPreimageV1,
+  computeRecordHashV1,
+  serializeRecordV1,
+  validatePersistentRecordV1,
+  parseAndValidateRecordLineV1,
+  type StorageState,
+  type PersistentAuditStorageConfig,
+  PersistentAuditStorage,
+} from './storage.js';
+export * from './metadata.js';
+export * from './lock.js';
+export {
+  MAX_TORN_TAIL_BYTES,
+  type TrustedPrimaryChainBoundary,
+  type DanglingOperation,
+  type VerifiedStreamResult,
+  type TornTailStreamResult,
+  type ActiveStreamVerificationResult,
+  type StreamVerificationOptions,
+  verifyActiveStream,
+  type AuditRecoveryResult,
+  type AuditRecoveryOptions,
+  recoverPersistentAuditStorage,
+} from './recovery.js';
+export {
+  SEGMENT_SIZE_THRESHOLD,
+  ROTATION_INTERVAL,
+  ROTATION_INTERVAL_MS,
+  MAX_ARCHIVE_SEGMENTS,
+  TOTAL_AUDIT_BUDGET_BYTES,
+  RECENT_RECORDS_CACHE_LIMIT,
+  type RotationSealBoundary,
+  type RotationCheckpointSealer,
+  validateRotationSealBoundary,
+  type ArchiveInventoryEntry,
+  type PhysicalArchiveRepresentation,
+  type LogicalArchiveEntry,
+  type SegmentRotationReason,
+  type RotationResult,
+  type SegmentDigest,
+  type RetainedPrimaryHistoryVerificationOptions,
+  type RetainedPrimaryHistoryVerificationResult,
+  verifyRetainedPrimaryHistory,
+  listArchiveInventory,
+  listLogicalArchiveInventory,
+  countLogicalArchives,
+  scanAuditStorePhysicalBytes,
+  assertAuditStorageCapacity,
+  assertArchiveCapacityAvailable,
+  type RotatingAuditStoreOptions,
+  RotatingAuditStore,
+} from './rotation.js';
+export {
+  CHECKPOINT_INTERVAL,
+  MAX_SIGNING_KEY_BYTES,
+  CHECKPOINT_FILENAME,
+  CHECKPOINT_SIGNATURE_DOMAIN,
+  CHECKPOINT_ALLOWED_KEYS,
+  CHECKPOINT_FORBIDDEN_EVENT_KEYS,
+  type AuditCheckpointV1,
+  type UnsignedAuditCheckpointV1,
+  validateCheckpointV1,
+  computeCheckpointSignaturePreimage,
+  computeCheckpointHashPreimage,
+  computeCheckpointHash,
+  serializeCheckpointV1,
+  verifyCheckpointSignature,
+  parseAndValidateCheckpointLineV1,
+  type CheckpointHistoryVerificationResult,
+  type CheckpointHistoryVerificationOptions,
+  verifyCheckpointHistory,
+  type Tier2CheckpointEngineConfig,
+  type CheckpointEngineState,
+  Tier2CheckpointEngine,
+  openTier2CheckpointEngine,
+  computeCheckpointPublicKeyFingerprint,
+  type TrustRootPurpose,
+  type SigningKeySource,
+  computePublicKeyFingerprint,
+  computeTrustRootFingerprintFromFile,
+  assertNoRawSigningKeyMaterial,
+} from './checkpoint.js';
+export {
+  ANCHOR_RECEIPT_FILENAME,
+  ANCHOR_SPOOL_DIRNAME,
+  ANCHOR_RECEIPT_SIGNATURE_DOMAIN,
+  ANCHOR_SPOOL_FILENAME_REGEX,
+  ANCHOR_SPOOL_FILE_MODE,
+  ANCHOR_SPOOL_DIRECTORY_MODE,
+  MAX_ANCHOR_RECEIPT_BYTES,
+  MAX_ANCHOR_ENDPOINT_BYTES,
+  MAX_ANCHOR_SPOOL_BYTES,
+  MAX_ANCHOR_SPOOL_ENTRY_BYTES,
+  MAX_PENDING_ANCHOR_CHECKPOINTS,
+  MAX_ANCHOR_ATTEMPTS,
+  ANCHOR_RETRY_BACKOFF_MS,
+  ANCHOR_REQUEST_TIMEOUT_MS,
+  ANCHOR_IDEMPOTENCY_HEADER,
+  ANCHOR_ACKNOWLEDGING_STATUS_CODES,
+  ANCHOR_RECEIPT_ALLOWED_KEYS,
+  type AnchorReceiptV1,
+  type UnsignedAnchorReceiptV1,
+  validateAnchorReceiptV1,
+  computeAnchorReceiptSignaturePreimage,
+  verifyAnchorReceiptSignature,
+  ReceiptEvidenceWalk,
+  walkReceiptEvidence,
+  serializeAnchorReceiptV1,
+  parseAndValidateAnchorReceiptLineV1,
+  computeAnchorReceiptPublicKeyFingerprint,
+  validateAnchorEndpoint,
+  type AnchorState,
+  type AnchorStatus,
+  type AnchorDispatchResult,
+  type Tier3AnchorEngineConfig,
+  Tier3AnchorEngine,
+  openTier3AnchorEngine,
+} from './anchor.js';
+export {
+  ROTATED_SEGMENT_PREFIX,
+  ROTATED_SEGMENT_PLAIN_SUFFIX,
+  ROTATED_SEGMENT_COMPRESSED_SUFFIX,
+  ROTATED_SEGMENT_REGEX,
+  MAX_SEQUENCE_NUMBER,
+  type ParsedRotatedSegmentFilename,
+  formatRotationTimestamp,
+  formatRotatedSegmentFilename,
+  parseRotatedSegmentFilename,
+  isValidRotatedSegmentFilename,
+} from './rotation-filename.js';
+
+/* -------------------------------------------------------------------------- *
+ * RC-06 Task 6 — the production audit runtime composition.
+ *
+ * The ONLY production surface Task 6 adds. Everything else Task 6 composes is
+ * already exported by the Task that owns it, and the deterministic seams live in
+ * `./internal/runtime-testing.js`, which is deliberately absent from the
+ * package's `exports` map so no consumer can import them by subpath.
+ * -------------------------------------------------------------------------- */
+export {
+  AUDIT_STARTUP_STAGE_ORDER,
+  openAuditRuntime,
+  type AuditConfig,
+  type AuditHealthMetadata,
+  type AuditRuntime,
+  type AuditStartupStage,
+} from './startup.js';
+
+/* -------------------------------------------------------------------------- *
+ * RC-06 Task 7 — the local operator verifier and evidence exporter.
+ *
+ * Both are READ ONLY and PUBLIC-KEY ONLY: neither opens the store for writing,
+ * takes the writer lock, repairs evidence, or reads a private signing key. The
+ * names here are deliberately distinct from any runtime/administrative surface,
+ * so a consumer can never mistake an offline observation for a live operation.
+ * -------------------------------------------------------------------------- */
+export {
+  MAX_INSPECT_RECORDS,
+  type EvidenceIdentity,
+  snapshotEvidenceInventory,
+  assertInventoryUnchanged,
+  assertOfflineEvidenceContentGenerationUnchanged,
+  streamDigestLogicalSegment,
+  type RetainedSegmentSource,
+  listRetainedSegmentSources,
+  streamRetainedRecords,
+  type OfflineAnchorOutcome,
+  type OfflineVerificationOptions,
+  type OfflineVerificationResult,
+  verifyOfflineStore,
+  type OfflineAuditStatus,
+  readOfflineAuditStatus,
+  type InspectOptions,
+  inspectRetainedRecords,
+  validateInspectRange,
+} from './verify.js';
+export {
+  MAX_EXPORT_BYTES,
+  BUNDLE_MANIFEST_FILENAME,
+  BUNDLE_AUDIT_DIRNAME,
+  BUNDLE_CHECKPOINTS_DIRNAME,
+  BUNDLE_ANCHORS_DIRNAME,
+  BUNDLE_PUBLIC_KEYS_DIRNAME,
+  BUNDLE_CHECKPOINT_KEY_FILENAME,
+  BUNDLE_ANCHOR_KEY_FILENAME,
+  type ManifestFileEntry,
+  type ExportManifest,
+  type ExportEvidenceOptions,
+  type ExportEvidenceResult,
+  type BundleDirectoryAuthority,
+  createBundleDirectoryAuthority,
+  assertExportWithinBudget,
+  predictManifestBytes,
+  MIN_CANONICAL_RECORD_BYTES,
+  MAX_MANIFEST_CHECKPOINT_REFS,
+  MAX_MANIFEST_RECEIPT_REFS,
+  assertManifestReferenceWithinBound,
+  exportEvidenceBundle,
+  type VerifyBundleResult,
+  verifyEvidenceBundleAuthoritative,
+  verifyEvidenceBundle,
+} from './export.js';

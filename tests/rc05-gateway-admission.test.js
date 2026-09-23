@@ -71,6 +71,7 @@ import {
   deriveSpkiPin,
 } from '../packages/auth/dist/index.js';
 import { createTestPki, hasOpenssl } from './helpers/rc05-test-pki.mjs';
+import { createAuditConfig } from './helpers/rc06-audit-runtime.mjs';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -196,6 +197,10 @@ async function startRemote({
       transport: 'remote',
       authorizedRoots: [{ id: 'ws', path: workspaceDir }],
       defaultWorkspaceId: 'ws',
+      // RC-06 Task 6: `start()` refuses to bind any transport until the durable
+      // audit runtime has reached startup step 12, so every started server is
+      // composed over a real store.
+      audit: createAuditConfig(tempRoot, `admission-${tag}`),
       remote: {
         bindHost: '127.0.0.1',
         port,

@@ -174,3 +174,46 @@ export interface AuditRecord {
     recordHash: string;
   };
 }
+
+/**
+ * Closed lifecycle phase vocabulary for RC-06 universal auditability.
+ *
+ * All privileged operations record a pre-dispatch STARTED event and a terminal
+ * COMPLETED or DENIED event, or RECOVERY_INDETERMINATE upon startup crash reconciliation.
+ */
+export type AuditLifecyclePhase = 'STARTED' | 'COMPLETED' | 'DENIED' | 'RECOVERY_INDETERMINATE';
+
+/**
+ * Server-generated correlation metadata for privileged operation lifecycle events.
+ * Never caller-supplied.
+ */
+export interface AuditLifecycleMetadata {
+  operationId: string;
+  phase: AuditLifecyclePhase;
+}
+
+/**
+ * Authoritative persistent audit record under schema version 1.
+ */
+export interface PersistentAuditRecordV1 extends AuditRecord {
+  schemaVersion: 1;
+  lifecycle?: AuditLifecycleMetadata;
+}
+
+/**
+ * Protected persistent store metadata stored in audit-store.json.
+ */
+export interface AuditStoreMetadataV1 {
+  version: 1;
+  storeId: string;
+  createdAt: string;
+  checkpointPublicKeyFingerprint: string;
+  anchorMode: 'DISABLED' | 'ENABLED';
+  anchorReceiptPublicKeyFingerprint?: string;
+}
+
+/**
+ * Maximum serialized size of a single persistent JSONL line in bytes,
+ * including terminating newline.
+ */
+export const MAX_RECORD_BYTES = 65_536;

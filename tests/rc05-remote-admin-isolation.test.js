@@ -69,6 +69,7 @@ import { FilesystemSubsystem } from '../packages/filesystem/dist/index.js';
 import { GitSubsystem } from '../packages/git/dist/index.js';
 import { DeviceTrustStore, deriveSpkiPin } from '../packages/auth/dist/index.js';
 import { createTestPki, hasOpenssl } from './helpers/rc05-test-pki.mjs';
+import { createAuditConfig } from './helpers/rc06-audit-runtime.mjs';
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -185,6 +186,9 @@ async function startIsolated({ tag }) {
       transport: 'remote',
       authorizedRoots: [{ id: 'ws', path: workspaceDir }],
       defaultWorkspaceId: 'ws',
+      // RC-06 Task 6: `start()` binds no transport until the durable audit
+      // runtime has reached startup step 12.
+      audit: createAuditConfig(tempRoot, `admin-isolation-${tag}`),
       remote: {
         bindHost: '127.0.0.1',
         port,

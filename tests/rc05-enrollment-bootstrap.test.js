@@ -41,8 +41,11 @@ import { AdminIpcServer } from '../apps/mcp-server/dist/admin-ipc.js';
 import { ApprovalStateManager } from '../packages/policy/dist/index.js';
 import { AuditLogger } from '../packages/audit/dist/index.js';
 import { createEmptyTrustStore, createTestPki, hasOpenssl } from './helpers/rc05-test-pki.mjs';
+import { createAuditConfig } from './helpers/rc06-audit-runtime.mjs';
 
 let tempRoot;
+/** Distinguishes the audit stores of several servers composed in one run. */
+let directCounter = 0;
 let pki;
 let publicHostname;
 /** Canonical SPKI pin of the primary ephemeral client certificate. */
@@ -528,6 +531,9 @@ describe('CesSpace ARC — RC-05 Task 4: Enrollment Bootstrap Endpoint', () => {
       const server = createArcMcpServer({
         transport: 'remote',
         authorizedRoots: [],
+        // RC-06 Task 6: `start()` binds no transport until the durable audit
+        // runtime has reached startup step 12.
+        audit: createAuditConfig(tempRoot, 'bootstrap-composed'),
         admin: { endpoint, operatorPublicKeyB64: operator.publicKeyB64 },
         remote: await remoteConfig(trustStorePath, { port }),
       });
@@ -1511,6 +1517,9 @@ describe('CesSpace ARC — RC-05 Task 4: Enrollment Bootstrap Endpoint', () => {
         {
           transport: 'remote',
           authorizedRoots: [],
+          // RC-06 Task 6: `start()` binds no transport until the durable audit
+          // runtime has reached startup step 12.
+          audit: createAuditConfig(tempRoot, `bootstrap-direct-${++directCounter}`),
           remote: await remoteConfig(store, { port }),
         },
         undefined,
@@ -1550,7 +1559,14 @@ describe('CesSpace ARC — RC-05 Task 4: Enrollment Bootstrap Endpoint', () => {
         new AuditLogger(),
         new FilesystemSubsystem(),
         new GitSubsystem(),
-        { transport: 'remote', authorizedRoots: [], remote: await remoteConfig(store, { port }) },
+        {
+          transport: 'remote',
+          authorizedRoots: [],
+          // RC-06 Task 6: `start()` binds no transport until the durable audit
+          // runtime has reached startup step 12.
+          audit: createAuditConfig(tempRoot, 'bootstrap-shared-manager'),
+          remote: await remoteConfig(store, { port }),
+        },
         undefined,
         undefined,
         new ApprovalStateManager(),
@@ -1661,6 +1677,9 @@ describe('CesSpace ARC — RC-05 Task 4: Enrollment Bootstrap Endpoint', () => {
       const server = createArcMcpServer({
         transport: 'remote',
         authorizedRoots: [],
+        // RC-06 Task 6: `start()` binds no transport until the durable audit
+        // runtime has reached startup step 12.
+        audit: createAuditConfig(tempRoot, 'bootstrap-factory'),
         admin: { endpoint, operatorPublicKeyB64: operator.publicKeyB64 },
         remote: await remoteConfig(store, { port }),
       });

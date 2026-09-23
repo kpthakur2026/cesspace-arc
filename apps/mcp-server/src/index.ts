@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { platform, arch, cpus, totalmem, freemem } from 'node:os';
 import { statfsSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -14,6 +15,8 @@ import {
 
 import {
   ArcError,
+  type AuditRecord,
+  type AuditLifecycleMetadata,
   type HealthResponse,
   type SystemStatusResponse,
   type PolicyEvaluationContext,
@@ -41,6 +44,7 @@ import {
 } from './remote-execution.js';
 import type { BoundedRequestLimiter } from './remote-resource-limits.js';
 import { ApprovalAuditSink, getApprovalAuditSink } from './approval-audit.js';
+import { getAuditWriteAuthority, type AuditWriteAuthority } from './audit-write-authority.js';
 import { getGatewayAuditSink } from './gateway-audit.js';
 import { RemoteGateway, type RemoteGatewayStatus } from './remote-gateway.js';
 import { readRemoteRequestContext, RemoteMcpSurface } from './remote-mcp-surface.js';
@@ -59,7 +63,15 @@ import {
   safeApprovalAuditMetadata,
   withArcApprovalSchema,
 } from './approval-gate.js';
-import { AuditLogger, computeSha256, canonicalJson } from '@cesspace-arc/audit';
+import {
+  AuditLogger,
+  computeSha256,
+  canonicalJson,
+  openAuditRuntime,
+  type AuditConfig,
+  type AuditHealthMetadata,
+  type AuditRuntime,
+} from '@cesspace-arc/audit';
 import { FilesystemSubsystem } from '@cesspace-arc/filesystem';
 import { GitSubsystem } from '@cesspace-arc/git';
 import {
@@ -112,6 +124,20 @@ export interface ArcServerConfig {
     sourceText: string;
     format: 'json' | 'yaml';
   };
+  /**
+   * The durable RC-06 audit runtime configuration (rc06 §24.2).
+   *
+   * Auditing is MANDATORY in production: there is no `enabled` flag, and a
+   * server composed without this field fails startup closed rather than serving
+   * privileged work with no durable evidence.
+   *
+   * This is TRUSTED LAUNCH CONFIGURATION ONLY. It is supplied by the process
+   * that constructs the server; it is never read from a command-line argument,
+   * an environment variable, an MCP parameter, a remote header, or a request
+   * body. It carries a PATH to the checkpoint signing key and never the key
+   * itself.
+   */
+  audit?: AuditConfig;
 }
 
 /** Safe, non-sensitive reason the Layer-2 engine is unavailable. */
@@ -964,11 +990,42 @@ export interface IArcMcpServer {
   ): Promise<{ isError?: boolean; content: Array<{ type: 'text'; text: string }> }>;
 }
 
+/**
+ * Raised when a denial could not be made durable.
+ *
+ * Module-private on purpose. It is never exported, so no subsystem, transport,
+ * CLI path or test can construct one, and `instanceof` at the single conversion
+ * point in {@link ArcMcpServer.executeAuthenticatedToolCall} cannot be satisfied
+ * by anything but a real failed durable `DENIED` append.
+ *
+ * It carries the already-bounded refusal. It never carries the raw cause: an
+ * `fs` error, a directory, a key path, an inode or a device number added to it,
+ * or read out of it, would be a leak with no security value.
+ */
+class AuditPersistenceFailure extends Error {
+  constructor(public readonly refusal: ArcError) {
+    super('a durable audit denial could not be recorded');
+    this.name = 'AuditPersistenceFailure';
+  }
+}
+
 export class ProcessAuditSink implements IProcessLifecycleSink {
+  /**
+   * The ONE production write authority for this chain.
+   *
+   * It is derived from the logger the composition root handed in, so a process
+   * lifecycle record lands in the same persistent primary sequence as the tool
+   * invocation that spawned it — rather than appearing only on the historical
+   * in-memory chain, where it would vanish on restart.
+   */
+  private readonly authority: AuditWriteAuthority;
+
   constructor(
-    private auditLogger: AuditLogger,
+    auditLogger: AuditLogger,
     private workspaceRegistry: WorkspaceRegistry,
-  ) {}
+  ) {
+    this.authority = getAuditWriteAuthority(auditLogger);
+  }
 
   public async onProcessEvent(event: ProcessLifecycleEvent): Promise<void> {
     const ws = this.workspaceRegistry.getWorkspace(event.workspaceId);
@@ -977,7 +1034,7 @@ export class ProcessAuditSink implements IProcessLifecycleSink {
     const isFailure = event.eventType === 'PROCESS_SPAWN_FAILED';
     const isTimeout = event.eventType === 'PROCESS_TIMEOUT';
 
-    await this.auditLogger.log({
+    await this.authority.write({
       timestamp: event.timestamp,
       actor: {
         clientId: event.actor.clientId,
@@ -1402,6 +1459,19 @@ export class ArcMcpServer implements IArcMcpServer {
    * a restart gets a clean rate and concurrency state and nothing is persisted.
    */
   private readonly authenticatedRequestLimiter: BoundedRequestLimiter;
+  /**
+   * The ONE authoritative durable audit runtime for this process (RC-06 Task 6).
+   *
+   * Present only between a successful `start()` audit startup and `stop()`. The
+   * persistent chain it owns is the DURABLE EXECUTION AUTHORITY: every
+   * privileged operation's STARTED and terminal records, every denial, every
+   * rotation checkpoint and every anchor handoff flow through this one object.
+   * There is no second persistent chain, no per-transport chain, and no way to
+   * reach the store except through it.
+   */
+  private auditRuntime?: AuditRuntime;
+  /** Trusted launch configuration for {@link auditRuntime}. */
+  private readonly auditConfig?: AuditConfig;
 
   constructor(
     public readonly workspaceRegistry: WorkspaceRegistry,
@@ -1448,6 +1518,9 @@ export class ArcMcpServer implements IArcMcpServer {
     // remote configuration supplied alongside stdio is NOT activated.
     this.transportMode = config?.transport ?? 'stdio';
     this.remoteConfig = this.transportMode === 'remote' ? config?.remote : undefined;
+    // Retained verbatim and never defaulted: an absent audit configuration is a
+    // startup failure, not a reason to run un-audited.
+    this.auditConfig = config?.audit;
 
     // The approval state manager is mandatory for Task 4 authorization.
     this.approvalStateManager = approvalStateManager ?? new ApprovalStateManager();
@@ -1546,7 +1619,7 @@ export class ArcMcpServer implements IArcMcpServer {
     this.server = new Server(
       {
         name: 'cesspace-arc',
-        version: '0.5.0-rc05',
+        version: '0.6.0-rc06',
       },
       {
         capabilities: {
@@ -1599,6 +1672,157 @@ export class ArcMcpServer implements IArcMcpServer {
     });
   }
 
+  /* ------------------------------------------------------------------------ *
+   * RC-06 Task 6 — the durable audit runtime.
+   *
+   * One chain, one writer, one lock. Every persistent write in this file goes
+   * through one of the three methods below, and each of them routes the record
+   * through `AuditLogger.log()` FIRST so the central minimization and redaction
+   * authority (rc04 §31/§32, rc05 §24, rc06 §19) is the only serialization path
+   * — there is no weaker second path that bypasses it.
+   * ------------------------------------------------------------------------ */
+
+  /**
+   * Establishes the durable audit runtime.
+   *
+   * Runs the frozen §22.1 startup sequence to completion BEFORE any transport is
+   * bound, so there is no window in which a session exists and tool dispatch can
+   * begin before the audit chain is verified. A failure here is a startup
+   * failure: nothing is bound, nothing is served, and no historical evidence is
+   * touched.
+   */
+  private async startAuditRuntime(): Promise<void> {
+    const config = this.auditConfig;
+    if (config === undefined) {
+      throw new Error(
+        'Audit configuration is required: refused to start privileged MCP service without a durable audit runtime.',
+      );
+    }
+    try {
+      this.auditRuntime = await this.openAuditRuntimeForProcess(config);
+    } catch (cause) {
+      throw new Error(
+        `Audit runtime startup failed (${boundedAuditFailureCode(cause)}); privileged MCP service was not started.`,
+        { cause },
+      );
+    }
+    // The durable chain is verified and open, so the production write authority
+    // can now commit to it. This runs BEFORE any transport is bound: there is no
+    // window in which a gateway event, an approval transition or a process
+    // lifecycle record can be emitted into a process whose evidence authority is
+    // still the in-memory mirror alone.
+    getAuditWriteAuthority(this.auditLogger).bindDurableRuntime(this.auditRuntime);
+  }
+
+  /**
+   * Opens the durable audit runtime this process will serve over.
+   *
+   * Production is exactly `openAuditRuntime`: the frozen §22.1 sequence, one
+   * writer lock, one verified store. It is a `protected` method rather than a
+   * direct call so the Task-6 durability suite can compose that SAME runtime
+   * with deterministic fault seams — the only way "the subsystem receives zero
+   * calls when STARTED persistence fails" can be proved against the real
+   * boundary rather than inferred from a response shape.
+   *
+   * @internal Following this application's existing internal-seam convention
+   * (`AdmissionLimiter`, `RemoteGateway`, `EnrollmentBootstrapController`): it
+   * is `protected`, it is never exported from the package root, and it cannot be
+   * reached from `ArcServerConfig`, the environment, the CLI, an MCP parameter,
+   * a remote header or a request body. An override still has to return a runtime
+   * produced by the audit package's own capability-gated entry point — there is
+   * no path that skips the frozen §22.1 verification.
+   */
+  protected async openAuditRuntimeForProcess(config: AuditConfig): Promise<AuditRuntime> {
+    return openAuditRuntime(config);
+  }
+
+  /**
+   * The ONE gate every privileged dispatch passes before it can reach a
+   * subsystem.
+   *
+   * It refuses when the process-wide degraded latch is set, when Tier-3 anchor
+   * backpressure is at its ceiling, and when the frozen archive or byte budget
+   * is exhausted. It performs no subsystem call and creates no approval state.
+   *
+   * @internal
+   */
+  private assertPrivilegedDispatchAllowed(): void {
+    const runtime = this.auditRuntime;
+    if (runtime === undefined) {
+      throw new Error('audit runtime unavailable');
+    }
+    runtime.assertPrivilegedOperationsAllowed();
+  }
+
+  /**
+   * Appends one record to the DURABLE chain, propagating any failure.
+   *
+   * The record is first produced by the historical in-memory `AuditLogger`, so
+   * the persistent chain receives exactly the minimized, redacted projection the
+   * in-memory chain always received — including `minimizeTarget`'s digesting of
+   * a raw workspace path. Only the persistence-owned fields are stripped, and
+   * the lifecycle block is added.
+   *
+   * This is a delegation to the ONE production write authority every other
+   * emitter uses — the gateway sink, the approval sink and the process sink —
+   * so there is a single definition of "a production audit record" rather than
+   * one per emitter. It remains here because the call sites below are the tool
+   * lifecycle, and their contract (a rejection means the evidence is not
+   * secured) is unchanged.
+   *
+   * @internal
+   */
+  private async appendDurableRecord(
+    body: Omit<AuditRecord, 'eventId' | 'sequenceNumber' | 'integrity'>,
+    lifecycle?: AuditLifecycleMetadata,
+  ): Promise<void> {
+    // No durable chain is composed for this object only when it was never
+    // started; a started server always has a runtime bound to the authority by
+    // `startAuditRuntime`. In that state the write is the historical
+    // in-memory-only write, exactly as it was before Task 6 — this is NOT a
+    // second authority, because the mirror never defines production truth.
+    await getAuditWriteAuthority(this.auditLogger).write(body, lifecycle);
+  }
+
+  /**
+   * Records a refusal that is decided BEFORE any subsystem boundary.
+   *
+   * Every policy, authorization, schema and security denial is a standalone
+   * terminal `DENIED` branch carrying its own server-generated UUIDv4
+   * `operationId` (rc06 §7.2, §22). A fresh identifier is minted per denial and
+   * is never reused, so `STARTED → DENIED` cannot arise from this path.
+   *
+   * A failure to make the denial durable is NOT swallowed. The denial the caller
+   * asked about is a policy fact; "the refusal is not on the record" is a
+   * different fact, and answering with the first would tell the caller the
+   * refusal was recorded when the durable chain holds no record of it — at the
+   * exact moment the process became unfit to serve. So this method:
+   *
+   *   1. latches the process-wide degraded audit state, so no later privileged
+   *      operation is dispatched against a chain that cannot record its outcome;
+   *   2. raises {@link AuditPersistenceFailure} carrying the bounded
+   *      audit-persistence refusal — never the ordinary policy/schema denial,
+   *      and never a fabricated durable `DENIED` record.
+   *
+   * It runs before any subsystem boundary and before any approval record is
+   * created, inspected or redeemed, so a persistence failure here executes zero
+   * privileged subsystem work — {@link executeAuthenticatedToolCall} converts it
+   * into the response, and nothing else in the pipeline has run.
+   *
+   * @internal
+   */
+  private async recordDurableDenial(
+    body: Omit<AuditRecord, 'eventId' | 'sequenceNumber' | 'integrity'>,
+  ): Promise<void> {
+    const operationId = randomUUID();
+    try {
+      await this.appendDurableRecord(body, { operationId, phase: 'DENIED' });
+    } catch (cause) {
+      this.auditRuntime?.latchDegradedAuditFailure();
+      throw new AuditPersistenceFailure(boundedAuditPersistenceFailure(cause));
+    }
+  }
+
   /**
    * The stdio/local entry point into the ONE shared execution pipeline.
    *
@@ -1645,6 +1869,42 @@ export class ArcMcpServer implements IArcMcpServer {
     toolName: string,
     parameters: Record<string, unknown>,
   ): Promise<{ isError?: boolean; content: Array<{ type: 'text'; text: string }> }> {
+    try {
+      return await this.executeToolCallPipeline(actor, toolName, parameters);
+    } catch (cause: unknown) {
+      // The ONE place a failed durable denial becomes a response (rc06 §22, §26,
+      // §44). Every DENIED branch in the pipeline records its refusal through
+      // `recordDurableDenial`, which raises this sentinel rather than returning
+      // the ordinary denial when the refusal could not be made durable. The
+      // conversion lives here so the caller is answered with the bounded
+      // audit-persistence failure instead of a policy answer it would have no way
+      // to know is unrecorded.
+      if (cause instanceof AuditPersistenceFailure) {
+        return {
+          isError: true,
+          content: [{ type: 'text', text: JSON.stringify(cause.refusal.toJSON(), null, 2) }],
+        };
+      }
+      throw cause;
+    }
+  }
+
+  /**
+   * The execution pipeline itself, from admission to the terminal response.
+   *
+   * It is separate from {@link executeAuthenticatedToolCall} only so that one
+   * failure — a denial that could not be recorded durably — has a single
+   * conversion point that no branch inside can bypass, without a `try`/`catch`
+   * around a thousand lines of dispatch logic that would also capture subsystem
+   * failures.
+   *
+   * @internal
+   */
+  private async executeToolCallPipeline(
+    actor: CompleteActor,
+    toolName: string,
+    parameters: Record<string, unknown>,
+  ): Promise<{ isError?: boolean; content: Array<{ type: 'text'; text: string }> }> {
     const startTime = new Date().toISOString();
     const startMs = Date.now();
 
@@ -1666,7 +1926,7 @@ export class ArcMcpServer implements IArcMcpServer {
       workspaceInfo?: { workspaceId: string; workspacePath: string },
       evalMs = 0,
     ): Promise<{ isError?: boolean; content: Array<{ type: 'text'; text: string }> }> => {
-      await this.auditLogger.log({
+      await this.recordDurableDenial({
         timestamp: startTime,
         actor: auditActor,
         target: workspaceInfo ?? { workspaceId: 'unbound', workspacePath: '' },
@@ -1689,6 +1949,35 @@ export class ArcMcpServer implements IArcMcpServer {
         content: [{ type: 'text', text: JSON.stringify(arcErr.toJSON(), null, 2) }],
       };
     };
+
+    // 1a. Global audit availability gate (rc06 §19, §21, §27, §28, §42).
+    //
+    // This is the FIRST thing a privileged invocation meets, before the reserved
+    // control object is parsed and long before any approval record is created,
+    // inspected or consumed. That ordering is load-bearing: an operation refused
+    // here must leave the approval transaction completely untouched — no pending
+    // request created, no token redeemed, no state transition — which is what
+    // §19 requires of a latched process and what §42 requires of any operation
+    // rejected by the global gate.
+    //
+    // It writes nothing. A latched process cannot write, and an operation that
+    // was never admitted is not a lifecycle branch: there is no DENIED record to
+    // append and no operationId to mint.
+    //
+    // `health` is the ONE non-dispatching surface (§21). Everything else —
+    // including `system_status`, which stats a workspace path — is privileged and
+    // is refused here.
+    if (this.auditRuntime !== undefined && toolName !== 'health') {
+      try {
+        this.assertPrivilegedDispatchAllowed();
+      } catch (gateErr: unknown) {
+        const refusal = boundedAuditRefusal(gateErr);
+        return {
+          isError: true,
+          content: [{ type: 'text', text: JSON.stringify(refusal.toJSON(), null, 2) }],
+        };
+      }
+    }
 
     // 1b. Reserved control-object admission (rc04 §4.1 step 1, §5, §6).
     // The control object is extracted and validated SEPARATELY, then removed, so
@@ -1718,7 +2007,7 @@ export class ArcMcpServer implements IArcMcpServer {
         `Tool '${toolName}' is not permitted in RC-01 stage (read-only inspection core only).`,
       );
       const preAuditParams = sanitizePreValidationParameters(toolName, businessParameters);
-      await this.auditLogger.log({
+      await this.recordDurableDenial({
         timestamp: startTime,
         actor: auditActor,
         target: { workspaceId: 'unbound', workspacePath: '' },
@@ -1781,7 +2070,7 @@ export class ArcMcpServer implements IArcMcpServer {
             `Invalid parameters for tool '${toolName}': ${issueMessages}`,
           );
       const preAuditParams = sanitizePreValidationParameters(toolName, businessParameters);
-      await this.auditLogger.log({
+      await this.recordDurableDenial({
         timestamp: startTime,
         actor: auditActor,
         target: { workspaceId: 'unbound', workspacePath: '' },
@@ -1870,7 +2159,7 @@ export class ArcMcpServer implements IArcMcpServer {
           'Access denied: run_command requires verified caller identity (clientId and sessionId).',
         );
         const preAuditParams = sanitizePreValidationParameters(toolName, businessParameters);
-        await this.auditLogger.log({
+        await this.recordDurableDenial({
           timestamp: startTime,
           actor: auditActor,
           target: { workspaceId: 'unbound', workspacePath: '' },
@@ -1911,7 +2200,7 @@ export class ArcMcpServer implements IArcMcpServer {
       if (!this.processRegistry) {
         const arcErr = ArcError.policyDenied('Process ownership verifier is unavailable.');
         const preAuditParams = sanitizePreValidationParameters(toolName, businessParameters);
-        await this.auditLogger.log({
+        await this.recordDurableDenial({
           timestamp: startTime,
           actor: auditActor,
           target: { workspaceId: 'unbound', workspacePath: '' },
@@ -1947,7 +2236,7 @@ export class ArcMcpServer implements IArcMcpServer {
       if (!procRecord) {
         const arcErr = ArcError.processNotFound(`Process not found: '${processId}'.`);
         const preAuditParams = sanitizePreValidationParameters(toolName, businessParameters);
-        await this.auditLogger.log({
+        await this.recordDurableDenial({
           timestamp: startTime,
           actor: auditActor,
           target: { workspaceId: 'unbound', workspacePath: '' },
@@ -1984,7 +2273,7 @@ export class ArcMcpServer implements IArcMcpServer {
           `Target workspace '${procRecord.workspaceId}' for process is not registered.`,
         );
         const preAuditParams = sanitizePreValidationParameters(toolName, businessParameters);
-        await this.auditLogger.log({
+        await this.recordDurableDenial({
           timestamp: startTime,
           actor: auditActor,
           target: { workspaceId: procRecord.workspaceId, workspacePath: '' },
@@ -2020,7 +2309,7 @@ export class ArcMcpServer implements IArcMcpServer {
           'Access denied: Caller workspace does not match process workspace.',
         );
         const preAuditParams = sanitizePreValidationParameters(toolName, businessParameters);
-        await this.auditLogger.log({
+        await this.recordDurableDenial({
           timestamp: startTime,
           actor: auditActor,
           target: { workspaceId: procRecord.workspaceId, workspacePath: procWs.rootPath },
@@ -2409,7 +2698,7 @@ export class ArcMcpServer implements IArcMcpServer {
           );
         }
 
-        await this.auditLogger.log({
+        await this.recordDurableDenial({
           timestamp: startTime,
           actor: auditActor,
           target: {
@@ -2501,7 +2790,7 @@ export class ArcMcpServer implements IArcMcpServer {
         // the ArcError, its details, toJSON(), or the MCP response (anti-oracle).
         const internalReason = getApprovalFailureReason(redemptionErr);
 
-        await this.auditLogger.log({
+        await this.recordDurableDenial({
           timestamp: startTime,
           actor: auditActor,
           target: {
@@ -2581,10 +2870,141 @@ export class ArcMcpServer implements IArcMcpServer {
       ? effectiveRuleId
       : layer2.matchingRuleId;
 
+    // 3b. Universal pre-dispatch durability (rc06 §7.2, §8, §11).
+    //
+    // This is the LAST gate before the subsystem boundary and it runs for BOTH
+    // transports: the stdio path and the authenticated remote bridge both arrive
+    // here through {@link executeAuthenticatedToolCall}, so there is no
+    // transport-specific early path and no per-transport chain.
+    //
+    // `health` is the ONE non-dispatching surface (rc06 §21). It reaches no
+    // subsystem, reads no workspace, spawns no process and inspects no Git
+    // state, so it emits no lifecycle evidence and is not gated — which is what
+    // leaves an operator a bounded informational surface while the process is
+    // latched. Everything else, INCLUDING `system_status` (which stats a
+    // workspace path), is privileged.
+    const isNonDispatchingHealthSurface = toolName === 'health';
+
+    // The durable chain exists exactly when a transport was composed over a
+    // verified store, which `start()` guarantees: it runs the frozen §22.1
+    // sequence to step 12 before binding anything, and it refuses to bind at all
+    // when no audit configuration was supplied. A server that was never started
+    // has no transport, no session and no reachable caller, and keeps the
+    // historical in-memory chain its backward-compatibility suites were written
+    // against — it is not a second authority for any started process.
+    const durableChainActive = this.auditRuntime !== undefined;
+    let lifecycleOperationId: string | undefined;
+
+    /**
+     * The ONE semantic request projection shared by STARTED and COMPLETED
+     * (rc06 §32).
+     *
+     * `operationId` is the lifecycle binder, so both records must describe the
+     * SAME operation. Building them from one closure — rather than two
+     * independently written literals — is what makes that structural: there is
+     * no second recomputation that could drift, and no raw request object is
+     * ever placed into persistent storage.
+     */
+    const buildInvocationRecordBody = (
+      execution: AuditRecord['execution'],
+      error: AuditRecord['error'],
+    ): Omit<AuditRecord, 'eventId' | 'sequenceNumber' | 'integrity'> => ({
+      timestamp: startTime,
+      actor: auditActor,
+      target: {
+        workspaceId: targetWorkspace.workspaceId,
+        workspacePath: targetWorkspace.rootPath,
+      },
+      invocation: {
+        toolName,
+        parametersRedacted: auditParams,
+        payloadHash: auditPayloadHash,
+      },
+      policy: {
+        // Truthful classification: an approved execution is recorded as
+        // REQUIRE_APPROVAL, never as an ordinary ALLOW.
+        decision: effectiveDecisionLabel,
+        ruleId: effectiveRuleIdForAudit,
+        evaluationDurationMs: evalDuration,
+        ...(consumedApprovalRequestId === undefined
+          ? {}
+          : { approvalId: consumedApprovalRequestId }),
+      },
+      ...(consumedApprovalRequestId === undefined
+        ? {}
+        : {
+            approval: {
+              requestId: consumedApprovalRequestId,
+              state: 'CONSUMED' as const,
+              source: 'MCP' as const,
+            },
+          }),
+      execution,
+      error,
+    });
+
+    if (durableChainActive && !isNonDispatchingHealthSurface) {
+      // (a) Audit availability, re-checked immediately before the durable
+      //     STARTED write. Section 1a already refused a latched or exhausted
+      //     process before any approval state existed; this second check is not
+      //     redundant, because policy evaluation and approval redemption are
+      //     `await` boundaries and a concurrent invocation can latch the process
+      //     between them. The chain is checked again at the last moment that a
+      //     refusal can still prevent every subsystem call.
+      try {
+        this.assertPrivilegedDispatchAllowed();
+      } catch (gateErr: unknown) {
+        const refusal = boundedAuditRefusal(gateErr);
+        return {
+          isError: true,
+          content: [{ type: 'text', text: JSON.stringify(refusal.toJSON(), null, 2) }],
+        };
+      }
+
+      // (b) STARTED, durably complete BEFORE the subsystem boundary. If this
+      //     write fails, the operation is aborted and the subsystem receives
+      //     ZERO calls: there is no read/mutation distinction here, because a
+      //     read that cannot be evidenced is treated exactly as a mutation that
+      //     cannot be evidenced.
+      //
+      //     Ordering note (rc06 §34): an approval is consumed BEFORE this point,
+      //     exactly as it always has been. When STARTED persistence then fails,
+      //     the approval stays CONSUMED and is never rolled back — the same
+      //     frozen semantics the pre-existing `approval-audit-failed` path has
+      //     always had, where a consumed-but-never-executed mutation is the
+      //     documented outcome. Nothing new is invented here.
+      lifecycleOperationId = randomUUID();
+      const startedOperationId = lifecycleOperationId;
+      try {
+        await this.appendDurableRecord(
+          buildInvocationRecordBody(
+            {
+              // The Task-1 status vocabulary is closed and deliberately not
+              // widened (rc06 §7.1, §22.2). A STARTED record's authority is
+              // `lifecycle.phase`; its `execution` block records only that the
+              // invocation became eligible here, with zero elapsed terminal
+              // time — it makes no claim about an outcome that has not happened.
+              status: 'SUCCESS',
+              startTime,
+              endTime: startTime,
+              durationMs: 0,
+            },
+            undefined,
+          ),
+          { operationId: startedOperationId, phase: 'STARTED' },
+        );
+      } catch (startedErr: unknown) {
+        const refusal = boundedAuditRefusal(startedErr);
+        return {
+          isError: true,
+          content: [{ type: 'text', text: JSON.stringify(refusal.toJSON(), null, 2) }],
+        };
+      }
+    }
+
     // 4. Tool Execution within Authorized Boundaries
 
     let result: unknown;
-    let executionStatus: 'SUCCESS' | 'ERROR' = 'SUCCESS';
     let arcError: ArcError | undefined;
     let bytesRead = 0;
 
@@ -2599,15 +3019,24 @@ export class ArcMcpServer implements IArcMcpServer {
           // A bound listener whose certificate has expired cannot serve new
           // sessions, so it is neither active nor healthy.
           const gatewayDegradedForHealth = gatewayStatus?.degraded === true;
+          // The bounded RC-06 audit block (rc06 §22.2, §31). STATE and COUNTS
+          // only: no audit directory, no key path, no public key body, no
+          // endpoint, no receipt body, no spool filename or hash, no host path.
+          const auditHealth: AuditHealthMetadata | undefined = this.auditRuntime?.getHealth();
           const health: HealthResponse = {
             status: !policyEngineActive
               ? 'UNHEALTHY'
-              : gatewayDegradedForHealth
+              : gatewayDegradedForHealth || this.auditRuntime?.isDegraded() === true
                 ? 'DEGRADED'
                 : 'HEALTHY',
-            version: '0.5.0-rc05',
-            stage: 'RC-05',
+            version: '0.6.0-rc06',
+            stage: 'RC-06',
             policyEngineActive,
+            // A chain is always active: the durable RC-06 chain on a started
+            // server, the in-memory chain otherwise. The durable chain's own
+            // STATE is reported by `audit.persistence` and by `status`, so this
+            // frozen RC-01 field keeps its original meaning rather than being
+            // overloaded into a second, weaker health signal.
             auditActive: true,
             authorizedWorkspacesCount: this.workspaceRegistry.getWorkspaces().length,
             transportMode: this.transportMode,
@@ -2623,6 +3052,12 @@ export class ArcMcpServer implements IArcMcpServer {
             // manager. No device list, no session list, no identifier.
             enrolledDevicesCount: this.remoteGateway?.getEnrolledDeviceCount() ?? 0,
             activeSessionsCount: this.sessionManager.getActiveSessionCount(),
+            // A bounded informational surface, and nothing more. `health` is the
+            // ONE tool that reaches no subsystem (rc06 §21): reporting the
+            // degraded condition must not become a read-only escape hatch, so
+            // this block is emitted here and the latch is enforced everywhere
+            // else.
+            ...(auditHealth === undefined ? {} : { audit: auditHealth }),
             // Only safe, bounded fields cross this boundary: no certificate or
             // key bytes, no file paths, no pins, no peer addresses.
             ...(gatewayStatus === undefined
@@ -2881,7 +3316,6 @@ export class ArcMcpServer implements IArcMcpServer {
           throw ArcError.policyDenied(`Tool '${toolName}' execution route not configured.`);
       }
     } catch (err: unknown) {
-      executionStatus = 'ERROR';
       if (err instanceof ArcError) {
         arcError = err;
       } else {
@@ -2893,51 +3327,62 @@ export class ArcMcpServer implements IArcMcpServer {
     const endTime = new Date().toISOString();
 
     // 5. Structured Audit Event (Data Minimization First)
-    await this.auditLogger.log({
-      timestamp: startTime,
-      actor: auditActor,
-      target: {
-        workspaceId: targetWorkspace.workspaceId,
-        workspacePath: targetWorkspace.rootPath,
-      },
-      invocation: {
-        toolName,
-        parametersRedacted: auditParams,
-        payloadHash: auditPayloadHash,
-      },
-      policy: {
-        // Truthful classification: an approved execution is recorded as
-        // REQUIRE_APPROVAL, never as an ordinary ALLOW.
-        decision: effectiveDecisionLabel,
-        ruleId: effectiveRuleIdForAudit,
-        evaluationDurationMs: evalDuration,
-        ...(consumedApprovalRequestId === undefined
-          ? {}
-          : { approvalId: consumedApprovalRequestId }),
-      },
-      ...(consumedApprovalRequestId === undefined
-        ? {}
-        : {
-            approval: {
-              requestId: consumedApprovalRequestId,
-              state: 'CONSUMED' as const,
-              source: 'MCP' as const,
-            },
-          }),
-      execution: {
-        status: executionStatus,
-        startTime,
-        endTime,
-        durationMs: endMs - startMs,
-        bytesRead: bytesRead > 0 ? bytesRead : undefined,
-      },
-      error: arcError
-        ? {
-            code: arcError.code,
-            message: sanitizeClientErrorMessage(arcError.message),
-          }
+    //
+    // The terminal record is built from the SAME projection the STARTED record
+    // used, so STARTED and COMPLETED describe one semantic operation bound by
+    // `operationId` (rc06 §32). It is then disposed of in exactly one of two
+    // ways:
+    //
+    //  - a privileged operation appends it to the DURABLE chain as its terminal
+    //    COMPLETED record; or
+    //  - the non-dispatching `health` surface, which emits no lifecycle
+    //    evidence, keeps it on the historical in-memory chain alone.
+    //
+    // Either way there is exactly one record per invocation per chain, and the
+    // durable chain receives the same minimized, redacted projection the
+    // in-memory chain has always received — there is no second, weaker
+    // serialization path.
+    const terminalExecution: AuditRecord['execution'] = {
+      // Truthful terminal outcome (rc06 §34): an execution failure is still a
+      // completed invocation, and a timeout is a timeout, not a generic error.
+      status: deriveTerminalExecutionStatus(arcError),
+      startTime,
+      endTime,
+      durationMs: endMs - startMs,
+      bytesRead: bytesRead > 0 ? bytesRead : undefined,
+    };
+    const terminalBody = buildInvocationRecordBody(
+      terminalExecution,
+      arcError
+        ? { code: arcError.code, message: sanitizeClientErrorMessage(arcError.message) }
         : undefined,
-    });
+    );
+
+    if (lifecycleOperationId === undefined) {
+      await this.auditLogger.log(terminalBody);
+    } else {
+      // Post-dispatch durability (rc06 §14, §15). The subsystem has already
+      // run, so a failure here means the outcome can no longer be evidenced:
+      // the process-wide latch is set, every later privileged invocation through
+      // EITHER transport is refused, and the caller is NOT told the operation
+      // succeeded. The durable STARTED remains truthful evidence — it is
+      // precisely what makes the uncertain outcome recoverable as
+      // RECOVERY_INDETERMINATE after a restart — and no rollback, no synthetic
+      // DENIED and no false SUCCESS terminal record is invented.
+      try {
+        await this.appendDurableRecord(terminalBody, {
+          operationId: lifecycleOperationId,
+          phase: 'COMPLETED',
+        });
+      } catch {
+        this.auditRuntime?.latchDegradedAuditFailure();
+        const refusal = boundedAuditRefusal(undefined);
+        return {
+          isError: true,
+          content: [{ type: 'text', text: JSON.stringify(refusal.toJSON(), null, 2) }],
+        };
+      }
+    }
 
     // Execution lifecycle evidence, emitted ONLY when this invocation actually
     // consumed an approval. Ordered after the ordinary invocation record, and
@@ -3004,6 +3449,18 @@ export class ArcMcpServer implements IArcMcpServer {
   }
 
   public async start(): Promise<void> {
+    // RC-06 Task 6 stage 1..11 — BEFORE step 12, which is everything below.
+    //
+    // The full-history verification, reconciliation and runtime-cursor stages
+    // run to completion first, and no transport is bound until they have. There
+    // is therefore no window in which a session exists, a listener is reachable,
+    // or a tool call can be dispatched before the durable audit chain is
+    // verified and reconciled — for either transport, because both bind below.
+    //
+    // A failure here propagates unchanged: nothing is bound, nothing is served,
+    // and `start()` has released everything stage 1..11 acquired.
+    await this.startAuditRuntime();
+
     // Exactly one transport mode runs per process (§4 L-4). In remote mode the
     // stdio transport is never connected, so there is no second listener and no
     // way for a remote failure to fall back to stdio.
@@ -3184,7 +3641,7 @@ export class ArcMcpServer implements IArcMcpServer {
     const server = new Server(
       {
         name: 'cesspace-arc',
-        version: '0.5.0-rc05',
+        version: '0.6.0-rc06',
       },
       {
         capabilities: {
@@ -3313,11 +3770,131 @@ export class ArcMcpServer implements IArcMcpServer {
     if (this.adminIpcServer) {
       await this.adminIpcServer.stop();
     }
-    await this.flushAudit();
+    // The last records are committed before the surface that produced them is
+    // released. A failure to secure them is NOT swallowed — it is rethrown after
+    // teardown below, because a caller that is told shutdown succeeded has been
+    // told the evidence is durable. What it must not do is stop the teardown:
+    // the flush is the one step here that can fail on a store that is already
+    // degraded, and abandoning the rest of this method on that failure would
+    // strand the transport, the writer lock and every descriptor the runtime
+    // holds, leaving a process that holds its store lock forever and a listener
+    // that never closes. Teardown therefore always runs to completion, and the
+    // failure is reported from the end.
+    let flushFailure: unknown;
+    try {
+      await this.flushAudit();
+    } catch (cause: unknown) {
+      flushFailure = cause;
+    }
     if (this.transport) {
       await this.transport.close();
     }
+    // The durable audit runtime is released LAST, once no transport can produce
+    // another record: its writer lock and every descriptor it owns (active
+    // segment, checkpoint artifact, anchor receipt ledger, anchor spool) must
+    // outlive the surface that writes through them, and releasing it earlier
+    // would leave a window in which a served request has no durable chain to
+    // write to. One deterministic order, no descriptor or lock leak, and no
+    // historical evidence deleted.
+    await this.closeAuditRuntime();
+    if (flushFailure !== undefined) {
+      throw flushFailure;
+    }
   }
+
+  /**
+   * Releases the durable audit runtime and its single-writer lock.
+   *
+   * Idempotent, so a failed `start()` followed by a `stop()` cannot double
+   * release. A runtime that was never established is a no-op.
+   *
+   * @internal
+   */
+  private async closeAuditRuntime(): Promise<void> {
+    const runtime = this.auditRuntime;
+    this.auditRuntime = undefined;
+    await runtime?.close();
+  }
+}
+
+/* -------------------------------------------------------------------------- *
+ * RC-06 Task 6 — bounded audit failure projection (rc06 §26, §44).
+ * -------------------------------------------------------------------------- */
+
+/**
+ * Reduces an arbitrary startup or runtime audit failure to a bounded code.
+ *
+ * The audit layer's own coded errors carry a machine-readable code and no host
+ * path; anything else — a raw `fs` error, a `node:crypto` error, a PEM parse
+ * failure, an `AggregateError` — is reported as `AUDIT_FAILURE` rather than
+ * passed through. No directory, key path, endpoint, stack trace, inode or device
+ * number can reach a caller or a log line through this function.
+ */
+export function boundedAuditFailureCode(cause: unknown): string {
+  const code = (cause as { code?: unknown })?.code;
+  return typeof code === 'string' && /^[A-Z][A-Z0-9_]{2,63}$/.test(code) ? code : 'AUDIT_FAILURE';
+}
+
+/**
+ * The bounded client-facing refusal for a privileged dispatch the audit layer
+ * will not admit (rc06 §11, §18, §26, §27).
+ *
+ * The message names no audit directory, key path, endpoint, receipt, spool file,
+ * sequence number or subsystem detail. It is the SAME refusal for a read and for
+ * a mutation: there is no read-only escape hatch.
+ */
+export function boundedAuditRefusal(cause: unknown): ArcError {
+  const code = boundedAuditFailureCode(cause);
+  if (code === 'ANCHOR_SPOOL_FULL' || code === 'AUDIT_STORAGE_EXHAUSTED') {
+    return ArcError.resourceExhausted(
+      'Audit evidence capacity is exhausted. Privileged operations are halted until an operator remediates the audit store.',
+    );
+  }
+  return ArcError.internalError(
+    'Privileged operations are halted: durable audit evidence could not be secured.',
+  );
+}
+
+/**
+ * The bounded client-facing failure for a refusal the audit layer could not
+ * record durably (rc06 §22, §26, §44).
+ *
+ * The operation it answers WAS denied by policy, authorization or schema — and
+ * that denial is evidence. A process that returns the ordinary denial has told
+ * the caller "you were refused, and the refusal is on the record" when the
+ * durable chain holds no such record, and it has done so at the exact moment the
+ * process-wide degraded latch was set. The two facts are not interchangeable, so
+ * they do not share a response.
+ *
+ * It carries the frozen bounded vocabulary and the same shape as
+ * {@link boundedAuditRefusal}: no `fs` error, no directory, no key path, no
+ * sequence number, no store detail, and no raw cause.
+ */
+export function boundedAuditPersistenceFailure(cause: unknown): ArcError {
+  const code = boundedAuditFailureCode(cause);
+  if (code === 'ANCHOR_SPOOL_FULL' || code === 'AUDIT_STORAGE_EXHAUSTED') {
+    return ArcError.resourceExhausted(
+      'Audit evidence capacity is exhausted, so the refusal could not be recorded. Privileged operations are halted until an operator remediates the audit store.',
+    );
+  }
+  return ArcError.internalError(
+    'The refusal could not be recorded durably: durable audit evidence could not be secured. Privileged operations are halted until restart.',
+  );
+}
+
+/**
+ * The truthful terminal status for a COMPLETED record (rc06 §34).
+ *
+ * A subsystem exception is `ERROR`, a timeout is `TIMEOUT`, and a clean return
+ * is `SUCCESS`. No subsystem in the frozen composition produces a cancellation
+ * outcome, so `CANCELLED` stays representable in the Task-1 vocabulary and
+ * unreachable here rather than being invented.
+ */
+export function deriveTerminalExecutionStatus(
+  arcError: ArcError | undefined,
+): 'SUCCESS' | 'ERROR' | 'TIMEOUT' {
+  if (arcError === undefined) return 'SUCCESS';
+  return arcError.code === 'EXECUTION_TIMEOUT' ? 'TIMEOUT' : 'ERROR';
 }
 
 /**

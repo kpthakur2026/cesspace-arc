@@ -27,6 +27,32 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Explicit Full-Range PR Gitleaks Scan
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          echo "Base SHA: $BASE_SHA"
+          echo "Head SHA: $HEAD_SHA"
+          git rev-list --count "$BASE_SHA..$HEAD_SHA"
+
+          GITLEAKS_BIN=$(command -v gitleaks || find /tmp -name gitleaks -type f -perm -111 2>/dev/null | head -n 1)
+          if [[ -z "$GITLEAKS_BIN" || ! -x "$GITLEAKS_BIN" ]]; then
+            echo "==> Downloading Gitleaks binary..."
+            VERSION="8.24.3"
+            curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz" | tar -xz -C /tmp gitleaks
+            GITLEAKS_BIN="/tmp/gitleaks"
+          fi
+
+          "$GITLEAKS_BIN" detect \
+            --source . \
+            --verbose \
+            --redact \
+            --exit-code 2 \
+            --log-opts="--no-merges $BASE_SHA..$HEAD_SHA"
+
   dependency-review:
     name: Dependency Review
     runs-on: ubuntu-latest

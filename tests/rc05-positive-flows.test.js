@@ -54,6 +54,7 @@ import {
 import { FilesystemSubsystem } from '../packages/filesystem/dist/index.js';
 import { GitSubsystem } from '../packages/git/dist/index.js';
 import { createTestPki, hasOpenssl } from './helpers/rc05-test-pki.mjs';
+import { createAuditConfig } from './helpers/rc06-audit-runtime.mjs';
 
 const publicHostname = 'localhost';
 let tempRoot;
@@ -231,6 +232,9 @@ async function startRemoteServer({
       transport: 'remote',
       authorizedRoots: [{ id: 'ws', path: workspaceDir }],
       defaultWorkspaceId: 'ws',
+      // RC-06 Task 6: `start()` binds no transport until the durable audit
+      // runtime has reached startup step 12.
+      audit: createAuditConfig(tempRoot, `positive-${tag}`),
       ...(policy === undefined ? {} : { policy }),
       remote: {
         bindHost: '127.0.0.1',
@@ -338,6 +342,7 @@ describe('CesSpace ARC — RC-05 Eleven Positive Acceptance Flows', () => {
         transport: 'stdio',
         authorizedRoots: [{ id: 'ws', path: workspaceDir }],
         defaultWorkspaceId: 'ws',
+        audit: createAuditConfig(tempRoot, 'positive-flow1-stdio'),
       },
     );
 
@@ -345,8 +350,8 @@ describe('CesSpace ARC — RC-05 Eleven Positive Acceptance Flows', () => {
     try {
       const health = await getHealth(server);
       assert.equal(health.status, 'HEALTHY');
-      assert.equal(health.version, '0.5.0-rc05');
-      assert.equal(health.stage, 'RC-05');
+      assert.equal(health.version, '0.6.0-rc06');
+      assert.equal(health.stage, 'RC-06');
       assert.equal(health.transportMode, 'stdio');
       assert.equal(health.remoteGatewayActive, false);
       assert.equal(health.authenticationActive, false);

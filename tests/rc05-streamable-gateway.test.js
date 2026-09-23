@@ -32,6 +32,7 @@ import {
 } from '../apps/mcp-server/dist/remote-execution.js';
 import { DeviceTrustStore, deriveSpkiPin } from '../packages/auth/dist/index.js';
 import { createEmptyTrustStore, createTestPki, hasOpenssl } from './helpers/rc05-test-pki.mjs';
+import { createAuditConfig } from './helpers/rc06-audit-runtime.mjs';
 
 let tempRoot;
 let pki;
@@ -117,6 +118,9 @@ async function startRemote({
     transport: 'remote',
     authorizedRoots: [{ id: 'ws', path: workspaceDir }],
     defaultWorkspaceId: 'ws',
+    // RC-06 Task 6: `start()` binds no transport until the durable audit
+    // runtime has reached startup step 12.
+    audit: createAuditConfig(tempRoot, `streamable-${tag}`),
     ...config,
     remote: {
       bindHost: '127.0.0.1',
@@ -881,7 +885,11 @@ describe('CesSpace ARC — RC-05 Task 8: Streamable HTTP Gateway', () => {
       await server.stop();
     }
 
-    const stdio = createArcMcpServer({ transport: 'stdio', authorizedRoots: [] });
+    const stdio = createArcMcpServer({
+      transport: 'stdio',
+      authorizedRoots: [],
+      audit: createAuditConfig(tempRoot, 'streamable-stdio'),
+    });
     try {
       await stdio.start();
       assert.equal(stdio.getTransportMode(), 'stdio');
@@ -930,6 +938,7 @@ describe('CesSpace ARC — RC-05 Task 8: Streamable HTTP Gateway', () => {
     const server = createArcMcpServer({
       transport: 'remote',
       authorizedRoots: [],
+      audit: createAuditConfig(tempRoot, `streamable-neg06-${++counter}`),
       remote: {
         bindHost: '127.0.0.1',
         port,
