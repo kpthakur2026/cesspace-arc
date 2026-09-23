@@ -116,10 +116,25 @@ export class ExecutableResolver implements IExecutableResolver {
       if (procStat.dev !== candidateStat.dev || procStat.ino !== candidateStat.ino) return null;
 
       // ── Step 5: untrusted-root guard ─────────────────────────────────────────
-      // Reject if the resolved path lands inside workspace, $HOME, cwd, or
+      // Reject if the resolved path lands inside workspace, cwd, or
       // node_modules — even if the kernel identifies it as the active runtime.
-      // (These locations are unconditionally untrusted regardless of identity.)
-      const isUntrusted = untrustedRoots.some(
+      //
+      // $HOME alone must NOT veto the exact kernel-bound current Node runtime
+      // once all identity checks pass (e.g. Node managed via nvm, asdf, fnm, or
+      // other per-user install paths under $HOME). Generic directory lookup
+      // continues to treat $HOME as untrusted and restricts search to fixed
+      // trusted system directories.
+      const homeRoots = new Set<string>();
+      if (process.env.HOME) {
+        homeRoots.add(resolve(process.env.HOME));
+        try {
+          homeRoots.add(realpathSync(process.env.HOME));
+        } catch {
+          // ignore
+        }
+      }
+      const effectiveRoots = untrustedRoots.filter((root) => !homeRoots.has(root));
+      const isUntrusted = effectiveRoots.some(
         (root) => realProcExe === root || realProcExe.startsWith(root + sep),
       );
       if (

@@ -1800,4 +1800,40 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
     assert.notEqual(parsedToolCall.state, 'RUNNING', 'Tool call result state must not be RUNNING');
     assert.equal(parsedToolCall.state, 'FAILED', 'Tool call result state must be FAILED');
   });
+
+  test('RC02-REG-49: kernel-bound active Node runtime under HOME resolves to /proc/self/exe', () => {
+    if (process.platform !== 'linux') return;
+
+    const realExec = fs.realpathSync(process.execPath);
+    const parentDir = path.dirname(realExec);
+    const ancestorDir = path.dirname(parentDir) !== '/' ? path.dirname(parentDir) : parentDir;
+    const origHome = process.env.HOME;
+
+    try {
+      // Simulate HOME containing the active runtime path (both direct parent and ancestor)
+      for (const simulatedHome of [ancestorDir, parentDir]) {
+        process.env.HOME = simulatedHome;
+        assert.ok(
+          realExec.startsWith(simulatedHome + path.sep),
+          `Test precondition: simulated HOME (${simulatedHome}) must contain active runtime (${realExec})`,
+        );
+
+        const resolver = new ExecutableResolver();
+        const resolved = resolver.resolveExecutable('node', workspaceDir);
+        assert.equal(
+          resolved,
+          '/proc/self/exe',
+          `Resolver must return /proc/self/exe when HOME contains active runtime (${simulatedHome})`,
+        );
+
+        // Verify generic lookup still rejects arbitrary executables and does NOT treat simulated HOME as trusted
+        assert.throws(
+          () => resolver.resolveExecutable('arbitrary_cmd_under_home', workspaceDir),
+          /could not be resolved|DENIED|NOT_FOUND|cannot be found/i,
+        );
+      }
+    } finally {
+      process.env.HOME = origHome;
+    }
+  });
 });
