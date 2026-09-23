@@ -33,6 +33,8 @@ import {
   type PolicyMatchTarget,
   type WorkspaceRecord,
   RC03_MUTATION_TOOLS,
+  RC07_COMPOSITE_TOOLS,
+  type CompositePlanSecurityFacts,
 } from '@cesspace-arc/policy';
 import { EnrollmentManager, SessionManager } from '@cesspace-arc/auth';
 import { AdminIpcError, AdminIpcServer } from './admin-ipc.js';
@@ -68,8 +70,12 @@ import {
   type CanonicalCompositePlan,
   TEST_COMPOSITE_HARNESS_TOKEN,
   computePlanHash,
+  deepFreezePlan,
+  validateStepAgainstRegistry,
   enterCompositeInvocation,
   executeCompositePlan,
+  type DeterministicExecutionRegistry,
+  createProductionDeterministicRegistry,
 } from './composite-framework.js';
 import {
   AuditLogger,
@@ -87,7 +93,12 @@ import {
   type IProcessLifecycleSink,
   type ProcessLifecycleEvent,
 } from '@cesspace-arc/processes';
-import { ControlledProcessRunner, type ITerminalSubsystem } from '@cesspace-arc/terminal';
+import {
+  ControlledProcessRunner,
+  type ITerminalSubsystem,
+  type IInternalDeterministicExecutor,
+  createControlledProcessExecution,
+} from '@cesspace-arc/terminal';
 import { z } from 'zod';
 
 export interface ArcServerConfig {
@@ -1482,6 +1493,10 @@ export class ArcMcpServer implements IArcMcpServer {
   private readonly auditConfig?: AuditConfig;
   /** Test-only composite framework harness (RC-07 Task 1). */
   private readonly testCompositeHarness?: TestCompositeHarness;
+  /** Privileged internal deterministic execution capability (RC-07 Task 1). */
+  private readonly internalDeterministicExecutor?: IInternalDeterministicExecutor;
+  /** Authoritative closed deterministic execution registry (RC-07 Task 1). */
+  private readonly deterministicRegistry: DeterministicExecutionRegistry;
 
   constructor(
     public readonly workspaceRegistry: WorkspaceRegistry,
@@ -1529,6 +1544,8 @@ export class ArcMcpServer implements IArcMcpServer {
      * The production factory never supplies it.
      */
     testCompositeHarness?: TestCompositeHarness,
+    internalDeterministicExecutor?: IInternalDeterministicExecutor,
+    deterministicRegistry?: DeterministicExecutionRegistry,
   ) {
     if (testCompositeHarness !== undefined) {
       if (testCompositeHarness[TEST_COMPOSITE_HARNESS_TOKEN] !== true) {
@@ -1536,6 +1553,11 @@ export class ArcMcpServer implements IArcMcpServer {
       }
       this.testCompositeHarness = testCompositeHarness;
     }
+    this.internalDeterministicExecutor = internalDeterministicExecutor;
+    this.deterministicRegistry =
+      testCompositeHarness?.registry ??
+      deterministicRegistry ??
+      createProductionDeterministicRegistry();
     // Transport mode is resolved once, at construction, and is immutable. A
     // remote configuration supplied alongside stdio is NOT activated.
     this.transportMode = config?.transport ?? 'stdio';
@@ -2023,7 +2045,9 @@ export class ArcMcpServer implements IArcMcpServer {
     }
 
     // 2. Pre-Admission Tool Name & Runtime Schema Validation Gate (P1-02)
-    const isCompositeTool = this.testCompositeHarness?.toolName === toolName;
+    const isCompositeTool =
+      (RC07_COMPOSITE_TOOLS as readonly string[]).includes(toolName) ||
+      this.testCompositeHarness?.toolName === toolName;
     const schema =
       (TOOL_SCHEMAS as Record<string, z.ZodTypeAny | undefined>)[toolName] ??
       (isCompositeTool ? this.testCompositeHarness?.schema : undefined);
@@ -2457,7 +2481,13 @@ export class ArcMcpServer implements IArcMcpServer {
         businessParameters: validatedParams,
         workspaceId: targetWorkspace.workspaceId,
         workspaceRoot: targetWorkspace.rootPath,
+        registry: this.deterministicRegistry,
       });
+      // Validate all materialized steps against the closed registry
+      for (const step of compositePlan.steps) {
+        validateStepAgainstRegistry(step, this.deterministicRegistry);
+      }
+      compositePlan = deepFreezePlan(compositePlan);
       compositePlanHash = computePlanHash(compositePlan);
     }
 
@@ -2562,19 +2592,20 @@ export class ArcMcpServer implements IArcMcpServer {
       reason: string;
     }> = [];
     if (isCompositeTool) {
-      if (!actor.authenticated) {
-        layer1Decisions.push({
-          effect: 'DENY',
-          matchingRuleId: 'deny-unauthenticated-caller',
-          reason: 'Caller is not authenticated.',
-        });
-      } else {
-        layer1Decisions.push({
-          effect: 'ALLOW',
-          matchingRuleId: 'allow-composite-framework',
-          reason: 'Composite tool invocation caller authenticated.',
-        });
-      }
+      const planFacts: CompositePlanSecurityFacts | undefined = compositePlan
+        ? {
+            toolName,
+            workspaceRoot: targetWorkspace.rootPath,
+            steps: compositePlan.steps.map((s) => ({
+              toolRegistryId: s.toolRegistryId,
+              executable: s.executable,
+              cwd: s.cwd,
+              sideEffectClass: s.sideEffectClass,
+              projectCodeExecution: s.projectCodeExecution,
+            })),
+          }
+        : undefined;
+      layer1Decisions.push(await this.securityKernel.evaluateComposite(context, planFacts));
     } else {
       layer1Decisions.push(await this.securityKernel.evaluate(context));
       if (toolName === 'apply_patch' && patchTargetPaths !== undefined) {
@@ -2663,49 +2694,14 @@ export class ArcMcpServer implements IArcMcpServer {
     // On the fail-closed diagnostic path there is no Layer-2 engine at all; the
     // diagnostic tools carry no targets and no side effects, so the absent layer
     // contributes no restriction. Every other tool was already refused above.
-    let layer2Decisions: Array<{
+    const layer2Decisions: Array<{
       effect: PolicyEffect;
       matchingRuleId: string;
       reason: string;
-    }>;
-    if (isCompositeTool) {
-      const defaultEffect: PolicyEffect = this.testCompositeHarness?.requiresApproval
-        ? 'REQUIRE_APPROVAL'
-        : 'ALLOW';
-      const defaultRuleId = this.testCompositeHarness?.requiresApproval
-        ? 'require-approval-composite-tool'
-        : 'allow-composite-tool';
-      if (policyEngine && policyEngine.getSourceMode() === 'EXTERNAL') {
-        const externalDecisions = layer2Targets.map((target: PolicyMatchTarget) =>
-          policyEngine.evaluate(target as never),
-        );
-        layer2Decisions =
-          externalDecisions.length > 0
-            ? externalDecisions
-            : [
-                {
-                  effect: defaultEffect,
-                  matchingRuleId: defaultRuleId,
-                  reason: 'Composite tool policy evaluation.',
-                },
-              ];
-      } else {
-        layer2Decisions = [
-          {
-            effect: defaultEffect,
-            matchingRuleId: defaultRuleId,
-            reason: 'Composite tool policy evaluation.',
-          },
-        ];
-      }
-    } else {
-      layer2Decisions =
-        policyEngine === undefined
-          ? [{ effect: 'ALLOW' as PolicyEffect, matchingRuleId: 'no-layer2-engine', reason: '' }]
-          : layer2Targets.map((target: PolicyMatchTarget) =>
-              policyEngine.evaluate(target as never),
-            );
-    }
+    }> =
+      policyEngine === undefined
+        ? [{ effect: 'ALLOW' as PolicyEffect, matchingRuleId: 'no-layer2-engine', reason: '' }]
+        : layer2Targets.map((target: PolicyMatchTarget) => policyEngine.evaluate(target as never));
     const layer2 = reduceDecisions(layer2Decisions) as {
       effect: PolicyEffect;
       matchingRuleId: string;
@@ -2733,13 +2729,6 @@ export class ArcMcpServer implements IArcMcpServer {
       // Defense in depth: a mutation can never resolve to automatic ALLOW.
       effectiveEffect = 'REQUIRE_APPROVAL';
       effectiveRuleId = 'require-approval-file-mutation';
-    } else if (
-      effectiveEffect === 'ALLOW' &&
-      isCompositeTool &&
-      this.testCompositeHarness?.requiresApproval
-    ) {
-      effectiveEffect = 'REQUIRE_APPROVAL';
-      effectiveRuleId = 'require-approval-composite-tool';
     }
 
     // Invocation-local, non-user-controlled authorization state. Mutation
@@ -3162,9 +3151,13 @@ export class ArcMcpServer implements IArcMcpServer {
           result = await enterCompositeInvocation(toolName, async () => {
             return await executeCompositePlan({
               plan: compositePlan!,
+              admittedPlanHash: compositePlanHash!,
               actor,
               targetWorkspace,
-              terminalSubsystem: this.terminalSubsystem,
+              internalExecutor: this.internalDeterministicExecutor,
+              registry: this.deterministicRegistry,
+              testPostAdmissionMutationHook:
+                this.testCompositeHarness?.testPostAdmissionMutationHook,
             });
           });
           if ((result as { status?: string }).status === 'FAILED') {
@@ -4101,7 +4094,7 @@ export function createArcMcpServer(config?: Partial<ArcServerConfig>): ArcMcpSer
   const auditLogger = new AuditLogger();
   const filesystemSubsystem = new FilesystemSubsystem();
   const gitSubsystem = new GitSubsystem();
-  const terminalSubsystem = new ControlledProcessRunner(processRegistry);
+  const { terminalSubsystem, internalExecutor } = createControlledProcessExecution(processRegistry);
 
   const approvalStateManager = new ApprovalStateManager();
 
@@ -4156,6 +4149,9 @@ export function createArcMcpServer(config?: Partial<ArcServerConfig>): ArcMcpSer
     adminIpcServer,
     enrollmentManager,
     sessionManager,
+    undefined,
+    internalExecutor,
+    createProductionDeterministicRegistry(),
   );
 }
 

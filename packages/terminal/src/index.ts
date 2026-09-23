@@ -280,12 +280,6 @@ export interface ITerminalSubsystem {
     actor: PolicyEvaluationContext['actor'],
     targetWorkspace: PolicyEvaluationContext['targetWorkspace'],
   ): Promise<RunCommandResponse>;
-  executeDeterministicStep?(
-    step: DeterministicExecutionStep,
-    actor: PolicyEvaluationContext['actor'],
-    targetWorkspace: PolicyEvaluationContext['targetWorkspace'],
-    capability: InternalExecutionCapability,
-  ): Promise<DeterministicStepResult>;
   getProcessStatus(
     processId: string,
     actor: PolicyEvaluationContext['actor'],
@@ -315,30 +309,19 @@ export interface ITerminalSubsystem {
   ): Promise<TerminateProcessResponse>;
 }
 
-/** Non-serializable, in-process capability token for internal deterministic execution. */
-const INTERNAL_EXEC_CAPABILITY_TOKEN = Symbol('arc.terminal.internalExecutionCapability');
+/** Module-private brand for internal execution core invocation. */
+const INTERNAL_EXEC_BRAND = Symbol('arc.terminal.internalExecutionBrand');
+
+/** Set of runtime-authorized internal deterministic executors. */
+const AUTHORIZED_EXECUTORS = new WeakSet<object>();
 
 /**
- * Non-serializable capability protecting internal deterministic composite execution.
- * Cannot be constructed from JSON, remote requests, or untrusted input.
+ * Type-level representation of the non-forgeable internal execution authority.
+ * Deliberately possesses no public factory (.create()) or constructible API.
  */
 export class InternalExecutionCapability {
-  private readonly [INTERNAL_EXEC_CAPABILITY_TOKEN] = true;
-
-  private constructor() {}
-
-  /**
-   * Internal factory: only accessible within Node runtime in-process.
-   */
-  public static create(): InternalExecutionCapability {
-    return new InternalExecutionCapability();
-  }
-
-  public static isAuthorized(candidate: unknown): candidate is InternalExecutionCapability {
-    return (
-      candidate instanceof InternalExecutionCapability &&
-      Boolean((candidate as unknown as Record<symbol, unknown>)[INTERNAL_EXEC_CAPABILITY_TOKEN])
-    );
+  private constructor() {
+    throw new TypeError('InternalExecutionCapability cannot be instantiated directly');
   }
 }
 
@@ -370,18 +353,75 @@ export interface DeterministicStepResult {
   timedOut: boolean;
 }
 
-export class ControlledProcessRunner implements ITerminalSubsystem {
-  private readonly internalCapability: InternalExecutionCapability =
-    InternalExecutionCapability.create();
+/**
+ * Separate internal authority interface for deterministic composite execution.
+ * Held privately by trusted server composition; never exposed on public ITerminalSubsystem.
+ */
+export interface IInternalDeterministicExecutor {
+  executeDeterministicStep(
+    step: DeterministicExecutionStep,
+    actor: PolicyEvaluationContext['actor'],
+    targetWorkspace: PolicyEvaluationContext['targetWorkspace'],
+  ): Promise<DeterministicStepResult>;
+}
 
+/**
+ * Runtime check verifying whether an object is an authorized internal executor.
+ */
+export function isAuthorizedDeterministicExecutor(
+  candidate: unknown,
+): candidate is IInternalDeterministicExecutor {
+  return typeof candidate === 'object' && candidate !== null && AUTHORIZED_EXECUTORS.has(candidate);
+}
+
+interface InternalProcessExecutionSpec {
+  workspaceId: string;
+  actor: {
+    clientId: string;
+    clientType: string;
+    sessionId: string;
+    deviceId?: string;
+  };
+  resolvedExecutable: string;
+  rawExecutableName: string;
+  args: string[];
+  executionCwd: string;
+  env: NodeJS.ProcessEnv;
+  timeoutMs: number;
+  outputLimitBytes: number;
+  runInBackground?: boolean;
+}
+
+interface InternalProcessExecutionResult {
+  processId: string;
+  state: 'RUNNING' | 'COMPLETED' | 'FAILED' | 'TERMINATED' | 'TIMED_OUT';
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+  durationMs: number;
+}
+
+export class ControlledProcessRunner implements ITerminalSubsystem {
   constructor(
     public readonly processRegistry: ProcessRegistry,
     public readonly commandPolicy: ICommandPolicy = new CommandPolicy(),
     public readonly executableResolver: IExecutableResolver = new ExecutableResolver(),
   ) {}
 
-  public getInternalExecutionCapability(): InternalExecutionCapability {
-    return this.internalCapability;
+  /**
+   * Internal bridge for authorized executor to enter the shared private process core.
+   * Throws if the unexported brand symbol does not match.
+   */
+  public async _executeInternalStepCore(
+    spec: InternalProcessExecutionSpec,
+    brand: symbol,
+  ): Promise<InternalProcessExecutionResult> {
+    if (brand !== INTERNAL_EXEC_BRAND) {
+      throw ArcError.forbiddenCommand('Access denied: unauthorized internal execution core call.');
+    }
+    return this.#spawnAndControlProcess(spec);
   }
 
   public async executeCommand(
@@ -389,7 +429,6 @@ export class ControlledProcessRunner implements ITerminalSubsystem {
     actor: PolicyEvaluationContext['actor'],
     targetWorkspace: PolicyEvaluationContext['targetWorkspace'],
   ): Promise<RunCommandResponse> {
-    const startTime = Date.now();
     const workspaceRoot = targetWorkspace.rootPath;
 
     if (
@@ -470,7 +509,7 @@ export class ControlledProcessRunner implements ITerminalSubsystem {
     // 5. Concurrency Check & Registration
     const timeoutMs = Math.min(Math.max(100, request.timeoutMs ?? 30000), 300000);
 
-    const record = this.processRegistry.registerProcess({
+    const result = await this.#spawnAndControlProcess({
       workspaceId: targetWorkspace.workspaceId,
       actor: {
         clientId: actor.clientId,
@@ -478,21 +517,55 @@ export class ControlledProcessRunner implements ITerminalSubsystem {
         sessionId: actor.sessionId,
         deviceId: actor.deviceId,
       },
-      executable: request.executable,
-      sanitizedArgs: args,
-      cwd: executionCwd,
+      resolvedExecutable,
+      rawExecutableName: request.executable,
+      args,
+      executionCwd,
+      env: sanitizedEnv,
+      timeoutMs,
+      outputLimitBytes: MAX_OUTPUT_READ_BYTES,
+      runInBackground: request.runInBackground,
+    });
+
+    return {
+      processId: result.processId,
+      state: result.state,
+      exitCode: result.exitCode,
+      signal: result.signal,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      timedOut: result.timedOut,
+      durationMs: result.durationMs,
+    };
+  }
+
+  /**
+   * One shared private controlled-process execution core.
+   * Handles ProcessRegistry registration, spawn, output streaming, timeout handling,
+   * signal escalation, and completion for both public and internal paths.
+   */
+  async #spawnAndControlProcess(
+    spec: InternalProcessExecutionSpec,
+  ): Promise<InternalProcessExecutionResult> {
+    const startTime = Date.now();
+
+    const record = this.processRegistry.registerProcess({
+      workspaceId: spec.workspaceId,
+      actor: spec.actor,
+      executable: spec.rawExecutableName,
+      sanitizedArgs: spec.args,
+      cwd: spec.executionCwd,
       startedAt: new Date(startTime).toISOString(),
       state: 'RUNNING',
       timedOut: false,
     });
 
-    // 6. Spawn Child Process (shell: false, detached: true on POSIX for process group kill)
     let child: ChildProcess;
     let spawnSucceeded = false;
     try {
-      child = spawn(resolvedExecutable, args, {
-        cwd: executionCwd,
-        env: sanitizedEnv,
+      child = spawn(spec.resolvedExecutable, spec.args, {
+        cwd: spec.executionCwd,
+        env: spec.env,
         shell: false,
         detached: process.platform !== 'win32',
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -512,7 +585,7 @@ export class ControlledProcessRunner implements ITerminalSubsystem {
       throw ArcError.internalError(`Failed to spawn process: ${errMsg}`);
     }
 
-    // 7. Output Stream Plumbing
+    // Output Stream Plumbing
     child.stdout?.on('data', (chunk: Buffer) => {
       this.processRegistry.appendOutput(record.processId, 'stdout', chunk);
     });
@@ -521,7 +594,7 @@ export class ControlledProcessRunner implements ITerminalSubsystem {
       this.processRegistry.appendOutput(record.processId, 'stderr', chunk);
     });
 
-    // 8. Timeout Setup
+    // Timeout Setup
     record._timeoutTimer = setTimeout(() => {
       this.processRegistry.markTimedOut(record.processId);
       try {
@@ -547,7 +620,7 @@ export class ControlledProcessRunner implements ITerminalSubsystem {
         }
       }, 1000);
       record._killTimer.unref();
-    }, timeoutMs);
+    }, spec.timeoutMs);
     record._timeoutTimer.unref();
 
     child.on('close', (code, signal) => {
@@ -562,8 +635,7 @@ export class ControlledProcessRunner implements ITerminalSubsystem {
       }
     });
 
-    // 9. Synchronous vs Background Return
-    if (request.runInBackground) {
+    if (spec.runInBackground) {
       // Ensure the spawn event or spawn error has been emitted before returning
       // so PROCESS_SPAWN_SUCCEEDED is reliably emitted and available in audit sinks.
       if (
@@ -590,7 +662,7 @@ export class ControlledProcessRunner implements ITerminalSubsystem {
             cleanup();
             resolvePromise();
           };
-          const timer: NodeJS.Timeout = setTimeout(onTimeout, Math.min(timeoutMs, 5000));
+          const timer: NodeJS.Timeout = setTimeout(onTimeout, Math.min(spec.timeoutMs, 5000));
           timer.unref();
           child.once('spawn', onSpawn);
           child.once('error', onError);
@@ -607,25 +679,25 @@ export class ControlledProcessRunner implements ITerminalSubsystem {
           this.processRegistry.markSpawnFailed(record.processId, 'Process failed to spawn');
         }
         const status = this.processRegistry.getProcessStatus(record.processId, {
-          clientId: actor.clientId,
-          sessionId: actor.sessionId,
-          workspaceId: targetWorkspace.workspaceId,
+          clientId: spec.actor.clientId,
+          sessionId: spec.actor.sessionId,
+          workspaceId: spec.workspaceId,
         });
         const output = this.processRegistry.getProcessOutput(
           record.processId,
           0,
-          MAX_OUTPUT_READ_BYTES,
+          spec.outputLimitBytes,
           {
-            clientId: actor.clientId,
-            sessionId: actor.sessionId,
-            workspaceId: targetWorkspace.workspaceId,
+            clientId: spec.actor.clientId,
+            sessionId: spec.actor.sessionId,
+            workspaceId: spec.workspaceId,
           },
         );
         return {
           processId: record.processId,
           state: status.state,
-          exitCode: status.exitCode,
-          signal: status.signal,
+          exitCode: status.exitCode ?? null,
+          signal: (status.signal as NodeJS.Signals | null) ?? null,
           stdout: output.stdoutChunk,
           stderr: output.stderrChunk,
           timedOut: status.timedOut,
@@ -636,6 +708,8 @@ export class ControlledProcessRunner implements ITerminalSubsystem {
       return {
         processId: record.processId,
         state: 'RUNNING',
+        exitCode: null,
+        signal: null,
         stdout: '',
         stderr: '',
         timedOut: false,
@@ -650,230 +724,30 @@ export class ControlledProcessRunner implements ITerminalSubsystem {
     });
 
     const status = this.processRegistry.getProcessStatus(record.processId, {
-      clientId: actor.clientId,
-      sessionId: actor.sessionId || '',
-      workspaceId: targetWorkspace.workspaceId,
+      clientId: spec.actor.clientId,
+      sessionId: spec.actor.sessionId,
+      workspaceId: spec.workspaceId,
     });
     const output = this.processRegistry.getProcessOutput(
       record.processId,
       0,
-      MAX_OUTPUT_READ_BYTES,
+      spec.outputLimitBytes,
       {
-        clientId: actor.clientId,
-        sessionId: actor.sessionId || '',
-        workspaceId: targetWorkspace.workspaceId,
+        clientId: spec.actor.clientId,
+        sessionId: spec.actor.sessionId,
+        workspaceId: spec.workspaceId,
       },
     );
 
     return {
       processId: record.processId,
       state: status.state,
-      exitCode: status.exitCode,
-      signal: status.signal,
-      stdout: output.stdoutChunk,
-      stderr: output.stderrChunk,
-      timedOut: status.timedOut,
-      durationMs: status.durationMs,
-    };
-  }
-
-  public async executeDeterministicStep(
-    step: DeterministicExecutionStep,
-    actor: PolicyEvaluationContext['actor'],
-    targetWorkspace: PolicyEvaluationContext['targetWorkspace'],
-    capability: InternalExecutionCapability,
-  ): Promise<DeterministicStepResult> {
-    if (!InternalExecutionCapability.isAuthorized(capability)) {
-      throw ArcError.forbiddenCommand(
-        'Access denied: valid internal execution capability is required.',
-      );
-    }
-
-    const startTime = Date.now();
-    const workspaceRoot = targetWorkspace.rootPath;
-
-    if (
-      !actor.clientId ||
-      !actor.sessionId ||
-      actor.clientId.trim().length === 0 ||
-      actor.sessionId.trim().length === 0
-    ) {
-      throw ArcError.unauthenticated(
-        'Access denied: internal deterministic execution requires verified caller identity (clientId and sessionId).',
-      );
-    }
-
-    if (!workspaceRoot || !existsSync(workspaceRoot)) {
-      throw ArcError.noWorkspaceConfigured('Authorized workspace root is required for execution.');
-    }
-
-    // 1. Resolve and Validate Working Directory (cwd)
-    let executionCwd = workspaceRoot;
-    if (step.cwd && step.cwd.trim().length > 0) {
-      const rawCwd = step.cwd.trim();
-      const resolvedCwd = resolve(workspaceRoot, rawCwd);
-      if (!existsSync(resolvedCwd)) {
-        throw ArcError.fileNotFound(`Execution working directory does not exist: '${rawCwd}'.`);
-      }
-      let canonicalCwd: string;
-      try {
-        canonicalCwd = realpathSync(resolvedCwd);
-      } catch {
-        throw ArcError.pathEscapesRoot('Failed to canonicalize execution working directory.');
-      }
-      if (canonicalCwd !== workspaceRoot && !canonicalCwd.startsWith(workspaceRoot + sep)) {
-        throw ArcError.pathEscapesRoot(
-          'Security violation: Working directory resolves outside authorized workspace.',
-        );
-      }
-      executionCwd = canonicalCwd;
-    }
-
-    const args = step.args || [];
-
-    // 2. Trusted Executable Resolution
-    const resolvedExecutable = this.executableResolver.resolveExecutable(
-      step.executable,
-      workspaceRoot,
-    );
-
-    // 3. Environment Sanitization (fixed sanitized environment; no ambient secrets)
-    const trustedPath = '/usr/bin:/bin:/usr/local/bin';
-    const sanitizedEnv: NodeJS.ProcessEnv = {
-      PATH: trustedPath,
-      LANG: 'C.UTF-8',
-      LC_ALL: 'C.UTF-8',
-      NODE_ENV: 'test',
-    };
-
-    if (basename(resolvedExecutable).toLowerCase() === 'git') {
-      sanitizedEnv.GIT_OPTIONAL_LOCKS = '0';
-      sanitizedEnv.GIT_CONFIG_GLOBAL = '/dev/null';
-      sanitizedEnv.GIT_CONFIG_NOSYSTEM = '1';
-    }
-
-    // 4. Concurrency Check & Registration
-    const timeoutMs = Math.min(Math.max(100, step.timeoutMs ?? 30000), 120000);
-    const maxOutputBytes = Math.min(
-      Math.max(1024, step.outputLimitBytes ?? MAX_OUTPUT_READ_BYTES),
-      MAX_OUTPUT_READ_BYTES,
-    );
-
-    const record = this.processRegistry.registerProcess({
-      workspaceId: targetWorkspace.workspaceId,
-      actor: {
-        clientId: actor.clientId,
-        clientType: actor.clientType,
-        sessionId: actor.sessionId,
-        deviceId: actor.deviceId,
-      },
-      executable: step.executable,
-      sanitizedArgs: args,
-      cwd: executionCwd,
-      startedAt: new Date(startTime).toISOString(),
-      state: 'RUNNING',
-      timedOut: false,
-    });
-
-    // 5. Spawn Child Process (shell: false, detached: true on POSIX for process group kill)
-    let child: ChildProcess;
-    let spawnSucceeded = false;
-    try {
-      child = spawn(resolvedExecutable, args, {
-        cwd: executionCwd,
-        env: sanitizedEnv,
-        shell: false,
-        detached: process.platform !== 'win32',
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      record._child = child;
-
-      child.once('spawn', () => {
-        spawnSucceeded = true;
-        this.processRegistry.notifySpawnSuccess(record.processId);
-      });
-    } catch (err: unknown) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      this.processRegistry.markSpawnFailed(record.processId, errMsg);
-      throw ArcError.internalError(`Failed to spawn process: ${errMsg}`);
-    }
-
-    // 6. Output Stream Plumbing
-    child.stdout?.on('data', (chunk: Buffer) => {
-      this.processRegistry.appendOutput(record.processId, 'stdout', chunk);
-    });
-
-    child.stderr?.on('data', (chunk: Buffer) => {
-      this.processRegistry.appendOutput(record.processId, 'stderr', chunk);
-    });
-
-    // 7. Timeout Setup
-    record._timeoutTimer = setTimeout(() => {
-      this.processRegistry.markTimedOut(record.processId);
-      try {
-        if (child.pid && process.platform !== 'win32') {
-          process.kill(-child.pid, 'SIGTERM');
-        } else {
-          child.kill('SIGTERM');
-        }
-      } catch {
-        // ignore
-      }
-      record._killTimer = setTimeout(() => {
-        try {
-          if (child.exitCode === null && child.signalCode === null) {
-            if (child.pid && process.platform !== 'win32') {
-              process.kill(-child.pid, 'SIGKILL');
-            } else {
-              child.kill('SIGKILL');
-            }
-          }
-        } catch {
-          // ignore
-        }
-      }, 1000);
-      record._killTimer.unref();
-    }, timeoutMs);
-    record._timeoutTimer.unref();
-
-    child.on('close', (code, signal) => {
-      this.processRegistry.markCompleted(record.processId, code, signal);
-    });
-
-    child.on('error', (err) => {
-      if (!spawnSucceeded) {
-        this.processRegistry.markSpawnFailed(record.processId, err.message);
-      } else {
-        this.processRegistry.markCompleted(record.processId, 1, null);
-      }
-    });
-
-    // Await completion or timeout
-    await new Promise<void>((resolvePromise) => {
-      child.on('close', () => resolvePromise());
-      child.on('error', () => resolvePromise());
-    });
-
-    const status = this.processRegistry.getProcessStatus(record.processId, {
-      clientId: actor.clientId,
-      sessionId: actor.sessionId || '',
-      workspaceId: targetWorkspace.workspaceId,
-    });
-    const output = this.processRegistry.getProcessOutput(record.processId, 0, maxOutputBytes, {
-      clientId: actor.clientId,
-      sessionId: actor.sessionId || '',
-      workspaceId: targetWorkspace.workspaceId,
-    });
-
-    return {
-      stepId: step.stepId,
-      processId: record.processId,
       exitCode: status.exitCode ?? null,
       signal: (status.signal as NodeJS.Signals | null) ?? null,
       stdout: output.stdoutChunk,
       stderr: output.stderrChunk,
-      durationMs: status.durationMs,
       timedOut: status.timedOut,
+      durationMs: status.durationMs,
     };
   }
 
@@ -924,4 +798,138 @@ export class ControlledProcessRunner implements ITerminalSubsystem {
       workspaceId: targetWorkspace?.workspaceId,
     });
   }
+}
+
+/**
+ * Concrete implementation of the internal deterministic execution authority.
+ * Branded in the module-private WeakSet at construction.
+ */
+class InternalDeterministicExecutorImpl implements IInternalDeterministicExecutor {
+  constructor(private readonly runner: ControlledProcessRunner) {
+    AUTHORIZED_EXECUTORS.add(this);
+  }
+
+  public async executeDeterministicStep(
+    step: DeterministicExecutionStep,
+    actor: PolicyEvaluationContext['actor'],
+    targetWorkspace: PolicyEvaluationContext['targetWorkspace'],
+  ): Promise<DeterministicStepResult> {
+    const workspaceRoot = targetWorkspace.rootPath;
+
+    if (
+      !actor.clientId ||
+      !actor.sessionId ||
+      actor.clientId.trim().length === 0 ||
+      actor.sessionId.trim().length === 0
+    ) {
+      throw ArcError.unauthenticated(
+        'Access denied: internal deterministic execution requires verified caller identity (clientId and sessionId).',
+      );
+    }
+
+    if (!workspaceRoot || !existsSync(workspaceRoot)) {
+      throw ArcError.noWorkspaceConfigured('Authorized workspace root is required for execution.');
+    }
+
+    // 1. Resolve and Validate Working Directory (cwd)
+    let executionCwd = workspaceRoot;
+    if (step.cwd && step.cwd.trim().length > 0) {
+      const rawCwd = step.cwd.trim();
+      const resolvedCwd = resolve(workspaceRoot, rawCwd);
+      if (!existsSync(resolvedCwd)) {
+        throw ArcError.fileNotFound(`Execution working directory does not exist: '${rawCwd}'.`);
+      }
+      let canonicalCwd: string;
+      try {
+        canonicalCwd = realpathSync(resolvedCwd);
+      } catch {
+        throw ArcError.pathEscapesRoot('Failed to canonicalize execution working directory.');
+      }
+      if (canonicalCwd !== workspaceRoot && !canonicalCwd.startsWith(workspaceRoot + sep)) {
+        throw ArcError.pathEscapesRoot(
+          'Security violation: Working directory resolves outside authorized workspace.',
+        );
+      }
+      executionCwd = canonicalCwd;
+    }
+
+    const args = step.args || [];
+
+    // 2. Executable resolution via runner's resolver
+    const resolvedExecutable = this.runner.executableResolver.resolveExecutable(
+      step.executable,
+      workspaceRoot,
+    );
+
+    // 3. Environment Sanitization (fixed sanitized environment; no ambient secrets)
+    const trustedPath = '/usr/bin:/bin:/usr/local/bin';
+    const sanitizedEnv: NodeJS.ProcessEnv = {
+      PATH: trustedPath,
+      LANG: 'C.UTF-8',
+      LC_ALL: 'C.UTF-8',
+      NODE_ENV: 'test',
+    };
+
+    if (basename(resolvedExecutable).toLowerCase() === 'git') {
+      sanitizedEnv.GIT_OPTIONAL_LOCKS = '0';
+      sanitizedEnv.GIT_CONFIG_GLOBAL = '/dev/null';
+      sanitizedEnv.GIT_CONFIG_NOSYSTEM = '1';
+    }
+
+    const timeoutMs = Math.min(Math.max(100, step.timeoutMs ?? 30000), 120000);
+    const maxOutputBytes = Math.min(
+      Math.max(1024, step.outputLimitBytes ?? MAX_OUTPUT_READ_BYTES),
+      MAX_OUTPUT_READ_BYTES,
+    );
+
+    const result = await this.runner._executeInternalStepCore(
+      {
+        workspaceId: targetWorkspace.workspaceId,
+        actor: {
+          clientId: actor.clientId,
+          clientType: actor.clientType,
+          sessionId: actor.sessionId,
+          deviceId: actor.deviceId,
+        },
+        resolvedExecutable,
+        rawExecutableName: step.executable,
+        args,
+        executionCwd,
+        env: sanitizedEnv,
+        timeoutMs,
+        outputLimitBytes: maxOutputBytes,
+        runInBackground: false,
+      },
+      INTERNAL_EXEC_BRAND,
+    );
+
+    return {
+      stepId: step.stepId,
+      processId: result.processId,
+      exitCode: result.exitCode,
+      signal: result.signal,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      durationMs: result.durationMs,
+      timedOut: result.timedOut,
+    };
+  }
+}
+
+/**
+ * Trusted server composition factory.
+ * Produces the public ITerminalSubsystem (ControlledProcessRunner) and the paired
+ * runtime-unforgeable IInternalDeterministicExecutor.
+ */
+export function createControlledProcessExecution(
+  processRegistry: ProcessRegistry,
+  commandPolicy: ICommandPolicy = new CommandPolicy(),
+  executableResolver: IExecutableResolver = new ExecutableResolver(),
+): {
+  terminalSubsystem: ControlledProcessRunner;
+  internalExecutor: IInternalDeterministicExecutor;
+} {
+  const runner = new ControlledProcessRunner(processRegistry, commandPolicy, executableResolver);
+  const internalExecutor = new InternalDeterministicExecutorImpl(runner);
+  return { terminalSubsystem: runner, internalExecutor };
 }
