@@ -112,6 +112,10 @@ export interface ApprovalReviewSummary {
   argumentCount?: number;
   insertions?: number;
   deletions?: number;
+  // RC-07 composite plan review fields (bounded, safe)
+  planId?: string;
+  planHash?: string;
+  stepCount?: number;
 }
 
 /** Maximum number of target paths retained in a review summary. */

@@ -177,6 +177,7 @@ export interface ExecutionPayloadInput {
   workspaceId: string;
   workspaceRootHash: string;
   policyHash: string;
+  planHash?: string;
 }
 
 /**
@@ -200,7 +201,7 @@ export function buildPayloadToSign(input: ExecutionPayloadInput): Record<string,
     actor.deviceId = input.actor.deviceId;
   }
 
-  return {
+  const payload: Record<string, unknown> = {
     schemaVersion: '1.0',
     toolName: input.toolName,
     parameters: input.businessParameters,
@@ -209,6 +210,12 @@ export function buildPayloadToSign(input: ExecutionPayloadInput): Record<string,
     workspaceRootHash: input.workspaceRootHash,
     policyHash: input.policyHash,
   };
+
+  if (input.planHash !== undefined) {
+    payload.planHash = input.planHash;
+  }
+
+  return payload;
 }
 
 /** SHA-256 over canonical JSON of the exact payload-to-sign. */
@@ -609,6 +616,17 @@ function boundTargetPaths(paths: readonly string[]): string[] {
  * never wrapped in a JSON envelope carrying metadata — doing so would push a
  * legal 1 MiB mutation over the per-record review byte limit.
  */
+export interface CompositePlanReviewInput {
+  planId: string;
+  planHash: string;
+  stepCount: number;
+  steps?: Array<{
+    stepId: string;
+    toolRegistryId: string;
+    sideEffectClass: string;
+  }>;
+}
+
 export function buildReviewPayload(
   toolName: string,
   params: Record<string, unknown>,
@@ -619,6 +637,7 @@ export function buildReviewPayload(
    * the filesystem act on.
    */
   canonicalTargetPaths: readonly string[] = [],
+  compositePlanReview?: CompositePlanReviewInput,
 ): ReviewMaterialAndSummary {
   switch (toolName) {
     case 'create_file': {
@@ -716,6 +735,24 @@ export function buildReviewPayload(
     }
 
     default: {
+      if (compositePlanReview !== undefined) {
+        return {
+          reviewMaterial: canonicalJson({
+            planId: compositePlanReview.planId,
+            planHash: compositePlanReview.planHash,
+            stepCount: compositePlanReview.stepCount,
+            ...(compositePlanReview.steps ? { steps: compositePlanReview.steps } : {}),
+          }),
+          reviewSummary: {
+            planId: compositePlanReview.planId,
+            planHash: compositePlanReview.planHash,
+            stepCount: compositePlanReview.stepCount,
+            ...(canonicalTargetPaths.length === 0
+              ? {}
+              : { targetPaths: boundTargetPaths(canonicalTargetPaths) }),
+          },
+        };
+      }
       // Non-mutation approvals: bounded canonical representation of the
       // validated business parameters.
       return {

@@ -121,6 +121,7 @@ function sanitizeReviewSummary(input: unknown): ApprovalReviewSummary | undefine
     'argumentCount',
     'insertions',
     'deletions',
+    'stepCount',
   ];
   for (const field of numberFields) {
     const value = source[field];
@@ -134,6 +135,7 @@ function sanitizeReviewSummary(input: unknown): ApprovalReviewSummary | undefine
     'patchHash',
     'expectedHash',
     'expectedSourceHash',
+    'planHash',
   ];
   for (const field of hashFields) {
     const value = source[field];
@@ -157,6 +159,15 @@ function sanitizeReviewSummary(input: unknown): ApprovalReviewSummary | undefine
     executable.length <= MAX_REVIEW_SUMMARY_STRING_LENGTH
   ) {
     out.executable = executable;
+  }
+
+  const planId = source.planId;
+  if (
+    typeof planId === 'string' &&
+    planId.length > 0 &&
+    planId.length <= MAX_REVIEW_SUMMARY_STRING_LENGTH
+  ) {
+    out.planId = planId;
   }
 
   return Object.keys(out).length > 0 ? out : undefined;

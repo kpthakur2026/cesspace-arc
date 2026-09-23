@@ -64,6 +64,14 @@ import {
   withArcApprovalSchema,
 } from './approval-gate.js';
 import {
+  type TestCompositeHarness,
+  type CanonicalCompositePlan,
+  TEST_COMPOSITE_HARNESS_TOKEN,
+  computePlanHash,
+  enterCompositeInvocation,
+  executeCompositePlan,
+} from './composite-framework.js';
+import {
   AuditLogger,
   computeSha256,
   canonicalJson,
@@ -1472,6 +1480,8 @@ export class ArcMcpServer implements IArcMcpServer {
   private auditRuntime?: AuditRuntime;
   /** Trusted launch configuration for {@link auditRuntime}. */
   private readonly auditConfig?: AuditConfig;
+  /** Test-only composite framework harness (RC-07 Task 1). */
+  private readonly testCompositeHarness?: TestCompositeHarness;
 
   constructor(
     public readonly workspaceRegistry: WorkspaceRegistry,
@@ -1513,7 +1523,19 @@ export class ArcMcpServer implements IArcMcpServer {
      * server constructed without one creates it here.
      */
     sessionManager?: SessionManager,
+    /**
+     * Test-only composite framework harness injection for RC-07 Task-1 integration tests.
+     * NOT reachable from ArcServerConfig, the environment, the CLI, or any network input.
+     * The production factory never supplies it.
+     */
+    testCompositeHarness?: TestCompositeHarness,
   ) {
+    if (testCompositeHarness !== undefined) {
+      if (testCompositeHarness[TEST_COMPOSITE_HARNESS_TOKEN] !== true) {
+        throw new Error('Invalid test composite harness provided.');
+      }
+      this.testCompositeHarness = testCompositeHarness;
+    }
     // Transport mode is resolved once, at construction, and is immutable. A
     // remote configuration supplied alongside stdio is NOT activated.
     this.transportMode = config?.transport ?? 'stdio';
@@ -2001,7 +2023,10 @@ export class ArcMcpServer implements IArcMcpServer {
     }
 
     // 2. Pre-Admission Tool Name & Runtime Schema Validation Gate (P1-02)
-    const schema = (TOOL_SCHEMAS as Record<string, z.ZodTypeAny | undefined>)[toolName];
+    const isCompositeTool = this.testCompositeHarness?.toolName === toolName;
+    const schema =
+      (TOOL_SCHEMAS as Record<string, z.ZodTypeAny | undefined>)[toolName] ??
+      (isCompositeTool ? this.testCompositeHarness?.schema : undefined);
     if (!schema) {
       const arcErr = ArcError.policyDenied(
         `Tool '${toolName}' is not permitted in RC-01 stage (read-only inspection core only).`,
@@ -2147,17 +2172,21 @@ export class ArcMcpServer implements IArcMcpServer {
     let workspaceConflict = false;
     let workspaceUnregistered = false;
 
-    // Caller Identity Gate (P1): run_command must fail closed before execution unless clientId and sessionId are non-empty
-    if (toolName === 'run_command') {
+    // Caller Identity Gate (P1): run_command & composite tools must fail closed before execution unless clientId and sessionId are non-empty
+    if (toolName === 'run_command' || isCompositeTool) {
       if (
         !actor.clientId ||
         !actor.sessionId ||
         actor.clientId.trim().length === 0 ||
         actor.sessionId.trim().length === 0
       ) {
-        const arcErr = ArcError.policyDenied(
-          'Access denied: run_command requires verified caller identity (clientId and sessionId).',
-        );
+        const arcErr = isCompositeTool
+          ? ArcError.unauthenticated(
+              `Access denied: composite tool '${toolName}' requires verified caller identity (clientId and sessionId).`,
+            )
+          : ArcError.policyDenied(
+              'Access denied: run_command requires verified caller identity (clientId and sessionId).',
+            );
         const preAuditParams = sanitizePreValidationParameters(toolName, businessParameters);
         await this.recordDurableDenial({
           timestamp: startTime,
@@ -2400,6 +2429,38 @@ export class ArcMcpServer implements IArcMcpServer {
       isGitRepo: targetWorkspaceRecord?.isGitRepo || false,
     };
 
+    // Composite tools require an authorized registered workspace (RC07-NEG-002)
+    if (
+      isCompositeTool &&
+      (!targetWorkspaceRecord ||
+        targetWorkspace.workspaceId === 'unbound' ||
+        targetWorkspace.workspaceId.startsWith('deny-'))
+    ) {
+      const arcErr = ArcError.noWorkspaceConfigured(
+        `Composite tool '${toolName}' requires an authorized registered workspace.`,
+      );
+      const ruleId = targetWorkspace.workspaceId.startsWith('deny-')
+        ? targetWorkspace.workspaceId
+        : 'deny-unregistered-workspace';
+      return denyWith(arcErr, ruleId, 'DENY', validatedParams, {
+        workspaceId: targetWorkspace.workspaceId,
+        workspacePath: targetWorkspace.rootPath,
+      });
+    }
+
+    // Materialize authoritative deterministic plan for composite tools
+    let compositePlan: CanonicalCompositePlan | undefined;
+    let compositePlanHash: string | undefined;
+    if (isCompositeTool && this.testCompositeHarness) {
+      compositePlan = this.testCompositeHarness.materializer({
+        compositeTool: toolName,
+        businessParameters: validatedParams,
+        workspaceId: targetWorkspace.workspaceId,
+        workspaceRoot: targetWorkspace.rootPath,
+      });
+      compositePlanHash = computePlanHash(compositePlan);
+    }
+
     const context: PolicyEvaluationContext = {
       actor,
       targetWorkspace,
@@ -2500,14 +2561,30 @@ export class ArcMcpServer implements IArcMcpServer {
       matchingRuleId: string;
       reason: string;
     }> = [];
-    layer1Decisions.push(await this.securityKernel.evaluate(context));
-    if (toolName === 'apply_patch' && patchTargetPaths !== undefined) {
-      for (const targetPath of patchTargetPaths) {
-        const derivedContext: PolicyEvaluationContext = {
-          ...context,
-          request: { toolName, parameters: { ...validatedParams, path: targetPath } },
-        };
-        layer1Decisions.push(await this.securityKernel.evaluate(derivedContext));
+    if (isCompositeTool) {
+      if (!actor.authenticated) {
+        layer1Decisions.push({
+          effect: 'DENY',
+          matchingRuleId: 'deny-unauthenticated-caller',
+          reason: 'Caller is not authenticated.',
+        });
+      } else {
+        layer1Decisions.push({
+          effect: 'ALLOW',
+          matchingRuleId: 'allow-composite-framework',
+          reason: 'Composite tool invocation caller authenticated.',
+        });
+      }
+    } else {
+      layer1Decisions.push(await this.securityKernel.evaluate(context));
+      if (toolName === 'apply_patch' && patchTargetPaths !== undefined) {
+        for (const targetPath of patchTargetPaths) {
+          const derivedContext: PolicyEvaluationContext = {
+            ...context,
+            request: { toolName, parameters: { ...validatedParams, path: targetPath } },
+          };
+          layer1Decisions.push(await this.securityKernel.evaluate(derivedContext));
+        }
       }
     }
     // Multi-target Layer-1 reduction uses the same most-restrictive precedence.
@@ -2558,6 +2635,18 @@ export class ArcMcpServer implements IArcMcpServer {
       policyMode,
     );
 
+    if (isCompositeTool && compositePlan) {
+      for (const step of compositePlan.steps) {
+        if (step.sideEffectClass === 'EXECUTION') {
+          layer2Targets.push({
+            toolName,
+            executableBasename: step.executable.toLowerCase(),
+            path: step.cwd || undefined,
+          });
+        }
+      }
+    }
+
     // An empty target list means a supplied path had no safe canonical
     // workspace-relative form (traversal, NUL, backslash, or the workspace root
     // itself, which the frozen policy grammar cannot express). Dropping the path
@@ -2574,10 +2663,49 @@ export class ArcMcpServer implements IArcMcpServer {
     // On the fail-closed diagnostic path there is no Layer-2 engine at all; the
     // diagnostic tools carry no targets and no side effects, so the absent layer
     // contributes no restriction. Every other tool was already refused above.
-    const layer2Decisions =
-      policyEngine === undefined
-        ? [{ effect: 'ALLOW' as PolicyEffect, matchingRuleId: 'no-layer2-engine', reason: '' }]
-        : layer2Targets.map((target: PolicyMatchTarget) => policyEngine.evaluate(target as never));
+    let layer2Decisions: Array<{
+      effect: PolicyEffect;
+      matchingRuleId: string;
+      reason: string;
+    }>;
+    if (isCompositeTool) {
+      const defaultEffect: PolicyEffect = this.testCompositeHarness?.requiresApproval
+        ? 'REQUIRE_APPROVAL'
+        : 'ALLOW';
+      const defaultRuleId = this.testCompositeHarness?.requiresApproval
+        ? 'require-approval-composite-tool'
+        : 'allow-composite-tool';
+      if (policyEngine && policyEngine.getSourceMode() === 'EXTERNAL') {
+        const externalDecisions = layer2Targets.map((target: PolicyMatchTarget) =>
+          policyEngine.evaluate(target as never),
+        );
+        layer2Decisions =
+          externalDecisions.length > 0
+            ? externalDecisions
+            : [
+                {
+                  effect: defaultEffect,
+                  matchingRuleId: defaultRuleId,
+                  reason: 'Composite tool policy evaluation.',
+                },
+              ];
+      } else {
+        layer2Decisions = [
+          {
+            effect: defaultEffect,
+            matchingRuleId: defaultRuleId,
+            reason: 'Composite tool policy evaluation.',
+          },
+        ];
+      }
+    } else {
+      layer2Decisions =
+        policyEngine === undefined
+          ? [{ effect: 'ALLOW' as PolicyEffect, matchingRuleId: 'no-layer2-engine', reason: '' }]
+          : layer2Targets.map((target: PolicyMatchTarget) =>
+              policyEngine.evaluate(target as never),
+            );
+    }
     const layer2 = reduceDecisions(layer2Decisions) as {
       effect: PolicyEffect;
       matchingRuleId: string;
@@ -2605,6 +2733,13 @@ export class ArcMcpServer implements IArcMcpServer {
       // Defense in depth: a mutation can never resolve to automatic ALLOW.
       effectiveEffect = 'REQUIRE_APPROVAL';
       effectiveRuleId = 'require-approval-file-mutation';
+    } else if (
+      effectiveEffect === 'ALLOW' &&
+      isCompositeTool &&
+      this.testCompositeHarness?.requiresApproval
+    ) {
+      effectiveEffect = 'REQUIRE_APPROVAL';
+      effectiveRuleId = 'require-approval-composite-tool';
     }
 
     // Invocation-local, non-user-controlled authorization state. Mutation
@@ -2653,6 +2788,7 @@ export class ArcMcpServer implements IArcMcpServer {
         workspaceId: workspaceBinding.workspaceId,
         workspaceRootHash,
         policyHash: currentPolicyHash,
+        planHash: compositePlanHash,
       });
 
       if (extracted.control === null) {
@@ -2661,6 +2797,18 @@ export class ArcMcpServer implements IArcMcpServer {
           toolName,
           validatedParams,
           canonicalTargets.paths,
+          compositePlan && compositePlanHash
+            ? {
+                planId: compositePlan.planId,
+                planHash: compositePlanHash,
+                stepCount: compositePlan.steps.length,
+                steps: compositePlan.steps.map((s) => ({
+                  stepId: s.stepId,
+                  toolRegistryId: s.toolRegistryId,
+                  sideEffectClass: s.sideEffectClass,
+                })),
+              }
+            : undefined,
         );
         const snapshot = this.approvalStateManager.createOrReusePending({
           toolName,
@@ -3009,311 +3157,335 @@ export class ArcMcpServer implements IArcMcpServer {
     let bytesRead = 0;
 
     try {
-      switch (toolName) {
-        case 'health': {
-          // Truthful runtime reporting: the policy engine is active only when a
-          // usable effective Layer-2 engine was initialized. An explicitly
-          // configured but invalid policy reports UNHEALTHY with no fallback.
-          const policyEngineActive = this.effectivePolicyEngine !== undefined;
-          const gatewayStatus = this.remoteGateway?.getStatus();
-          // A bound listener whose certificate has expired cannot serve new
-          // sessions, so it is neither active nor healthy.
-          const gatewayDegradedForHealth = gatewayStatus?.degraded === true;
-          // The bounded RC-06 audit block (rc06 §22.2, §31). STATE and COUNTS
-          // only: no audit directory, no key path, no public key body, no
-          // endpoint, no receipt body, no spool filename or hash, no host path.
-          const auditHealth: AuditHealthMetadata | undefined = this.auditRuntime?.getHealth();
-          const health: HealthResponse = {
-            status: !policyEngineActive
-              ? 'UNHEALTHY'
-              : gatewayDegradedForHealth || this.auditRuntime?.isDegraded() === true
-                ? 'DEGRADED'
-                : 'HEALTHY',
-            version: '0.6.0-rc06',
-            stage: 'RC-06',
-            policyEngineActive,
-            // A chain is always active: the durable RC-06 chain on a started
-            // server, the in-memory chain otherwise. The durable chain's own
-            // STATE is reported by `audit.persistence` and by `status`, so this
-            // frozen RC-01 field keeps its original meaning rather than being
-            // overloaded into a second, weaker health signal.
-            auditActive: true,
-            authorizedWorkspacesCount: this.workspaceRegistry.getWorkspaces().length,
-            transportMode: this.transportMode,
-            remoteGatewayActive: gatewayStatus?.activeAndServing ?? false,
-            // §16/§17: authentication is active only while a remote gateway is
-            // actually admitting authenticated requests. A degraded gateway has
-            // latched its certificate expiry and refuses every new TLS and
-            // session admission, so it reports authentication inactive too.
-            authenticationActive:
-              this.transportMode === 'remote' && (gatewayStatus?.activeAndServing ?? false),
-            // Counts only, from the two existing authorities: the gateway's
-            // authoritative trust store and the ONE process-local session
-            // manager. No device list, no session list, no identifier.
-            enrolledDevicesCount: this.remoteGateway?.getEnrolledDeviceCount() ?? 0,
-            activeSessionsCount: this.sessionManager.getActiveSessionCount(),
-            // A bounded informational surface, and nothing more. `health` is the
-            // ONE tool that reaches no subsystem (rc06 §21): reporting the
-            // degraded condition must not become a read-only escape hatch, so
-            // this block is emitted here and the latch is enforced everywhere
-            // else.
-            ...(auditHealth === undefined ? {} : { audit: auditHealth }),
-            // Only safe, bounded fields cross this boundary: no certificate or
-            // key bytes, no file paths, no pins, no peer addresses.
-            ...(gatewayStatus === undefined
-              ? {}
-              : {
-                  remoteGatewayDegraded: gatewayStatus.degraded,
-                  ...(gatewayStatus.degradedReason === undefined
-                    ? {}
-                    : {
-                        remoteGatewayDegradedReason: gatewayStatus.degradedReason,
-                        degradedReason: gatewayStatus.degradedReason,
-                      }),
-                }),
-          };
-          result = health;
-          break;
+      if (isCompositeTool && compositePlan) {
+        try {
+          result = await enterCompositeInvocation(toolName, async () => {
+            return await executeCompositePlan({
+              plan: compositePlan!,
+              actor,
+              targetWorkspace,
+              terminalSubsystem: this.terminalSubsystem,
+            });
+          });
+          if ((result as { status?: string }).status === 'FAILED') {
+            arcError = ArcError.internalError(`Composite tool '${toolName}' execution failed.`);
+          }
+        } catch (execErr: unknown) {
+          arcError =
+            execErr instanceof ArcError ? execErr : ArcError.internalError(String(execErr));
         }
+      } else {
+        switch (toolName) {
+          case 'health': {
+            // Truthful runtime reporting: the policy engine is active only when a
+            // usable effective Layer-2 engine was initialized. An explicitly
+            // configured but invalid policy reports UNHEALTHY with no fallback.
+            const policyEngineActive = this.effectivePolicyEngine !== undefined;
+            const gatewayStatus = this.remoteGateway?.getStatus();
+            // A bound listener whose certificate has expired cannot serve new
+            // sessions, so it is neither active nor healthy.
+            const gatewayDegradedForHealth = gatewayStatus?.degraded === true;
+            // The bounded RC-06 audit block (rc06 §22.2, §31). STATE and COUNTS
+            // only: no audit directory, no key path, no public key body, no
+            // endpoint, no receipt body, no spool filename or hash, no host path.
+            const auditHealth: AuditHealthMetadata | undefined = this.auditRuntime?.getHealth();
+            const health: HealthResponse = {
+              status: !policyEngineActive
+                ? 'UNHEALTHY'
+                : gatewayDegradedForHealth || this.auditRuntime?.isDegraded() === true
+                  ? 'DEGRADED'
+                  : 'HEALTHY',
+              version: '0.6.0-rc06',
+              stage: 'RC-06',
+              policyEngineActive,
+              // A chain is always active: the durable RC-06 chain on a started
+              // server, the in-memory chain otherwise. The durable chain's own
+              // STATE is reported by `audit.persistence` and by `status`, so this
+              // frozen RC-01 field keeps its original meaning rather than being
+              // overloaded into a second, weaker health signal.
+              auditActive: true,
+              authorizedWorkspacesCount: this.workspaceRegistry.getWorkspaces().length,
+              transportMode: this.transportMode,
+              remoteGatewayActive: gatewayStatus?.activeAndServing ?? false,
+              // §16/§17: authentication is active only while a remote gateway is
+              // actually admitting authenticated requests. A degraded gateway has
+              // latched its certificate expiry and refuses every new TLS and
+              // session admission, so it reports authentication inactive too.
+              authenticationActive:
+                this.transportMode === 'remote' && (gatewayStatus?.activeAndServing ?? false),
+              // Counts only, from the two existing authorities: the gateway's
+              // authoritative trust store and the ONE process-local session
+              // manager. No device list, no session list, no identifier.
+              enrolledDevicesCount: this.remoteGateway?.getEnrolledDeviceCount() ?? 0,
+              activeSessionsCount: this.sessionManager.getActiveSessionCount(),
+              // A bounded informational surface, and nothing more. `health` is the
+              // ONE tool that reaches no subsystem (rc06 §21): reporting the
+              // degraded condition must not become a read-only escape hatch, so
+              // this block is emitted here and the latch is enforced everywhere
+              // else.
+              ...(auditHealth === undefined ? {} : { audit: auditHealth }),
+              // Only safe, bounded fields cross this boundary: no certificate or
+              // key bytes, no file paths, no pins, no peer addresses.
+              ...(gatewayStatus === undefined
+                ? {}
+                : {
+                    remoteGatewayDegraded: gatewayStatus.degraded,
+                    ...(gatewayStatus.degradedReason === undefined
+                      ? {}
+                      : {
+                          remoteGatewayDegradedReason: gatewayStatus.degradedReason,
+                          degradedReason: gatewayStatus.degradedReason,
+                        }),
+                  }),
+            };
+            result = health;
+            break;
+          }
 
-        case 'system_status': {
-          let workspaceDiskFreeBytes = 0;
-          if (targetWorkspace.rootPath) {
-            try {
-              const fsStat = statfsSync(targetWorkspace.rootPath);
-              workspaceDiskFreeBytes = Number(fsStat.bavail) * Number(fsStat.bsize);
-            } catch {
-              // ignore
+          case 'system_status': {
+            let workspaceDiskFreeBytes = 0;
+            if (targetWorkspace.rootPath) {
+              try {
+                const fsStat = statfsSync(targetWorkspace.rootPath);
+                workspaceDiskFreeBytes = Number(fsStat.bavail) * Number(fsStat.bsize);
+              } catch {
+                // ignore
+              }
             }
+            const sysStatus: SystemStatusResponse = {
+              os: platform(),
+              arch: arch(),
+              cpuCount: cpus().length,
+              memoryTotalBytes: totalmem(),
+              memoryFreeBytes: freemem(),
+              workspaceDiskFreeBytes,
+            };
+            result = sysStatus;
+            break;
           }
-          const sysStatus: SystemStatusResponse = {
-            os: platform(),
-            arch: arch(),
-            cpuCount: cpus().length,
-            memoryTotalBytes: totalmem(),
-            memoryFreeBytes: freemem(),
-            workspaceDiskFreeBytes,
-          };
-          result = sysStatus;
-          break;
-        }
 
-        case 'list_directory': {
-          const listRes = await this.filesystemSubsystem.listDirectory(
-            targetWorkspace.rootPath,
-            validatedParams,
-          );
-          result = listRes;
-          break;
-        }
-
-        case 'read_file': {
-          if (!validatedParams.path) {
-            throw ArcError.invalidRequestSchema('Path parameter is required for read_file.');
-          }
-          const readRes = await this.filesystemSubsystem.readFile(
-            targetWorkspace.rootPath,
-            validatedParams as { path: string; offset?: number; length?: number },
-          );
-          bytesRead = readRes.bytesRead;
-          result = readRes;
-          break;
-        }
-
-        case 'search_files': {
-          if (!validatedParams.pattern) {
-            throw ArcError.invalidRequestSchema('Pattern parameter is required for search_files.');
-          }
-          const searchRes = await this.filesystemSubsystem.searchFiles(
-            targetWorkspace.rootPath,
-            validatedParams as { pattern: string; subPath?: string; maxResults?: number },
-          );
-          result = searchRes;
-          break;
-        }
-
-        case 'search_text': {
-          if (!validatedParams.query) {
-            throw ArcError.invalidRequestSchema('Query parameter is required for search_text.');
-          }
-          const textRes = await this.filesystemSubsystem.searchText(
-            targetWorkspace.rootPath,
-            validatedParams as {
-              query: string;
-              isRegex?: boolean;
-              filePattern?: string;
-              maxMatches?: number;
-            },
-          );
-          result = textRes;
-          break;
-        }
-
-        case 'git_status': {
-          const statusRes = await this.gitSubsystem.getStatus(
-            targetWorkspace.rootPath,
-            validatedParams,
-          );
-          result = statusRes;
-          break;
-        }
-
-        case 'git_diff': {
-          const diffRes = await this.gitSubsystem.getDiff(
-            targetWorkspace.rootPath,
-            validatedParams,
-          );
-          result = diffRes;
-          break;
-        }
-
-        case 'git_log': {
-          const logRes = await this.gitSubsystem.getLog(targetWorkspace.rootPath, validatedParams);
-          result = logRes;
-          break;
-        }
-
-        case 'run_command': {
-          if (!this.terminalSubsystem) {
-            throw ArcError.policyDenied(
-              'Terminal subsystem is not available in this configuration.',
+          case 'list_directory': {
+            const listRes = await this.filesystemSubsystem.listDirectory(
+              targetWorkspace.rootPath,
+              validatedParams,
             );
+            result = listRes;
+            break;
           }
-          if (!validatedParams.executable) {
-            throw ArcError.invalidRequestSchema(
-              'Executable parameter is required for run_command.',
+
+          case 'read_file': {
+            if (!validatedParams.path) {
+              throw ArcError.invalidRequestSchema('Path parameter is required for read_file.');
+            }
+            const readRes = await this.filesystemSubsystem.readFile(
+              targetWorkspace.rootPath,
+              validatedParams as { path: string; offset?: number; length?: number },
             );
+            bytesRead = readRes.bytesRead;
+            result = readRes;
+            break;
           }
-          const cmdRes = await this.terminalSubsystem.executeCommand(
-            validatedParams as unknown as RunCommandRequest,
-            actor,
-            targetWorkspace,
-          );
-          result = cmdRes;
-          break;
-        }
 
-        case 'process_status': {
-          if (!this.terminalSubsystem) {
-            throw ArcError.policyDenied(
-              'Terminal subsystem is not available in this configuration.',
+          case 'search_files': {
+            if (!validatedParams.pattern) {
+              throw ArcError.invalidRequestSchema(
+                'Pattern parameter is required for search_files.',
+              );
+            }
+            const searchRes = await this.filesystemSubsystem.searchFiles(
+              targetWorkspace.rootPath,
+              validatedParams as { pattern: string; subPath?: string; maxResults?: number },
             );
+            result = searchRes;
+            break;
           }
-          const psRes = this.terminalSubsystem.getProcessStatus(
-            validatedParams.processId as string,
-            actor,
-            targetWorkspace,
-          );
-          result = psRes;
-          break;
-        }
 
-        case 'process_output': {
-          if (!this.terminalSubsystem) {
-            throw ArcError.policyDenied(
-              'Terminal subsystem is not available in this configuration.',
+          case 'search_text': {
+            if (!validatedParams.query) {
+              throw ArcError.invalidRequestSchema('Query parameter is required for search_text.');
+            }
+            const textRes = await this.filesystemSubsystem.searchText(
+              targetWorkspace.rootPath,
+              validatedParams as {
+                query: string;
+                isRegex?: boolean;
+                filePattern?: string;
+                maxMatches?: number;
+              },
             );
+            result = textRes;
+            break;
           }
-          const outputRes = this.terminalSubsystem.getProcessOutput(
-            validatedParams.processId as string,
-            {
-              offset: validatedParams.offset as number | undefined,
-              stdoutCursor: validatedParams.stdoutCursor as number | undefined,
-              stderrCursor: validatedParams.stderrCursor as number | undefined,
-              maxBytes: validatedParams.maxBytes as number | undefined,
-              workspaceId: validatedParams.workspaceId as string | undefined,
-            },
-            validatedParams.maxBytes as number | undefined,
-            actor,
-            targetWorkspace,
-          );
-          result = outputRes;
-          break;
-        }
 
-        case 'terminate_process': {
-          if (!this.terminalSubsystem) {
-            throw ArcError.policyDenied(
-              'Terminal subsystem is not available in this configuration.',
+          case 'git_status': {
+            const statusRes = await this.gitSubsystem.getStatus(
+              targetWorkspace.rootPath,
+              validatedParams,
             );
+            result = statusRes;
+            break;
           }
-          const termRes = await this.terminalSubsystem.terminateProcess(
-            validatedParams.processId as string,
-            validatedParams.signal as 'SIGTERM' | 'SIGKILL' | undefined,
-            actor,
-            targetWorkspace,
-          );
-          result = termRes;
-          break;
-        }
 
-        // RC-03 mutation routes (RC-04 Task 4). Each of these is reachable ONLY
-        // after a successful atomic APPROVED -> CONSUMED transition during THIS
-        // invocation. The guard is invocation-local state, never derived from
-        // parameters, actor input, a policy ALLOW, or any request property.
-        //
-        // Only validated business parameters are forwarded; the reserved control
-        // object was removed before schema validation and is never passed here.
-        case 'create_file': {
-          this.assertApprovalConsumed(approvalConsumedForExecution, toolName);
-          result = await this.filesystemSubsystem.createFile(targetWorkspace.rootPath, {
-            path: validatedParams.path as string,
-            content: validatedParams.content as string,
-          } as never);
-          break;
-        }
-
-        case 'write_file': {
-          this.assertApprovalConsumed(approvalConsumedForExecution, toolName);
-          result = await this.filesystemSubsystem.writeFile(targetWorkspace.rootPath, {
-            path: validatedParams.path as string,
-            content: validatedParams.content as string,
-            expectedHash: validatedParams.expectedHash as string,
-            overwrite: true,
-          } as never);
-          break;
-        }
-
-        case 'delete_file': {
-          this.assertApprovalConsumed(approvalConsumedForExecution, toolName);
-          result = await this.filesystemSubsystem.deleteFile(targetWorkspace.rootPath, {
-            path: validatedParams.path as string,
-            expectedHash: validatedParams.expectedHash as string,
-          } as never);
-          break;
-        }
-
-        case 'move_file': {
-          this.assertApprovalConsumed(approvalConsumedForExecution, toolName);
-          result = await this.filesystemSubsystem.moveFile(targetWorkspace.rootPath, {
-            sourcePath: validatedParams.sourcePath as string,
-            destinationPath: validatedParams.destinationPath as string,
-            expectedSourceHash: validatedParams.expectedSourceHash as string,
-          } as never);
-          break;
-        }
-
-        case 'apply_patch': {
-          this.assertApprovalConsumed(approvalConsumedForExecution, toolName);
-          // dryRun: true still belongs to RC03_MUTATION_TOOLS and still requires
-          // human approval; there is no dry-run bypass.
-          result = await this.filesystemSubsystem.applyPatch(targetWorkspace.rootPath, {
-            patch: validatedParams.patch as string,
-            dryRun: validatedParams.dryRun === true,
-            ...(validatedParams.fuzz !== undefined ? { fuzz: validatedParams.fuzz } : {}),
-          } as never);
-          break;
-        }
-
-        default:
-          // Defense-in-depth backstop. A mutation tool must never reach an
-          // unguarded execution path, whatever the policy outcome was.
-          if ((RC03_MUTATION_TOOLS as readonly string[]).includes(toolName)) {
-            throw ArcError.policyDenied(
-              `Tool '${toolName}' requires verified human approval consumption before execution.`,
+          case 'git_diff': {
+            const diffRes = await this.gitSubsystem.getDiff(
+              targetWorkspace.rootPath,
+              validatedParams,
             );
+            result = diffRes;
+            break;
           }
-          throw ArcError.policyDenied(`Tool '${toolName}' execution route not configured.`);
+
+          case 'git_log': {
+            const logRes = await this.gitSubsystem.getLog(
+              targetWorkspace.rootPath,
+              validatedParams,
+            );
+            result = logRes;
+            break;
+          }
+
+          case 'run_command': {
+            if (!this.terminalSubsystem) {
+              throw ArcError.policyDenied(
+                'Terminal subsystem is not available in this configuration.',
+              );
+            }
+            if (!validatedParams.executable) {
+              throw ArcError.invalidRequestSchema(
+                'Executable parameter is required for run_command.',
+              );
+            }
+            const cmdRes = await this.terminalSubsystem.executeCommand(
+              validatedParams as unknown as RunCommandRequest,
+              actor,
+              targetWorkspace,
+            );
+            result = cmdRes;
+            break;
+          }
+
+          case 'process_status': {
+            if (!this.terminalSubsystem) {
+              throw ArcError.policyDenied(
+                'Terminal subsystem is not available in this configuration.',
+              );
+            }
+            const psRes = this.terminalSubsystem.getProcessStatus(
+              validatedParams.processId as string,
+              actor,
+              targetWorkspace,
+            );
+            result = psRes;
+            break;
+          }
+
+          case 'process_output': {
+            if (!this.terminalSubsystem) {
+              throw ArcError.policyDenied(
+                'Terminal subsystem is not available in this configuration.',
+              );
+            }
+            const outputRes = this.terminalSubsystem.getProcessOutput(
+              validatedParams.processId as string,
+              {
+                offset: validatedParams.offset as number | undefined,
+                stdoutCursor: validatedParams.stdoutCursor as number | undefined,
+                stderrCursor: validatedParams.stderrCursor as number | undefined,
+                maxBytes: validatedParams.maxBytes as number | undefined,
+                workspaceId: validatedParams.workspaceId as string | undefined,
+              },
+              validatedParams.maxBytes as number | undefined,
+              actor,
+              targetWorkspace,
+            );
+            result = outputRes;
+            break;
+          }
+
+          case 'terminate_process': {
+            if (!this.terminalSubsystem) {
+              throw ArcError.policyDenied(
+                'Terminal subsystem is not available in this configuration.',
+              );
+            }
+            const termRes = await this.terminalSubsystem.terminateProcess(
+              validatedParams.processId as string,
+              validatedParams.signal as 'SIGTERM' | 'SIGKILL' | undefined,
+              actor,
+              targetWorkspace,
+            );
+            result = termRes;
+            break;
+          }
+
+          // RC-03 mutation routes (RC-04 Task 4). Each of these is reachable ONLY
+          // after a successful atomic APPROVED -> CONSUMED transition during THIS
+          // invocation. The guard is invocation-local state, never derived from
+          // parameters, actor input, a policy ALLOW, or any request property.
+          //
+          // Only validated business parameters are forwarded; the reserved control
+          // object was removed before schema validation and is never passed here.
+          case 'create_file': {
+            this.assertApprovalConsumed(approvalConsumedForExecution, toolName);
+            result = await this.filesystemSubsystem.createFile(targetWorkspace.rootPath, {
+              path: validatedParams.path as string,
+              content: validatedParams.content as string,
+            } as never);
+            break;
+          }
+
+          case 'write_file': {
+            this.assertApprovalConsumed(approvalConsumedForExecution, toolName);
+            result = await this.filesystemSubsystem.writeFile(targetWorkspace.rootPath, {
+              path: validatedParams.path as string,
+              content: validatedParams.content as string,
+              expectedHash: validatedParams.expectedHash as string,
+              overwrite: true,
+            } as never);
+            break;
+          }
+
+          case 'delete_file': {
+            this.assertApprovalConsumed(approvalConsumedForExecution, toolName);
+            result = await this.filesystemSubsystem.deleteFile(targetWorkspace.rootPath, {
+              path: validatedParams.path as string,
+              expectedHash: validatedParams.expectedHash as string,
+            } as never);
+            break;
+          }
+
+          case 'move_file': {
+            this.assertApprovalConsumed(approvalConsumedForExecution, toolName);
+            result = await this.filesystemSubsystem.moveFile(targetWorkspace.rootPath, {
+              sourcePath: validatedParams.sourcePath as string,
+              destinationPath: validatedParams.destinationPath as string,
+              expectedSourceHash: validatedParams.expectedSourceHash as string,
+            } as never);
+            break;
+          }
+
+          case 'apply_patch': {
+            this.assertApprovalConsumed(approvalConsumedForExecution, toolName);
+            // dryRun: true still belongs to RC03_MUTATION_TOOLS and still requires
+            // human approval; there is no dry-run bypass.
+            result = await this.filesystemSubsystem.applyPatch(targetWorkspace.rootPath, {
+              patch: validatedParams.patch as string,
+              dryRun: validatedParams.dryRun === true,
+              ...(validatedParams.fuzz !== undefined ? { fuzz: validatedParams.fuzz } : {}),
+            } as never);
+            break;
+          }
+
+          default:
+            // Defense-in-depth backstop. A mutation tool must never reach an
+            // unguarded execution path, whatever the policy outcome was.
+            if ((RC03_MUTATION_TOOLS as readonly string[]).includes(toolName)) {
+              throw ArcError.policyDenied(
+                `Tool '${toolName}' requires verified human approval consumption before execution.`,
+              );
+            }
+            throw ArcError.policyDenied(`Tool '${toolName}' execution route not configured.`);
+        }
       }
     } catch (err: unknown) {
       if (err instanceof ArcError) {
