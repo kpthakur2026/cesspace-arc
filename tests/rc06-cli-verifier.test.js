@@ -1292,7 +1292,7 @@ describe('CesSpace ARC — RC-06 Task 7: Local Operator CLI & Standalone Offline
       );
     });
 
-    test('RC06-NEG-108: export refuses to guess at authoritative workspace roots', async () => {
+    test('RC06-NEG-108b: export refuses to guess at authoritative workspace roots', async () => {
       const fixture = await multiSegmentFixture('neg108b');
       const base = newRoot('neg108b-out');
       await assertRejectsWithCode(
@@ -1405,8 +1405,8 @@ describe('CesSpace ARC — RC-06 Task 7: Local Operator CLI & Standalone Offline
       const cliPackage = JSON.parse(
         fs.readFileSync(path.join(REPO_ROOT, 'apps/cli/package.json'), 'utf8'),
       );
-      assert.equal(rootPackage.version, '0.5.0-rc05');
-      assert.equal(cliPackage.version, '0.5.0-rc05');
+      assert.equal(rootPackage.version, '0.6.0-rc06');
+      assert.equal(cliPackage.version, '0.6.0-rc06');
     });
   });
 

@@ -38,8 +38,8 @@ export const SENSITIVE_KEY_PATTERNS = [
  * mistakenly pass a raw host path cannot leak it into a stored record.
  */
 export const ABSOLUTE_PATH_REGEXES = [
-  /\/(?:home|tmp|root|Users|var|private|opt|etc|usr|bin|sbin|lib|lib64|mnt|media|srv)(?:\/[^\s'",;:)\]]*)*/g,
-  /[a-zA-Z]:\\[^\s'",;:)\]]*/g,
+  /[a-zA-Z]:[\\/][^\s'",;:)\]]*/g,
+  /\/(?:home|tmp|root|Users|var|private|opt|etc|usr|bin|sbin|lib|lib64|mnt|media|srv|workspace|workspaces|project|projects)(?:\/[^\s'",;:)\]]*)*/g,
 ];
 
 export const ABSOLUTE_PATH_PLACEHOLDER = '[REDACTED_PATH]';
@@ -55,24 +55,18 @@ export function redactAbsolutePaths(value: string): string {
 
 /**
  * High-confidence secret shapes removed from ANY string that reaches a stored
- * record, whatever key it arrived under (rc05 §24, RC05-NEG-73).
+ * record, whatever key it arrived under (rc05 §24, RC05-NEG-73, RC-06 Task 8).
  *
- * Two families, both deterministic and both bounded:
- *
- * - Private-key blocks (`-----BEGIN [A-Z ]+PRIVATE KEY-----`), which cover RSA,
- *   EC, OPENSSH, and the unqualified `PRIVATE KEY` form.
- * - Certificate blocks (`-----BEGIN CERTIFICATE-----`), so a full PEM
- *   certificate blob cannot reach a record even when a caller puts it under an
- *   innocent key name such as `detail` or `notes`. The `cert(ificate)?` KEY
- *   pattern only helps when the field is honestly NAMED for what it holds; this
- *   covers the value wherever it lands.
+ * Deterministic and bounded secret patterns covering session tokens, authorization
+ * headers, bearer credentials, enrollment secrets, multiline PEM private keys,
+ * and certificates.
  *
  * Deliberately NOT included: a bare 64-character hexadecimal string. SHA-256
  * digests are intentional, safe audit references — the trust store's workspace
  * root digest, the session token DIGEST, and every SPKI pin are all exactly that
  * shape — so redacting that shape would destroy legitimate evidence rather than
  * protect anything. Secrets reach this layer as VALUES under a sensitive key
- * name (caught by {@link SENSITIVE_KEY_PATTERNS}) or as one of the block forms
+ * name (caught by {@link SENSITIVE_KEY_PATTERNS}) or as one of the pattern forms
  * above, never as a bare digest that ARC minted itself.
  */
 export const SENSITIVE_VALUE_REGEXES = [
@@ -80,11 +74,12 @@ export const SENSITIVE_VALUE_REGEXES = [
   /ghp_[a-zA-Z0-9]{36}/g,
   /gho_[a-zA-Z0-9]{36}/g,
   /sk-[a-zA-Z0-9]{20,}/g,
-  /Bearer\s+[a-zA-Z0-9._-]+/gi,
-  /Arc-Session-Token[:\s=]+[a-zA-Z0-9._-]+/gi,
-  /Authorization[:\s=]+[a-zA-Z0-9._-]+/gi,
+  /(?:Arc-Session-Token|session[_-]?token)[:\s=]+[a-zA-Z0-9._~+/-]+=*/gi,
+  /(?:Authorization[:\s=]+)(?:(?:Bearer|Basic)\s+)?[a-zA-Z0-9._~+/-]+=*/gi,
+  /(?:enrollment[_-]?secret|enrollment[_-]?token)[:\s=]+[a-zA-Z0-9._~+/-]+=*/gi,
+  /Bearer\s+[a-zA-Z0-9._~+/-]+=*/gi,
   /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g,
-  /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----/g,
+  /-----BEGIN [A-Z0-9 ]*CERTIFICATE-----[\s\S]*?-----END [A-Z0-9 ]*CERTIFICATE-----/g,
 ];
 
 export function redactValue(value: unknown): unknown {
@@ -343,10 +338,12 @@ export class AuditLogger implements IAuditLogger {
     const previousRecordHash = this.lastRecordHash;
 
     // Build the REDACTED/minimized parameter representation FIRST, then derive
-    // any fallback payload hash from it. A fallback hash must never be computed
-    // from raw content, patch text, environment values, or a token (rc04 §33).
+    // the authoritative payload hash from it. The persisted payloadHash MUST be
+    // derived centrally from sanitized bytes (rc06 Task 8). A caller-supplied hash
+    // is never trusted as authoritative because it could be derived from raw secret
+    // input and turn the audit trail into an offline secret oracle.
     const parametersRedacted = this.redact(recordData.invocation.parametersRedacted);
-    const fallbackPayloadHash = computeSha256(canonicalJson(parametersRedacted));
+    const payloadHash = computeSha256(canonicalJson(parametersRedacted));
 
     // Central defense-in-depth for the top-level error message. Redaction is
     // applied HERE, for every caller, so a writer that forgets cannot leak an
@@ -392,7 +389,7 @@ export class AuditLogger implements IAuditLogger {
       invocation: {
         toolName: recordData.invocation.toolName,
         parametersRedacted,
-        payloadHash: recordData.invocation.payloadHash || fallbackPayloadHash,
+        payloadHash,
       },
       policy: this.redact(
         recordData.policy as unknown as Record<string, unknown>,
@@ -446,7 +443,8 @@ export class AuditLogger implements IAuditLogger {
    * for every caller without anyone having to remember to redact it.
    */
   private minimizeTarget(target: AuditRecord['target']): AuditRecord['target'] {
-    const workspaceId = typeof target?.workspaceId === 'string' ? target.workspaceId : '';
+    const workspaceId =
+      typeof target?.workspaceId === 'string' ? redactString(target.workspaceId) : '';
     const workspacePath = typeof target?.workspacePath === 'string' ? target.workspacePath : '';
 
     // An explicitly supplied digest is always safe and is retained even when no

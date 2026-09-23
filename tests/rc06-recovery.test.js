@@ -318,7 +318,7 @@ describe('CesSpace ARC — RC-06 Task 2: Restart Recovery, Torn Tails & Dangling
   });
 
   describe('3. Negative Control: RC06-NEG-36 (Trusted Primary-Chain Boundary)', () => {
-    test('Boundary sequence beyond retained history fails closed', () => {
+    test('RC06-NEG-36: Boundary sequence beyond retained history fails closed', () => {
       const activePath = path.join(tempBaseDir, 'neg-36-missing.jsonl');
       const r1 = createSampleRecord(
         1,
@@ -406,7 +406,7 @@ describe('CesSpace ARC — RC-06 Task 2: Restart Recovery, Torn Tails & Dangling
   });
 
   describe('4. Negative Controls: RC06-NEG-37..39 (Torn Tails, Corruption & Anti-Reset)', () => {
-    test('RC06-NEG-37 (Case A): Torn final line missing LF recovers to sidecar, truncates active, continues chain', async () => {
+    test('RC06-NEG-37: Torn final line missing LF recovers to sidecar, truncates active, continues chain', async () => {
       const config = createTestStoreConfig('neg-37-case-a');
       const storage1 = new PersistentAuditStorage(config);
       storage1.initialize();
@@ -489,7 +489,7 @@ describe('CesSpace ARC — RC-06 Task 2: Restart Recovery, Torn Tails & Dangling
       recResult.storage.close();
     });
 
-    test('RC06-NEG-37 (Case B): Malformed JSON line at EOF recovers to sidecar', async () => {
+    test('RC06-NEG-37b: Malformed JSON line at EOF recovers to sidecar', async () => {
       const config = createTestStoreConfig('neg-37-case-b');
       const storage1 = new PersistentAuditStorage(config);
       storage1.initialize();

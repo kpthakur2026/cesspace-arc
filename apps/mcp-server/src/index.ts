@@ -1619,7 +1619,7 @@ export class ArcMcpServer implements IArcMcpServer {
     this.server = new Server(
       {
         name: 'cesspace-arc',
-        version: '0.5.0-rc05',
+        version: '0.6.0-rc06',
       },
       {
         capabilities: {
@@ -3029,8 +3029,8 @@ export class ArcMcpServer implements IArcMcpServer {
               : gatewayDegradedForHealth || this.auditRuntime?.isDegraded() === true
                 ? 'DEGRADED'
                 : 'HEALTHY',
-            version: '0.5.0-rc05',
-            stage: 'RC-05',
+            version: '0.6.0-rc06',
+            stage: 'RC-06',
             policyEngineActive,
             // A chain is always active: the durable RC-06 chain on a started
             // server, the in-memory chain otherwise. The durable chain's own
@@ -3641,7 +3641,7 @@ export class ArcMcpServer implements IArcMcpServer {
     const server = new Server(
       {
         name: 'cesspace-arc',
-        version: '0.5.0-rc05',
+        version: '0.6.0-rc06',
       },
       {
         capabilities: {

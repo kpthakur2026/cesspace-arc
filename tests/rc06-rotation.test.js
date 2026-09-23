@@ -970,7 +970,7 @@ describe('CesSpace ARC — RC-06 Task 3: Segment Rotation, Streaming Compression
       );
     });
 
-    test('RC06-NEG-53: rapid rotations in the same second stay distinct via the sequence range', async () => {
+    test('RC06-NEG-53b: rapid rotations in the same second stay distinct via the sequence range', async () => {
       const clock = new TestClock(FIXED_CLOCK_START);
       const { auditDir, store } = createRotatingStore('neg53-rapid', { clock });
 
