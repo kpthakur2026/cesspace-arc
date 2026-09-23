@@ -4,7 +4,7 @@
 | :------------- | :------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Stage**      | RC-07                                                                                                                                              |
 | **Title**      | Engineering-Aware Tools — Scope, Architecture, Composition Contracts & Acceptance Freeze                                                           |
-| **Status**     | **Task-0 Scope Candidate — Frozen Architecture Specification (Erratum Applied)**                                                                   |
+| **Status**     | **Task-0 Scope Candidate — Frozen Architecture Specification (Final Erratum Applied)**                                                             |
 | **Base main**  | `20de2e72bf85dd9178a35881c951f637de9e8ec7`                                                                                                         |
 | **Branch**     | `feat/rc-07-engineering-aware-tools`                                                                                                               |
 | **Target Ver** | `0.7.0-rc07` (promotion in Task 8 only)                                                                                                            |
@@ -50,18 +50,32 @@ Higher-level engineering tools **MUST COMPOSE** the already-secured, policy-eval
 
 Specifically, RC-07 tools:
 
-1. **MUST NOT** invoke Node's `child_process` directly (`exec`, `execFile`, `spawn`, `fork`). All subprocess execution must pass through `ControlledProcessRunner` / `ITerminalSubsystem` (`packages/terminal`).
-2. **MUST NOT** call Node's `fs` or `fs/promises` directly to bypass canonical workspace jailing. All workspace path reads must pass through canonical `FilesystemSubsystem` (`packages/filesystem`).
-3. **MUST NOT** execute raw `git` commands through an unvalidated or ambient child process. All Git operations must traverse the sandboxed, argument-array-bound `GitSubsystem` (`packages/git`).
-4. **MUST NOT** instantiate a secondary policy evaluator. All policy checks must be mediated by the authoritative `DeclarativePolicyEngine` (`packages/policy`).
-5. **MUST NOT** instantiate a secondary approval manager. All approval lifecycle transitions and token verifications must flow through the central `ApprovalStateManager` (`packages/policy/src/approval-state.ts`), `apps/mcp-server/src/approval-gate.ts` helpers, and the authoritative `ArcMcpServer` execution pipeline.
-6. **MUST NOT** instantiate a secondary process registry. Process lifecycle and tracking must use the single `ProcessRegistry` (`packages/processes`).
-7. **MUST NOT** instantiate a secondary audit logger or secondary append stream. Every operation must record durable events in the single process-wide `AuditLogger` and persistent store (`packages/audit`).
-8. **MUST NOT** bypass durable `STARTED` and `COMPLETED` lifecycle ordering (RC-06 §7, INV-13).
-9. **MUST NOT** weaken the fundamental policy precedence: `DENY > REQUIRE_APPROVAL > ALLOW`.
-10. **MUST NOT** implicitly authorize `process.cwd()` or accept unvalidated host paths from untrusted callers.
-11. **MUST NOT** consume ambient secrets or environment credentials (`GITHUB_TOKEN`, `AWS_SECRET_ACCESS_KEY`, etc.).
-12. **MUST NOT** expose administrative IPC commands over stdio MCP or remote HTTP endpoints.
+1. **Subprocess Ownership & Isolation:**
+   - RC-07 composite implementation modules **MUST NOT** import or invoke Node's `child_process` directly (`exec`, `execFile`, `spawn`, `fork`).
+   - Project-code execution in `arc_verify` and `arc_test` MUST be mediated by `ControlledProcessRunner` / `ITerminalSubsystem` (`packages/terminal`) and tracked in `ProcessRegistry` (`packages/processes`) via the internal deterministic execution capability.
+   - All Git repository, diff, status, and log subprocess execution MUST traverse the already-reviewed, hardened `GitSubsystem` / `IGitSubsystem` (`packages/git`). `GitSubsystem` remains the sole authority for Git subprocess creation using its established `execFileAsync` path; RC-07 does not duplicate or bypass Git process mechanisms.
+2. **Filesystem Ownership:**
+   - RC-07 tools **MUST NOT** call Node's `fs` or `fs/promises` directly to bypass canonical workspace jailing. All workspace path reads must pass through canonical `FilesystemSubsystem` (`packages/filesystem`).
+3. **Git Subsystem Mediation:**
+   - RC-07 tools **MUST NOT** execute raw `git` commands through an unvalidated or ambient child process. All Git operations must traverse the sandboxed, argument-array-bound `GitSubsystem` (`packages/git`).
+4. **Policy Engine Mediation:**
+   - RC-07 tools **MUST NOT** instantiate a secondary policy evaluator. All policy checks must be mediated by the authoritative `DeclarativePolicyEngine` (`packages/policy`).
+5. **Approval Authority Mediation:**
+   - RC-07 tools **MUST NOT** instantiate a secondary approval manager. All approval lifecycle transitions and token verifications must flow through the central `ApprovalStateManager` (`packages/policy/src/approval-state.ts`), `apps/mcp-server/src/approval-gate.ts` helpers, and the authoritative `ArcMcpServer` execution pipeline.
+6. **Process Tracking Mediation:**
+   - RC-07 tools **MUST NOT** instantiate a secondary process registry. Process lifecycle and tracking must use the single `ProcessRegistry` (`packages/processes`).
+7. **Single Audit Ledger Invariant:**
+   - RC-07 tools **MUST NOT** instantiate a secondary audit logger or secondary append stream. Every operation must record durable events in the single process-wide `AuditLogger` and persistent store (`packages/audit`).
+8. **Lifecycle Ordering:**
+   - RC-07 tools **MUST NOT** bypass durable `STARTED` and `COMPLETED` lifecycle ordering (RC-06 §7, INV-13).
+9. **Policy Precedence:**
+   - RC-07 tools **MUST NOT** weaken the fundamental policy precedence: `DENY > REQUIRE_APPROVAL > ALLOW`.
+10. **Path Confinement:**
+    - RC-07 tools **MUST NOT** implicitly authorize `process.cwd()` or accept unvalidated host paths from untrusted callers.
+11. **Credential Isolation:**
+    - RC-07 tools **MUST NOT** consume ambient secrets or environment credentials (`GITHUB_TOKEN`, `AWS_SECRET_ACCESS_KEY`, etc.).
+12. **Admin IPC Isolation:**
+    - RC-07 tools **MUST NOT** expose administrative IPC commands over stdio MCP or remote HTTP endpoints.
 
 ### 2.2 Public RC-02 Command Policy Invariant
 
@@ -74,8 +88,8 @@ It explicitly denies:
 
 ### 2.3 Internal Composite Execution Capability
 
-Task 1 must introduce a separate internal execution framework required for controlled RC-07 project-tool execution.
-It is **NOT** a second process runner. It operates strictly inside the existing secured execution stack:
+Task 1 introduces a separate internal execution framework required for controlled RC-07 project-tool execution.
+It is **NOT** a second process runner, and it does **NOT** compose public `run_command`. It operates strictly inside the existing secured execution stack:
 
 ```text
 CommandPolicy / canonical policy authority
@@ -127,8 +141,10 @@ The following capabilities are explicitly declared **NON-GOALS** and are prohibi
    - Git branch deletion or creation
      Any future requirement for agent Git mutation demands a distinct, dedicated stage and a separately reviewed security architecture.
 
-2. **No Remote CI Provider Network Egress:**
-   RC-07 tools operate with **ZERO remote network access**. `arc_ci_status` will NOT query the GitHub API, GitLab API, or any external service. No HTTP client, no ambient token harvesting, and no outbound socket connections are permitted.
+2. **Accurate Network Egress Guarantee & Scope Boundary:**
+   - **RC-07 Framework Code:** Production RC-07 composite handlers and framework code operate with **ZERO outbound network calls**. They must NOT instantiate HTTP/HTTPS clients for remote services, open outbound network sockets, query GitHub/GitLab APIs, silently fetch remote state, or harvest ambient network credentials.
+   - **`arc_ci_status`:** Strictly **ZERO-NETWORK** in RC-07. It performs local repository inspection and workflow simulation only (`.github/workflows/`, Git status/log, local verification artifacts). It MUST NOT call external CI provider APIs, MUST NOT read `GITHUB_TOKEN` or `GH_TOKEN`, and MUST report remote CI status as deferred/not queried (`localSimulationMode: true`, `remoteQueryDeferred: true`).
+   - **`arc_verify` and `arc_test` Project Code:** ARC does not intentionally grant network authority to the composite framework, ambient credentials must be stripped/suppressed, and no client-supplied network credentials are accepted. However, **executed repository/dependency code is NOT claimed or guaranteed to be OS-level network sandboxed in RC-07**. There is currently no OS-level network namespace or firewall sandbox around arbitrary project code executed by `ControlledProcessRunner`. OS-level egress sandboxing is explicitly deferred to a future milestone; RC-07 does not claim or imply that `shell: false` provides network containment.
 
 3. **No Package-Manager Script Shell Bypass:**
    Do **NOT** freeze `npm run` or `pnpm run` as RC-07 execution primitives. Package-manager scripts can execute repository-controlled shell commands and therefore cannot satisfy the `shell: false` / no-arbitrary-shell contract.
@@ -169,15 +185,15 @@ The following capabilities are explicitly declared **NON-GOALS** and are prohibi
 
 The initial RC-07 tool suite consists of exactly **seven** engineering-aware tools. No tool may be renamed, removed, or added.
 
-| #   | Tool Name             | Execution Mode | Composed Lower-Level Primitives                                             | Default Policy Outcome |
-| :-- | :-------------------- | :------------- | :-------------------------------------------------------------------------- | :--------------------- |
-| 1   | `arc_repo_status`     | READ-ONLY      | `git_status`, `git_log`, `health`                                           | `ALLOW`                |
-| 2   | `arc_worktree_status` | READ-ONLY      | `list_directory`, `read_file`, `git_status`                                 | `ALLOW`                |
-| 3   | `arc_review_diff`     | READ-ONLY      | `git_diff`, `git_status`                                                    | `ALLOW`                |
-| 4   | `arc_verify`          | EXECUTION      | `run_command`, `process_status`, `process_output`, `terminate_process`      | `REQUIRE_APPROVAL`     |
-| 5   | `arc_test`            | EXECUTION      | `run_command`, `process_status`, `process_output`, `terminate_process`      | `REQUIRE_APPROVAL`     |
-| 6   | `arc_ci_status`       | READ-ONLY      | `read_file`, `list_directory`, `git_status`, `git_log`                      | `ALLOW`                |
-| 7   | `arc_stage_evidence`  | READ-ONLY      | `git_status`, `git_log`, `health`, `packages/audit` verification/inspection | `ALLOW`                |
+| #   | Tool Name             | Execution Mode | Composed Lower-Level Primitives                                                                                    | Default Policy Outcome |
+| :-- | :-------------------- | :------------- | :----------------------------------------------------------------------------------------------------------------- | :--------------------- |
+| 1   | `arc_repo_status`     | READ-ONLY      | `git_status`, `git_log`, `health`                                                                                  | `ALLOW`                |
+| 2   | `arc_worktree_status` | READ-ONLY      | `list_directory`, `read_file`, `git_status`                                                                        | `ALLOW`                |
+| 3   | `arc_review_diff`     | READ-ONLY      | `git_diff`, `git_status`                                                                                           | `ALLOW`                |
+| 4   | `arc_verify`          | EXECUTION      | Internal Execution Capability (`ControlledProcessRunner`), `process_status`, `process_output`, `terminate_process` | `REQUIRE_APPROVAL`     |
+| 5   | `arc_test`            | EXECUTION      | Internal Execution Capability (`ControlledProcessRunner`), `process_status`, `process_output`, `terminate_process` | `REQUIRE_APPROVAL`     |
+| 6   | `arc_ci_status`       | READ-ONLY      | `read_file`, `list_directory`, `git_status`, `git_log`                                                             | `ALLOW`                |
+| 7   | `arc_stage_evidence`  | READ-ONLY      | `git_status`, `git_log`, `health`, `packages/audit` verification/inspection                                        | `ALLOW`                |
 
 ---
 
@@ -342,7 +358,7 @@ The initial RC-07 tool suite consists of exactly **seven** engineering-aware too
   }
   ```
 - **Security Constraints:**
-  - Subprocess execution mediated exclusively by `ControlledProcessRunner` under internal capability gating.
+  - Subprocess execution mediated exclusively by `ControlledProcessRunner` under internal capability gating (does NOT compose public `run_command`).
   - `shell: false` strictly enforced; zero shell metacharacter expansion.
   - Check-only: auto-fix mutation strictly excluded.
   - Per-step timeout capped at 30 seconds; overall composite timeout hard-capped at 120 seconds.
@@ -387,7 +403,7 @@ The initial RC-07 tool suite consists of exactly **seven** engineering-aware too
   }
   ```
 - **Security Constraints:**
-  - Subprocess execution mediated by `ControlledProcessRunner` under internal capability gating.
+  - Subprocess execution mediated by `ControlledProcessRunner` under internal capability gating (does NOT compose public `run_command`).
   - Target `testPath` validated within workspace boundary (`realpath` containment).
   - Subprocess timeout hard-capped at 60 seconds (or requested `maxDurationMs` <= 60000).
   - Workspace concurrency enforced via `CONCURRENCY_LIMITS.maxPerWorkspaceRunning = 4`.
@@ -498,11 +514,13 @@ The table below defines the authoritative mapping between existing ARC primitive
 | `git_diff`             |         -         |           -           |      COMPOSE      |      -       |     -      |        -        |          -           |
 | `git_log`              |      COMPOSE      |           -           |         -         |      -       |     -      |     COMPOSE     |       COMPOSE        |
 | `system_status`        |         -         |           -           |         -         |      -       |     -      |        -        |          -           |
-| `run_command`          |         -         |           -           |         -         |   COMPOSE    |  COMPOSE   |        -        |          -           |
+| `run_command` (public) |         -         |           -           |         -         |      -       |     -      |        -        |          -           |
 | `process_status`       |         -         |           -           |         -         |   COMPOSE    |  COMPOSE   |        -        |          -           |
 | `process_output`       |         -         |           -           |         -         |   COMPOSE    |  COMPOSE   |        -        |          -           |
 | `terminate_process`    |         -         |           -           |         -         |   COMPOSE    |  COMPOSE   |        -        |          -           |
 | `audit verification`   |         -         |           -           |         -         |      -       |     -      |        -        |       COMPOSE        |
+
+> **Execution Composition Note:** Public `run_command` retains its frozen RC-02 safe informational policy and is NOT composed by `arc_verify` or `arc_test`. Instead, privileged project execution is driven by the **internal deterministic composite execution capability**, which dispatches directly to `ControlledProcessRunner` / `ITerminalSubsystem` (`packages/terminal`) under server-owned capability gating, supervised by `ProcessRegistry` (`packages/processes`). Process observation and control surfaces (`process_status`, `process_output`, `terminate_process`) are composed as needed.
 
 ---
 
@@ -514,7 +532,7 @@ The following 20 answers constitute binding architectural requirements for RC-07
    Only `arc_verify` and `arc_test`. The remaining five tools (`arc_repo_status`, `arc_worktree_status`, `arc_review_diff`, `arc_ci_status`, `arc_stage_evidence`) are strictly read-only and invoke zero subprocesses directly.
 
 2. **Which exact executables may they invoke?**
-   Only the active kernel-bound Node runtime and explicitly approved verification-tool entrypoints from a closed server-owned registry, executed via the internal capability-gated framework. Public `run_command` retains its RC-02 policy unchanged; `npm run` and `pnpm run` are strictly excluded from execution.
+   Only the active kernel-bound Node runtime and explicitly approved verification-tool entrypoints from a closed server-owned registry, executed via the internal deterministic execution capability. Public `run_command` retains its RC-02 policy unchanged and is NOT composed by `arc_verify` / `arc_test`; `npm run` and `pnpm run` are strictly excluded from execution.
 
 3. **How are arguments constructed without shell injection?**
    Arguments are constructed exclusively via deterministic command plans materialized on the server. Subprocess execution uses `shell: false` with discrete token vectors (`argv: string[]`). No concatenation of shell command strings and no client-supplied command strings or package-manager scripts are permitted. Arguments are validated against strict token patterns rejecting shell metacharacters (`;`, `&`, `|`, `` ` ``, `$()`, `>`, `<`, `\n`, `\r`).
@@ -581,8 +599,10 @@ The following 20 answers constitute binding architectural requirements for RC-07
 18. **How are remote and stdio semantics kept identical?**
     All 7 composite tools are registered in the unified `ArcMcpServer` tool dispatch table. Invocations from stdio and remote Streamable HTTP over TLS 1.3 execute through the identical `executeToolCallPipeline`, enforcing identical schemas, workspace bounds, policy checks, approval gates, and durable audit records.
 
-19. **Does `arc_ci_status` perform network access in RC-07?**
-    **NO.** Remote network access is explicitly prohibited and deferred. `arc_ci_status` operates exclusively in local simulation mode by inspecting local repository files and workflow definitions.
+19. **Does `arc_ci_status` perform network access in RC-07, and what is the network guarantee for composite execution?**
+    - `arc_ci_status` performs **ZERO remote network access** in RC-07. It operates exclusively in local simulation mode by inspecting local repository files and workflow definitions. Remote CI querying is explicitly deferred.
+    - Production RC-07 framework code itself opens zero outbound sockets and calls zero external APIs.
+    - However, executed repository/dependency code in `arc_verify` and `arc_test` is **NOT** claimed to have OS-level network isolation in RC-07; OS-level network sandboxing of child processes is deferred.
 
 20. **What evidence may `arc_stage_evidence` report versus merely reference?**
     - **Reported:** Bounded summaries of repository identity (branch, HEAD SHA, clean status), audit sequence count, verification script presence, and test outcome summary.
@@ -657,7 +677,7 @@ All 75 controls are mandatory, immutable, and assigned to a single future task o
 
 ### Category 6: CI Status, Trust & Network Boundary (`arc_ci_status`) (Task 6 Owner)
 
-- **`RC07-NEG-047`**: `arc_ci_status` attempts outbound HTTP/HTTPS connection to api.github.com. Connection refused; zero network access.
+- **`RC07-NEG-047`**: `arc_ci_status` attempts outbound HTTP/HTTPS connection to api.github.com or external CI endpoints. Connection refused; zero network access in `arc_ci_status`. (Note: this control verifies that `arc_ci_status` framework code initiates zero outbound network requests; it does not claim arbitrary project test code is network-sandboxed).
 - **`RC07-NEG-048`**: `arc_ci_status` attempts to read `GITHUB_TOKEN` or `GH_TOKEN` from environment. Suppressed / rejected.
 - **`RC07-NEG-049`**: `arc_ci_status` workflow path points outside `.github/workflows/`. Traversal rejected with `PATH_OUTSIDE_WORKSPACE`.
 - **`RC07-NEG-050`**: `arc_ci_status` parses malformed YAML workflow. Handled gracefully with sanitized error; no unhandled crash.
@@ -682,7 +702,7 @@ All 75 controls are mandatory, immutable, and assigned to a single future task o
 - **`RC07-NEG-063`**: Remote client presents revoked session token to composite tool. Denied with `INVALID_SESSION_TOKEN`.
 - **`RC07-NEG-064`**: Remote client attempts to invoke composite tool without valid device enrollment. Denied with `UNAUTHENTICATED`.
 - **`RC07-NEG-065`**: Discrepancy between stdio and remote response schema for any composite tool. Parity check fails closed.
-- **`RC07-NEG-066`**: Direct `child_process` import detected in any RC-07 production implementation modules (excluding lower-level terminal/git subsystems). Static verification rejects build.
+- **`RC07-NEG-066`**: Direct `child_process` import/use detected in any RC-07 production composite implementation modules. Static verification rejects build. (Clarified: this prohibits direct `child_process` usage in RC-07 composite modules; it does not outlaw the established lower-level process mechanisms in `packages/terminal` or `packages/git`).
 - **`RC07-NEG-067`**: Direct `fs` / `fs/promises` import bypassing `FilesystemSubsystem` detected in RC-07 production implementation modules. Static verification rejects build.
 - **`RC07-NEG-068`**: RC-07 production execution path attempts to invoke a mutating Git operation (`commit`, `push`, `pull`, `checkout`/`switch`, `reset`, `clean`, `merge`, `rebase`, `cherry-pick`, tag mutation, branch mutation). Verified across RC-07 invocation surfaces; rejects build/execution.
 - **`RC07-NEG-069`**: Failure of a child operation causes parent composite to hang indefinitely. Hard composite timeout aborts operation.
@@ -728,16 +748,16 @@ All 20 positive flows are mandatory and assigned to future task owners.
 
 RC-07 is strictly partitioned into **eight** implementation tasks following Task 0:
 
-| Task  | Title                                                  | Scope & Deliverables                                                                                                                                               | Negative Controls Owned | Positive Flows Owned |
-| :---- | :----------------------------------------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------- | :---------------------- | :------------------- |
-| **1** | Shared Composite-Tool Execution Framework              | Deterministic plan authority, `planHash`, internal execution capability, approval binding, bearer token validation, single `STARTED -> COMPLETED` lifecycle model. | `RC07-NEG-001`..`010`   | `RC07-FLOW-01`..`02` |
-| **2** | `arc_repo_status` & `arc_worktree_status`              | Repository summary, branch identity, clean/dirty detection, worktree validation, protected-branch flags.                                                           | `RC07-NEG-011`..`018`   | `RC07-FLOW-03`..`05` |
-| **3** | `arc_review_diff`                                      | Review diff generation, staged/unstaged/target modes, buffer cap (512 KiB), automated secret masking, file summaries.                                              | `RC07-NEG-019`..`027`   | `RC07-FLOW-06`..`08` |
-| **4** | `arc_verify`                                           | Structured check-only verification runner, server-materialized command plans, step sequencing, timeout & cancellation.                                             | `RC07-NEG-028`..`037`   | `RC07-FLOW-09`..`10` |
-| **5** | `arc_test`                                             | Targeted test runner, test path validation within workspace, output streaming & truncation, process supervision.                                                   | `RC07-NEG-038`..`046`   | `RC07-FLOW-11`..`12` |
-| **6** | `arc_ci_status`                                        | Local CI workflow parser, simulation reporting, zero-network enforcement, credential isolation.                                                                    | `RC07-NEG-047`..`053`   | `RC07-FLOW-13`       |
-| **7** | `arc_stage_evidence` & Cross-Tool Evidence Integration | Evidence aggregation, audit ledger verification linking, cryptographic references, anti-fabrication invariants.                                                    | `RC07-NEG-054`..`061`   | `RC07-FLOW-14`..`15` |
-| **8** | Security Hardening, Acceptance, Version & PR Readiness | Full test suite (all 75 NEG, all 20 FLOW), static bypass audits, remote/stdio parity, version bump `0.7.0-rc07`.                                                   | `RC07-NEG-062`..`075`   | `RC07-FLOW-16`..`20` |
+| Task  | Title                                                  | Scope & Deliverables                                                                                                                                                                         | Negative Controls Owned | Positive Flows Owned |
+| :---- | :----------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :---------------------- | :------------------- |
+| **1** | Shared Composite Framework & Internal Execution Cap.   | Deterministic plan authority, `planHash`, internal execution capability via `ControlledProcessRunner`, approval binding, bearer token validation, single `STARTED -> COMPLETED` audit model. | `RC07-NEG-001`..`010`   | `RC07-FLOW-01`..`02` |
+| **2** | `arc_repo_status` & `arc_worktree_status`              | Repository summary, branch identity, clean/dirty detection, worktree validation, protected-branch flags.                                                                                     | `RC07-NEG-011`..`018`   | `RC07-FLOW-03`..`05` |
+| **3** | `arc_review_diff`                                      | Review diff generation, staged/unstaged/target modes, buffer cap (512 KiB), automated secret masking, file summaries.                                                                        | `RC07-NEG-019`..`027`   | `RC07-FLOW-06`..`08` |
+| **4** | `arc_verify`                                           | Structured check-only verification runner, server-materialized command plans, step sequencing, timeout & cancellation.                                                                       | `RC07-NEG-028`..`037`   | `RC07-FLOW-09`..`10` |
+| **5** | `arc_test`                                             | Targeted test runner, test path validation within workspace, output streaming & truncation, process supervision.                                                                             | `RC07-NEG-038`..`046`   | `RC07-FLOW-11`..`12` |
+| **6** | `arc_ci_status`                                        | Local CI workflow parser, simulation reporting, zero-network enforcement, credential isolation.                                                                                              | `RC07-NEG-047`..`053`   | `RC07-FLOW-13`       |
+| **7** | `arc_stage_evidence` & Cross-Tool Evidence Integration | Evidence aggregation, audit ledger verification linking, cryptographic references, anti-fabrication invariants.                                                                              | `RC07-NEG-054`..`061`   | `RC07-FLOW-14`..`15` |
+| **8** | Security Hardening, Acceptance, Version & PR Readiness | Full test suite (all 75 NEG, all 20 FLOW), static bypass audits, remote/stdio parity, version bump `0.7.0-rc07`.                                                                             | `RC07-NEG-062`..`075`   | `RC07-FLOW-16`..`20` |
 
 ---
 
@@ -746,7 +766,7 @@ RC-07 is strictly partitioned into **eight** implementation tasks following Task
 Stage RC-07 is complete when and only when all of the following conditions are verified:
 
 1. **Tool Contracts Implemented:** All seven higher-level engineering tools (`arc_repo_status`, `arc_worktree_status`, `arc_review_diff`, `arc_verify`, `arc_test`, `arc_ci_status`, `arc_stage_evidence`) are fully implemented and conform to their frozen schemas.
-2. **Strict Composition Enforced:** Zero direct `child_process` or `fs` bypasses exist in RC-07 modules. All tools strictly compose lower-level ARC primitives (`packages/terminal`, `packages/filesystem`, `packages/git`, `packages/audit`, `packages/policy`).
+2. **Strict Composition Enforced:** Zero direct `child_process` or `fs` bypasses exist in RC-07 composite implementation modules. All tools strictly compose lower-level ARC authorities (`ControlledProcessRunner`, `FilesystemSubsystem`, `GitSubsystem`, `AuditLogger`, `DeclarativePolicyEngine`).
 3. **No Alternate Execution Paths:** Policy evaluation, approval gating (`ApprovalStateManager`), workspace jailing (`FilesystemSubsystem`), and durable audit lifecycle cannot be bypassed by any composite tool.
 4. **All Negative Controls Pass:** All 75 frozen negative controls (`RC07-NEG-001` through `RC07-NEG-075`) are implemented as automated tests and pass cleanly.
 5. **All Positive Flows Pass:** All 20 frozen positive acceptance flows (`RC07-FLOW-01` through `RC07-FLOW-20`) are implemented as automated tests and pass cleanly.
@@ -763,5 +783,6 @@ Stage RC-07 is complete when and only when all of the following conditions are v
 The following items are explicitly deferred to future release candidates:
 
 1. **Remote CI Provider API Querying:** Querying GitHub Actions or external CI providers via network HTTP requests is deferred until a formal remote network egress and credential proxy architecture is designed.
-2. **Git Mutation Operations:** Agent-initiated `git commit`, `git push`, branch creation/deletion, and merge/rebase operations are deferred until a dedicated branch mutation and approval architecture is specified.
-3. **Interactive Debugger / REPL Primitives:** Interactive streaming terminal sessions (e.g. interactive gdb or node repl) remain deferred beyond RC-07.
+2. **OS-Level Network Sandboxing for Project/Dependency Execution:** While RC-07 framework code performs zero network calls, OS-level network isolation (e.g. network namespaces / seccomp / eBPF egress filtering) for arbitrary child repository/test execution is deferred beyond RC-07.
+3. **Git Mutation Operations:** Agent-initiated `git commit`, `git push`, branch creation/deletion, and merge/rebase operations are deferred until a dedicated branch mutation and approval architecture is specified.
+4. **Interactive Debugger / REPL Primitives:** Interactive streaming terminal sessions (e.g. interactive gdb or node repl) remain deferred beyond RC-07.
