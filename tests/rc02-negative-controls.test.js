@@ -1836,4 +1836,52 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
       process.env.HOME = origHome;
     }
   });
+
+  test('RC02-REG-50: collision case workspaceRoot == HOME preserves workspace boundary and refuses kernel runtime', () => {
+    if (process.platform !== 'linux') return;
+
+    const realExec = fs.realpathSync(process.execPath);
+    const parentDir = path.dirname(realExec);
+    const ancestorDir = path.dirname(parentDir) !== '/' ? path.dirname(parentDir) : parentDir;
+    const origHome = process.env.HOME;
+
+    try {
+      // Simulate HOME containing the active runtime path
+      for (const simulatedHome of [ancestorDir, parentDir]) {
+        process.env.HOME = simulatedHome;
+        const collisionWorkspace = simulatedHome;
+
+        // 1. With no generic trusted-directory fallback, prove the kernel-bound path itself was refused
+        // because the candidate is inside workspaceRoot (workspace boundary preserved even when workspaceRoot == HOME)
+        const resolverNoFallback = new ExecutableResolver([], true);
+        assert.throws(
+          () => resolverNoFallback.resolveExecutable('node', collisionWorkspace),
+          /could not be resolved|DENIED|NOT_FOUND|cannot be found/i,
+          'Kernel-bound /proc/self/exe must NOT be granted when candidate is within workspaceRoot == HOME',
+        );
+
+        // 2. Default resolver must NOT return /proc/self/exe when workspaceRoot == HOME
+        const defaultResolver = new ExecutableResolver();
+        try {
+          const resolved = defaultResolver.resolveExecutable('node', collisionWorkspace);
+          assert.notEqual(
+            resolved,
+            '/proc/self/exe',
+            'Default resolver must not return /proc/self/exe when workspaceRoot == HOME',
+          );
+        } catch (err) {
+          // If no fallback system binary exists, refusing is also valid
+          assert.match(err.message, /could not be resolved|DENIED|NOT_FOUND|cannot be found/i);
+        }
+
+        // 3. Generic arbitrary executable lookup under HOME remains denied
+        assert.throws(
+          () => defaultResolver.resolveExecutable('arbitrary_cmd_under_home', workspaceDir),
+          /could not be resolved|DENIED|NOT_FOUND|cannot be found/i,
+        );
+      }
+    } finally {
+      process.env.HOME = origHome;
+    }
+  });
 });
