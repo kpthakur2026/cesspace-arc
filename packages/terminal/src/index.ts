@@ -116,9 +116,13 @@ export class ExecutableResolver implements IExecutableResolver {
       if (procStat.dev !== candidateStat.dev || procStat.ino !== candidateStat.ino) return null;
 
       // ── Step 5: untrusted-root guard ─────────────────────────────────────────
-      // Reject if the resolved path lands inside workspace, $HOME, cwd, or
+      // Reject if the resolved path lands inside workspace, cwd, or
       // node_modules — even if the kernel identifies it as the active runtime.
-      // (These locations are unconditionally untrusted regardless of identity.)
+      //
+      // The caller intentionally passes only workspace and cwd as untrustedRoots
+      // (preserving root provenance without passing HOME), so HOME alone does not
+      // veto the exact kernel-bound current Node runtime. However, if workspaceRoot
+      // or cwd equals or contains the path, that security boundary is strictly enforced.
       const isUntrusted = untrustedRoots.some(
         (root) => realProcExe === root || realProcExe.startsWith(root + sep),
       );
@@ -167,19 +171,28 @@ export class ExecutableResolver implements IExecutableResolver {
       );
     }
 
-    // Never trust workspace, HOME, current directory, or node_modules
-    const untrustedRoots: string[] = [];
-    if (workspaceRoot) untrustedRoots.push(resolve(workspaceRoot));
-    if (process.env.HOME) untrustedRoots.push(resolve(process.env.HOME));
-    untrustedRoots.push(resolve(process.cwd()));
+    // Preserve provenance across untrusted roots:
+    // - Kernel-bound active Node validation requires workspaceRoot and cwd boundaries,
+    //   but HOME alone must not veto the active runtime.
+    // - Generic lookup requires all boundaries: workspaceRoot, HOME, and cwd.
+    const workspaceRootCanonical = workspaceRoot ? resolve(workspaceRoot) : null;
+    const homeRootCanonical = process.env.HOME ? resolve(process.env.HOME) : null;
+    const cwdRootCanonical = resolve(process.cwd());
+
+    const kernelUntrustedRoots: string[] = [];
+    if (workspaceRootCanonical) kernelUntrustedRoots.push(workspaceRootCanonical);
+    kernelUntrustedRoots.push(cwdRootCanonical);
 
     // 1. On Linux, prefer kernel-bound current Node runtime identity (/proc/self/exe)
     if (trimmed === 'node' && this.allowCurrentNodeRuntime && process.platform === 'linux') {
-      const kernelNode = this.validateKernelBoundNodeLinux(untrustedRoots);
+      const kernelNode = this.validateKernelBoundNodeLinux(kernelUntrustedRoots);
       if (kernelNode) {
         return kernelNode;
       }
     }
+
+    const genericUntrustedRoots: string[] = [...kernelUntrustedRoots];
+    if (homeRootCanonical) genericUntrustedRoots.push(homeRootCanonical);
 
     // 2. Search Fixed Trusted System Locations ONLY
     for (const dir of this.trustedDirs) {
@@ -226,7 +239,7 @@ export class ExecutableResolver implements IExecutableResolver {
           const real = realpathSync(candidate);
 
           // Verify realpath does not resolve into untrusted roots or node_modules
-          const isUntrusted = untrustedRoots.some(
+          const isUntrusted = genericUntrustedRoots.some(
             (root) => real === root || real.startsWith(root + sep),
           );
           if (
