@@ -3480,5 +3480,101 @@ describe('CesSpace ARC — RC-06 Task 7: Local Operator CLI & Standalone Offline
       await assertRejectsWithCode(promise, 'AUDIT_SOURCE_UNSTABLE');
       assert.ok(hookRan, 'afterReceiptVerification hook must have executed');
     });
+
+    test('RC06-T7-REG-80: metadata audit-store.json rewritten in place between metadata parsing and baseline establishment causes offline verification to reject', async () => {
+      // Structurally prove verifyOfflineStore no longer performs:
+      // loadStoreMetadataFile(...) followed by an independent metadata baseline digest.
+      const verifySrc = fs.readFileSync(
+        path.join(REPO_ROOT, 'packages/audit/src/verify.ts'),
+        'utf8',
+      );
+      const verifyOfflineFn = verifySrc.match(
+        /export async function verifyOfflineStore\([\s\S]*?\n\}/,
+      );
+      assert.ok(verifyOfflineFn, 'verifyOfflineStore implementation found in verify.ts');
+      assert.equal(
+        /loadStoreMetadataFile/.test(verifyOfflineFn[0]),
+        false,
+        'verifyOfflineStore must not call loadStoreMetadataFile',
+      );
+      assert.equal(
+        /loadStoreMetadataEvidence/.test(verifyOfflineFn[0]),
+        true,
+        'verifyOfflineStore must call loadStoreMetadataEvidence',
+      );
+      assert.equal(
+        /streamDigestLogicalSegment\([^)]*METADATA/.test(verifyOfflineFn[0]),
+        false,
+        'verifyOfflineStore must not perform independent metadata baseline digest',
+      );
+
+      const compiledVerify = fs.readFileSync(
+        path.join(REPO_ROOT, 'packages/audit/dist/verify.js'),
+        'utf8',
+      );
+      const compiledFn = compiledVerify.match(/async function verifyOfflineStore\([\s\S]*?\n\}/);
+      assert.ok(compiledFn, 'verifyOfflineStore implementation found in dist/verify.js');
+      assert.equal(
+        /loadStoreMetadataFile/.test(compiledFn[0]),
+        false,
+        'compiled verifyOfflineStore must not call loadStoreMetadataFile',
+      );
+      assert.equal(
+        /loadStoreMetadataEvidence/.test(compiledFn[0]),
+        true,
+        'compiled verifyOfflineStore must call loadStoreMetadataEvidence',
+      );
+      assert.equal(
+        /streamDigestLogicalSegment\([^)]*METADATA/.test(compiledFn[0]),
+        false,
+        'compiled verifyOfflineStore must not perform independent metadata baseline digest',
+      );
+
+      // Use an anchor-DISABLED store below checkpoint cadence so unrelated checkpoint
+      // or anchor failures cannot satisfy the regression.
+      const fixture = makeAuditConfig('reg80', { anchor: false });
+      await buildStore(fixture, { records: 5 });
+
+      const metaPath = path.join(fixture.auditDir, 'audit-store.json');
+      const statBefore = fs.statSync(metaPath);
+      const content = fs.readFileSync(metaPath, 'utf8');
+      const parsed = JSON.parse(content);
+      const originalStoreId = parsed.storeId;
+      assert.equal(typeof originalStoreId, 'string');
+      assert.equal(parsed.anchorMode, 'DISABLED');
+
+      // Deterministically rewrite audit-store.json IN PLACE:
+      // - same inode
+      // - exact same byte length
+      // - still valid metadata
+      // - replace storeId with another same-length valid UUIDv4
+      const substituteStoreId = '88888888-8888-4888-8888-888888888888';
+      assert.equal(substituteStoreId.length, originalStoreId.length);
+      const mutatedStr = content.replace(originalStoreId, substituteStoreId);
+      assert.equal(Buffer.byteLength(mutatedStr), Buffer.byteLength(content));
+
+      let hookRan = false;
+      const promise = verifyOfflineStore({
+        directory: fixture.auditDir,
+        checkpointPublicKeyPath: fixture.checkpoint.publicKeyPath,
+        workspacePaths: [],
+        hooks: {
+          afterMetadataLoad: () => {
+            hookRan = true;
+            const fd = fs.openSync(metaPath, 'r+');
+            const buf = Buffer.from(mutatedStr, 'utf8');
+            fs.writeSync(fd, buf, 0, buf.length, 0);
+            fs.closeSync(fd);
+
+            const statAfter = fs.statSync(metaPath);
+            assert.equal(statAfter.ino, statBefore.ino, 'inode must be preserved');
+            assert.equal(statAfter.size, statBefore.size, 'size must be preserved');
+          },
+        },
+      });
+
+      await assertRejectsWithCode(promise, 'AUDIT_SOURCE_UNSTABLE');
+      assert.ok(hookRan, 'afterMetadataLoad hook must have executed');
+    });
   });
 });

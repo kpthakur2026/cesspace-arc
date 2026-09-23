@@ -21,7 +21,7 @@
  * composed entirely from the already-reviewed Task 1-5 primitives, so that no
  * cryptographic rule is restated in a weaker second implementation:
  *
- *   Task 1  `validateAuditDirectory`, `loadStoreMetadataFile`    store identity
+ *   Task 1  `validateAuditDirectory`, `loadStoreMetadataEvidence` store identity
  *   Task 3  `verifyRetainedPrimaryHistory`                       primary chain
  *   Task 4  `verifyCheckpointHistoryWithObserver`                checkpoint chain
  *   Task 4  `loadEd25519TrustRootFile`                           public keys only
@@ -59,7 +59,7 @@ import {
   validateFileDescriptorAuthority,
   parseAndValidateRecordLineV1,
 } from './storage.js';
-import { loadStoreMetadataFile, METADATA_FILENAME } from './metadata.js';
+import { loadStoreMetadataEvidence, METADATA_FILENAME } from './metadata.js';
 import {
   listLogicalArchiveInventory,
   verifyRetainedPrimaryHistory,
@@ -1058,13 +1058,8 @@ export async function verifyOfflineStore(
   // checkpoint or receipt ledger — fails the whole verification.
   const inventoryBefore = snapshotEvidenceInventory(options.directory, expectedUid);
 
-  const metadata = loadStoreMetadataFile(options.directory, expectedUid);
-  const metadataDigest = await streamDigestLogicalSegment(
-    path.join(options.directory, METADATA_FILENAME),
-    METADATA_FILENAME,
-    false,
-    expectedUid,
-  );
+  const metadataEvidence = loadStoreMetadataEvidence(options.directory, expectedUid);
+  const { metadata } = metadataEvidence;
   await options.hooks?.afterMetadataLoad?.();
 
   const primary = await verifyRetainedPrimaryHistory(options.directory, expectedUid);
@@ -1119,7 +1114,10 @@ export async function verifyOfflineStore(
     directory: options.directory,
     expectedUid,
     inventoryBefore,
-    metadataDigest,
+    metadataDigest: {
+      sha256: metadataEvidence.artifactState.sha256,
+      identity: metadataEvidence.artifactState,
+    },
     primary,
     checkpoints,
     anchor,

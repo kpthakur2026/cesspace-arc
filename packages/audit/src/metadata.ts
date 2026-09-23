@@ -1,6 +1,8 @@
 import fs, { constants as fsConstants } from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import type { AuditStoreMetadataV1 } from '@cesspace-arc/protocol';
+import { MAX_RECORD_BYTES } from '@cesspace-arc/protocol';
 import {
   canonicalJsonV1,
   createCodedError,
@@ -239,10 +241,32 @@ export function createStoreMetadataFile(
   }
 }
 
-export function loadStoreMetadataFile(
+export interface StoreMetadataEvidence {
+  metadata: AuditStoreMetadataV1;
+  artifactState: {
+    dev: number;
+    ino: number;
+    size: number;
+    bytes: number;
+    sha256: string;
+  };
+}
+
+/**
+ * Reads, authenticates, and parses the store metadata from `audit-store.json`
+ * in a single atomic descriptor read.
+ *
+ * Enforces descriptor-level security:
+ * - O_RDONLY | O_NOFOLLOW
+ * - Authority validation (0o600 mode, regular file, expected UID, nlink === 1)
+ * - Bounded read up to MAX_RECORD_BYTES
+ * - Exact-length and descriptor identity stability checks
+ * - Atomic SHA-256 digesting and JSON parsing from the exact same bytes
+ */
+export function loadStoreMetadataEvidence(
   auditDir: string,
   expectedUid = getProcessUid(),
-): AuditStoreMetadataV1 {
+): StoreMetadataEvidence {
   const metadataPath = path.join(auditDir, METADATA_FILENAME);
   if (!fs.existsSync(metadataPath)) {
     throw createCodedError('METADATA_MISSING', 'audit-store.json missing on non-empty store');
@@ -265,27 +289,91 @@ export function loadStoreMetadataFile(
     if (errCode === 'ELOOP') {
       throw createCodedError('SYMLINK_DETECTED', 'audit-store.json is a symbolic link');
     }
+    if (errCode === 'ENOENT') {
+      throw createCodedError('METADATA_MISSING', 'audit-store.json missing on non-empty store');
+    }
     throw err;
   }
 
-  let rawContent: string;
   try {
     validateFileDescriptorAuthority(fd, 0o600, expectedUid);
-    rawContent = fs.readFileSync(fd, 'utf8');
+
+    const startStats = fs.fstatSync(fd);
+    const startDev = Number(startStats.dev);
+    const startIno = Number(startStats.ino);
+    const startSize = Number(startStats.size);
+
+    if (startSize > MAX_RECORD_BYTES) {
+      throw createCodedError(
+        'INVALID_METADATA',
+        `audit-store.json exceeds maximum size of ${MAX_RECORD_BYTES} bytes`,
+      );
+    }
+
+    const chunks: Buffer[] = [];
+    let bytesRead = 0;
+    const chunkBuffer = Buffer.alloc(16 * 1024);
+
+    while (bytesRead <= MAX_RECORD_BYTES) {
+      const n = fs.readSync(fd, chunkBuffer, 0, chunkBuffer.length, null);
+      if (n <= 0) break;
+      bytesRead += n;
+      if (bytesRead > MAX_RECORD_BYTES) {
+        throw createCodedError(
+          'INVALID_METADATA',
+          `audit-store.json exceeds maximum size of ${MAX_RECORD_BYTES} bytes`,
+        );
+      }
+      chunks.push(Buffer.from(chunkBuffer.subarray(0, n)));
+    }
+
+    const endStats = fs.fstatSync(fd);
+    if (
+      Number(endStats.dev) !== startDev ||
+      Number(endStats.ino) !== startIno ||
+      Number(endStats.size) !== startSize ||
+      bytesRead !== startSize
+    ) {
+      throw createCodedError(
+        'AUDIT_SOURCE_UNSTABLE',
+        'audit-store.json changed while it was being read',
+      );
+    }
+
+    const exactBytes = Buffer.concat(chunks, bytesRead);
+    const sha256 = crypto.createHash('sha256').update(exactBytes).digest('hex');
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(exactBytes.toString('utf8'));
+    } catch (cause) {
+      throw createCodedError('INVALID_METADATA', 'audit-store.json contains malformed JSON', {
+        cause,
+      });
+    }
+
+    const metadata = validateStoreMetadata(parsed);
+
+    return {
+      metadata,
+      artifactState: {
+        dev: startDev,
+        ino: startIno,
+        size: startSize,
+        bytes: bytesRead,
+        sha256,
+      },
+    };
   } finally {
     fs.closeSync(fd);
   }
+}
 
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(rawContent);
-  } catch (cause) {
-    throw createCodedError('INVALID_METADATA', 'audit-store.json contains malformed JSON', {
-      cause,
-    });
-  }
-
-  return validateStoreMetadata(parsed);
+export function loadStoreMetadataFile(
+  auditDir: string,
+  expectedUid = getProcessUid(),
+): AuditStoreMetadataV1 {
+  return loadStoreMetadataEvidence(auditDir, expectedUid).metadata;
 }
 
 export function validateStoreMetadataConsistency(
