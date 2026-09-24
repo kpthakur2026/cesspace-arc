@@ -230,14 +230,37 @@ export interface WorktreeMetadata {
 }
 
 /**
+ * Options for Sandboxed Git Subsystem execution, supporting cancellation and deadlines.
+ */
+export interface GitExecutionOptions {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}
+
+/**
  * Interface definition for Sandboxed Git Subsystem.
  */
 export interface IGitSubsystem {
-  getStatus(workspaceRoot: string, request?: GitStatusRequest): Promise<GitStatusResponse>;
-  getDiff(workspaceRoot: string, request: GitDiffRequest): Promise<GitDiffResponse>;
-  getLog(workspaceRoot: string, request: GitLogRequest): Promise<GitLogResponse>;
+  getStatus(
+    workspaceRoot: string,
+    request?: GitStatusRequest,
+    options?: GitExecutionOptions,
+  ): Promise<GitStatusResponse>;
+  getDiff(
+    workspaceRoot: string,
+    request: GitDiffRequest,
+    options?: GitExecutionOptions,
+  ): Promise<GitDiffResponse>;
+  getLog(
+    workspaceRoot: string,
+    request: GitLogRequest,
+    options?: GitExecutionOptions,
+  ): Promise<GitLogResponse>;
   assertBranchWritable(workspaceRoot: string, targetBranch: string): Promise<void>;
-  getWorktreeMetadata(workspaceRoot: string): Promise<WorktreeMetadata>;
+  getWorktreeMetadata(
+    workspaceRoot: string,
+    options?: GitExecutionOptions,
+  ): Promise<WorktreeMetadata>;
 }
 
 /**
@@ -256,7 +279,12 @@ export class GitSubsystem implements IGitSubsystem {
     cwd: string,
     args: string[],
     maxBuffer: number = 1024 * 1024,
+    options?: GitExecutionOptions,
   ): Promise<{ stdout: string; stderr: string }> {
+    if (options?.signal?.aborted) {
+      throw ArcError.executionTimeout('Command execution exceeded configured timeout.');
+    }
+
     const safeEnv: NodeJS.ProcessEnv = {
       PATH: TRUSTED_SYSTEM_PATH,
       HOME: '/dev/null',
@@ -289,13 +317,30 @@ export class GitSubsystem implements IGitSubsystem {
       const result = await execFileAsync(this.trustedGitBinary, [...safeGlobalArgs, ...args], {
         cwd,
         shell: false,
-        timeout: 10000,
+        timeout: options?.timeoutMs ?? 10000,
         maxBuffer,
         env: safeEnv,
+        signal: options?.signal,
       });
       return { stdout: result.stdout, stderr: result.stderr };
     } catch (err: unknown) {
-      const execErr = err as { code?: string | number; message?: string; stderr?: string };
+      if (options?.signal?.aborted) {
+        throw ArcError.executionTimeout('Command execution exceeded configured timeout.');
+      }
+      const execErr = err as {
+        code?: string | number;
+        name?: string;
+        message?: string;
+        stderr?: string;
+        killed?: boolean;
+        signal?: string;
+      };
+      if (execErr.name === 'AbortError' || execErr.code === 'ABORT_ERR') {
+        throw ArcError.executionTimeout('Command execution exceeded configured timeout.');
+      }
+      if (execErr.code === 'ETIMEDOUT' || (execErr.killed && execErr.signal === 'SIGTERM')) {
+        throw ArcError.executionTimeout('Command execution exceeded configured timeout.');
+      }
       if (execErr.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
         throw ArcError.payloadTooLarge('Git command output exceeded maximum buffer limit.');
       }
@@ -303,7 +348,10 @@ export class GitSubsystem implements IGitSubsystem {
     }
   }
 
-  private async verifyRepositoryBoundary(canonicalRoot: string): Promise<void> {
+  private async verifyRepositoryBoundary(
+    canonicalRoot: string,
+    options?: GitExecutionOptions,
+  ): Promise<void> {
     const dotGit = resolve(canonicalRoot, '.git');
     const isGit = existsSync(dotGit) || existsSync(resolve(canonicalRoot, 'HEAD'));
 
@@ -331,12 +379,12 @@ export class GitSubsystem implements IGitSubsystem {
     }
 
     try {
-      const { stdout } = await this.runRawGit(canonicalRoot, [
-        'rev-parse',
-        '--show-toplevel',
-        '--git-dir',
-        '--git-common-dir',
-      ]);
+      const { stdout } = await this.runRawGit(
+        canonicalRoot,
+        ['rev-parse', '--show-toplevel', '--git-dir', '--git-common-dir'],
+        undefined,
+        options,
+      );
       const lines = stdout
         .split('\n')
         .map((l) => l.trim())
@@ -434,6 +482,7 @@ export class GitSubsystem implements IGitSubsystem {
     workspaceRoot: string,
     args: string[],
     maxBuffer: number = 1024 * 1024,
+    options?: GitExecutionOptions,
   ): Promise<{ stdout: string; stderr: string }> {
     let canonicalRoot: string;
     try {
@@ -441,14 +490,18 @@ export class GitSubsystem implements IGitSubsystem {
     } catch {
       throw ArcError.fileNotFound('Workspace directory not found.');
     }
-    await this.verifyRepositoryBoundary(canonicalRoot);
-    return this.runRawGit(canonicalRoot, args, maxBuffer);
+    await this.verifyRepositoryBoundary(canonicalRoot, options);
+    return this.runRawGit(canonicalRoot, args, maxBuffer, options);
   }
 
   public async getStatus(
     workspaceRoot: string,
     _request?: GitStatusRequest,
+    options?: GitExecutionOptions,
   ): Promise<GitStatusResponse> {
+    if (options?.signal?.aborted) {
+      throw ArcError.executionTimeout('Command execution exceeded configured timeout.');
+    }
     // Non-bypassable: execution subsystems MUST receive only the canonical workspace root
     // Caller parameters must never override the execution root after policy authorization.
     const targetRoot = workspaceRoot;
@@ -456,23 +509,45 @@ export class GitSubsystem implements IGitSubsystem {
     // Get current branch
     let branch = 'unknown';
     try {
-      const branchRes = await this.runGit(targetRoot, ['rev-parse', '--abbrev-ref', 'HEAD']);
+      const branchRes = await this.runGit(
+        targetRoot,
+        ['rev-parse', '--abbrev-ref', 'HEAD'],
+        undefined,
+        options,
+      );
       branch = branchRes.stdout.trim();
-    } catch {
+    } catch (err: unknown) {
+      if (
+        err instanceof ArcError &&
+        (err.code === 'EXECUTION_TIMEOUT' || err.code === 'PAYLOAD_TOO_LARGE')
+      ) {
+        throw err;
+      }
       // Empty repo or detached HEAD
     }
 
     // Get commit hash
     let commitHash = 'unknown';
     try {
-      const commitRes = await this.runGit(targetRoot, ['rev-parse', 'HEAD']);
+      const commitRes = await this.runGit(targetRoot, ['rev-parse', 'HEAD'], undefined, options);
       commitHash = commitRes.stdout.trim();
-    } catch {
+    } catch (err: unknown) {
+      if (
+        err instanceof ArcError &&
+        (err.code === 'EXECUTION_TIMEOUT' || err.code === 'PAYLOAD_TOO_LARGE')
+      ) {
+        throw err;
+      }
       // Empty repo
     }
 
     // Status porcelain
-    const statusRes = await this.runGit(targetRoot, ['status', '--porcelain=v1', '-uall']);
+    const statusRes = await this.runGit(
+      targetRoot,
+      ['status', '--porcelain=v1', '-uall'],
+      undefined,
+      options,
+    );
 
     const lines = statusRes.stdout.split('\n').filter((l) => l.length > 0);
 
@@ -515,7 +590,14 @@ export class GitSubsystem implements IGitSubsystem {
     };
   }
 
-  public async getDiff(workspaceRoot: string, request: GitDiffRequest): Promise<GitDiffResponse> {
+  public async getDiff(
+    workspaceRoot: string,
+    request: GitDiffRequest,
+    options?: GitExecutionOptions,
+  ): Promise<GitDiffResponse> {
+    if (options?.signal?.aborted) {
+      throw ArcError.executionTimeout('Command execution exceeded configured timeout.');
+    }
     validateGitArgument('target', request.target);
     validateGitArgument('path', request.path);
 
@@ -557,7 +639,7 @@ export class GitSubsystem implements IGitSubsystem {
       args.push('--', '.', ...secretExcludes);
     }
 
-    const { stdout } = await this.runGit(workspaceRoot, args, MAX_DIFF_BYTES * 2);
+    const { stdout } = await this.runGit(workspaceRoot, args, MAX_DIFF_BYTES * 2, options);
 
     // Defense-in-depth: purge any diff hunks mentioning sensitive files
     let diffText = purgeSensitiveDiffBlocks(stdout);
@@ -572,7 +654,14 @@ export class GitSubsystem implements IGitSubsystem {
     };
   }
 
-  public async getLog(workspaceRoot: string, request: GitLogRequest): Promise<GitLogResponse> {
+  public async getLog(
+    workspaceRoot: string,
+    request: GitLogRequest,
+    options?: GitExecutionOptions,
+  ): Promise<GitLogResponse> {
+    if (options?.signal?.aborted) {
+      throw ArcError.executionTimeout('Command execution exceeded configured timeout.');
+    }
     validateGitArgument('revision', request.revision);
     validateGitArgument('path', request.path);
 
@@ -594,7 +683,7 @@ export class GitSubsystem implements IGitSubsystem {
       args.push('--', request.path.trim());
     }
 
-    const { stdout } = await this.runGit(workspaceRoot, args);
+    const { stdout } = await this.runGit(workspaceRoot, args, undefined, options);
     const lines = stdout.split('\n').filter((l) => l.trim().length > 0);
 
     const commits: GitCommitItem[] = [];
@@ -644,7 +733,13 @@ export class GitSubsystem implements IGitSubsystem {
     }
   }
 
-  public async getWorktreeMetadata(workspaceRoot: string): Promise<WorktreeMetadata> {
+  public async getWorktreeMetadata(
+    workspaceRoot: string,
+    options?: GitExecutionOptions,
+  ): Promise<WorktreeMetadata> {
+    if (options?.signal?.aborted) {
+      throw ArcError.executionTimeout('Command execution exceeded configured timeout.');
+    }
     let canonicalRoot: string;
     try {
       canonicalRoot = realpathSync(resolve(workspaceRoot));
@@ -755,12 +850,27 @@ export class GitSubsystem implements IGitSubsystem {
       }
     }
 
+    if (options?.signal?.aborted) {
+      throw ArcError.executionTimeout('Command execution exceeded configured timeout.');
+    }
+
     // Resolve HEAD commit hash if not already known
     if (headSha === 'unknown' || !isDetached) {
       try {
-        const { stdout } = await this.runRawGit(canonicalRoot, ['rev-parse', 'HEAD']);
+        const { stdout } = await this.runRawGit(
+          canonicalRoot,
+          ['rev-parse', 'HEAD'],
+          undefined,
+          options,
+        );
         headSha = stdout.trim();
-      } catch {
+      } catch (err: unknown) {
+        if (
+          err instanceof ArcError &&
+          (err.code === 'EXECUTION_TIMEOUT' || err.code === 'PAYLOAD_TOO_LARGE')
+        ) {
+          throw err;
+        }
         // Empty repo
       }
     }
@@ -768,16 +878,23 @@ export class GitSubsystem implements IGitSubsystem {
     // If not a linked worktree, resolve branch and detached status from rev-parse
     if (!isWorktree) {
       try {
-        const { stdout: branchOut } = await this.runRawGit(canonicalRoot, [
-          'rev-parse',
-          '--abbrev-ref',
-          'HEAD',
-        ]);
+        const { stdout: branchOut } = await this.runRawGit(
+          canonicalRoot,
+          ['rev-parse', '--abbrev-ref', 'HEAD'],
+          undefined,
+          options,
+        );
         branch = branchOut.trim();
         if (branch === 'HEAD') {
           isDetached = true;
         }
-      } catch {
+      } catch (err: unknown) {
+        if (
+          err instanceof ArcError &&
+          (err.code === 'EXECUTION_TIMEOUT' || err.code === 'PAYLOAD_TOO_LARGE')
+        ) {
+          throw err;
+        }
         // Empty repo
       }
     }

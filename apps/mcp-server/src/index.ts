@@ -80,7 +80,11 @@ import {
 import { SERVER_INTERNAL_ACCESS } from './internal/server-seam.js';
 import { createServerDeterministicExecutor } from './internal/execution-authority.js';
 import type { TestCompositeHarness } from './internal/composite-testing.js';
-import { handleArcRepoStatus, handleArcWorktreeStatus } from './internal/repo-worktree-status.js';
+import {
+  handleArcRepoStatus,
+  handleArcWorktreeStatus,
+  DEFAULT_TASK2_TIMEOUT_MS,
+} from './internal/repo-worktree-status.js';
 import {
   AuditLogger,
   computeSha256,
@@ -160,6 +164,11 @@ export interface ArcServerConfig {
    * itself.
    */
   audit?: AuditConfig;
+  /**
+   * Internal/test-configurable aggregate timeout ceiling for Task-2 read-only tools.
+   * Defaults to DEFAULT_TASK2_TIMEOUT_MS (15,000 ms).
+   */
+  task2TimeoutMs?: number;
 }
 
 /** Safe, non-sensitive reason the Layer-2 engine is unavailable. */
@@ -1558,6 +1567,8 @@ export class ArcMcpServer implements IArcMcpServer {
   #internalDeterministicExecutor?: IInternalDeterministicExecutor;
   /** Authoritative closed deterministic execution registry (RC-07 Task 1). */
   #deterministicRegistry: DeterministicExecutionRegistry;
+  /** Aggregate execution timeout ceiling for Task-2 read-only tools. */
+  #task2TimeoutMs: number;
 
   constructor(
     public readonly workspaceRegistry: WorkspaceRegistry,
@@ -1601,6 +1612,7 @@ export class ArcMcpServer implements IArcMcpServer {
     sessionManager?: SessionManager,
   ) {
     this.#deterministicRegistry = createProductionDeterministicRegistry();
+    this.#task2TimeoutMs = config?.task2TimeoutMs ?? DEFAULT_TASK2_TIMEOUT_MS;
     SERVER_INTERNAL_ACCESS.set(this, {
       setTestCompositeHarness: (harness) => {
         this.#testCompositeHarness = harness;
@@ -1614,6 +1626,10 @@ export class ArcMcpServer implements IArcMcpServer {
         this.#deterministicRegistry = registry;
       },
       getDeterministicRegistry: () => this.#deterministicRegistry,
+      setTask2TimeoutMs: (timeoutMs: number) => {
+        this.#task2TimeoutMs = timeoutMs;
+      },
+      getTask2TimeoutMs: () => this.#task2TimeoutMs,
     });
     // Transport mode is resolved once, at construction, and is immutable. A
     // remote configuration supplied alongside stdio is NOT activated.
@@ -2838,16 +2854,6 @@ export class ArcMcpServer implements IArcMcpServer {
       policyEngine === undefined
         ? [{ effect: 'ALLOW' as PolicyEffect, matchingRuleId: 'no-layer2-engine', reason: '' }]
         : layer2Targets.map((target: PolicyMatchTarget) => {
-            if (
-              policyMode === 'BUILTIN' &&
-              (toolName === 'arc_repo_status' || toolName === 'arc_worktree_status')
-            ) {
-              return {
-                effect: 'ALLOW' as PolicyEffect,
-                matchingRuleId: 'builtin-allow-rc07-read-only',
-                reason: `Tool '${toolName}' is permitted by default for authorized workspaces in built-in mode.`,
-              };
-            }
             return policyEngine.evaluate(target as never);
           });
     const layer2 = reduceDecisions(layer2Decisions) as {
@@ -3504,6 +3510,7 @@ export class ArcMcpServer implements IArcMcpServer {
                 },
                 gitSubsystem: this.gitSubsystem,
                 filesystemSubsystem: this.filesystemSubsystem,
+                timeoutMs: this.#task2TimeoutMs,
               });
             });
             break;
@@ -3520,6 +3527,7 @@ export class ArcMcpServer implements IArcMcpServer {
                 validatedParams,
                 gitSubsystem: this.gitSubsystem,
                 filesystemSubsystem: this.filesystemSubsystem,
+                timeoutMs: this.#task2TimeoutMs,
               });
             });
             break;

@@ -21,7 +21,12 @@ import {
   type PolicyEffect,
 } from '@cesspace-arc/protocol';
 
-import { RC01_ALLOWED_TOOLS, RC03_MUTATION_TOOLS, ALL_POLICY_TOOLS } from './index.js';
+import {
+  RC01_ALLOWED_TOOLS,
+  RC03_MUTATION_TOOLS,
+  ALL_POLICY_TOOLS,
+  RC07_TASK2_READ_ONLY_TOOLS,
+} from './index.js';
 import {
   MAX_PATTERN_LENGTH,
   compilePathPattern,
@@ -984,6 +989,11 @@ function buildBuiltInDocument(): ParsedDocument {
         id: 'builtin-require-approval-file-mutation',
         effect: 'REQUIRE_APPROVAL',
         tools: [...RC03_MUTATION_TOOLS],
+      },
+      {
+        id: 'builtin-allow-rc07-read-only',
+        effect: 'ALLOW',
+        tools: [...RC07_TASK2_READ_ONLY_TOOLS],
       },
     ],
   };

@@ -16,6 +16,8 @@ export interface ServerInternalAccess {
   getInternalDeterministicExecutor(): IInternalDeterministicExecutor | undefined;
   setDeterministicRegistry(registry: DeterministicExecutionRegistry): void;
   getDeterministicRegistry(): DeterministicExecutionRegistry;
+  setTask2TimeoutMs?(timeoutMs: number): void;
+  getTask2TimeoutMs?(): number;
 }
 
 export const SERVER_INTERNAL_ACCESS = new WeakMap<ArcMcpServer, ServerInternalAccess>();

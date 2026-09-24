@@ -89,6 +89,13 @@ export const RC07_COMPOSITE_TOOLS = [
 export type Rc07CompositeTool = (typeof RC07_COMPOSITE_TOOLS)[number];
 
 /**
+ * The 2 RC-07 Task-2 read-only engineering-aware inspection tools.
+ */
+export const RC07_TASK2_READ_ONLY_TOOLS = ['arc_repo_status', 'arc_worktree_status'] as const;
+
+export type Rc07Task2ReadOnlyTool = (typeof RC07_TASK2_READ_ONLY_TOOLS)[number];
+
+/**
  * Canonical complete policy vocabulary including registered tools and frozen composite tools.
  */
 export const ALL_POLICY_TOOLS = [...RC03_REGISTERED_TOOLS, ...RC07_COMPOSITE_TOOLS] as const;

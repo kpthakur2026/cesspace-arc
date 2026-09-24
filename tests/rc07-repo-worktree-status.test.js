@@ -19,13 +19,23 @@ import {
   WorkspaceRegistry,
   SecurityKernel,
   ApprovalStateManager,
+  DeclarativePolicyEngine,
+  RC07_TASK2_READ_ONLY_TOOLS,
 } from '../packages/policy/dist/index.js';
+import { ArcError } from '../packages/protocol/dist/index.js';
 import { FilesystemSubsystem } from '../packages/filesystem/dist/index.js';
 import { GitSubsystem } from '../packages/git/dist/index.js';
 import { AuditLogger } from '../packages/audit/dist/index.js';
 import { ControlledProcessRunner } from '../packages/terminal/dist/index.js';
 import { ProcessRegistry } from '../packages/processes/dist/index.js';
 import { createAuditConfig } from './helpers/rc06-audit-runtime.mjs';
+import {
+  DEFAULT_TASK2_TIMEOUT_MS,
+  truncateStringBytes,
+  boundRepoStatusResponse,
+  boundWorktreeStatusResponse,
+  getMcpPayloadByteLength,
+} from '../apps/mcp-server/dist/internal/repo-worktree-status.js';
 
 // ---------------------------------------------------------------------------
 // Test Fixtures & Setup
@@ -252,14 +262,16 @@ describe('RC-07 Task 2: Negative Controls (RC07-NEG-011..018)', () => {
     });
 
     assert.equal(res.isError, undefined, 'arc_repo_status must succeed with bounded response');
-    const body = parseResponse(res);
+    const actualMcpText = res.content[0].text;
+    const actualMcpBytes = Buffer.byteLength(actualMcpText, 'utf8');
 
-    // Validate 64 KiB bound (65,536 bytes)
-    const jsonBytes = Buffer.byteLength(JSON.stringify(body), 'utf8');
+    // Required acceptance: Buffer.byteLength(res.content[0].text, 'utf8') <= 65536
     assert.ok(
-      jsonBytes <= 64 * 1024,
-      `Response size (${jsonBytes} bytes) must be <= 64 KiB (65,536 bytes)`,
+      actualMcpBytes <= 64 * 1024,
+      `Actual MCP response byte length (${actualMcpBytes} bytes) must be <= 64 KiB (65,536 bytes)`,
     );
+
+    const body = JSON.parse(actualMcpText);
 
     // Explicit acceptance requirement from RC07-NEG-013
     assert.equal(body.truncated, true, 'Response must carry truncated: true');
@@ -686,5 +698,553 @@ describe('RC-07 Task 2: Discovery, Schema & Security Controls', () => {
       !content.includes('fs/promises'),
       'repo-worktree-status.ts must not import fs/promises',
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Defect 1: Declarative Policy Integration & No-Bypass Invariants
+// ---------------------------------------------------------------------------
+
+describe('RC-07 Task 2: Declarative Policy Integration & No-Bypass Invariants', () => {
+  test('built-in DeclarativePolicyEngine itself returns ALLOW for arc_repo_status', () => {
+    const registry = new WorkspaceRegistry();
+    registry.registerWorkspace('ws-test', mainRepoDir);
+    const engine = DeclarativePolicyEngine.builtIn(registry);
+
+    const decision = engine.evaluate({ toolName: 'arc_repo_status' });
+    assert.equal(decision.effect, 'ALLOW');
+    assert.equal(decision.matchingRuleId, 'builtin-allow-rc07-read-only');
+  });
+
+  test('built-in DeclarativePolicyEngine itself returns ALLOW for arc_worktree_status', () => {
+    const registry = new WorkspaceRegistry();
+    registry.registerWorkspace('ws-test', mainRepoDir);
+    const engine = DeclarativePolicyEngine.builtIn(registry);
+
+    const decision = engine.evaluate({ toolName: 'arc_worktree_status' });
+    assert.equal(decision.effect, 'ALLOW');
+    assert.equal(decision.matchingRuleId, 'builtin-allow-rc07-read-only');
+  });
+
+  test('RC07_TASK2_READ_ONLY_TOOLS contains exactly arc_repo_status and arc_worktree_status', () => {
+    assert.deepEqual(RC07_TASK2_READ_ONLY_TOOLS, ['arc_repo_status', 'arc_worktree_status']);
+  });
+
+  test('MCP server contains no tool-name-specific hard-coded ALLOW branch for Task 2', () => {
+    const mcpIndexPath = path.resolve('apps/mcp-server/src/index.ts');
+    const content = fs.readFileSync(mcpIndexPath, 'utf8');
+
+    // Assert that the old Layer 2 bypass branch was completely eliminated
+    assert.ok(
+      !content.includes("policyMode === 'BUILTIN' &&"),
+      "apps/mcp-server/src/index.ts must not special-case policyMode === 'BUILTIN'",
+    );
+    assert.ok(
+      !content.includes("matchingRuleId: 'builtin-allow-rc07-read-only'"),
+      'apps/mcp-server/src/index.ts must not synthesize builtin-allow-rc07-read-only directly',
+    );
+  });
+
+  test('an external DENY still denies arc_repo_status and arc_worktree_status', async () => {
+    const registry = new WorkspaceRegistry();
+    registry.registerWorkspace('ws-policy', mainRepoDir);
+    const procReg = new ProcessRegistry();
+    const terminal = new ControlledProcessRunner(procReg);
+    const audit = new AuditLogger();
+    const kernel = new SecurityKernel(registry, procReg);
+
+    const server = new ArcMcpServer(
+      registry,
+      kernel,
+      audit,
+      new FilesystemSubsystem(),
+      new GitSubsystem(),
+      {
+        transport: 'stdio',
+        policy: {
+          format: 'json',
+          sourceText: JSON.stringify({
+            version: '1.0',
+            workspaces: [{ id: 'ws-policy' }],
+            rules: [
+              {
+                id: 'deny-rc07-status-tools',
+                effect: 'DENY',
+                tools: ['arc_repo_status', 'arc_worktree_status'],
+              },
+            ],
+          }),
+        },
+      },
+      terminal,
+      procReg,
+      new ApprovalStateManager(),
+    );
+
+    const resRepo = await server.executeAuthenticatedToolCall(safeActor, 'arc_repo_status', {
+      workspaceId: 'ws-policy',
+    });
+    assert.equal(resRepo.isError, true);
+    assert.equal(parseResponse(resRepo).code, 'POLICY_DENIED');
+
+    const resWt = await server.executeAuthenticatedToolCall(safeActor, 'arc_worktree_status', {
+      workspaceId: 'ws-policy',
+    });
+    assert.equal(resWt.isError, true);
+    assert.equal(parseResponse(resWt).code, 'POLICY_DENIED');
+  });
+
+  test('an external REQUIRE_APPROVAL rule participates normally', async () => {
+    const registry = new WorkspaceRegistry();
+    registry.registerWorkspace('ws-policy', mainRepoDir);
+    const procReg = new ProcessRegistry();
+    const terminal = new ControlledProcessRunner(procReg);
+    const audit = new AuditLogger();
+    const kernel = new SecurityKernel(registry, procReg);
+
+    const server = new ArcMcpServer(
+      registry,
+      kernel,
+      audit,
+      new FilesystemSubsystem(),
+      new GitSubsystem(),
+      {
+        transport: 'stdio',
+        policy: {
+          format: 'json',
+          sourceText: JSON.stringify({
+            version: '1.0',
+            workspaces: [{ id: 'ws-policy' }],
+            rules: [
+              {
+                id: 'approval-required-repo-status',
+                effect: 'REQUIRE_APPROVAL',
+                tools: ['arc_repo_status'],
+              },
+            ],
+          }),
+        },
+      },
+      terminal,
+      procReg,
+      new ApprovalStateManager(),
+    );
+
+    const res = await server.executeAuthenticatedToolCall(safeActor, 'arc_repo_status', {
+      workspaceId: 'ws-policy',
+    });
+
+    assert.equal(res.isError, true, 'REQUIRE_APPROVAL rule must require approval');
+    const err = parseResponse(res);
+    assert.equal(err.code, 'APPROVAL_REQUIRED');
+  });
+
+  test('DENY precedence outranks REQUIRE_APPROVAL and ALLOW', async () => {
+    const registry = new WorkspaceRegistry();
+    registry.registerWorkspace('ws-policy', mainRepoDir);
+    const procReg = new ProcessRegistry();
+    const terminal = new ControlledProcessRunner(procReg);
+    const audit = new AuditLogger();
+    const kernel = new SecurityKernel(registry, procReg);
+
+    const server = new ArcMcpServer(
+      registry,
+      kernel,
+      audit,
+      new FilesystemSubsystem(),
+      new GitSubsystem(),
+      {
+        transport: 'stdio',
+        policy: {
+          format: 'json',
+          sourceText: JSON.stringify({
+            version: '1.0',
+            workspaces: [{ id: 'ws-policy' }],
+            rules: [
+              {
+                id: 'allow-status',
+                effect: 'ALLOW',
+                tools: ['arc_repo_status'],
+              },
+              {
+                id: 'require-approval-status',
+                effect: 'REQUIRE_APPROVAL',
+                tools: ['arc_repo_status'],
+              },
+              {
+                id: 'deny-status',
+                effect: 'DENY',
+                tools: ['arc_repo_status'],
+              },
+            ],
+          }),
+        },
+      },
+      terminal,
+      procReg,
+      new ApprovalStateManager(),
+    );
+
+    const res = await server.executeAuthenticatedToolCall(safeActor, 'arc_repo_status', {
+      workspaceId: 'ws-policy',
+    });
+
+    assert.equal(res.isError, true, 'DENY must outrank all other rules');
+    const err = parseResponse(res);
+    assert.equal(err.code, 'POLICY_DENIED');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Defect 2: 15-Second Aggregate Timeout & Immediate Subprocess Cancellation
+// ---------------------------------------------------------------------------
+
+class FakeSlowGitSubsystem extends GitSubsystem {
+  getStatusCalls = 0;
+  getLogCalls = 0;
+  operationsAfterCancellation = 0;
+  slowDelayMs = 200;
+
+  constructor() {
+    super();
+  }
+
+  async getStatus(workspaceRoot, request, options) {
+    this.getStatusCalls++;
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(resolve, this.slowDelayMs);
+      if (options?.signal) {
+        options.signal.addEventListener('abort', () => {
+          clearTimeout(timer);
+          reject(ArcError.executionTimeout('Command execution exceeded configured timeout.'));
+        });
+      }
+    });
+    return super.getStatus(workspaceRoot, request, options);
+  }
+
+  async getLog(workspaceRoot, request, options) {
+    if (options?.signal?.aborted) {
+      this.operationsAfterCancellation++;
+      throw ArcError.executionTimeout('Command execution exceeded configured timeout.');
+    }
+    this.getLogCalls++;
+    return super.getLog(workspaceRoot, request, options);
+  }
+}
+
+describe('RC-07 Task 2: 15-Second Aggregate Timeout & Cancellation Invariants', () => {
+  test('total Task-2 execution is bounded by the configured 15-second ceiling', () => {
+    assert.equal(
+      DEFAULT_TASK2_TIMEOUT_MS,
+      15000,
+      'Default Task-2 timeout ceiling must be exactly 15,000 ms',
+    );
+  });
+
+  test('deterministic aggregate timeout regression with FakeSlowGitSubsystem', async () => {
+    const registry = new WorkspaceRegistry();
+    registry.registerWorkspace('ws-timeout', mainRepoDir);
+    const procReg = new ProcessRegistry();
+    const terminal = new ControlledProcessRunner(procReg);
+    const audit = new AuditLogger();
+    const kernel = new SecurityKernel(registry, procReg);
+    const fakeSlowGit = new FakeSlowGitSubsystem();
+
+    const server = new ArcMcpServer(
+      registry,
+      kernel,
+      audit,
+      new FilesystemSubsystem(),
+      fakeSlowGit,
+      {
+        transport: 'stdio',
+        // Configure short test deadline (50ms) to keep CI fast while testing real aggregate timeout
+        task2TimeoutMs: 50,
+      },
+      terminal,
+      procReg,
+      new ApprovalStateManager(),
+    );
+
+    const startTime = Date.now();
+    const res = await server.executeAuthenticatedToolCall(safeActor, 'arc_repo_status', {
+      workspaceId: 'ws-timeout',
+    });
+    const elapsed = Date.now() - startTime;
+
+    // 1. Total execution time bounded by configured ceiling
+    assert.ok(
+      elapsed < 1000,
+      `Tool execution should terminate near the 50ms deadline, took ${elapsed}ms`,
+    );
+
+    // 2. Timeout produces frozen sanitized timeout outcome
+    assert.equal(res.isError, true, 'Timeout must produce error outcome');
+    const err = parseResponse(res);
+    assert.equal(err.code, 'EXECUTION_TIMEOUT');
+    assert.equal(err.message, 'Command execution exceeded configured timeout.');
+
+    // 3. No later Git operation continues after cancellation
+    assert.equal(
+      fakeSlowGit.getLogCalls,
+      0,
+      'gitSubsystem.getLog must NEVER be called after cancellation',
+    );
+    assert.equal(
+      fakeSlowGit.operationsAfterCancellation,
+      0,
+      'Zero operations should occur after cancellation',
+    );
+
+    // 4. Durable lifecycle remains truthful: execution status is 'TIMEOUT'
+    const records = audit.getRecords();
+    const terminalRecord = records[records.length - 1];
+    assert.ok(terminalRecord, 'Audit record must be logged');
+    assert.equal(
+      terminalRecord.execution.status,
+      'TIMEOUT',
+      'Truthful audit lifecycle status must be TIMEOUT',
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Defect 3: Exact MCP Payload Byte-Bounding (<= 65,536 bytes) & Multibyte Handling
+// ---------------------------------------------------------------------------
+
+describe('RC-07 Task 2: Response Bounding & Serialization Invariants', () => {
+  test('oversized commit message: actual res.content[0].text <= 65536 and truncated: true', async () => {
+    const { server } = createTestServer([{ id: 'ws-huge-msg', rootPath: hugeMessageRepoDir }]);
+    const res = await server.executeAuthenticatedToolCall(safeActor, 'arc_repo_status', {
+      workspaceId: 'ws-huge-msg',
+    });
+
+    assert.equal(res.isError, undefined);
+    const mcpText = res.content[0].text;
+    const byteLength = Buffer.byteLength(mcpText, 'utf8');
+
+    assert.ok(
+      byteLength <= 65536,
+      `Actual MCP response byte length (${byteLength}) must be <= 65,536 bytes`,
+    );
+
+    const data = JSON.parse(mcpText);
+    assert.equal(data.truncated, true);
+    assert.ok(data.headCommit.message.includes('[TRUNCATED]'));
+  });
+
+  test('oversized author field: actual res.content[0].text <= 65536 and truncated: true', async () => {
+    const registry = new WorkspaceRegistry();
+    registry.registerWorkspace('ws-author', mainRepoDir);
+    const procReg = new ProcessRegistry();
+    const terminal = new ControlledProcessRunner(procReg);
+    const audit = new AuditLogger();
+    const kernel = new SecurityKernel(registry, procReg);
+
+    class HugeAuthorGitSubsystem extends GitSubsystem {
+      async getLog(workspaceRoot, request, options) {
+        const res = await super.getLog(workspaceRoot, request, options);
+        if (res.commits.length > 0) {
+          res.commits[0].author = 'Alice Engineer '.repeat(6000); // ~90 KiB author field
+        }
+        return res;
+      }
+    }
+
+    const server = new ArcMcpServer(
+      registry,
+      kernel,
+      audit,
+      new FilesystemSubsystem(),
+      new HugeAuthorGitSubsystem(),
+      { transport: 'stdio' },
+      terminal,
+      procReg,
+      new ApprovalStateManager(),
+    );
+
+    const res = await server.executeAuthenticatedToolCall(safeActor, 'arc_repo_status', {
+      workspaceId: 'ws-author',
+    });
+
+    assert.equal(res.isError, undefined);
+    const mcpText = res.content[0].text;
+    const byteLength = Buffer.byteLength(mcpText, 'utf8');
+
+    assert.ok(
+      byteLength <= 65536,
+      `Actual MCP response byte length (${byteLength}) must be <= 65,536 bytes`,
+    );
+
+    const data = JSON.parse(mcpText);
+    assert.equal(data.truncated, true);
+    assert.ok(data.headCommit.author.includes('[TRUNCATED]'));
+  });
+
+  test('oversized worktree lockReason: actual res.content[0].text <= 65536 and truncated: true', async () => {
+    const registry = new WorkspaceRegistry();
+    registry.registerWorkspace('ws-locked', lockedWtDir);
+    const procReg = new ProcessRegistry();
+    const terminal = new ControlledProcessRunner(procReg);
+    const audit = new AuditLogger();
+    const kernel = new SecurityKernel(registry, procReg);
+
+    class HugeLockReasonGitSubsystem extends GitSubsystem {
+      async getWorktreeMetadata(workspaceRoot, options) {
+        const meta = await super.getWorktreeMetadata(workspaceRoot, options);
+        meta.lockReason = 'Deployment lock in progress: '.repeat(4000); // ~120 KiB lockReason
+        return meta;
+      }
+    }
+
+    const server = new ArcMcpServer(
+      registry,
+      kernel,
+      audit,
+      new FilesystemSubsystem(),
+      new HugeLockReasonGitSubsystem(),
+      { transport: 'stdio' },
+      terminal,
+      procReg,
+      new ApprovalStateManager(),
+    );
+
+    const res = await server.executeAuthenticatedToolCall(safeActor, 'arc_worktree_status', {
+      workspaceId: 'ws-locked',
+    });
+
+    assert.equal(res.isError, undefined);
+    const mcpText = res.content[0].text;
+    const byteLength = Buffer.byteLength(mcpText, 'utf8');
+
+    assert.ok(
+      byteLength <= 65536,
+      `Actual MCP response byte length (${byteLength}) must be <= 65,536 bytes`,
+    );
+
+    const data = JSON.parse(mcpText);
+    assert.equal(data.truncated, true);
+    assert.ok(data.lockReason.includes('[TRUNCATED]'));
+  });
+
+  test('multibyte UTF-8 boundary truncation safety', () => {
+    // 4-byte emojis, 3-byte Japanese characters, and 2-byte accented characters
+    const complexString = '🚀🌟🔥日本語テストéàü'.repeat(100);
+
+    for (let maxBytes = 1; maxBytes <= 200; maxBytes++) {
+      const truncated = truncateStringBytes(complexString, maxBytes);
+      const actualBytes = Buffer.byteLength(truncated, 'utf8');
+
+      assert.ok(
+        actualBytes <= maxBytes,
+        `Truncated byte length (${actualBytes}) must not exceed maxBytes (${maxBytes})`,
+      );
+      assert.ok(
+        !truncated.includes('\uFFFD'),
+        'Truncated string must never contain UTF-8 replacement character \\uFFFD',
+      );
+    }
+  });
+
+  test('boundRepoStatusResponse, boundWorktreeStatusResponse, and getMcpPayloadByteLength invariants', () => {
+    const rawRepo = {
+      workspaceId: 'ws-1',
+      branch: 'main',
+      headCommit: {
+        hash: 'abc',
+        message: 'hello',
+        author: 'dev',
+        date: '2026-01-01',
+      },
+      workingTree: {
+        clean: true,
+        staged: [],
+        unstaged: [],
+        untracked: [],
+      },
+      isClean: true,
+    };
+    const boundedRepo = boundRepoStatusResponse(rawRepo);
+    assert.equal(boundedRepo.isClean, true);
+    assert.ok(getMcpPayloadByteLength(boundedRepo) <= 65536);
+
+    const rawWt = {
+      workspaceId: 'ws-1',
+      worktreePath: '/tmp/wt',
+      headHash: 'abc',
+      branch: 'main',
+      isBare: false,
+      isLocked: false,
+      lockReason: null,
+      isPrunable: false,
+    };
+    const boundedWt = boundWorktreeStatusResponse(rawWt);
+    assert.equal(boundedWt.isBare, false);
+    assert.ok(getMcpPayloadByteLength(boundedWt) <= 65536);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Truthfulness Hardening: Git Failure Handling
+// ---------------------------------------------------------------------------
+
+describe('RC-07 Task 2: Truthful Git-Log & Repository Failure Handling', () => {
+  test('genuine empty repository condition produces clean status with empty HEAD metadata', async () => {
+    const emptyRepoDir = path.join(tempDir, 'empty_repo');
+    fs.mkdirSync(emptyRepoDir, { recursive: true });
+    runGit(['init', '-b', 'main'], emptyRepoDir);
+
+    const { server } = createTestServer([{ id: 'ws-empty', rootPath: emptyRepoDir }]);
+    const res = await server.executeAuthenticatedToolCall(safeActor, 'arc_repo_status', {
+      workspaceId: 'ws-empty',
+    });
+
+    assert.equal(res.isError, undefined, 'arc_repo_status should succeed on empty repository');
+    const data = parseResponse(res);
+    assert.equal(data.headCommit.hash, '', 'Empty repo must have blank commit hash');
+    assert.equal(data.headCommit.message, '', 'Empty repo must have blank commit message');
+    assert.equal(data.headCommit.author, '', 'Empty repo must have blank commit author');
+    assert.equal(data.isClean, true);
+  });
+
+  test('GitSubsystem failure during getLog when commit exists is NOT swallowed and fails closed', async () => {
+    const registry = new WorkspaceRegistry();
+    registry.registerWorkspace('ws-corrupt', mainRepoDir);
+    const procReg = new ProcessRegistry();
+    const terminal = new ControlledProcessRunner(procReg);
+    const audit = new AuditLogger();
+    const kernel = new SecurityKernel(registry, procReg);
+
+    class FailingLogGitSubsystem extends GitSubsystem {
+      async getLog(_workspaceRoot, _request, _options) {
+        throw ArcError.internalError('Corrupted Git commit object database.');
+      }
+    }
+
+    const server = new ArcMcpServer(
+      registry,
+      kernel,
+      audit,
+      new FilesystemSubsystem(),
+      new FailingLogGitSubsystem(),
+      { transport: 'stdio' },
+      terminal,
+      procReg,
+      new ApprovalStateManager(),
+    );
+
+    const res = await server.executeAuthenticatedToolCall(safeActor, 'arc_repo_status', {
+      workspaceId: 'ws-corrupt',
+    });
+
+    assert.equal(
+      res.isError,
+      true,
+      'GitSubsystem failure during getLog must fail closed and NOT be swallowed',
+    );
+    const err = parseResponse(res);
+    assert.equal(err.code, 'INTERNAL_ERROR');
+    assert.ok(err.message.includes('Corrupted Git commit object database'));
   });
 });

@@ -1622,6 +1622,11 @@ rules: []
             effect: 'REQUIRE_APPROVAL',
             tools: [...RC03_MUTATION_TOOLS],
           },
+          {
+            id: 'builtin-allow-rc07-read-only',
+            effect: 'ALLOW',
+            tools: ['arc_repo_status', 'arc_worktree_status'],
+          },
         ]),
       );
       assert.equal(
