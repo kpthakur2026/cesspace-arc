@@ -72,13 +72,37 @@ export function validateGitArgument(paramName: string, value: string | undefined
 }
 
 /**
- * Mask sensitive tokens in diff output.
+ * Mask sensitive tokens and private-key PEM blocks in diff output.
  */
 export function maskSensitiveDiff(diff: string): string {
-  return diff.replace(
-    /(AKIA[0-9A-Z]{16}|ghp_[a-zA-Z0-9]{36}|sk-[a-zA-Z0-9]{20,}|Bearer\s+[a-zA-Z0-9._-]+)/g,
-    '[REDACTED_SECRET]',
-  );
+  return maskSensitiveDiffWithCount(diff).diff;
+}
+
+/**
+ * Mask sensitive tokens and private-key PEM blocks in diff output,
+ * returning the sanitized diff and the count of masked blocks/tokens.
+ */
+export function maskSensitiveDiffWithCount(diff: string): { diff: string; maskedCount: number } {
+  let maskedCount = 0;
+
+  // 1. Mask private key blocks (RSA, EC, OPENSSH, PGP, PKCS, DSA, etc.)
+  // Matches both bare key blocks and git diff hunks with leading +/- markers
+  const privateKeyPattern =
+    /(?:^[+-]?\s*)?-----BEGIN\s+(?:[A-Z0-9_ -]+\s+)?PRIVATE\s+KEY(?:\s+BLOCK)?-----[\s\S]*?-----END\s+(?:[A-Z0-9_ -]+\s+)?PRIVATE\s+KEY(?:\s+BLOCK)?-----/gm;
+  let masked = diff.replace(privateKeyPattern, () => {
+    maskedCount++;
+    return '[REDACTED_SECRET]';
+  });
+
+  // 2. Mask sensitive API tokens, secret keys, and Bearer credentials
+  const tokenPattern =
+    /(AKIA[0-9A-Z]{16}|ghp_[a-zA-Z0-9]{36}|github_pat_[a-zA-Z0-9_]{22,}|sk-[a-zA-Z0-9_-]{20,}|Bearer\s+[a-zA-Z0-9._-]+)/g;
+  masked = masked.replace(tokenPattern, () => {
+    maskedCount++;
+    return '[REDACTED_SECRET]';
+  });
+
+  return { diff: masked, maskedCount };
 }
 
 /**
@@ -104,6 +128,17 @@ export function isSensitiveGitPath(filePath: string): boolean {
  * Purges file diff hunks belonging to sensitive files (even if tracked in git).
  */
 export function purgeSensitiveDiffBlocks(diff: string): string {
+  return purgeSensitiveDiffBlocksWithCount(diff).diff;
+}
+
+/**
+ * Purges file diff hunks belonging to sensitive files (even if tracked in git),
+ * returning the sanitized diff and the count of suppressed file hunks.
+ */
+export function purgeSensitiveDiffBlocksWithCount(diff: string): {
+  diff: string;
+  suppressedCount: number;
+} {
   const sensitivePatterns = [
     /(^|[/\\])\.env($|\..*)/i,
     /(^|[/\\])\.ssh([/\\]|$)/i,
@@ -119,6 +154,7 @@ export function purgeSensitiveDiffBlocks(diff: string): string {
 
   const blocks = diff.split(/(?=diff --git )/);
   const sanitizedBlocks: string[] = [];
+  let suppressedCount = 0;
 
   for (const block of blocks) {
     if (!block.startsWith('diff --git ')) {
@@ -130,13 +166,17 @@ export function purgeSensitiveDiffBlocks(diff: string): string {
     const isSensitive = sensitivePatterns.some((pattern) => pattern.test(firstLine));
 
     if (isSensitive) {
+      suppressedCount++;
       sanitizedBlocks.push(`${firstLine}\n[SENSITIVE FILE DIFF SUPPRESSED]\n`);
     } else {
       sanitizedBlocks.push(block);
     }
   }
 
-  return sanitizedBlocks.join('');
+  return {
+    diff: sanitizedBlocks.join(''),
+    suppressedCount,
+  };
 }
 
 /**
@@ -237,6 +277,28 @@ export interface GitExecutionOptions {
   timeoutMs?: number;
 }
 
+export interface GitReviewDiffOptions {
+  mode: 'staged' | 'unstaged' | 'target';
+  targetRevision?: string;
+  path?: string;
+  maxBytes?: number;
+}
+
+export interface GitReviewDiffFileSummary {
+  path: string;
+  status: 'modified' | 'added' | 'deleted' | 'renamed';
+  insertions: number;
+  deletions: number;
+}
+
+export interface GitReviewDiffResult {
+  diff: string;
+  truncated: boolean;
+  totalFilesChanged: number;
+  fileSummaries: GitReviewDiffFileSummary[];
+  sensitiveBlocksMasked: number;
+}
+
 /**
  * Interface definition for Sandboxed Git Subsystem.
  */
@@ -261,6 +323,11 @@ export interface IGitSubsystem {
     workspaceRoot: string,
     options?: GitExecutionOptions,
   ): Promise<WorktreeMetadata>;
+  getReviewDiff(
+    workspaceRoot: string,
+    options: GitReviewDiffOptions,
+    execOptions?: GitExecutionOptions,
+  ): Promise<GitReviewDiffResult>;
 }
 
 /**
@@ -908,6 +975,219 @@ export class GitSubsystem implements IGitSubsystem {
       lockReason,
       isDetached,
       headSha,
+    };
+  }
+
+  private parseFileSummaries(
+    nameStatusRaw: string,
+    numstatRaw: string,
+  ): GitReviewDiffFileSummary[] {
+    const nameEntries: Array<{
+      status: 'modified' | 'added' | 'deleted' | 'renamed';
+      path: string;
+      oldPath?: string;
+    }> = [];
+
+    const nsTokens = nameStatusRaw.split('\0');
+    let i = 0;
+    while (i < nsTokens.length) {
+      const token = nsTokens[i];
+      if (!token) {
+        i++;
+        continue;
+      }
+      const code = token.trim();
+      if (code.startsWith('R') || code.startsWith('C')) {
+        const oldPath = nsTokens[i + 1] || '';
+        const newPath = nsTokens[i + 2] || '';
+        nameEntries.push({
+          status: code.startsWith('R') ? 'renamed' : 'added',
+          oldPath,
+          path: newPath,
+        });
+        i += 3;
+      } else {
+        const path = nsTokens[i + 1] || '';
+        let status: 'modified' | 'added' | 'deleted' | 'renamed';
+        if (code.startsWith('A')) {
+          status = 'added';
+        } else if (code.startsWith('D')) {
+          status = 'deleted';
+        } else {
+          status = 'modified';
+        }
+        nameEntries.push({ status, path });
+        i += 2;
+      }
+    }
+
+    const numMap = new Map<string, { ins: number; dels: number }>();
+    const numTokens = numstatRaw.split('\0');
+    let j = 0;
+    while (j < numTokens.length) {
+      const token = numTokens[j];
+      if (!token) {
+        j++;
+        continue;
+      }
+      const tabParts = token.split('\t');
+      if (tabParts.length >= 2) {
+        const ins = tabParts[0] === '-' ? 0 : parseInt(tabParts[0], 10) || 0;
+        const dels = tabParts[1] === '-' ? 0 : parseInt(tabParts[1], 10) || 0;
+        if (tabParts.length >= 3 && tabParts[2] !== '') {
+          const path = tabParts.slice(2).join('\t');
+          numMap.set(path, { ins, dels });
+          j++;
+        } else {
+          // Rename or copy: next two tokens are oldPath and newPath
+          const newPath = numTokens[j + 2] || '';
+          numMap.set(newPath, { ins, dels });
+          j += 3;
+        }
+      } else {
+        j++;
+      }
+    }
+
+    const summaries: GitReviewDiffFileSummary[] = [];
+    for (const entry of nameEntries) {
+      if (!entry.path) continue;
+      // Filter out sensitive files so they never leak in metadata
+      if (isSensitiveGitPath(entry.path) || (entry.oldPath && isSensitiveGitPath(entry.oldPath))) {
+        continue;
+      }
+      const counts = numMap.get(entry.path) ?? { ins: 0, dels: 0 };
+      summaries.push({
+        path: entry.path,
+        status: entry.status,
+        insertions: counts.ins,
+        deletions: counts.dels,
+      });
+    }
+
+    return summaries;
+  }
+
+  public async getReviewDiff(
+    workspaceRoot: string,
+    options: GitReviewDiffOptions,
+    execOptions?: GitExecutionOptions,
+  ): Promise<GitReviewDiffResult> {
+    if (execOptions?.signal?.aborted) {
+      throw ArcError.executionTimeout('Command execution exceeded configured timeout.');
+    }
+
+    validateGitArgument('targetRevision', options.targetRevision);
+    validateGitArgument('path', options.path);
+
+    if (options.path && isSensitiveGitPath(options.path)) {
+      throw ArcError.accessDenied(
+        'Target diff path matches sensitive credential or system blacklist pattern.',
+      );
+    }
+
+    const baseArgs = ['diff', '--no-ext-diff', '--no-textconv'];
+    const mode = options.mode;
+
+    if (mode === 'staged') {
+      baseArgs.push('--cached');
+      if (options.targetRevision) {
+        baseArgs.push(options.targetRevision.trim());
+      }
+    } else if (mode === 'target') {
+      if (!options.targetRevision) {
+        throw ArcError.invalidRequestSchema("targetRevision is required in 'target' mode.");
+      }
+      baseArgs.push(options.targetRevision.trim());
+    } else if (mode === 'unstaged') {
+      if (options.targetRevision) {
+        throw ArcError.invalidRequestSchema(
+          "targetRevision is not supported in 'unstaged' mode.",
+          "Omit targetRevision for unstaged mode, or specify mode as 'staged' or 'target'.",
+        );
+      }
+    } else {
+      throw ArcError.invalidRequestSchema(`Unsupported mode: ${String(mode)}`);
+    }
+
+    const secretExcludes = [
+      ':(exclude)*.env*',
+      ':(exclude)*.pem',
+      ':(exclude)*.key',
+      ':(exclude)*.p12',
+      ':(exclude)*.pfx',
+      ':(exclude)*id_rsa*',
+      ':(exclude)*id_ed25519*',
+      ':(exclude).ssh/**',
+      ':(exclude).aws/**',
+      ':(exclude).gnupg/**',
+      ':(exclude).kube/**',
+    ];
+
+    const pathFilter = options.path ? options.path.trim() : '.';
+    const diffArgs = [...baseArgs, '--', pathFilter, ...secretExcludes];
+
+    // 1. Run git diff for full diff output
+    const { stdout: rawDiffStdout } = await this.runGit(
+      workspaceRoot,
+      diffArgs,
+      MAX_DIFF_BYTES * 2,
+      execOptions,
+    );
+
+    if (execOptions?.signal?.aborted) {
+      throw ArcError.executionTimeout('Command execution exceeded configured timeout.');
+    }
+
+    // 2. Run git diff --name-status -z -M and --numstat -z -M for structured file summaries
+    const nameStatusArgs = [
+      ...baseArgs,
+      '--name-status',
+      '-z',
+      '-M',
+      '--',
+      pathFilter,
+      ...secretExcludes,
+    ];
+    const { stdout: nameStatusStdout } = await this.runGit(
+      workspaceRoot,
+      nameStatusArgs,
+      undefined,
+      execOptions,
+    );
+
+    if (execOptions?.signal?.aborted) {
+      throw ArcError.executionTimeout('Command execution exceeded configured timeout.');
+    }
+
+    const numstatArgs = [...baseArgs, '--numstat', '-z', '-M', '--', pathFilter, ...secretExcludes];
+    const { stdout: numstatStdout } = await this.runGit(
+      workspaceRoot,
+      numstatArgs,
+      undefined,
+      execOptions,
+    );
+
+    // 3. Parse name-status -z and numstat -z
+    const fileSummaries = this.parseFileSummaries(nameStatusStdout, numstatStdout);
+
+    // 4. Defense-in-depth: purge sensitive file diff hunks and mask sensitive tokens/keys
+    const { diff: purgedDiff, suppressedCount } = purgeSensitiveDiffBlocksWithCount(rawDiffStdout);
+    const { diff: maskedDiff, maskedCount } = maskSensitiveDiffWithCount(purgedDiff);
+    const sensitiveBlocksMasked = suppressedCount + maskedCount;
+
+    // 5. Enforce requested maxBytes (bounded by MAX_DIFF_BYTES)
+    const maxBudget =
+      options.maxBytes !== undefined ? Math.min(options.maxBytes, MAX_DIFF_BYTES) : MAX_DIFF_BYTES;
+
+    const { text: boundedDiff, truncated } = truncateUtf8ToByteLimit(maskedDiff, maxBudget);
+
+    return {
+      diff: boundedDiff,
+      truncated,
+      totalFilesChanged: fileSummaries.length,
+      fileSummaries,
+      sensitiveBlocksMasked,
     };
   }
 }

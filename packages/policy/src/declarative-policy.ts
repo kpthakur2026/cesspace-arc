@@ -25,7 +25,7 @@ import {
   RC01_ALLOWED_TOOLS,
   RC03_MUTATION_TOOLS,
   ALL_POLICY_TOOLS,
-  RC07_TASK2_READ_ONLY_TOOLS,
+  RC07_READ_ONLY_TOOLS,
 } from './index.js';
 import {
   MAX_PATTERN_LENGTH,
@@ -993,7 +993,7 @@ function buildBuiltInDocument(): ParsedDocument {
       {
         id: 'builtin-allow-rc07-read-only',
         effect: 'ALLOW',
-        tools: [...RC07_TASK2_READ_ONLY_TOOLS],
+        tools: [...RC07_READ_ONLY_TOOLS],
       },
     ],
   };

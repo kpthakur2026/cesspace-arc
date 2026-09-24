@@ -386,3 +386,30 @@ export interface ArcWorktreeStatusResponse {
   headSha: string;
   truncated?: boolean;
 }
+
+export interface ArcReviewDiffRequest {
+  mode?: 'staged' | 'unstaged' | 'target';
+  targetRevision?: string;
+  path?: string;
+  maxBytes?: number;
+  workspaceId?: string;
+}
+
+export interface ArcReviewDiffFileSummary {
+  path: string;
+  status: 'modified' | 'added' | 'deleted' | 'renamed';
+  insertions: number;
+  deletions: number;
+}
+
+export interface ArcReviewDiffResponse {
+  mode: 'staged' | 'unstaged' | 'target';
+  targetRevision?: string;
+  pathFilter?: string;
+  diff: string;
+  bytes: number;
+  truncated: boolean;
+  totalFilesChanged: number;
+  fileSummaries: ArcReviewDiffFileSummary[];
+  sensitiveBlocksMasked: number;
+}

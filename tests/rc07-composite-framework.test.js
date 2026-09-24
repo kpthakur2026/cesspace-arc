@@ -1037,10 +1037,10 @@ describe('RC-07 Task 1: Static Architecture & Boundary Verification', () => {
     );
   });
 
-  test('Zero unowned RC-07 composite tools exposed in TOOL_SCHEMAS or production server list (Task 2: count 20)', async () => {
-    // None of the 5 remaining RC-07 composite tools should be in TOOL_SCHEMAS
+  test('Zero unowned RC-07 composite tools exposed in TOOL_SCHEMAS or production server list (Task 3: count 21)', async () => {
+    // None of the 4 remaining unowned RC-07 composite tools should be in TOOL_SCHEMAS
     const unownedTools = RC07_COMPOSITE_TOOLS.filter(
-      (t) => t !== 'arc_repo_status' && t !== 'arc_worktree_status',
+      (t) => t !== 'arc_repo_status' && t !== 'arc_worktree_status' && t !== 'arc_review_diff',
     );
     for (const tool of unownedTools) {
       assert.equal(TOOL_SCHEMAS[tool], undefined, `${tool} must not be exposed in TOOL_SCHEMAS`);
@@ -1052,8 +1052,18 @@ describe('RC-07 Task 1: Static Architecture & Boundary Verification', () => {
       assert.equal(toolNames.includes(tool), false, `${tool} must not be in ALL_TOOL_DEFINITIONS`);
     }
 
-    // Exact count in Task 2 is 20 (18 base + 2 Task 2 tools)
-    assert.equal(ALL_TOOL_DEFINITIONS.length, 20);
+    // Owned tools are present
+    assert.ok(
+      TOOL_SCHEMAS.arc_review_diff !== undefined,
+      'arc_review_diff must be in TOOL_SCHEMAS',
+    );
+    assert.ok(
+      toolNames.includes('arc_review_diff'),
+      'arc_review_diff must be in ALL_TOOL_DEFINITIONS',
+    );
+
+    // Exact count in Task 3 is 21 (18 base + 2 Task 2 tools + 1 Task 3 tool)
+    assert.equal(ALL_TOOL_DEFINITIONS.length, 21);
 
     const prodServer = createArcMcpServer({ transport: 'stdio' });
     assert.equal(prodServer.testCompositeHarness, undefined);

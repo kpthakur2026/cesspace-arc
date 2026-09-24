@@ -69,7 +69,8 @@ export type ArcErrorCode =
   | 'GIT_REPOSITORY_NOT_FOUND'
   | 'PATH_OUTSIDE_WORKSPACE'
   | 'SYMLINK_ESCAPE_DETECTED'
-  | 'WORKSPACE_UNREGISTERED';
+  | 'WORKSPACE_UNREGISTERED'
+  | 'INVALID_GIT_ARGUMENT';
 
 /**
  * Canonical structured error payload emitted across the control plane.
@@ -598,6 +599,21 @@ export class ArcError extends Error implements ArcErrorPayload {
       message,
       retryable: false,
       remediationHint: 'Provide an authorized registered workspaceId or workspaceRoot.',
+    });
+  }
+
+  public static invalidGitArgument(
+    message = 'Invalid Git argument provided.',
+    remediationHint?: string,
+  ): ArcError {
+    return new ArcError({
+      code: 'INVALID_GIT_ARGUMENT',
+      category: 'PROTOCOL',
+      message,
+      retryable: false,
+      remediationHint:
+        remediationHint ??
+        'Provide a valid Git revision or argument without leading dashes or shell metacharacters.',
     });
   }
 }

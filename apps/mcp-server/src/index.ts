@@ -85,6 +85,7 @@ import {
   handleArcWorktreeStatus,
   DEFAULT_TASK2_TIMEOUT_MS,
 } from './internal/repo-worktree-status.js';
+import { handleArcReviewDiff, DEFAULT_TASK3_TIMEOUT_MS } from './internal/review-diff.js';
 import {
   AuditLogger,
   computeSha256,
@@ -95,7 +96,7 @@ import {
   type AuditRuntime,
 } from '@cesspace-arc/audit';
 import { FilesystemSubsystem } from '@cesspace-arc/filesystem';
-import { GitSubsystem } from '@cesspace-arc/git';
+import { GitSubsystem, MAX_DIFF_BYTES } from '@cesspace-arc/git';
 import {
   ProcessRegistry,
   type IProcessLifecycleSink,
@@ -433,6 +434,15 @@ export const TOOL_SCHEMAS = {
     .object({
       workspaceId: WorkspaceIdSchema.optional(),
       workspaceRoot: WorkspaceRootSchema.optional(),
+    })
+    .strict(),
+  arc_review_diff: z
+    .object({
+      mode: z.enum(['staged', 'unstaged', 'target']).optional(),
+      targetRevision: z.string().min(1).max(256).optional(),
+      path: z.string().min(1).optional(),
+      maxBytes: z.number().int().positive().max(MAX_DIFF_BYTES).optional(),
+      workspaceId: WorkspaceIdSchema.optional(),
     })
     .strict(),
 } as const;
@@ -992,7 +1002,50 @@ export const RC07_TASK2_TOOL_DEFINITIONS: Tool[] = withArcApprovalSchemaOnTools(
 ]);
 
 /**
- * Authoritative complete list of all 20 registered tools (RC-01 + RC-02 + RC-03 + RC-07 Task 2).
+ * Definition of the 1 RC-07 Task-3 MCP Tool (review diff).
+ * Advertised as tool #21 in production tool discovery.
+ */
+export const RC07_TASK3_TOOL_DEFINITIONS: Tool[] = withArcApprovalSchemaOnTools([
+  {
+    name: 'arc_review_diff',
+    description:
+      'Provide a bounded, structured review diff for the active workspace, including changed file summaries, insertions/deletions, and automatic redaction of sensitive credentials and private keys.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        mode: {
+          type: 'string',
+          enum: ['staged', 'unstaged', 'target'],
+          description:
+            "Review diff mode ('staged', 'unstaged', or 'target'). Defaults to 'unstaged'.",
+        },
+        targetRevision: {
+          type: 'string',
+          description:
+            'Target Git revision to compare against (required in target mode, optional in staged mode).',
+        },
+        path: {
+          type: 'string',
+          description: 'Authorized workspace-relative path filter (optional).',
+        },
+        maxBytes: {
+          type: 'integer',
+          minimum: 1,
+          maximum: 524288,
+          description: 'Maximum diff payload size budget in bytes (up to 524,288 bytes / 512 KiB).',
+        },
+        workspaceId: {
+          type: 'string',
+          description: 'Authorized workspace identifier (optional).',
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+]);
+
+/**
+ * Authoritative complete list of all 21 registered tools (RC-01 + RC-02 + RC-03 + RC-07 Tasks 2 & 3).
  * Used directly by the ListTools handler.
  */
 export const ALL_TOOL_DEFINITIONS: Tool[] = withArcApprovalSchemaOnTools([
@@ -1000,6 +1053,7 @@ export const ALL_TOOL_DEFINITIONS: Tool[] = withArcApprovalSchemaOnTools([
   ...RC02_TOOL_DEFINITIONS,
   ...RC03_TOOL_DEFINITIONS,
   ...RC07_TASK2_TOOL_DEFINITIONS,
+  ...RC07_TASK3_TOOL_DEFINITIONS,
 ]);
 
 /**
@@ -1564,6 +1618,8 @@ export class ArcMcpServer implements IArcMcpServer {
   #deterministicRegistry: DeterministicExecutionRegistry;
   /** Aggregate execution timeout ceiling for Task-2 read-only tools. */
   #task2TimeoutMs: number;
+  /** Aggregate execution timeout ceiling for Task-3 read-only tools. */
+  #task3TimeoutMs: number;
 
   constructor(
     public readonly workspaceRegistry: WorkspaceRegistry,
@@ -1608,6 +1664,7 @@ export class ArcMcpServer implements IArcMcpServer {
   ) {
     this.#deterministicRegistry = createProductionDeterministicRegistry();
     this.#task2TimeoutMs = DEFAULT_TASK2_TIMEOUT_MS;
+    this.#task3TimeoutMs = DEFAULT_TASK3_TIMEOUT_MS;
     SERVER_INTERNAL_ACCESS.set(this, {
       setTestCompositeHarness: (harness) => {
         this.#testCompositeHarness = harness;
@@ -1640,6 +1697,25 @@ export class ArcMcpServer implements IArcMcpServer {
         this.#task2TimeoutMs = timeoutMs;
       },
       getTask2TimeoutMs: () => this.#task2TimeoutMs,
+      setTask3TimeoutMs: (timeoutMs: number) => {
+        if (
+          typeof timeoutMs !== 'number' ||
+          !Number.isFinite(timeoutMs) ||
+          Number.isNaN(timeoutMs)
+        ) {
+          throw new TypeError('Task-3 timeout must be a finite number.');
+        }
+        if (timeoutMs <= 0) {
+          throw new RangeError(`Task-3 timeout must be > 0 ms (got ${timeoutMs}).`);
+        }
+        if (timeoutMs > DEFAULT_TASK3_TIMEOUT_MS) {
+          throw new RangeError(
+            `Task-3 timeout cannot exceed frozen maximum of ${DEFAULT_TASK3_TIMEOUT_MS} ms (got ${timeoutMs}).`,
+          );
+        }
+        this.#task3TimeoutMs = timeoutMs;
+      },
+      getTask3TimeoutMs: () => this.#task3TimeoutMs,
     });
     // Transport mode is resolved once, at construction, and is immutable. A
     // remote configuration supplied alongside stdio is NOT activated.
@@ -2614,7 +2690,7 @@ export class ArcMcpServer implements IArcMcpServer {
           `Workspace '${String(validatedParams.workspaceId || validatedParams.workspaceRoot || '')}' is not registered in authorized workspaces.`,
         );
       } else if (
-        toolName === 'arc_repo_status' &&
+        (toolName === 'arc_repo_status' || toolName === 'arc_review_diff') &&
         (workspaceUnregistered || targetWorkspace.workspaceId === 'deny-unregistered-workspace')
       ) {
         arcErr = ArcError.gitRepositoryNotFound(
@@ -3538,6 +3614,23 @@ export class ArcMcpServer implements IArcMcpServer {
                 gitSubsystem: this.gitSubsystem,
                 filesystemSubsystem: this.filesystemSubsystem,
                 timeoutMs: this.#task2TimeoutMs,
+              });
+            });
+            break;
+          }
+
+          case 'arc_review_diff': {
+            result = await enterCompositeInvocation(toolName, async () => {
+              return await handleArcReviewDiff({
+                targetWorkspace: {
+                  workspaceId: targetWorkspace.workspaceId,
+                  rootPath: targetWorkspace.rootPath,
+                  isGitRepo: targetWorkspace.isGitRepo,
+                },
+                validatedParams,
+                gitSubsystem: this.gitSubsystem,
+                filesystemSubsystem: this.filesystemSubsystem,
+                timeoutMs: this.#task3TimeoutMs,
               });
             });
             break;

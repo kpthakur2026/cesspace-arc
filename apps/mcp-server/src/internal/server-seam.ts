@@ -18,6 +18,8 @@ export interface ServerInternalAccess {
   getDeterministicRegistry(): DeterministicExecutionRegistry;
   setTask2TimeoutMs(timeoutMs: number): void;
   getTask2TimeoutMs(): number;
+  setTask3TimeoutMs(timeoutMs: number): void;
+  getTask3TimeoutMs(): number;
 }
 
 export const SERVER_INTERNAL_ACCESS = new WeakMap<ArcMcpServer, ServerInternalAccess>();
@@ -36,4 +38,20 @@ export function getTask2TimeoutForTest(server: ArcMcpServer): number {
     throw new Error('Invalid ArcMcpServer instance: internal test access unavailable');
   }
   return access.getTask2TimeoutMs();
+}
+
+export function setTask3TimeoutForTest(server: ArcMcpServer, timeoutMs: number): void {
+  const access = SERVER_INTERNAL_ACCESS.get(server);
+  if (!access) {
+    throw new Error('Invalid ArcMcpServer instance: internal test access unavailable');
+  }
+  access.setTask3TimeoutMs(timeoutMs);
+}
+
+export function getTask3TimeoutForTest(server: ArcMcpServer): number {
+  const access = SERVER_INTERNAL_ACCESS.get(server);
+  if (!access) {
+    throw new Error('Invalid ArcMcpServer instance: internal test access unavailable');
+  }
+  return access.getTask3TimeoutMs();
 }

@@ -7,7 +7,7 @@ import {
   closeSync,
   type Stats,
 } from 'node:fs';
-import { resolve, normalize, sep, relative, join } from 'node:path';
+import { resolve, normalize, sep, relative, join, dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import {
   ArcError,
@@ -73,6 +73,7 @@ export interface IFilesystemSubsystem {
   moveFile(workspaceRoot: string, request: MoveFileRequest): Promise<MoveFileResponse>;
   applyPatch(workspaceRoot: string, request: ApplyPatchRequest): Promise<ApplyPatchResponse>;
   validateWorkspaceContainment(workspaceRoot: string, targetPath: string): Promise<string>;
+  validateReviewDiffPath(workspaceRoot: string, targetPath: string): Promise<string>;
 }
 
 /**
@@ -302,6 +303,106 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
       );
     }
     return canonicalTarget;
+  }
+
+  /**
+   * Validates a workspace-relative review diff path filter.
+   * Enforces RC07-NEG-021 (PATH_OUTSIDE_WORKSPACE on traversal escape like ../../etc/passwd),
+   * RC07-NEG-026 (blocking sensitive paths like .env and id_rsa with ACCESS_DENIED),
+   * and symlink escape detection.
+   * Correctly validates tracked files that may be deleted or missing from the working tree.
+   * Returns normalized workspace-relative filter path.
+   */
+  public async validateReviewDiffPath(
+    workspaceRoot: string,
+    requestedPath: string,
+  ): Promise<string> {
+    if (!requestedPath || typeof requestedPath !== 'string') {
+      throw ArcError.invalidRequestSchema('Path parameter is required and must be a string.');
+    }
+
+    const trimmed = requestedPath.trim();
+    if (trimmed.length === 0) {
+      throw ArcError.invalidRequestSchema('Path parameter must not be empty.');
+    }
+
+    // 1. Syntactic Null Byte & Traversal Pre-checks
+    if (trimmed.includes('\0')) {
+      throw ArcError.invalidPathChars('Path contains invalid null byte.');
+    }
+    if (/%2e%2e|%2f|%5c/i.test(trimmed)) {
+      throw ArcError.invalidPathChars('Path contains forbidden URL-encoded traversal characters.');
+    }
+    // RC07-NEG-021: directory traversal (..) rejected with PATH_OUTSIDE_WORKSPACE
+    if (/(^|[/\\])\.\.([/\\]|$)/.test(trimmed)) {
+      throw ArcError.pathOutsideWorkspace(
+        'Directory traversal (..) is forbidden in review diff path.',
+      );
+    }
+
+    // 2. Canonicalize Workspace Root
+    let canonicalRoot: string;
+    try {
+      canonicalRoot = realpathSync(resolve(workspaceRoot));
+    } catch {
+      throw ArcError.noWorkspaceConfigured('Workspace root directory does not exist.');
+    }
+
+    // 3. Workspace Root Join & Boundary Check
+    let candidatePath: string;
+    if (trimmed.startsWith('/') || /^[a-zA-Z]:\\/.test(trimmed)) {
+      const normRequested = normalize(resolve(trimmed));
+      if (normRequested !== canonicalRoot && !normRequested.startsWith(canonicalRoot + sep)) {
+        throw ArcError.pathOutsideWorkspace(
+          'Security violation: Path resides outside authorized workspace boundary.',
+        );
+      }
+      candidatePath = normRequested;
+    } else {
+      candidatePath = resolve(canonicalRoot, trimmed);
+    }
+
+    const norm = normalize(candidatePath);
+    if (norm !== canonicalRoot && !norm.startsWith(canonicalRoot + sep)) {
+      throw ArcError.pathOutsideWorkspace(
+        'Security violation: Path resides outside authorized workspace boundary.',
+      );
+    }
+
+    // 4. Symlink containment check for existing path components
+    let currentCheck = candidatePath;
+    while (currentCheck !== canonicalRoot && currentCheck.length >= canonicalRoot.length) {
+      try {
+        const resolvedCurrent = realpathSync(currentCheck);
+        if (resolvedCurrent !== canonicalRoot && !resolvedCurrent.startsWith(canonicalRoot + sep)) {
+          throw ArcError.symlinkEscapeDetected(
+            'Symlink resolves outside authorized workspace boundary.',
+          );
+        }
+        break; // Successfully verified nearest existing ancestor
+      } catch (err: unknown) {
+        const nodeErr = err as NodeJS.ErrnoException;
+        if (nodeErr.code === 'ENOENT') {
+          const parent = dirname(currentCheck);
+          if (parent === currentCheck) {
+            break;
+          }
+          currentCheck = parent;
+        } else {
+          throw ArcError.internalError('Filesystem path resolution failed.');
+        }
+      }
+    }
+
+    // 5. RC07-NEG-026: Blacklist & Sensitive Path Enforcement
+    const relFromRoot = relative(canonicalRoot, candidatePath);
+    if (isBlacklistedPath(candidatePath, relFromRoot) || isBlacklistedPath(trimmed)) {
+      throw ArcError.accessDenied(
+        'Access denied: Target path matches sensitive credential or system blacklist pattern.',
+      );
+    }
+
+    return relFromRoot.length > 0 ? relFromRoot : '.';
   }
 
   public async listDirectory(

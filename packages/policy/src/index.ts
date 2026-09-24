@@ -96,6 +96,23 @@ export const RC07_TASK2_READ_ONLY_TOOLS = ['arc_repo_status', 'arc_worktree_stat
 export type Rc07Task2ReadOnlyTool = (typeof RC07_TASK2_READ_ONLY_TOOLS)[number];
 
 /**
+ * The RC-07 Task-3 read-only engineering-aware review diff tool.
+ */
+export const RC07_TASK3_READ_ONLY_TOOLS = ['arc_review_diff'] as const;
+
+export type Rc07Task3ReadOnlyTool = (typeof RC07_TASK3_READ_ONLY_TOOLS)[number];
+
+/**
+ * The combined RC-07 read-only engineering-aware inspection tools (Tasks 2 & 3).
+ */
+export const RC07_READ_ONLY_TOOLS = [
+  ...RC07_TASK2_READ_ONLY_TOOLS,
+  ...RC07_TASK3_READ_ONLY_TOOLS,
+] as const;
+
+export type Rc07ReadOnlyTool = (typeof RC07_READ_ONLY_TOOLS)[number];
+
+/**
  * Canonical complete policy vocabulary including registered tools and frozen composite tools.
  */
 export const ALL_POLICY_TOOLS = [...RC03_REGISTERED_TOOLS, ...RC07_COMPOSITE_TOOLS] as const;
