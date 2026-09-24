@@ -1513,10 +1513,10 @@ describe('RC-07 Task 1: Authoritative Positive Acceptance Flows (RC07-FLOW-01, R
 });
 
 // ---------------------------------------------------------------------------
-// 8. Forward Security Corrections: Proofs A through H
+// 8. Forward Security Corrections: Proofs A through N
 // ---------------------------------------------------------------------------
 
-describe('RC-07 Task 1 Forward Security Corrections (Proofs A through H)', () => {
+describe('RC-07 Task 1 Forward Security Corrections (Proofs A through N)', () => {
   test('Proof A: Importing the public @cesspace-arc/terminal production surface cannot mint or retrieve an authorized deterministic executor', async () => {
     const terminalModule = await import('../packages/terminal/dist/index.js');
     assert.equal(terminalModule.createControlledProcessExecution, undefined);
@@ -1762,5 +1762,108 @@ describe('RC-07 Task 1 Forward Security Corrections (Proofs A through H)', () =>
 
     // ZERO processes registered in ProcessRegistry on direct execution bypass attempt
     assert.equal(procReg.listProcesses().length, 0);
+  });
+
+  test('Proof J: No RC-07 composite production module imports node:child_process, child_process, spawn, exec, execFile, or fork', () => {
+    const compositeFiles = [
+      'apps/mcp-server/src/composite-framework.ts',
+      'apps/mcp-server/src/internal/execution-authority.ts',
+    ];
+
+    for (const relPath of compositeFiles) {
+      const src = fs.readFileSync(path.join(process.cwd(), relPath), 'utf8');
+      assert.ok(
+        !src.includes("from 'child_process'"),
+        `${relPath} must not import from 'child_process'`,
+      );
+      assert.ok(
+        !src.includes("from 'node:child_process'"),
+        `${relPath} must not import from 'node:child_process'`,
+      );
+      assert.ok(
+        !src.includes('require("child_process")'),
+        `${relPath} must not require child_process`,
+      );
+      assert.ok(
+        !src.includes('require("node:child_process")'),
+        `${relPath} must not require node:child_process`,
+      );
+      assert.ok(!/\bspawn\s*\(/.test(src), `${relPath} must not invoke spawn() directly`);
+      assert.ok(!/\bexec\s*\(/.test(src), `${relPath} must not invoke exec() directly`);
+      assert.ok(!/\bexecFile\s*\(/.test(src), `${relPath} must not invoke execFile() directly`);
+      assert.ok(!/\bfork\s*\(/.test(src), `${relPath} must not invoke fork() directly`);
+    }
+  });
+
+  test('Proof K: apps/mcp-server/src/internal/execution-authority.ts does not directly spawn processes', () => {
+    const src = fs.readFileSync(
+      path.join(process.cwd(), 'apps/mcp-server/src/internal/execution-authority.ts'),
+      'utf8',
+    );
+    assert.ok(
+      !src.includes('child_process'),
+      'execution-authority.ts must not reference child_process',
+    );
+    assert.ok(!src.includes('spawn'), 'execution-authority.ts must not reference spawn');
+    assert.ok(
+      !src.includes('registerProcess'),
+      'execution-authority.ts must not call registerProcess directly',
+    );
+  });
+
+  test('Proof L: No RC-07 composite production module imports node:fs or node:fs/promises for workspace execution validation', () => {
+    const compositeFiles = [
+      'apps/mcp-server/src/composite-framework.ts',
+      'apps/mcp-server/src/internal/execution-authority.ts',
+    ];
+
+    for (const relPath of compositeFiles) {
+      const src = fs.readFileSync(path.join(process.cwd(), relPath), 'utf8');
+      assert.ok(!src.includes("from 'fs'"), `${relPath} must not import from 'fs'`);
+      assert.ok(!src.includes("from 'node:fs'"), `${relPath} must not import from 'node:fs'`);
+      assert.ok(
+        !src.includes("from 'fs/promises'"),
+        `${relPath} must not import from 'fs/promises'`,
+      );
+      assert.ok(
+        !src.includes("from 'node:fs/promises'"),
+        `${relPath} must not import from 'node:fs/promises'`,
+      );
+      assert.ok(!src.includes('existsSync'), `${relPath} must not use existsSync`);
+      assert.ok(!src.includes('realpathSync'), `${relPath} must not use realpathSync`);
+    }
+  });
+
+  test('Proof M: Deterministic execution still reaches ProcessRegistry through lower-level terminal machinery', async () => {
+    const testRegistry = createTestDeterministicRegistry();
+    const { server, processRegistry } = makeTestServer({
+      deterministicRegistry: testRegistry,
+      materializer: () => createDeterministicSafePlan('ws'),
+    });
+
+    // Run safe composite flow through full authoritative pipeline
+    const res = await server.executeAuthenticatedToolCall(safeActor, 'arc_verify', {});
+    assert.ok(!res.isError, 'Execution through server pipeline must succeed');
+
+    const body = parseResponse(res);
+    assert.equal(body.status, 'SUCCESS');
+    assert.ok(body.steps && body.steps.length === 1);
+    assert.equal(body.steps[0].stepId, 'step-01-node-version');
+    assert.equal(body.steps[0].status, 'PASSED');
+    assert.match(body.steps[0].stdout, /^v\d+\.\d+\.\d+/);
+
+    // ProcessRegistry was invoked through terminal machinery
+    const processes = processRegistry.listProcesses();
+    assert.equal(processes.length, 1);
+    assert.equal(processes[0].executable, 'node');
+    assert.equal(processes[0].state, 'COMPLETED');
+    assert.equal(processes[0].exitCode, 0);
+  });
+
+  test('Proof N: Non-public seam: public @cesspace-arc/terminal export does not expose execution seam token, executeDeterministicStepCore, or spawnAndControlProcess', async () => {
+    const terminalModule = await import('../packages/terminal/dist/index.js');
+    assert.equal(terminalModule.TERMINAL_EXECUTION_SEAM_TOKEN, undefined);
+    assert.equal(terminalModule.executeDeterministicStepCore, undefined);
+    assert.equal(terminalModule.spawnAndControlProcess, undefined);
   });
 });
