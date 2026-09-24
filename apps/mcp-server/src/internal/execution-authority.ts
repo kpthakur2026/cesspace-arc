@@ -6,6 +6,7 @@
  * @internal
  */
 
+import { type ChildProcess, spawn } from 'node:child_process';
 import { existsSync, realpathSync } from 'node:fs';
 import { basename, resolve, sep } from 'node:path';
 
@@ -25,10 +26,7 @@ import {
 } from '../composite-framework.js';
 
 export class ServerDeterministicExecutor implements IInternalDeterministicExecutor {
-  constructor(
-    private readonly runner: ControlledProcessRunner,
-    private readonly internalBrand: symbol,
-  ) {
+  constructor(private readonly runner: ControlledProcessRunner) {
     AUTHORIZED_INTERNAL_EXECUTORS.add(this);
   }
 
@@ -116,43 +114,129 @@ export class ServerDeterministicExecutor implements IInternalDeterministicExecut
       MAX_OUTPUT_READ_BYTES,
     );
 
-    const result = await this.runner._executeInternalStepCore(
-      {
-        workspaceId: targetWorkspace.workspaceId,
-        actor: {
-          clientId: actor.clientId,
-          clientType: actor.clientType,
-          sessionId: actor.sessionId,
-          deviceId: actor.deviceId,
-        },
-        resolvedExecutable,
-        rawExecutableName: step.executable,
-        args,
-        executionCwd,
-        env: sanitizedEnv,
-        timeoutMs,
-        outputLimitBytes: maxOutputBytes,
-        runInBackground: false,
+    const startTime = Date.now();
+    const record = this.runner.processRegistry.registerProcess({
+      workspaceId: targetWorkspace.workspaceId,
+      actor: {
+        clientId: actor.clientId,
+        clientType: actor.clientType || 'agent',
+        sessionId: actor.sessionId,
+        deviceId: actor.deviceId,
       },
-      this.internalBrand,
+      executable: step.executable,
+      sanitizedArgs: args,
+      cwd: executionCwd,
+      startedAt: new Date(startTime).toISOString(),
+      state: 'RUNNING',
+      timedOut: false,
+    });
+
+    let child: ChildProcess;
+    let spawnSucceeded = false;
+    try {
+      child = spawn(resolvedExecutable, args, {
+        cwd: executionCwd,
+        env: sanitizedEnv,
+        shell: false,
+        detached: process.platform !== 'win32',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+      record._child = child;
+
+      child.once('spawn', () => {
+        spawnSucceeded = true;
+        this.runner.processRegistry.notifySpawnSuccess(record.processId);
+      });
+    } catch (err: unknown) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      this.runner.processRegistry.markSpawnFailed(record.processId, errMsg);
+      throw ArcError.internalError(`Failed to spawn process: ${errMsg}`);
+    }
+
+    child.stdout?.on('data', (chunk: Buffer) => {
+      this.runner.processRegistry.appendOutput(record.processId, 'stdout', chunk);
+    });
+
+    child.stderr?.on('data', (chunk: Buffer) => {
+      this.runner.processRegistry.appendOutput(record.processId, 'stderr', chunk);
+    });
+
+    record._timeoutTimer = setTimeout(() => {
+      this.runner.processRegistry.markTimedOut(record.processId);
+      try {
+        if (child.pid && process.platform !== 'win32') {
+          process.kill(-child.pid, 'SIGTERM');
+        } else {
+          child.kill('SIGTERM');
+        }
+      } catch {
+        // ignore
+      }
+      record._killTimer = setTimeout(() => {
+        try {
+          if (child.exitCode === null && child.signalCode === null) {
+            if (child.pid && process.platform !== 'win32') {
+              process.kill(-child.pid, 'SIGKILL');
+            } else {
+              child.kill('SIGKILL');
+            }
+          }
+        } catch {
+          // ignore
+        }
+      }, 1000);
+      record._killTimer.unref();
+    }, timeoutMs);
+    record._timeoutTimer.unref();
+
+    child.on('close', (code, signal) => {
+      this.runner.processRegistry.markCompleted(record.processId, code, signal);
+    });
+
+    child.on('error', (err) => {
+      if (!spawnSucceeded) {
+        this.runner.processRegistry.markSpawnFailed(record.processId, err.message);
+      } else {
+        this.runner.processRegistry.markCompleted(record.processId, 1, null);
+      }
+    });
+
+    await new Promise<void>((resolvePromise) => {
+      child.on('close', () => resolvePromise());
+      child.on('error', () => resolvePromise());
+    });
+
+    const status = this.runner.processRegistry.getProcessStatus(record.processId, {
+      clientId: actor.clientId,
+      sessionId: actor.sessionId,
+      workspaceId: targetWorkspace.workspaceId,
+    });
+    const output = this.runner.processRegistry.getProcessOutput(
+      record.processId,
+      0,
+      maxOutputBytes,
+      {
+        clientId: actor.clientId,
+        sessionId: actor.sessionId,
+        workspaceId: targetWorkspace.workspaceId,
+      },
     );
 
     return {
       stepId: step.stepId,
-      processId: result.processId,
-      exitCode: result.exitCode,
-      signal: result.signal,
-      stdout: result.stdout,
-      stderr: result.stderr,
-      durationMs: result.durationMs,
-      timedOut: result.timedOut,
+      processId: record.processId,
+      exitCode: status.exitCode ?? null,
+      signal: (status.signal as NodeJS.Signals | null) ?? null,
+      stdout: output.stdoutChunk,
+      stderr: output.stderrChunk,
+      durationMs: status.durationMs,
+      timedOut: status.timedOut,
     };
   }
 }
 
 export function createServerDeterministicExecutor(
   runner: ControlledProcessRunner,
-  internalBrand: symbol,
 ): IInternalDeterministicExecutor {
-  return new ServerDeterministicExecutor(runner, internalBrand);
+  return new ServerDeterministicExecutor(runner);
 }

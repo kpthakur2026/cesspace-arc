@@ -203,14 +203,8 @@ function makeTestServer(options = {}) {
       processEvents.push(evt);
     },
   });
-  const internalBrand = Symbol('arc.test.internalBrand');
-  const terminalSubsystem = new ControlledProcessRunner(
-    processRegistry,
-    undefined,
-    undefined,
-    internalBrand,
-  );
-  const internalExecutor = createServerDeterministicExecutor(terminalSubsystem, internalBrand);
+  const terminalSubsystem = new ControlledProcessRunner(processRegistry);
+  const internalExecutor = createServerDeterministicExecutor(terminalSubsystem);
 
   const policyEffect = options.policyEffect ?? 'ALLOW';
   const policyRuleId = options.policyRuleId ?? 'test-rule-verify';
@@ -660,6 +654,8 @@ describe('RC-07 Task 1: Internal Execution Capability Gating', () => {
     const runner = new ControlledProcessRunner(new ProcessRegistry());
     assert.equal(typeof runner.getInternalExecutionCapability, 'undefined');
     assert.equal(typeof runner.executeDeterministicStep, 'undefined');
+    assert.equal(typeof runner._executeInternalStepCore, 'undefined');
+    assert.equal(typeof ControlledProcessRunner.prototype._executeInternalStepCore, 'undefined');
   });
 
   test('InternalExecutionCapability possesses no public .create() and constructor throws TypeError', () => {
@@ -670,9 +666,8 @@ describe('RC-07 Task 1: Internal Execution Capability Gating', () => {
   });
 
   test('Serialized/deserialized values fail authority check', () => {
-    const brand = Symbol('test-brand');
-    const runner = new ControlledProcessRunner(new ProcessRegistry(), undefined, undefined, brand);
-    const internalExecutor = createServerDeterministicExecutor(runner, brand);
+    const runner = new ControlledProcessRunner(new ProcessRegistry());
+    const internalExecutor = createServerDeterministicExecutor(runner);
     assert.equal(isAuthorizedDeterministicExecutor(internalExecutor), true);
 
     const serialized = JSON.stringify(internalExecutor);
@@ -1574,9 +1569,8 @@ describe('RC-07 Task 1 Forward Security Corrections (Proofs A through H)', () =>
       false,
     );
 
-    const brand = Symbol('test-brand');
-    const runner = new ControlledProcessRunner(new ProcessRegistry(), undefined, undefined, brand);
-    const validExecutor = createServerDeterministicExecutor(runner, brand);
+    const runner = new ControlledProcessRunner(new ProcessRegistry());
+    const validExecutor = createServerDeterministicExecutor(runner);
     assert.equal(isAuthorizedDeterministicExecutor(validExecutor), true);
 
     const deserialized = JSON.parse(JSON.stringify(validExecutor));
@@ -1604,10 +1598,9 @@ describe('RC-07 Task 1 Forward Security Corrections (Proofs A through H)', () =>
     );
 
     // 2. Direct executeCompositePlan call outside executeToolCallPipeline throws POLICY_DENIED
-    const brand = Symbol('test-brand');
     const procReg = new ProcessRegistry();
-    const runner = new ControlledProcessRunner(procReg, undefined, undefined, brand);
-    const executor = createServerDeterministicExecutor(runner, brand);
+    const runner = new ControlledProcessRunner(procReg);
+    const executor = createServerDeterministicExecutor(runner);
     const reg = createTestDeterministicRegistry();
     const safePlan = createDeterministicSafePlan('ws');
     const planHash = computePlanHash(safePlan);
@@ -1639,9 +1632,8 @@ describe('RC-07 Task 1 Forward Security Corrections (Proofs A through H)', () =>
       },
     });
 
-    const brand = Symbol('test-brand');
-    const runner = new ControlledProcessRunner(procReg, undefined, undefined, brand);
-    const executor = createServerDeterministicExecutor(runner, brand);
+    const runner = new ControlledProcessRunner(procReg);
+    const executor = createServerDeterministicExecutor(runner);
     const safePlan = createDeterministicSafePlan('ws');
     const planHash = computePlanHash(safePlan);
 
@@ -1733,5 +1725,42 @@ describe('RC-07 Task 1 Forward Security Corrections (Proofs A through H)', () =>
     // Harness must not exist
     const access = SERVER_INTERNAL_ACCESS.get(server);
     assert.equal(access.getTestCompositeHarness(), undefined);
+  });
+
+  test('Proof I: ControlledProcessRunner caller-supplied authority path and public callable _executeInternalStepCore are eliminated (direct runtime bypass regression)', async () => {
+    const procReg = new ProcessRegistry();
+    // 1. Caller passing 4th argument to ControlledProcessRunner constructor establishes no authority path
+    const fakeBrand = Symbol('fakeBrand');
+    const runner = new ControlledProcessRunner(procReg, undefined, undefined, fakeBrand);
+    assert.equal(runner._executeInternalStepCore, undefined);
+    assert.equal(ControlledProcessRunner.prototype._executeInternalStepCore, undefined);
+    assert.equal(Object.getOwnPropertySymbols(runner).length, 0);
+
+    // 2. Direct runtime bypass attempt on ServerDeterministicExecutor without admission ticket fails closed
+    const executor = createServerDeterministicExecutor(runner);
+    assert.ok(isAuthorizedDeterministicExecutor(executor));
+
+    await assert.rejects(
+      async () => {
+        await executor.executeDeterministicStep(
+          {
+            stepId: 'step-bypass',
+            executable: 'node',
+            args: ['-v'],
+            sideEffectClass: 'READ_ONLY',
+            projectCodeExecution: false,
+          },
+          safeActor,
+          { workspaceId: 'ws', rootPath: workspaceDir },
+        );
+      },
+      (err) =>
+        err instanceof ArcError &&
+        err.code === 'POLICY_DENIED' &&
+        err.message.includes('requires active server admission ticket'),
+    );
+
+    // ZERO processes registered in ProcessRegistry on direct execution bypass attempt
+    assert.equal(procReg.listProcesses().length, 0);
   });
 });

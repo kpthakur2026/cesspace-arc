@@ -359,7 +359,7 @@ export interface IInternalDeterministicExecutor {
   ): Promise<DeterministicStepResult>;
 }
 
-export interface InternalProcessExecutionSpec {
+interface InternalProcessExecutionSpec {
   workspaceId: string;
   actor: {
     clientId: string;
@@ -377,7 +377,7 @@ export interface InternalProcessExecutionSpec {
   runInBackground?: boolean;
 }
 
-export interface InternalProcessExecutionResult {
+interface InternalProcessExecutionResult {
   processId: string;
   state: 'RUNNING' | 'COMPLETED' | 'FAILED' | 'TERMINATED' | 'TIMED_OUT';
   exitCode: number | null;
@@ -389,30 +389,11 @@ export interface InternalProcessExecutionResult {
 }
 
 export class ControlledProcessRunner implements ITerminalSubsystem {
-  readonly #internalBrand?: symbol;
-
   constructor(
     public readonly processRegistry: ProcessRegistry,
     public readonly commandPolicy: ICommandPolicy = new CommandPolicy(),
     public readonly executableResolver: IExecutableResolver = new ExecutableResolver(),
-    internalBrand?: symbol,
-  ) {
-    this.#internalBrand = internalBrand;
-  }
-
-  /**
-   * Internal bridge for authorized executor to enter the shared private process core.
-   * Throws if the unexported brand symbol does not match the instance brand.
-   */
-  public async _executeInternalStepCore(
-    spec: InternalProcessExecutionSpec,
-    brand: symbol,
-  ): Promise<InternalProcessExecutionResult> {
-    if (!this.#internalBrand || brand !== this.#internalBrand) {
-      throw ArcError.forbiddenCommand('Access denied: unauthorized internal execution core call.');
-    }
-    return this.#spawnAndControlProcess(spec);
-  }
+  ) {}
 
   public async executeCommand(
     request: RunCommandRequest,

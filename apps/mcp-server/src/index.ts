@@ -4101,14 +4101,8 @@ export function createArcMcpServer(config?: Partial<ArcServerConfig>): ArcMcpSer
   const auditLogger = new AuditLogger();
   const filesystemSubsystem = new FilesystemSubsystem();
   const gitSubsystem = new GitSubsystem();
-  const internalBrand = Symbol('arc.server.internalExecutionBrand');
-  const terminalSubsystem = new ControlledProcessRunner(
-    processRegistry,
-    undefined,
-    undefined,
-    internalBrand,
-  );
-  const internalExecutor = createServerDeterministicExecutor(terminalSubsystem, internalBrand);
+  const terminalSubsystem = new ControlledProcessRunner(processRegistry);
+  const internalExecutor = createServerDeterministicExecutor(terminalSubsystem);
 
   const approvalStateManager = new ApprovalStateManager();
 
