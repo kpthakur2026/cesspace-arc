@@ -14,16 +14,26 @@ import {
   ALL_TOOL_DEFINITIONS,
 } from '../apps/mcp-server/dist/index.js';
 import {
-  createTestCompositeHarness,
   computePlanHash,
   deepFreezePlan,
   validateStepExecutionAgainstPlan,
   validateStepAgainstRegistry,
   enterCompositeInvocation,
   createProductionDeterministicRegistry,
+  DeterministicExecutionRegistry,
+  executeCompositePlan,
+  isAuthorizedDeterministicExecutor,
+} from '../apps/mcp-server/dist/composite-framework.js';
+import {
+  createTestCompositeHarness,
   createTestDeterministicRegistry,
   TEST_NODE_VERSION_REGISTRY_ID,
-} from '../apps/mcp-server/dist/composite-framework.js';
+  attachTestCompositeHarness,
+  getInternalExecutorForTest,
+  getDeterministicRegistryForTest,
+} from '../apps/mcp-server/dist/internal/composite-testing.js';
+import { createServerDeterministicExecutor } from '../apps/mcp-server/dist/internal/execution-authority.js';
+import { SERVER_INTERNAL_ACCESS } from '../apps/mcp-server/dist/internal/server-seam.js';
 import { buildPayloadToSign, buildReviewPayload } from '../apps/mcp-server/dist/approval-gate.js';
 import {
   ApprovalStateManager,
@@ -35,8 +45,6 @@ import {
 import {
   ControlledProcessRunner,
   InternalExecutionCapability,
-  createControlledProcessExecution,
-  isAuthorizedDeterministicExecutor,
 } from '../packages/terminal/dist/index.js';
 import { ProcessRegistry } from '../packages/processes/dist/index.js';
 import { AuditLogger } from '../packages/audit/dist/index.js';
@@ -195,7 +203,14 @@ function makeTestServer(options = {}) {
       processEvents.push(evt);
     },
   });
-  const { terminalSubsystem, internalExecutor } = createControlledProcessExecution(processRegistry);
+  const internalBrand = Symbol('arc.test.internalBrand');
+  const terminalSubsystem = new ControlledProcessRunner(
+    processRegistry,
+    undefined,
+    undefined,
+    internalBrand,
+  );
+  const internalExecutor = createServerDeterministicExecutor(terminalSubsystem, internalBrand);
 
   const policyEffect = options.policyEffect ?? 'ALLOW';
   const policyRuleId = options.policyRuleId ?? 'test-rule-verify';
@@ -261,10 +276,20 @@ function makeTestServer(options = {}) {
     adminIpcServer,
     undefined,
     undefined,
-    harness,
-    options.omitInternalExecutor ? undefined : internalExecutor,
-    options.deterministicRegistry,
   );
+
+  if (!options.omitHarness) {
+    attachTestCompositeHarness(server, harness);
+  }
+  const access = SERVER_INTERNAL_ACCESS.get(server);
+  if (!options.omitInternalExecutor) {
+    access?.setInternalDeterministicExecutor(internalExecutor);
+  } else {
+    access?.setInternalDeterministicExecutor(undefined);
+  }
+  if (options.deterministicRegistry) {
+    access?.setDeterministicRegistry(options.deterministicRegistry);
+  }
 
   return {
     server,
@@ -645,7 +670,9 @@ describe('RC-07 Task 1: Internal Execution Capability Gating', () => {
   });
 
   test('Serialized/deserialized values fail authority check', () => {
-    const { internalExecutor } = createControlledProcessExecution(new ProcessRegistry());
+    const brand = Symbol('test-brand');
+    const runner = new ControlledProcessRunner(new ProcessRegistry(), undefined, undefined, brand);
+    const internalExecutor = createServerDeterministicExecutor(runner, brand);
     assert.equal(isAuthorizedDeterministicExecutor(internalExecutor), true);
 
     const serialized = JSON.stringify(internalExecutor);
@@ -829,13 +856,8 @@ describe('RC-07 Task 1: Real Policy Integration (SecurityKernel & DeclarativePol
         },
       },
       runner,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      undefined,
-      harness,
     );
+    attachTestCompositeHarness(server, harness);
 
     await server.executeAuthenticatedToolCall(safeActor, 'arc_verify', {});
     assert.equal(kernelInvoked, true, 'SecurityKernel.evaluateComposite must be invoked');
@@ -1492,5 +1514,224 @@ describe('RC-07 Task 1: Authoritative Positive Acceptance Flows (RC07-FLOW-01, R
         `Hash chain broken at index ${i}`,
       );
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 8. Forward Security Corrections: Proofs A through H
+// ---------------------------------------------------------------------------
+
+describe('RC-07 Task 1 Forward Security Corrections (Proofs A through H)', () => {
+  test('Proof A: Importing the public @cesspace-arc/terminal production surface cannot mint or retrieve an authorized deterministic executor', async () => {
+    const terminalModule = await import('../packages/terminal/dist/index.js');
+    assert.equal(terminalModule.createControlledProcessExecution, undefined);
+    assert.equal(terminalModule.isAuthorizedDeterministicExecutor, undefined);
+    assert.equal(terminalModule.INTERNAL_EXEC_BRAND, undefined);
+
+    const runner = new terminalModule.ControlledProcessRunner(new ProcessRegistry());
+    assert.equal(isAuthorizedDeterministicExecutor(runner), false);
+    for (const key of Object.keys(terminalModule)) {
+      assert.equal(
+        typeof terminalModule[key] === 'function' &&
+          terminalModule[key].name === 'createControlledProcessExecution',
+        false,
+      );
+    }
+  });
+
+  test('Proof B: The old createControlledProcessExecution-style authority minting route is no longer publicly usable', async () => {
+    const terminalModule = await import('../packages/terminal/dist/index.js');
+    assert.equal(typeof terminalModule.createControlledProcessExecution, 'undefined');
+    assert.throws(() => {
+      // Calling nonexistent minting function
+      terminalModule.createControlledProcessExecution();
+    }, TypeError);
+  });
+
+  test('Proof C: Plain objects, symbols, serialization/deserialization, prototype tricks, or structurally matching objects still fail authority checks', () => {
+    assert.equal(isAuthorizedDeterministicExecutor(null), false);
+    assert.equal(isAuthorizedDeterministicExecutor(undefined), false);
+    assert.equal(isAuthorizedDeterministicExecutor({}), false);
+    assert.equal(
+      isAuthorizedDeterministicExecutor({ executeDeterministicStep: async () => ({}) }),
+      false,
+    );
+    assert.equal(isAuthorizedDeterministicExecutor(Object.create(null)), false);
+    assert.equal(
+      isAuthorizedDeterministicExecutor(
+        Object.create({ executeDeterministicStep: async () => ({}) }),
+      ),
+      false,
+    );
+    assert.equal(
+      isAuthorizedDeterministicExecutor({
+        [Symbol.for('arc.terminal.internalExecutionBrand')]: true,
+      }),
+      false,
+    );
+    assert.equal(
+      isAuthorizedDeterministicExecutor({ [Symbol('arc.terminal.internalExecutionBrand')]: true }),
+      false,
+    );
+
+    const brand = Symbol('test-brand');
+    const runner = new ControlledProcessRunner(new ProcessRegistry(), undefined, undefined, brand);
+    const validExecutor = createServerDeterministicExecutor(runner, brand);
+    assert.equal(isAuthorizedDeterministicExecutor(validExecutor), true);
+
+    const deserialized = JSON.parse(JSON.stringify(validExecutor));
+    assert.equal(isAuthorizedDeterministicExecutor(deserialized), false);
+  });
+
+  test('Proof D: Arbitrary production importers cannot construct a custom deterministic registry and invoke privileged execution outside executeToolCallPipeline', async () => {
+    // 1. Constructing registry with unapproved entry throws POLICY_DENIED
+    assert.throws(
+      () => {
+        new DeterministicExecutionRegistry([
+          {
+            registryId: 'unauthorized-tool',
+            executable: 'bash',
+            permittedArgvTemplate: ['-c', 'id'],
+            sideEffectClass: 'READ_ONLY',
+            projectCodeExecution: false,
+            timeoutCeilingMs: 5000,
+            maxOutputBytesCeiling: 1024,
+            allowCwdSubdirectory: false,
+          },
+        ]);
+      },
+      (err) => err instanceof ArcError && err.code === 'POLICY_DENIED',
+    );
+
+    // 2. Direct executeCompositePlan call outside executeToolCallPipeline throws POLICY_DENIED
+    const brand = Symbol('test-brand');
+    const procReg = new ProcessRegistry();
+    const runner = new ControlledProcessRunner(procReg, undefined, undefined, brand);
+    const executor = createServerDeterministicExecutor(runner, brand);
+    const reg = createTestDeterministicRegistry();
+    const safePlan = createDeterministicSafePlan('ws');
+    const planHash = computePlanHash(safePlan);
+
+    await assert.rejects(
+      async () => {
+        await executeCompositePlan({
+          plan: safePlan,
+          admittedPlanHash: planHash,
+          actor: safeActor,
+          targetWorkspace: { workspaceId: 'ws', rootPath: workspaceDir },
+          internalExecutor: executor,
+          registry: reg,
+        });
+      },
+      (err) =>
+        err instanceof ArcError &&
+        err.code === 'POLICY_DENIED' &&
+        err.message.includes('outside authoritative pipeline'),
+    );
+  });
+
+  test('Proof E: A direct attempt to invoke any remaining exported composite helper without trusted server-owned authority performs ZERO ProcessRegistry registration and ZERO spawn', async () => {
+    const procReg = new ProcessRegistry();
+    const processEvents = [];
+    procReg.registerLifecycleSink({
+      onProcessEvent(evt) {
+        processEvents.push(evt);
+      },
+    });
+
+    const brand = Symbol('test-brand');
+    const runner = new ControlledProcessRunner(procReg, undefined, undefined, brand);
+    const executor = createServerDeterministicExecutor(runner, brand);
+    const safePlan = createDeterministicSafePlan('ws');
+    const planHash = computePlanHash(safePlan);
+
+    // Initial count
+    assert.equal(procReg.listProcesses().length, 0);
+    assert.equal(processEvents.length, 0);
+
+    // Direct invocation without admission context fails closed
+    await assert.rejects(
+      async () => {
+        await executeCompositePlan({
+          plan: safePlan,
+          admittedPlanHash: planHash,
+          actor: safeActor,
+          targetWorkspace: { workspaceId: 'ws', rootPath: workspaceDir },
+          internalExecutor: executor,
+          registry: createTestDeterministicRegistry(),
+        });
+      },
+      (err) => err instanceof ArcError && err.code === 'POLICY_DENIED',
+    );
+
+    // Must perform ZERO process registration and ZERO spawn
+    assert.equal(procReg.listProcesses().length, 0);
+    assert.equal(processEvents.length, 0);
+  });
+
+  test('Proof F: Test-only harness construction/injection is not reachable from the production-importable surface', async () => {
+    const mcpModule = await import('../apps/mcp-server/dist/index.js');
+    assert.equal(mcpModule.TEST_COMPOSITE_HARNESS_TOKEN, undefined);
+    assert.equal(mcpModule.createTestCompositeHarness, undefined);
+    assert.equal(mcpModule.createTestDeterministicRegistry, undefined);
+    assert.equal(mcpModule.attachTestCompositeHarness, undefined);
+    assert.equal(mcpModule.SERVER_INTERNAL_ACCESS, undefined);
+    assert.equal(mcpModule.isAuthorizedDeterministicExecutor, undefined);
+    assert.equal(mcpModule.executeCompositePlan, undefined);
+
+    // ArcMcpServer constructor has arity that does not accept harness
+    const reg = new WorkspaceRegistry();
+    reg.registerWorkspace('ws', workspaceDir);
+    const server = new mcpModule.ArcMcpServer(
+      reg,
+      new SecurityKernel(reg),
+      new AuditLogger(),
+      new FilesystemSubsystem(),
+      new GitSubsystem(),
+      { transport: 'stdio', defaultWorkspaceId: 'ws' },
+      new ControlledProcessRunner(new ProcessRegistry()),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      // Attempting to pass harness as 13th arg
+      { fakeHarness: true },
+    );
+    // Server does NOT install fake harness
+    const fakeResp = await server.executeAuthenticatedToolCall(safeActor, 'arc_verify', {});
+    assert.equal(fakeResp.isError, true);
+  });
+
+  test('Proof G: Production createArcMcpServer still constructs and holds exactly the intended execution authority internally and uses createProductionDeterministicRegistry()', async () => {
+    const server = createArcMcpServer({
+      transport: 'stdio',
+      authorizedRoots: [{ id: 'ws', path: workspaceDir }],
+      defaultWorkspaceId: 'ws',
+    });
+
+    const reg = getDeterministicRegistryForTest(server);
+    assert.ok(reg instanceof DeterministicExecutionRegistry);
+    assert.equal(reg.listEntryIds().length, 0); // Task 1 production registry has 0 entries
+
+    const executor = getInternalExecutorForTest(server);
+    assert.ok(executor);
+    assert.equal(isAuthorizedDeterministicExecutor(executor), true);
+  });
+
+  test('Proof H: Production factory never installs the test registry/harness', async () => {
+    const server = createArcMcpServer({
+      transport: 'stdio',
+      authorizedRoots: [{ id: 'ws', path: workspaceDir }],
+      defaultWorkspaceId: 'ws',
+    });
+
+    // The test node entry must NOT be present
+    const reg = getDeterministicRegistryForTest(server);
+    assert.equal(reg.hasEntry(TEST_NODE_VERSION_REGISTRY_ID), false);
+
+    // Harness must not exist
+    const access = SERVER_INTERNAL_ACCESS.get(server);
+    assert.equal(access.getTestCompositeHarness(), undefined);
   });
 });

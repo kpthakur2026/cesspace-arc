@@ -309,12 +309,6 @@ export interface ITerminalSubsystem {
   ): Promise<TerminateProcessResponse>;
 }
 
-/** Module-private brand for internal execution core invocation. */
-const INTERNAL_EXEC_BRAND = Symbol('arc.terminal.internalExecutionBrand');
-
-/** Set of runtime-authorized internal deterministic executors. */
-const AUTHORIZED_EXECUTORS = new WeakSet<object>();
-
 /**
  * Type-level representation of the non-forgeable internal execution authority.
  * Deliberately possesses no public factory (.create()) or constructible API.
@@ -365,16 +359,7 @@ export interface IInternalDeterministicExecutor {
   ): Promise<DeterministicStepResult>;
 }
 
-/**
- * Runtime check verifying whether an object is an authorized internal executor.
- */
-export function isAuthorizedDeterministicExecutor(
-  candidate: unknown,
-): candidate is IInternalDeterministicExecutor {
-  return typeof candidate === 'object' && candidate !== null && AUTHORIZED_EXECUTORS.has(candidate);
-}
-
-interface InternalProcessExecutionSpec {
+export interface InternalProcessExecutionSpec {
   workspaceId: string;
   actor: {
     clientId: string;
@@ -392,7 +377,7 @@ interface InternalProcessExecutionSpec {
   runInBackground?: boolean;
 }
 
-interface InternalProcessExecutionResult {
+export interface InternalProcessExecutionResult {
   processId: string;
   state: 'RUNNING' | 'COMPLETED' | 'FAILED' | 'TERMINATED' | 'TIMED_OUT';
   exitCode: number | null;
@@ -404,21 +389,26 @@ interface InternalProcessExecutionResult {
 }
 
 export class ControlledProcessRunner implements ITerminalSubsystem {
+  readonly #internalBrand?: symbol;
+
   constructor(
     public readonly processRegistry: ProcessRegistry,
     public readonly commandPolicy: ICommandPolicy = new CommandPolicy(),
     public readonly executableResolver: IExecutableResolver = new ExecutableResolver(),
-  ) {}
+    internalBrand?: symbol,
+  ) {
+    this.#internalBrand = internalBrand;
+  }
 
   /**
    * Internal bridge for authorized executor to enter the shared private process core.
-   * Throws if the unexported brand symbol does not match.
+   * Throws if the unexported brand symbol does not match the instance brand.
    */
   public async _executeInternalStepCore(
     spec: InternalProcessExecutionSpec,
     brand: symbol,
   ): Promise<InternalProcessExecutionResult> {
-    if (brand !== INTERNAL_EXEC_BRAND) {
+    if (!this.#internalBrand || brand !== this.#internalBrand) {
       throw ArcError.forbiddenCommand('Access denied: unauthorized internal execution core call.');
     }
     return this.#spawnAndControlProcess(spec);
@@ -798,138 +788,4 @@ export class ControlledProcessRunner implements ITerminalSubsystem {
       workspaceId: targetWorkspace?.workspaceId,
     });
   }
-}
-
-/**
- * Concrete implementation of the internal deterministic execution authority.
- * Branded in the module-private WeakSet at construction.
- */
-class InternalDeterministicExecutorImpl implements IInternalDeterministicExecutor {
-  constructor(private readonly runner: ControlledProcessRunner) {
-    AUTHORIZED_EXECUTORS.add(this);
-  }
-
-  public async executeDeterministicStep(
-    step: DeterministicExecutionStep,
-    actor: PolicyEvaluationContext['actor'],
-    targetWorkspace: PolicyEvaluationContext['targetWorkspace'],
-  ): Promise<DeterministicStepResult> {
-    const workspaceRoot = targetWorkspace.rootPath;
-
-    if (
-      !actor.clientId ||
-      !actor.sessionId ||
-      actor.clientId.trim().length === 0 ||
-      actor.sessionId.trim().length === 0
-    ) {
-      throw ArcError.unauthenticated(
-        'Access denied: internal deterministic execution requires verified caller identity (clientId and sessionId).',
-      );
-    }
-
-    if (!workspaceRoot || !existsSync(workspaceRoot)) {
-      throw ArcError.noWorkspaceConfigured('Authorized workspace root is required for execution.');
-    }
-
-    // 1. Resolve and Validate Working Directory (cwd)
-    let executionCwd = workspaceRoot;
-    if (step.cwd && step.cwd.trim().length > 0) {
-      const rawCwd = step.cwd.trim();
-      const resolvedCwd = resolve(workspaceRoot, rawCwd);
-      if (!existsSync(resolvedCwd)) {
-        throw ArcError.fileNotFound(`Execution working directory does not exist: '${rawCwd}'.`);
-      }
-      let canonicalCwd: string;
-      try {
-        canonicalCwd = realpathSync(resolvedCwd);
-      } catch {
-        throw ArcError.pathEscapesRoot('Failed to canonicalize execution working directory.');
-      }
-      if (canonicalCwd !== workspaceRoot && !canonicalCwd.startsWith(workspaceRoot + sep)) {
-        throw ArcError.pathEscapesRoot(
-          'Security violation: Working directory resolves outside authorized workspace.',
-        );
-      }
-      executionCwd = canonicalCwd;
-    }
-
-    const args = step.args || [];
-
-    // 2. Executable resolution via runner's resolver
-    const resolvedExecutable = this.runner.executableResolver.resolveExecutable(
-      step.executable,
-      workspaceRoot,
-    );
-
-    // 3. Environment Sanitization (fixed sanitized environment; no ambient secrets)
-    const trustedPath = '/usr/bin:/bin:/usr/local/bin';
-    const sanitizedEnv: NodeJS.ProcessEnv = {
-      PATH: trustedPath,
-      LANG: 'C.UTF-8',
-      LC_ALL: 'C.UTF-8',
-      NODE_ENV: 'test',
-    };
-
-    if (basename(resolvedExecutable).toLowerCase() === 'git') {
-      sanitizedEnv.GIT_OPTIONAL_LOCKS = '0';
-      sanitizedEnv.GIT_CONFIG_GLOBAL = '/dev/null';
-      sanitizedEnv.GIT_CONFIG_NOSYSTEM = '1';
-    }
-
-    const timeoutMs = Math.min(Math.max(100, step.timeoutMs ?? 30000), 120000);
-    const maxOutputBytes = Math.min(
-      Math.max(1024, step.outputLimitBytes ?? MAX_OUTPUT_READ_BYTES),
-      MAX_OUTPUT_READ_BYTES,
-    );
-
-    const result = await this.runner._executeInternalStepCore(
-      {
-        workspaceId: targetWorkspace.workspaceId,
-        actor: {
-          clientId: actor.clientId,
-          clientType: actor.clientType,
-          sessionId: actor.sessionId,
-          deviceId: actor.deviceId,
-        },
-        resolvedExecutable,
-        rawExecutableName: step.executable,
-        args,
-        executionCwd,
-        env: sanitizedEnv,
-        timeoutMs,
-        outputLimitBytes: maxOutputBytes,
-        runInBackground: false,
-      },
-      INTERNAL_EXEC_BRAND,
-    );
-
-    return {
-      stepId: step.stepId,
-      processId: result.processId,
-      exitCode: result.exitCode,
-      signal: result.signal,
-      stdout: result.stdout,
-      stderr: result.stderr,
-      durationMs: result.durationMs,
-      timedOut: result.timedOut,
-    };
-  }
-}
-
-/**
- * Trusted server composition factory.
- * Produces the public ITerminalSubsystem (ControlledProcessRunner) and the paired
- * runtime-unforgeable IInternalDeterministicExecutor.
- */
-export function createControlledProcessExecution(
-  processRegistry: ProcessRegistry,
-  commandPolicy: ICommandPolicy = new CommandPolicy(),
-  executableResolver: IExecutableResolver = new ExecutableResolver(),
-): {
-  terminalSubsystem: ControlledProcessRunner;
-  internalExecutor: IInternalDeterministicExecutor;
-} {
-  const runner = new ControlledProcessRunner(processRegistry, commandPolicy, executableResolver);
-  const internalExecutor = new InternalDeterministicExecutorImpl(runner);
-  return { terminalSubsystem: runner, internalExecutor };
 }

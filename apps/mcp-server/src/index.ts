@@ -66,9 +66,7 @@ import {
   withArcApprovalSchema,
 } from './approval-gate.js';
 import {
-  type TestCompositeHarness,
   type CanonicalCompositePlan,
-  TEST_COMPOSITE_HARNESS_TOKEN,
   computePlanHash,
   deepFreezePlan,
   validateStepAgainstRegistry,
@@ -76,7 +74,12 @@ import {
   executeCompositePlan,
   type DeterministicExecutionRegistry,
   createProductionDeterministicRegistry,
+  createServerCompositeAdmissionTicket,
+  runWithCompositeAdmissionTicket,
 } from './composite-framework.js';
+import { SERVER_INTERNAL_ACCESS } from './internal/server-seam.js';
+import { createServerDeterministicExecutor } from './internal/execution-authority.js';
+import type { TestCompositeHarness } from './internal/composite-testing.js';
 import {
   AuditLogger,
   computeSha256,
@@ -97,7 +100,6 @@ import {
   ControlledProcessRunner,
   type ITerminalSubsystem,
   type IInternalDeterministicExecutor,
-  createControlledProcessExecution,
 } from '@cesspace-arc/terminal';
 import { z } from 'zod';
 
@@ -1492,11 +1494,11 @@ export class ArcMcpServer implements IArcMcpServer {
   /** Trusted launch configuration for {@link auditRuntime}. */
   private readonly auditConfig?: AuditConfig;
   /** Test-only composite framework harness (RC-07 Task 1). */
-  private readonly testCompositeHarness?: TestCompositeHarness;
+  #testCompositeHarness?: TestCompositeHarness;
   /** Privileged internal deterministic execution capability (RC-07 Task 1). */
-  private readonly internalDeterministicExecutor?: IInternalDeterministicExecutor;
+  #internalDeterministicExecutor?: IInternalDeterministicExecutor;
   /** Authoritative closed deterministic execution registry (RC-07 Task 1). */
-  private readonly deterministicRegistry: DeterministicExecutionRegistry;
+  #deterministicRegistry: DeterministicExecutionRegistry;
 
   constructor(
     public readonly workspaceRegistry: WorkspaceRegistry,
@@ -1538,26 +1540,22 @@ export class ArcMcpServer implements IArcMcpServer {
      * server constructed without one creates it here.
      */
     sessionManager?: SessionManager,
-    /**
-     * Test-only composite framework harness injection for RC-07 Task-1 integration tests.
-     * NOT reachable from ArcServerConfig, the environment, the CLI, or any network input.
-     * The production factory never supplies it.
-     */
-    testCompositeHarness?: TestCompositeHarness,
-    internalDeterministicExecutor?: IInternalDeterministicExecutor,
-    deterministicRegistry?: DeterministicExecutionRegistry,
   ) {
-    if (testCompositeHarness !== undefined) {
-      if (testCompositeHarness[TEST_COMPOSITE_HARNESS_TOKEN] !== true) {
-        throw new Error('Invalid test composite harness provided.');
-      }
-      this.testCompositeHarness = testCompositeHarness;
-    }
-    this.internalDeterministicExecutor = internalDeterministicExecutor;
-    this.deterministicRegistry =
-      testCompositeHarness?.registry ??
-      deterministicRegistry ??
-      createProductionDeterministicRegistry();
+    this.#deterministicRegistry = createProductionDeterministicRegistry();
+    SERVER_INTERNAL_ACCESS.set(this, {
+      setTestCompositeHarness: (harness) => {
+        this.#testCompositeHarness = harness;
+      },
+      getTestCompositeHarness: () => this.#testCompositeHarness,
+      setInternalDeterministicExecutor: (executor) => {
+        this.#internalDeterministicExecutor = executor;
+      },
+      getInternalDeterministicExecutor: () => this.#internalDeterministicExecutor,
+      setDeterministicRegistry: (registry) => {
+        this.#deterministicRegistry = registry;
+      },
+      getDeterministicRegistry: () => this.#deterministicRegistry,
+    });
     // Transport mode is resolved once, at construction, and is immutable. A
     // remote configuration supplied alongside stdio is NOT activated.
     this.transportMode = config?.transport ?? 'stdio';
@@ -2047,10 +2045,10 @@ export class ArcMcpServer implements IArcMcpServer {
     // 2. Pre-Admission Tool Name & Runtime Schema Validation Gate (P1-02)
     const isCompositeTool =
       (RC07_COMPOSITE_TOOLS as readonly string[]).includes(toolName) ||
-      this.testCompositeHarness?.toolName === toolName;
+      this.#testCompositeHarness?.toolName === toolName;
     const schema =
       (TOOL_SCHEMAS as Record<string, z.ZodTypeAny | undefined>)[toolName] ??
-      (isCompositeTool ? this.testCompositeHarness?.schema : undefined);
+      (isCompositeTool ? this.#testCompositeHarness?.schema : undefined);
     if (!schema) {
       const arcErr = ArcError.policyDenied(
         `Tool '${toolName}' is not permitted in RC-01 stage (read-only inspection core only).`,
@@ -2475,17 +2473,17 @@ export class ArcMcpServer implements IArcMcpServer {
     // Materialize authoritative deterministic plan for composite tools
     let compositePlan: CanonicalCompositePlan | undefined;
     let compositePlanHash: string | undefined;
-    if (isCompositeTool && this.testCompositeHarness) {
-      compositePlan = this.testCompositeHarness.materializer({
+    if (isCompositeTool && this.#testCompositeHarness) {
+      compositePlan = this.#testCompositeHarness.materializer({
         compositeTool: toolName,
         businessParameters: validatedParams,
         workspaceId: targetWorkspace.workspaceId,
         workspaceRoot: targetWorkspace.rootPath,
-        registry: this.deterministicRegistry,
+        registry: this.#deterministicRegistry,
       });
       // Validate all materialized steps against the closed registry
       for (const step of compositePlan.steps) {
-        validateStepAgainstRegistry(step, this.deterministicRegistry);
+        validateStepAgainstRegistry(step, this.#deterministicRegistry);
       }
       compositePlan = deepFreezePlan(compositePlan);
       compositePlanHash = computePlanHash(compositePlan);
@@ -3148,16 +3146,25 @@ export class ArcMcpServer implements IArcMcpServer {
     try {
       if (isCompositeTool && compositePlan) {
         try {
+          const admissionTicket = createServerCompositeAdmissionTicket({
+            toolName,
+            admittedPlanHash: compositePlanHash!,
+            workspaceId: targetWorkspace.workspaceId,
+            operationId: lifecycleOperationId || 'composite-operation',
+          });
+
           result = await enterCompositeInvocation(toolName, async () => {
-            return await executeCompositePlan({
-              plan: compositePlan!,
-              admittedPlanHash: compositePlanHash!,
-              actor,
-              targetWorkspace,
-              internalExecutor: this.internalDeterministicExecutor,
-              registry: this.deterministicRegistry,
-              testPostAdmissionMutationHook:
-                this.testCompositeHarness?.testPostAdmissionMutationHook,
+            return await runWithCompositeAdmissionTicket(admissionTicket, async () => {
+              return await executeCompositePlan({
+                plan: compositePlan!,
+                admittedPlanHash: compositePlanHash!,
+                actor,
+                targetWorkspace,
+                internalExecutor: this.#internalDeterministicExecutor,
+                registry: this.#deterministicRegistry,
+                testPostAdmissionMutationHook:
+                  this.#testCompositeHarness?.testPostAdmissionMutationHook,
+              });
             });
           });
           if ((result as { status?: string }).status === 'FAILED') {
@@ -4094,7 +4101,14 @@ export function createArcMcpServer(config?: Partial<ArcServerConfig>): ArcMcpSer
   const auditLogger = new AuditLogger();
   const filesystemSubsystem = new FilesystemSubsystem();
   const gitSubsystem = new GitSubsystem();
-  const { terminalSubsystem, internalExecutor } = createControlledProcessExecution(processRegistry);
+  const internalBrand = Symbol('arc.server.internalExecutionBrand');
+  const terminalSubsystem = new ControlledProcessRunner(
+    processRegistry,
+    undefined,
+    undefined,
+    internalBrand,
+  );
+  const internalExecutor = createServerDeterministicExecutor(terminalSubsystem, internalBrand);
 
   const approvalStateManager = new ApprovalStateManager();
 
@@ -4136,7 +4150,7 @@ export function createArcMcpServer(config?: Partial<ArcServerConfig>): ArcMcpSer
     }
   }
 
-  return new ArcMcpServer(
+  const server = new ArcMcpServer(
     workspaceRegistry,
     securityKernel,
     auditLogger,
@@ -4149,10 +4163,11 @@ export function createArcMcpServer(config?: Partial<ArcServerConfig>): ArcMcpSer
     adminIpcServer,
     enrollmentManager,
     sessionManager,
-    undefined,
-    internalExecutor,
-    createProductionDeterministicRegistry(),
   );
+  const access = SERVER_INTERNAL_ACCESS.get(server)!;
+  access.setInternalDeterministicExecutor(internalExecutor);
+  access.setDeterministicRegistry(createProductionDeterministicRegistry());
+  return server;
 }
 
 // Auto-start in stdio transport mode if executed directly as script

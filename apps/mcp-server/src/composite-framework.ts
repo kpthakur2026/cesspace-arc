@@ -19,16 +19,14 @@
  */
 
 import { AsyncLocalStorage } from 'node:async_hooks';
-import { z } from 'zod';
 
 import { ArcError, type PolicyEvaluationContext } from '@cesspace-arc/protocol';
 import type { CompleteActor } from './remote-execution.js';
 import { canonicalJson, sha256Hex } from '@cesspace-arc/policy';
-import {
-  type DeterministicExecutionStep,
-  type DeterministicStepResult,
-  type IInternalDeterministicExecutor,
-  isAuthorizedDeterministicExecutor,
+import type {
+  DeterministicExecutionStep,
+  DeterministicStepResult,
+  IInternalDeterministicExecutor,
 } from '@cesspace-arc/terminal';
 
 // ---------------------------------------------------------------------------
@@ -46,28 +44,6 @@ export interface DeterministicRegistryEntry {
   readonly timeoutCeilingMs: number;
   readonly maxOutputBytesCeiling: number;
   readonly allowCwdSubdirectory: boolean;
-}
-
-export class DeterministicExecutionRegistry {
-  private readonly entries = new Map<string, DeterministicRegistryEntry>();
-
-  constructor(initialEntries: readonly DeterministicRegistryEntry[] = []) {
-    for (const entry of initialEntries) {
-      this.entries.set(entry.registryId, Object.freeze({ ...entry }));
-    }
-  }
-
-  public getEntry(registryId: string): DeterministicRegistryEntry | undefined {
-    return this.entries.get(registryId);
-  }
-
-  public hasEntry(registryId: string): boolean {
-    return this.entries.has(registryId);
-  }
-
-  public listEntryIds(): string[] {
-    return Array.from(this.entries.keys());
-  }
 }
 
 /**
@@ -88,20 +64,63 @@ export const TEST_NODE_VERSION_ENTRY: DeterministicRegistryEntry = Object.freeze
 });
 
 /**
+ * Server-owned catalog of approved deterministic execution registry entries.
+ * Any entry not in this catalog is strictly rejected at registry construction.
+ */
+const APPROVED_REGISTRY_ENTRIES = new Map<string, DeterministicRegistryEntry>([
+  [TEST_NODE_VERSION_REGISTRY_ID, TEST_NODE_VERSION_ENTRY],
+]);
+
+export class DeterministicExecutionRegistry {
+  private readonly entries = new Map<string, DeterministicRegistryEntry>();
+
+  constructor(initialEntries: readonly DeterministicRegistryEntry[] = []) {
+    for (const entry of initialEntries) {
+      const approved = APPROVED_REGISTRY_ENTRIES.get(entry.registryId);
+      if (!approved) {
+        throw ArcError.policyDenied(
+          `Registry violation: unauthorized deterministic registry entry '${entry.registryId}'.`,
+        );
+      }
+      if (
+        entry.executable !== approved.executable ||
+        entry.permittedArgvTemplate.length !== approved.permittedArgvTemplate.length ||
+        entry.permittedArgvTemplate.some(
+          (arg, idx) => arg !== approved.permittedArgvTemplate[idx],
+        ) ||
+        entry.sideEffectClass !== approved.sideEffectClass ||
+        entry.projectCodeExecution !== approved.projectCodeExecution ||
+        entry.timeoutCeilingMs > approved.timeoutCeilingMs ||
+        entry.maxOutputBytesCeiling > approved.maxOutputBytesCeiling ||
+        entry.allowCwdSubdirectory !== approved.allowCwdSubdirectory
+      ) {
+        throw ArcError.policyDenied(
+          `Registry violation: registry entry '${entry.registryId}' does not match server-approved definition.`,
+        );
+      }
+      this.entries.set(entry.registryId, Object.freeze({ ...approved }));
+    }
+  }
+
+  public getEntry(registryId: string): DeterministicRegistryEntry | undefined {
+    return this.entries.get(registryId);
+  }
+
+  public hasEntry(registryId: string): boolean {
+    return this.entries.has(registryId);
+  }
+
+  public listEntryIds(): string[] {
+    return Array.from(this.entries.keys());
+  }
+}
+
+/**
  * Creates the production deterministic execution registry.
  * In Task 1, contains zero Task-4/Task-5 project execution entries.
  */
 export function createProductionDeterministicRegistry(): DeterministicExecutionRegistry {
   return new DeterministicExecutionRegistry([]);
-}
-
-/**
- * Creates a test-only deterministic execution registry populated with the test node entry.
- */
-export function createTestDeterministicRegistry(
-  extraEntries: readonly DeterministicRegistryEntry[] = [],
-): DeterministicExecutionRegistry {
-  return new DeterministicExecutionRegistry([TEST_NODE_VERSION_ENTRY, ...extraEntries]);
 }
 
 /**
@@ -349,46 +368,67 @@ export interface PlanMaterializerContext {
 export type PlanMaterializer = (context: PlanMaterializerContext) => CanonicalCompositePlan;
 
 // ---------------------------------------------------------------------------
-// 5. Test-Only Integration Harness (Section 9, 14, 15)
+// 5. Server Composite Admission Context & Authority Validation
 // ---------------------------------------------------------------------------
 
-export const TEST_COMPOSITE_HARNESS_TOKEN = Symbol('arc.test.composite.framework.harness');
-
-/**
- * Test-only harness allowing Task-1 integration tests to exercise the framework
- * without registering any synthetic tool in production schemas or route tables.
- * Policy authorization is governed exclusively by DeclarativePolicyEngine (Section 14).
- */
-export interface TestCompositeHarness {
-  readonly [TEST_COMPOSITE_HARNESS_TOKEN]: true;
+export interface ServerCompositeAdmissionTicket {
+  readonly ticketId: symbol;
   readonly toolName: string;
-  readonly schema: z.ZodTypeAny;
-  readonly materializer: PlanMaterializer;
-  readonly registry: DeterministicExecutionRegistry;
-  readonly testPostAdmissionMutationHook?: (
-    plan: CanonicalCompositePlan,
-  ) => CanonicalCompositePlan | void;
+  readonly admittedPlanHash: string;
+  readonly workspaceId: string;
+  readonly operationId: string;
+  consumed: boolean;
 }
 
-/**
- * Creates an in-process test harness instance.
- * Production server factory never invokes this.
- */
-export function createTestCompositeHarness(options: {
+export const VALID_ADMISSION_TICKETS = new WeakSet<object>();
+const admissionContextStorage = new AsyncLocalStorage<ServerCompositeAdmissionTicket>();
+
+export function createServerCompositeAdmissionTicket(params: {
   toolName: string;
-  schema: z.ZodTypeAny;
-  materializer: PlanMaterializer;
-  registry?: DeterministicExecutionRegistry;
-  testPostAdmissionMutationHook?: (plan: CanonicalCompositePlan) => CanonicalCompositePlan | void;
-}): TestCompositeHarness {
-  return {
-    [TEST_COMPOSITE_HARNESS_TOKEN]: true,
-    toolName: options.toolName,
-    schema: options.schema,
-    materializer: options.materializer,
-    registry: options.registry ?? createTestDeterministicRegistry(),
-    testPostAdmissionMutationHook: options.testPostAdmissionMutationHook,
+  admittedPlanHash: string;
+  workspaceId: string;
+  operationId: string;
+}): ServerCompositeAdmissionTicket {
+  const ticket: ServerCompositeAdmissionTicket = {
+    ticketId: Symbol('arc.composite.admission.ticket'),
+    toolName: params.toolName,
+    admittedPlanHash: params.admittedPlanHash,
+    workspaceId: params.workspaceId,
+    operationId: params.operationId,
+    consumed: false,
   };
+  VALID_ADMISSION_TICKETS.add(ticket);
+  return ticket;
+}
+
+export function runWithCompositeAdmissionTicket<T>(
+  ticket: ServerCompositeAdmissionTicket,
+  fn: () => Promise<T>,
+): Promise<T> {
+  if (!VALID_ADMISSION_TICKETS.has(ticket)) {
+    throw ArcError.policyDenied('Invalid or forged composite admission ticket.');
+  }
+  return admissionContextStorage.run(ticket, fn);
+}
+
+export function getActiveCompositeAdmissionTicket(): ServerCompositeAdmissionTicket | undefined {
+  return admissionContextStorage.getStore();
+}
+
+export function isValidServerAdmissionTicket(
+  ticket: unknown,
+): ticket is ServerCompositeAdmissionTicket {
+  if (!ticket || typeof ticket !== 'object') return false;
+  return VALID_ADMISSION_TICKETS.has(ticket);
+}
+
+export const AUTHORIZED_INTERNAL_EXECUTORS = new WeakSet<object>();
+
+export function isAuthorizedDeterministicExecutor(candidate: unknown): boolean {
+  if (!candidate || typeof candidate !== 'object') {
+    return false;
+  }
+  return AUTHORIZED_INTERNAL_EXECUTORS.has(candidate);
 }
 
 // ---------------------------------------------------------------------------
@@ -434,14 +474,37 @@ export async function executeCompositePlan(options: {
     registry,
     testPostAdmissionMutationHook,
   } = options;
+
+  // 1. Validate Active Server Admission Ticket (Defect 2, Proof D, Proof E)
+  const activeTicket = getActiveCompositeAdmissionTicket();
+  if (!activeTicket || !VALID_ADMISSION_TICKETS.has(activeTicket)) {
+    throw ArcError.policyDenied(
+      'Direct composite execution outside authoritative pipeline is forbidden.',
+    );
+  }
+  if (activeTicket.consumed) {
+    throw ArcError.policyDenied('Composite admission ticket has already been consumed.');
+  }
+  if (activeTicket.admittedPlanHash !== admittedPlanHash) {
+    throw ArcError.policyDenied(
+      `Composite admission ticket plan hash mismatch: expected '${activeTicket.admittedPlanHash}', got '${admittedPlanHash}'.`,
+    );
+  }
+  if (activeTicket.workspaceId !== targetWorkspace.workspaceId) {
+    throw ArcError.policyDenied(
+      `Composite admission ticket workspace mismatch: expected '${activeTicket.workspaceId}', got '${targetWorkspace.workspaceId}'.`,
+    );
+  }
+
+  // 2. Validate Privileged Execution Authority (Defect 1, Proof C)
+  if (!internalExecutor || !isAuthorizedDeterministicExecutor(internalExecutor)) {
+    throw ArcError.internalError('Privileged internal execution authority is unavailable.');
+  }
+
   let plan = options.plan;
   const startMs = Date.now();
   const stepResults: CompositeStepExecutionResult[] = [];
   let overallFailed = false;
-
-  if (!internalExecutor || !isAuthorizedDeterministicExecutor(internalExecutor)) {
-    throw ArcError.internalError('Privileged internal execution authority is unavailable.');
-  }
 
   // TEST-ONLY in-process seam: attempt post-admission alteration before execution
   if (testPostAdmissionMutationHook) {
@@ -464,81 +527,85 @@ export async function executeCompositePlan(options: {
     validateStepAgainstRegistry(step, registry);
   }
 
-  for (let i = 0; i < plan.steps.length; i++) {
-    const step = plan.steps[i];
+  try {
+    for (let i = 0; i < plan.steps.length; i++) {
+      const step = plan.steps[i];
 
-    if (overallFailed) {
-      stepResults.push({
-        stepId: step.stepId,
-        toolRegistryId: step.toolRegistryId,
-        status: 'SKIPPED',
-        durationMs: 0,
-        exitCode: null,
-        signal: null,
-        stdout: '',
-        stderr: '',
-      });
-      continue;
-    }
-
-    // Verify step against plan
-    validateStepExecutionAgainstPlan(plan, i, step);
-
-    const stepStart = Date.now();
-    try {
-      const stepExecution: DeterministicExecutionStep = {
-        stepId: step.stepId,
-        executable: step.executable,
-        args: step.argv,
-        cwd: step.cwd,
-        timeoutMs: step.timeoutMs,
-        outputLimitBytes: step.outputLimitBytes,
-        projectCodeExecution: step.projectCodeExecution,
-        sideEffectClass: step.sideEffectClass,
-      };
-
-      const result: DeterministicStepResult = await internalExecutor.executeDeterministicStep(
-        stepExecution,
-        actor,
-        targetWorkspace,
-      );
-
-      const stepPassed = result.exitCode === 0 && !result.timedOut;
-      if (!stepPassed) {
-        overallFailed = true;
+      if (overallFailed) {
+        stepResults.push({
+          stepId: step.stepId,
+          toolRegistryId: step.toolRegistryId,
+          status: 'SKIPPED',
+          durationMs: 0,
+          exitCode: null,
+          signal: null,
+          stdout: '',
+          stderr: '',
+        });
+        continue;
       }
 
-      stepResults.push({
-        stepId: step.stepId,
-        toolRegistryId: step.toolRegistryId,
-        status: stepPassed ? 'PASSED' : 'FAILED',
-        durationMs: Date.now() - stepStart,
-        exitCode: result.exitCode,
-        signal: result.signal,
-        stdout: result.stdout,
-        stderr: result.stderr,
-        processId: result.processId,
-        errorMessage: result.timedOut
-          ? 'Process execution timed out.'
-          : result.exitCode !== 0
-            ? `Process exited with code ${result.exitCode}.`
-            : undefined,
-      });
-    } catch (stepErr: unknown) {
-      overallFailed = true;
-      const errMsg = stepErr instanceof Error ? stepErr.message : String(stepErr);
-      stepResults.push({
-        stepId: step.stepId,
-        toolRegistryId: step.toolRegistryId,
-        status: 'FAILED',
-        durationMs: Date.now() - stepStart,
-        exitCode: null,
-        signal: null,
-        stdout: '',
-        stderr: '',
-        errorMessage: errMsg,
-      });
+      // Verify step against plan
+      validateStepExecutionAgainstPlan(plan, i, step);
+
+      const stepStart = Date.now();
+      try {
+        const stepExecution: DeterministicExecutionStep = {
+          stepId: step.stepId,
+          executable: step.executable,
+          args: step.argv,
+          cwd: step.cwd,
+          timeoutMs: step.timeoutMs,
+          outputLimitBytes: step.outputLimitBytes,
+          projectCodeExecution: step.projectCodeExecution,
+          sideEffectClass: step.sideEffectClass,
+        };
+
+        const result: DeterministicStepResult = await internalExecutor.executeDeterministicStep(
+          stepExecution,
+          actor,
+          targetWorkspace,
+        );
+
+        const stepPassed = result.exitCode === 0 && !result.timedOut;
+        if (!stepPassed) {
+          overallFailed = true;
+        }
+
+        stepResults.push({
+          stepId: step.stepId,
+          toolRegistryId: step.toolRegistryId,
+          status: stepPassed ? 'PASSED' : 'FAILED',
+          durationMs: Date.now() - stepStart,
+          exitCode: result.exitCode,
+          signal: result.signal,
+          stdout: result.stdout,
+          stderr: result.stderr,
+          processId: result.processId,
+          errorMessage: result.timedOut
+            ? 'Process execution timed out.'
+            : result.exitCode !== 0
+              ? `Process exited with code ${result.exitCode}.`
+              : undefined,
+        });
+      } catch (stepErr: unknown) {
+        overallFailed = true;
+        const errMsg = stepErr instanceof Error ? stepErr.message : String(stepErr);
+        stepResults.push({
+          stepId: step.stepId,
+          toolRegistryId: step.toolRegistryId,
+          status: 'FAILED',
+          durationMs: Date.now() - stepStart,
+          exitCode: null,
+          signal: null,
+          stdout: '',
+          stderr: '',
+          errorMessage: errMsg,
+        });
+      }
     }
+  } finally {
+    activeTicket.consumed = true;
   }
 
   return {
