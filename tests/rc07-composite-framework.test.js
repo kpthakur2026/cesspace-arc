@@ -5,6 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
 import crypto from 'node:crypto';
+import { createRequire } from 'node:module';
+import { execFileSync } from 'node:child_process';
 import { z } from '../apps/mcp-server/node_modules/zod/index.js';
 
 import {
@@ -1513,10 +1515,10 @@ describe('RC-07 Task 1: Authoritative Positive Acceptance Flows (RC07-FLOW-01, R
 });
 
 // ---------------------------------------------------------------------------
-// 8. Forward Security Corrections: Proofs A through N
+// 8. Forward Security Corrections: Proofs A through O
 // ---------------------------------------------------------------------------
 
-describe('RC-07 Task 1 Forward Security Corrections (Proofs A through N)', () => {
+describe('RC-07 Task 1 Forward Security Corrections (Proofs A through O)', () => {
   test('Proof A: Importing the public @cesspace-arc/terminal production surface cannot mint or retrieve an authorized deterministic executor', async () => {
     const terminalModule = await import('../packages/terminal/dist/index.js');
     assert.equal(terminalModule.createControlledProcessExecution, undefined);
@@ -1860,10 +1862,125 @@ describe('RC-07 Task 1 Forward Security Corrections (Proofs A through N)', () =>
     assert.equal(processes[0].exitCode, 0);
   });
 
-  test('Proof N: Non-public seam: public @cesspace-arc/terminal export does not expose execution seam token, executeDeterministicStepCore, or spawnAndControlProcess', async () => {
+  test('Proof N: Package boundary: @cesspace-arc/terminal exports map contains zero internal privileged subpaths and blocks unexported deep imports', async () => {
+    // 1. Verify packages/terminal/package.json exports map contains strictly only "."
+    const terminalPkg = JSON.parse(
+      fs.readFileSync(path.join(process.cwd(), 'packages/terminal/package.json'), 'utf8'),
+    );
+    assert.deepEqual(Object.keys(terminalPkg.exports), ['.']);
+    assert.equal(terminalPkg.exports['./internal/execution-seam'], undefined);
+
+    // 2. Package-level import of @cesspace-arc/terminal/internal/execution-seam fails with ERR_PACKAGE_PATH_NOT_EXPORTED
+    const requireFromMcp = createRequire(path.join(process.cwd(), 'apps/mcp-server/package.json'));
+    assert.throws(
+      () => {
+        requireFromMcp.resolve('@cesspace-arc/terminal/internal/execution-seam');
+      },
+      (err) => err.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED',
+    );
+
+    const testImportScript = (specifier) => {
+      try {
+        execFileSync(
+          process.execPath,
+          ['--input-type=module', '-e', `await import(${JSON.stringify(specifier)});`],
+          {
+            cwd: path.join(process.cwd(), 'apps/mcp-server'),
+            encoding: 'utf8',
+            stdio: 'pipe',
+          },
+        );
+        return { success: true };
+      } catch (err) {
+        return {
+          success: false,
+          code: err.stderr?.includes('ERR_PACKAGE_PATH_NOT_EXPORTED')
+            ? 'ERR_PACKAGE_PATH_NOT_EXPORTED'
+            : err.code,
+          stderr: err.stderr,
+        };
+      }
+    };
+
+    const resSeam = testImportScript('@cesspace-arc/terminal/internal/execution-seam');
+    assert.equal(resSeam.success, false);
+    assert.equal(resSeam.code, 'ERR_PACKAGE_PATH_NOT_EXPORTED');
+
+    // 3. Test that equivalent deep package imports cannot retrieve execution seam token or process machinery
+    const deepImports = [
+      '@cesspace-arc/terminal/dist/internal/execution-seam.js',
+      '@cesspace-arc/terminal/internal/execution-seam.js',
+      '@cesspace-arc/terminal/internal/process-machinery',
+      '@cesspace-arc/terminal/dist/internal/process-machinery.js',
+    ];
+    for (const specifier of deepImports) {
+      assert.throws(
+        () => {
+          requireFromMcp.resolve(specifier);
+        },
+        (err) => err.code === 'ERR_PACKAGE_PATH_NOT_EXPORTED',
+        `Deep import '${specifier}' must be blocked by package exports map`,
+      );
+
+      const subRes = testImportScript(specifier);
+      assert.equal(subRes.success, false, `Import '${specifier}' must fail`);
+      assert.equal(subRes.code, 'ERR_PACKAGE_PATH_NOT_EXPORTED');
+    }
+
+    // 4. Public @cesspace-arc/terminal root exports no privileged tokens or execution functions
     const terminalModule = await import('../packages/terminal/dist/index.js');
     assert.equal(terminalModule.TERMINAL_EXECUTION_SEAM_TOKEN, undefined);
     assert.equal(terminalModule.executeDeterministicStepCore, undefined);
     assert.equal(terminalModule.spawnAndControlProcess, undefined);
+    assert.equal(terminalModule.createControlledProcessExecution, undefined);
+    assert.equal(
+      terminalModule.ControlledProcessRunner.prototype._executeInternalStepCore,
+      undefined,
+    );
+  });
+
+  test('Proof O: Previously possible pipeline-bypass attack is impossible through the production package API', async () => {
+    // Attack model:
+    // Attacker constructs ControlledProcessRunner and tries to import executeDeterministicStepCore
+    // and TERMINAL_EXECUTION_SEAM_TOKEN to invoke the low-level process core directly.
+    const terminalModule = await import('../packages/terminal/dist/index.js');
+    const runner = new terminalModule.ControlledProcessRunner(new ProcessRegistry());
+    assert.ok(runner);
+    assert.equal(runner._executeInternalStepCore, undefined);
+
+    // The privileged seam import itself MUST be impossible through the package API
+    let attackSucceeded = false;
+    try {
+      execFileSync(
+        process.execPath,
+        [
+          '--input-type=module',
+          '-e',
+          `
+          import { ControlledProcessRunner } from '@cesspace-arc/terminal';
+          import {
+            executeDeterministicStepCore,
+            TERMINAL_EXECUTION_SEAM_TOKEN
+          } from '@cesspace-arc/terminal/internal/execution-seam';
+          `,
+        ],
+        {
+          cwd: path.join(process.cwd(), 'apps/mcp-server'),
+          encoding: 'utf8',
+          stdio: 'pipe',
+        },
+      );
+      attackSucceeded = true;
+    } catch (err) {
+      assert.ok(
+        err.stderr?.includes('ERR_PACKAGE_PATH_NOT_EXPORTED'),
+        'Must fail with ERR_PACKAGE_PATH_NOT_EXPORTED',
+      );
+    }
+    assert.equal(
+      attackSucceeded,
+      false,
+      'Privileged seam import attack must be completely impossible',
+    );
   });
 });

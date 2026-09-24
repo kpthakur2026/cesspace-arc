@@ -16,7 +16,7 @@ import type {
 import {
   executeDeterministicStepCore,
   TERMINAL_EXECUTION_SEAM_TOKEN,
-} from '@cesspace-arc/terminal/internal/execution-seam';
+} from '../../../../packages/terminal/dist/internal/execution-seam.js';
 
 import {
   AUTHORIZED_INTERNAL_EXECUTORS,

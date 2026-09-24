@@ -12,11 +12,6 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
-    },
-    "./internal/execution-seam": {
-      "types": "./dist/internal/execution-seam.d.ts",
-      "import": "./dist/internal/execution-seam.js",
-      "default": "./dist/internal/execution-seam.js"
     }
   },
   "scripts": {
