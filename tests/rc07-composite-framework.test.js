@@ -1037,20 +1037,23 @@ describe('RC-07 Task 1: Static Architecture & Boundary Verification', () => {
     );
   });
 
-  test('Zero new production MCP tools exposed in TOOL_SCHEMAS or production server list', async () => {
-    // None of the 7 RC-07 composite tools should be in TOOL_SCHEMAS
-    for (const tool of RC07_COMPOSITE_TOOLS) {
+  test('Zero unowned RC-07 composite tools exposed in TOOL_SCHEMAS or production server list (Task 2: count 20)', async () => {
+    // None of the 5 remaining RC-07 composite tools should be in TOOL_SCHEMAS
+    const unownedTools = RC07_COMPOSITE_TOOLS.filter(
+      (t) => t !== 'arc_repo_status' && t !== 'arc_worktree_status',
+    );
+    for (const tool of unownedTools) {
       assert.equal(TOOL_SCHEMAS[tool], undefined, `${tool} must not be exposed in TOOL_SCHEMAS`);
     }
 
     // None in ALL_TOOL_DEFINITIONS
     const toolNames = ALL_TOOL_DEFINITIONS.map((t) => t.name);
-    for (const tool of RC07_COMPOSITE_TOOLS) {
+    for (const tool of unownedTools) {
       assert.equal(toolNames.includes(tool), false, `${tool} must not be in ALL_TOOL_DEFINITIONS`);
     }
 
-    // Exact count remains 18
-    assert.equal(ALL_TOOL_DEFINITIONS.length, 18);
+    // Exact count in Task 2 is 20 (18 base + 2 Task 2 tools)
+    assert.equal(ALL_TOOL_DEFINITIONS.length, 20);
 
     const prodServer = createArcMcpServer({ transport: 'stdio' });
     assert.equal(prodServer.testCompositeHarness, undefined);

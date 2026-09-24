@@ -63,7 +63,13 @@ export type ArcErrorCode =
 
   // Internal Errors
   | 'INTERNAL_ERROR'
-  | 'ROLLBACK_FAILED';
+  | 'ROLLBACK_FAILED'
+
+  // Repository & Worktree Errors (RC-07 Target)
+  | 'GIT_REPOSITORY_NOT_FOUND'
+  | 'PATH_OUTSIDE_WORKSPACE'
+  | 'SYMLINK_ESCAPE_DETECTED'
+  | 'WORKSPACE_UNREGISTERED';
 
 /**
  * Canonical structured error payload emitted across the control plane.
@@ -544,6 +550,54 @@ export class ArcError extends Error implements ArcErrorPayload {
       category: 'AUTHENTICATION',
       message,
       retryable: false,
+    });
+  }
+
+  public static gitRepositoryNotFound(
+    message = 'Directory is not a valid Git repository.',
+  ): ArcError {
+    return new ArcError({
+      code: 'GIT_REPOSITORY_NOT_FOUND',
+      category: 'FILESYSTEM',
+      message,
+      retryable: false,
+      remediationHint: 'Ensure the target directory is an initialized Git repository.',
+    });
+  }
+
+  public static pathOutsideWorkspace(
+    message = 'Target path resolves outside authorized workspace boundary.',
+  ): ArcError {
+    return new ArcError({
+      code: 'PATH_OUTSIDE_WORKSPACE',
+      category: 'FILESYSTEM',
+      message,
+      retryable: false,
+      remediationHint: 'Ensure target path is strictly contained within authorized workspace root.',
+    });
+  }
+
+  public static symlinkEscapeDetected(
+    message = 'Symlink resolves outside authorized workspace boundary.',
+  ): ArcError {
+    return new ArcError({
+      code: 'SYMLINK_ESCAPE_DETECTED',
+      category: 'FILESYSTEM',
+      message,
+      retryable: false,
+      remediationHint: 'Symlinks escaping the workspace boundary are strictly forbidden.',
+    });
+  }
+
+  public static workspaceUnregistered(
+    message = 'Specified workspace is not registered in authorized workspaces.',
+  ): ArcError {
+    return new ArcError({
+      code: 'WORKSPACE_UNREGISTERED',
+      category: 'AUTHORIZATION',
+      message,
+      retryable: false,
+      remediationHint: 'Provide an authorized registered workspaceId or workspaceRoot.',
     });
   }
 }

@@ -80,6 +80,7 @@ import {
 import { SERVER_INTERNAL_ACCESS } from './internal/server-seam.js';
 import { createServerDeterministicExecutor } from './internal/execution-authority.js';
 import type { TestCompositeHarness } from './internal/composite-testing.js';
+import { handleArcRepoStatus, handleArcWorktreeStatus } from './internal/repo-worktree-status.js';
 import {
   AuditLogger,
   computeSha256,
@@ -416,6 +417,18 @@ export const TOOL_SCHEMAS = {
       dryRun: z.boolean().optional(),
       fuzz: z.literal(0).optional(),
       workspaceId: WorkspaceIdSchema.optional(),
+    })
+    .strict(),
+  arc_repo_status: z
+    .object({
+      workspaceId: WorkspaceIdSchema.optional(),
+      workspaceRoot: WorkspaceRootSchema.optional(),
+    })
+    .strict(),
+  arc_worktree_status: z
+    .object({
+      workspaceId: WorkspaceIdSchema.optional(),
+      workspaceRoot: WorkspaceRootSchema.optional(),
     })
     .strict(),
 } as const;
@@ -930,13 +943,59 @@ export const RC01_TOOL_DEFINITIONS: Tool[] = withArcApprovalSchemaOnTools([
 ]);
 
 /**
- * Authoritative complete list of all 18 registered tools (RC-01 + RC-02 + RC-03).
+ * Definition of the 2 RC-07 Task-2 MCP Tools (repository and worktree status).
+ * Only these two tools are advertised from RC-07; the other 5 remain unexposed until their owning tasks.
+ */
+export const RC07_TASK2_TOOL_DEFINITIONS: Tool[] = withArcApprovalSchemaOnTools([
+  {
+    name: 'arc_repo_status',
+    description:
+      'Provide a bounded, structured repository status summary for the active workspace, including branch identity, HEAD commit details, clean/dirty state, file change counts, and protected-branch awareness.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        workspaceId: {
+          type: 'string',
+          description: 'Authorized workspace identifier (optional).',
+        },
+        workspaceRoot: {
+          type: 'string',
+          description: 'Authorized workspace root directory path (optional).',
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: 'arc_worktree_status',
+    description:
+      'Provide bounded worktree status for isolated agent environments, confirming worktree isolation, main repository linkage, branch binding, and lock state without arbitrary filesystem traversal.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        workspaceId: {
+          type: 'string',
+          description: 'Authorized workspace identifier (optional).',
+        },
+        workspaceRoot: {
+          type: 'string',
+          description: 'Authorized workspace root directory path (optional).',
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+]);
+
+/**
+ * Authoritative complete list of all 20 registered tools (RC-01 + RC-02 + RC-03 + RC-07 Task 2).
  * Used directly by the ListTools handler.
  */
 export const ALL_TOOL_DEFINITIONS: Tool[] = withArcApprovalSchemaOnTools([
   ...RC01_TOOL_DEFINITIONS,
   ...RC02_TOOL_DEFINITIONS,
   ...RC03_TOOL_DEFINITIONS,
+  ...RC07_TASK2_TOOL_DEFINITIONS,
 ]);
 
 /**
@@ -2396,6 +2455,68 @@ export class ArcMcpServer implements IArcMcpServer {
       targetWorkspaceRecord = this.defaultWorkspaceId
         ? this.workspaceRegistry.getWorkspace(this.defaultWorkspaceId)
         : undefined;
+    } else if (toolName === 'arc_worktree_status') {
+      const rawWsRoot =
+        typeof validatedParams.workspaceRoot === 'string'
+          ? (validatedParams.workspaceRoot as string)
+          : undefined;
+
+      // RC07-NEG-016: directory traversal (..) rejected before resolution
+      if (rawWsRoot !== undefined && /(^|[/\\])\.\.([/\\]|$)/.test(rawWsRoot)) {
+        const arcErr = ArcError.pathOutsideWorkspace(
+          `Directory traversal (..) detected in path before resolution: '${rawWsRoot}'`,
+        );
+        return denyWith(arcErr, 'deny-directory-traversal', 'DENY', validatedParams, {
+          workspaceId: 'traversal-denied',
+          workspacePath: rawWsRoot,
+        });
+      }
+
+      if (hasExplicitId) {
+        const wsById = this.workspaceRegistry.getWorkspace(validatedParams.workspaceId as string);
+        if (!wsById) {
+          workspaceUnregistered = true;
+        } else {
+          targetWorkspaceRecord = wsById;
+          if (rawWsRoot !== undefined) {
+            try {
+              await this.filesystemSubsystem.validateWorkspaceContainment(
+                wsById.rootPath,
+                rawWsRoot,
+              );
+            } catch (containErr: unknown) {
+              const arcErr =
+                containErr instanceof ArcError
+                  ? containErr
+                  : ArcError.pathOutsideWorkspace(String(containErr));
+              return denyWith(arcErr, 'deny-path-outside-workspace', 'DENY', validatedParams, {
+                workspaceId: wsById.id,
+                workspacePath: wsById.rootPath,
+              });
+            }
+          }
+        }
+      } else if (hasExplicitRoot) {
+        const ws =
+          this.workspaceRegistry.findWorkspaceForPath(validatedParams.workspaceRoot as string) ||
+          this.workspaceRegistry.getWorkspace(validatedParams.workspaceRoot as string);
+        if (!ws) {
+          workspaceUnregistered = true;
+        } else {
+          targetWorkspaceRecord = ws;
+        }
+      } else {
+        if (this.defaultWorkspaceId) {
+          targetWorkspaceRecord = this.workspaceRegistry.getWorkspace(this.defaultWorkspaceId);
+        } else {
+          const allWorkspaces = this.workspaceRegistry.getWorkspaces();
+          if (allWorkspaces.length === 1) {
+            targetWorkspaceRecord = allWorkspaces[0];
+          } else {
+            workspaceUnregistered = true;
+          }
+        }
+      }
     } else {
       if (hasExplicitId && hasExplicitRoot) {
         const wsById = this.workspaceRegistry.getWorkspace(validatedParams.workspaceId as string);
@@ -2451,16 +2572,33 @@ export class ArcMcpServer implements IArcMcpServer {
       isGitRepo: targetWorkspaceRecord?.isGitRepo || false,
     };
 
-    // Composite tools require an authorized registered workspace (RC07-NEG-002)
+    // Composite tools require an authorized registered workspace (RC07-NEG-002, RC07-NEG-018)
     if (
       isCompositeTool &&
       (!targetWorkspaceRecord ||
         targetWorkspace.workspaceId === 'unbound' ||
         targetWorkspace.workspaceId.startsWith('deny-'))
     ) {
-      const arcErr = ArcError.noWorkspaceConfigured(
-        `Composite tool '${toolName}' requires an authorized registered workspace.`,
-      );
+      let arcErr: ArcError;
+      if (
+        toolName === 'arc_worktree_status' &&
+        (workspaceUnregistered || targetWorkspace.workspaceId === 'deny-unregistered-workspace')
+      ) {
+        arcErr = ArcError.workspaceUnregistered(
+          `Workspace '${String(validatedParams.workspaceId || validatedParams.workspaceRoot || '')}' is not registered in authorized workspaces.`,
+        );
+      } else if (
+        toolName === 'arc_repo_status' &&
+        (workspaceUnregistered || targetWorkspace.workspaceId === 'deny-unregistered-workspace')
+      ) {
+        arcErr = ArcError.gitRepositoryNotFound(
+          `Path '${String(validatedParams.workspaceId || validatedParams.workspaceRoot || '')}' is not a valid Git repository.`,
+        );
+      } else {
+        arcErr = ArcError.noWorkspaceConfigured(
+          `Composite tool '${toolName}' requires an authorized registered workspace.`,
+        );
+      }
       const ruleId = targetWorkspace.workspaceId.startsWith('deny-')
         ? targetWorkspace.workspaceId
         : 'deny-unregistered-workspace';
@@ -2699,7 +2837,19 @@ export class ArcMcpServer implements IArcMcpServer {
     }> =
       policyEngine === undefined
         ? [{ effect: 'ALLOW' as PolicyEffect, matchingRuleId: 'no-layer2-engine', reason: '' }]
-        : layer2Targets.map((target: PolicyMatchTarget) => policyEngine.evaluate(target as never));
+        : layer2Targets.map((target: PolicyMatchTarget) => {
+            if (
+              policyMode === 'BUILTIN' &&
+              (toolName === 'arc_repo_status' || toolName === 'arc_worktree_status')
+            ) {
+              return {
+                effect: 'ALLOW' as PolicyEffect,
+                matchingRuleId: 'builtin-allow-rc07-read-only',
+                reason: `Tool '${toolName}' is permitted by default for authorized workspaces in built-in mode.`,
+              };
+            }
+            return policyEngine.evaluate(target as never);
+          });
     const layer2 = reduceDecisions(layer2Decisions) as {
       effect: PolicyEffect;
       matchingRuleId: string;
@@ -3341,6 +3491,37 @@ export class ArcMcpServer implements IArcMcpServer {
               validatedParams,
             );
             result = logRes;
+            break;
+          }
+
+          case 'arc_repo_status': {
+            result = await enterCompositeInvocation(toolName, async () => {
+              return await handleArcRepoStatus({
+                targetWorkspace: {
+                  workspaceId: targetWorkspace.workspaceId,
+                  rootPath: targetWorkspace.rootPath,
+                  isGitRepo: targetWorkspace.isGitRepo,
+                },
+                gitSubsystem: this.gitSubsystem,
+                filesystemSubsystem: this.filesystemSubsystem,
+              });
+            });
+            break;
+          }
+
+          case 'arc_worktree_status': {
+            result = await enterCompositeInvocation(toolName, async () => {
+              return await handleArcWorktreeStatus({
+                targetWorkspace: {
+                  workspaceId: targetWorkspace.workspaceId,
+                  rootPath: targetWorkspace.rootPath,
+                  isGitRepo: targetWorkspace.isGitRepo,
+                },
+                validatedParams,
+                gitSubsystem: this.gitSubsystem,
+                filesystemSubsystem: this.filesystemSubsystem,
+              });
+            });
             break;
           }
 

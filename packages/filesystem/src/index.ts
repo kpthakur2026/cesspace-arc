@@ -72,6 +72,7 @@ export interface IFilesystemSubsystem {
   deleteFile(workspaceRoot: string, request: DeleteFileRequest): Promise<DeleteFileResponse>;
   moveFile(workspaceRoot: string, request: MoveFileRequest): Promise<MoveFileResponse>;
   applyPatch(workspaceRoot: string, request: ApplyPatchRequest): Promise<ApplyPatchResponse>;
+  validateWorkspaceContainment(workspaceRoot: string, targetPath: string): Promise<string>;
 }
 
 /**
@@ -263,6 +264,44 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
     }
 
     return canonicalPath;
+  }
+
+  /**
+   * Validates that targetPath resides strictly within workspaceRoot.
+   * Enforces RC07-NEG-016 (rejecting traversal tokens like .. before resolution)
+   * and RC07-NEG-014 (failing closed with PATH_OUTSIDE_WORKSPACE if resolving outside).
+   */
+  public async validateWorkspaceContainment(
+    workspaceRoot: string,
+    targetPath: string,
+  ): Promise<string> {
+    if (!targetPath || typeof targetPath !== 'string') {
+      throw ArcError.invalidRequestSchema('Path parameter is required and must be a string.');
+    }
+    // RC07-NEG-016: directory traversal (..) rejected before unsafe resolution
+    if (/(^|[/\\])\.\.([/\\]|$)/.test(targetPath)) {
+      throw ArcError.pathOutsideWorkspace(
+        'Directory traversal (..) is forbidden in workspace path.',
+      );
+    }
+    let canonicalRoot: string;
+    try {
+      canonicalRoot = realpathSync(resolve(workspaceRoot));
+    } catch {
+      throw ArcError.noWorkspaceConfigured('Workspace root directory does not exist.');
+    }
+    let canonicalTarget: string;
+    try {
+      canonicalTarget = realpathSync(resolve(targetPath));
+    } catch {
+      throw ArcError.pathOutsideWorkspace('Target path cannot be resolved.');
+    }
+    if (canonicalTarget !== canonicalRoot && !canonicalTarget.startsWith(canonicalRoot + sep)) {
+      throw ArcError.pathOutsideWorkspace(
+        'Security violation: Target path resides outside authorized workspace boundary.',
+      );
+    }
+    return canonicalTarget;
   }
 
   public async listDirectory(

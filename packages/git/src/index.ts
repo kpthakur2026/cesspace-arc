@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { realpathSync, existsSync } from 'node:fs';
-import { resolve, sep } from 'node:path';
+import { realpathSync, existsSync, lstatSync, readFileSync } from 'node:fs';
+import { resolve, sep, dirname } from 'node:path';
 import {
   ArcError,
   type GitStatusRequest,
@@ -29,6 +29,27 @@ export const MAX_LOG_COUNT = 100;
  * Protected branches that cannot be directly mutated.
  */
 export const PROTECTED_BRANCHES = ['main', 'master', 'release/*'];
+
+/**
+ * Checks whether a branch matches any protected branch pattern.
+ */
+export function isProtectedBranch(branch: string): boolean {
+  if (!branch) {
+    return false;
+  }
+  const normalized = branch.replace(/^refs\/heads\//, '').trim();
+  for (const protectedPattern of PROTECTED_BRANCHES) {
+    if (protectedPattern.endsWith('/*')) {
+      const prefix = protectedPattern.slice(0, -2);
+      if (normalized === prefix || normalized.startsWith(prefix + '/')) {
+        return true;
+      }
+    } else if (normalized === protectedPattern) {
+      return true;
+    }
+  }
+  return false;
+}
 
 /**
  * Validates that a git parameter (target, revision, or path) is not an option flag.
@@ -195,6 +216,20 @@ export function resolveTrustedGitBinary(): string {
 }
 
 /**
+ * Bounded worktree metadata for isolated agent environments.
+ */
+export interface WorktreeMetadata {
+  isWorktree: boolean;
+  worktreePath: string;
+  mainRepoPath: string;
+  branch: string;
+  locked: boolean;
+  lockReason?: string;
+  isDetached: boolean;
+  headSha: string;
+}
+
+/**
  * Interface definition for Sandboxed Git Subsystem.
  */
 export interface IGitSubsystem {
@@ -202,6 +237,7 @@ export interface IGitSubsystem {
   getDiff(workspaceRoot: string, request: GitDiffRequest): Promise<GitDiffResponse>;
   getLog(workspaceRoot: string, request: GitLogRequest): Promise<GitLogResponse>;
   assertBranchWritable(workspaceRoot: string, targetBranch: string): Promise<void>;
+  getWorktreeMetadata(workspaceRoot: string): Promise<WorktreeMetadata>;
 }
 
 /**
@@ -268,11 +304,30 @@ export class GitSubsystem implements IGitSubsystem {
   }
 
   private async verifyRepositoryBoundary(canonicalRoot: string): Promise<void> {
-    const isGit =
-      existsSync(resolve(canonicalRoot, '.git')) || existsSync(resolve(canonicalRoot, 'HEAD'));
+    const dotGit = resolve(canonicalRoot, '.git');
+    const isGit = existsSync(dotGit) || existsSync(resolve(canonicalRoot, 'HEAD'));
 
     if (!isGit) {
-      throw ArcError.fileNotFound('Directory is not a valid Git repository.');
+      throw ArcError.gitRepositoryNotFound('Directory is not a valid Git repository.');
+    }
+
+    if (existsSync(dotGit)) {
+      const dotGitStat = lstatSync(dotGit);
+      if (dotGitStat.isSymbolicLink()) {
+        let symlinkTarget: string;
+        try {
+          symlinkTarget = realpathSync(dotGit);
+        } catch {
+          throw ArcError.symlinkEscapeDetected(
+            'Symlinked .git metadata resolves outside authorized workspace boundary.',
+          );
+        }
+        if (symlinkTarget !== canonicalRoot && !symlinkTarget.startsWith(canonicalRoot + sep)) {
+          throw ArcError.symlinkEscapeDetected(
+            'Symlinked .git metadata resolves outside authorized workspace boundary.',
+          );
+        }
+      }
     }
 
     try {
@@ -313,10 +368,6 @@ export class GitSubsystem implements IGitSubsystem {
         throw ArcError.accessDenied('Git directory path could not be resolved.');
       }
 
-      if (resolvedGitDir !== canonicalRoot && !resolvedGitDir.startsWith(canonicalRoot + sep)) {
-        throw ArcError.accessDenied('Git directory is outside authorized workspace boundary.');
-      }
-
       let resolvedGitCommonDir = '';
       try {
         resolvedGitCommonDir = realpathSync(resolve(canonicalRoot, gitCommonDirRaw));
@@ -324,19 +375,58 @@ export class GitSubsystem implements IGitSubsystem {
         throw ArcError.accessDenied('Git common directory path could not be resolved.');
       }
 
-      if (
-        resolvedGitCommonDir !== canonicalRoot &&
-        !resolvedGitCommonDir.startsWith(canonicalRoot + sep)
-      ) {
-        throw ArcError.accessDenied(
-          'Git common directory is outside authorized workspace boundary.',
-        );
+      // Check if this is a verified linked worktree
+      let isLinkedWorktree = false;
+      if (existsSync(dotGit)) {
+        const dotGitStat = lstatSync(dotGit);
+        if (dotGitStat.isFile()) {
+          const dotGitContent = readFileSync(dotGit, 'utf8').trim();
+          if (dotGitContent.startsWith('gitdir:')) {
+            const rawWorktreeGitDir = dotGitContent.slice(7).trim();
+            let resolvedWtGitDir = '';
+            try {
+              resolvedWtGitDir = realpathSync(resolve(canonicalRoot, rawWorktreeGitDir));
+            } catch {
+              // ignore
+            }
+            if (resolvedWtGitDir && resolvedWtGitDir === resolvedGitDir) {
+              const backlinkFile = resolve(resolvedGitDir, 'gitdir');
+              if (existsSync(backlinkFile)) {
+                const backlink = readFileSync(backlinkFile, 'utf8').trim();
+                let resolvedBacklink = '';
+                try {
+                  resolvedBacklink = realpathSync(resolve(resolvedGitDir, backlink));
+                } catch {
+                  // ignore
+                }
+                if (resolvedBacklink === realpathSync(dotGit)) {
+                  isLinkedWorktree = true;
+                }
+              }
+            }
+          }
+        }
+      }
+
+      if (!isLinkedWorktree) {
+        if (resolvedGitDir !== canonicalRoot && !resolvedGitDir.startsWith(canonicalRoot + sep)) {
+          throw ArcError.accessDenied('Git directory is outside authorized workspace boundary.');
+        }
+
+        if (
+          resolvedGitCommonDir !== canonicalRoot &&
+          !resolvedGitCommonDir.startsWith(canonicalRoot + sep)
+        ) {
+          throw ArcError.accessDenied(
+            'Git common directory is outside authorized workspace boundary.',
+          );
+        }
       }
     } catch (err: unknown) {
       if (err instanceof ArcError) {
         throw err;
       }
-      throw ArcError.fileNotFound('Directory is not a valid Git repository.');
+      throw ArcError.gitRepositoryNotFound('Directory is not a valid Git repository.');
     }
   }
 
@@ -552,5 +642,155 @@ export class GitSubsystem implements IGitSubsystem {
         });
       }
     }
+  }
+
+  public async getWorktreeMetadata(workspaceRoot: string): Promise<WorktreeMetadata> {
+    let canonicalRoot: string;
+    try {
+      canonicalRoot = realpathSync(resolve(workspaceRoot));
+    } catch {
+      throw ArcError.fileNotFound('Workspace directory not found.');
+    }
+
+    const dotGitPath = resolve(canonicalRoot, '.git');
+    const hasDotGit = existsSync(dotGitPath);
+    const hasHead = existsSync(resolve(canonicalRoot, 'HEAD'));
+
+    if (!hasDotGit && !hasHead) {
+      throw ArcError.gitRepositoryNotFound('Directory is not a valid Git repository.');
+    }
+
+    let isWorktree = false;
+    let mainRepoPath = canonicalRoot;
+    let branch = 'unknown';
+    let isDetached = false;
+    let headSha = 'unknown';
+    let locked = false;
+    let lockReason: string | undefined = undefined;
+
+    if (hasDotGit) {
+      const dotGitStat = lstatSync(dotGitPath);
+      if (dotGitStat.isSymbolicLink()) {
+        let symlinkTarget: string;
+        try {
+          symlinkTarget = realpathSync(dotGitPath);
+        } catch {
+          throw ArcError.symlinkEscapeDetected(
+            'Symlinked .git metadata resolves outside authorized workspace boundary.',
+          );
+        }
+        if (symlinkTarget !== canonicalRoot && !symlinkTarget.startsWith(canonicalRoot + sep)) {
+          throw ArcError.symlinkEscapeDetected(
+            'Symlinked .git metadata resolves outside authorized workspace boundary.',
+          );
+        }
+      } else if (dotGitStat.isFile()) {
+        const dotGitContent = readFileSync(dotGitPath, 'utf8').trim();
+        if (!dotGitContent.startsWith('gitdir:')) {
+          throw ArcError.gitRepositoryNotFound('Invalid .git worktree pointer.');
+        }
+        const rawGitDir = dotGitContent.slice(7).trim();
+        let canonicalGitDir: string;
+        try {
+          canonicalGitDir = realpathSync(resolve(canonicalRoot, rawGitDir));
+        } catch {
+          throw ArcError.gitRepositoryNotFound('Git worktree directory could not be resolved.');
+        }
+
+        const backlinkFile = resolve(canonicalGitDir, 'gitdir');
+        if (!existsSync(backlinkFile)) {
+          throw ArcError.gitRepositoryNotFound('Git worktree backlink missing.');
+        }
+        const backlink = readFileSync(backlinkFile, 'utf8').trim();
+        let resolvedBacklink: string;
+        try {
+          resolvedBacklink = realpathSync(resolve(canonicalGitDir, backlink));
+        } catch {
+          throw ArcError.gitRepositoryNotFound('Git worktree backlink could not be resolved.');
+        }
+        if (resolvedBacklink !== realpathSync(dotGitPath)) {
+          throw ArcError.gitRepositoryNotFound(
+            'Git worktree bidirectional link verification failed.',
+          );
+        }
+
+        isWorktree = true;
+
+        // Resolve main repo path via commondir
+        const commondirFile = resolve(canonicalGitDir, 'commondir');
+        if (existsSync(commondirFile)) {
+          const commondirRel = readFileSync(commondirFile, 'utf8').trim();
+          let mainGitDir: string;
+          try {
+            mainGitDir = realpathSync(resolve(canonicalGitDir, commondirRel));
+          } catch {
+            mainGitDir = resolve(canonicalGitDir, commondirRel);
+          }
+          mainRepoPath = dirname(mainGitDir);
+        }
+
+        // Check lock status
+        const lockedFile = resolve(canonicalGitDir, 'locked');
+        if (existsSync(lockedFile)) {
+          locked = true;
+          const reason = readFileSync(lockedFile, 'utf8').trim();
+          if (reason.length > 0) {
+            lockReason = reason;
+          }
+        }
+
+        // Check HEAD
+        const headFile = resolve(canonicalGitDir, 'HEAD');
+        if (existsSync(headFile)) {
+          const headContent = readFileSync(headFile, 'utf8').trim();
+          if (headContent.startsWith('ref: refs/heads/')) {
+            branch = headContent.replace('ref: refs/heads/', '').trim();
+            isDetached = false;
+          } else {
+            branch = headContent;
+            isDetached = true;
+            headSha = headContent;
+          }
+        }
+      }
+    }
+
+    // Resolve HEAD commit hash if not already known
+    if (headSha === 'unknown' || !isDetached) {
+      try {
+        const { stdout } = await this.runRawGit(canonicalRoot, ['rev-parse', 'HEAD']);
+        headSha = stdout.trim();
+      } catch {
+        // Empty repo
+      }
+    }
+
+    // If not a linked worktree, resolve branch and detached status from rev-parse
+    if (!isWorktree) {
+      try {
+        const { stdout: branchOut } = await this.runRawGit(canonicalRoot, [
+          'rev-parse',
+          '--abbrev-ref',
+          'HEAD',
+        ]);
+        branch = branchOut.trim();
+        if (branch === 'HEAD') {
+          isDetached = true;
+        }
+      } catch {
+        // Empty repo
+      }
+    }
+
+    return {
+      isWorktree,
+      worktreePath: canonicalRoot,
+      mainRepoPath,
+      branch,
+      locked,
+      lockReason,
+      isDetached,
+      headSha,
+    };
   }
 }

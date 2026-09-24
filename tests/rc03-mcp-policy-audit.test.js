@@ -1547,19 +1547,19 @@ describe('CesSpace ARC — RC-03 MCP Policy & Audit Integration', () => {
   // ==========================================================================
 
   describe('Section 15: Actual Tool Discovery Source & Enumeration', () => {
-    test('RC03-DISC-01: ALL_TOOL_DEFINITIONS matches ListTools authoritative source with exactly 18 tools', () => {
-      assert.equal(ALL_TOOL_DEFINITIONS.length, 18, 'Total tool definitions must be exactly 18');
+    test('RC03-DISC-01: ALL_TOOL_DEFINITIONS matches ListTools authoritative source with exactly 20 tools', () => {
+      assert.equal(ALL_TOOL_DEFINITIONS.length, 20, 'Total tool definitions must be exactly 20');
       assert.equal(
         server.getRegisteredTools().length,
-        18,
-        'server.getRegisteredTools() must return 18 tools',
+        20,
+        'server.getRegisteredTools() must return 20 tools',
       );
     });
 
-    test('RC03-DISC-02: all 18 tool names are distinct with zero duplicates', () => {
+    test('RC03-DISC-02: all 20 tool names are distinct with zero duplicates', () => {
       const names = ALL_TOOL_DEFINITIONS.map((t) => t.name);
       const uniqueNames = new Set(names);
-      assert.equal(uniqueNames.size, 18, 'Must have exactly 18 unique tool names');
+      assert.equal(uniqueNames.size, 20, 'Must have exactly 20 unique tool names');
       assert.equal(
         names.length,
         uniqueNames.size,

@@ -337,3 +337,52 @@ export interface ApplyPatchResponse {
   };
   dryRun: boolean;
 }
+
+// ============================================================================
+// Tier 3: Engineering-Aware Composite Tools (RC-07 Target)
+// ============================================================================
+
+export interface ArcRepoStatusRequest {
+  workspaceId?: string;
+  workspaceRoot?: string;
+}
+
+export interface ArcRepoStatusResponse {
+  branch: string;
+  headCommit: {
+    hash: string;
+    shortHash: string;
+    message: string;
+    author: string;
+    date: string;
+  };
+  isClean: boolean;
+  isProtectedBranch: boolean;
+  counts: {
+    staged: number;
+    unstaged: number;
+    untracked: number;
+  };
+  aheadCount?: number;
+  behindCount?: number;
+  upstreamBranch?: string;
+  truncated?: boolean;
+}
+
+export interface ArcWorktreeStatusRequest {
+  workspaceId?: string;
+  workspaceRoot?: string;
+}
+
+export interface ArcWorktreeStatusResponse {
+  workspaceId: string;
+  isWorktree: boolean;
+  worktreePath: string;
+  mainRepoPath: string;
+  branch: string;
+  locked: boolean;
+  lockReason?: string;
+  isDetached: boolean;
+  headSha: string;
+  truncated?: boolean;
+}
