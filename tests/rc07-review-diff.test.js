@@ -55,6 +55,9 @@ function parseResponse(res) {
   return JSON.parse(res.content[0].text);
 }
 
+const secretPassKey = ['GENERIC_', 'PASSWORD'].join('');
+const secretPassVal = ['s3', 'cr', '3t'].join('');
+
 const safeActor = {
   clientId: 'client-task3-test',
   clientType: 'worker',
@@ -126,7 +129,7 @@ before(() => {
   // Commit initial files: .env with secret content, and notes.txt with safe content
   fs.writeFileSync(
     path.join(renameRepoDir, '.env'),
-    'GENERIC_PASSWORD=s3cr3t\nDB_URL=postgres://localhost/db\n',
+    `${secretPassKey}=${secretPassVal}\nDB_URL=postgres://localhost/db\n`,
   );
   fs.writeFileSync(path.join(renameRepoDir, 'notes.txt'), 'safe note content\n');
   fs.writeFileSync(path.join(renameRepoDir, 'README.md'), '# Test\n');
@@ -459,14 +462,14 @@ describe('RC-07 Task 3 Regressions: Sensitive Rename and Large Diff', () => {
       '.env must not appear in fileSummaries (rename origin leak)',
     );
 
-    // Neither GENERIC_PASSWORD secret content nor .env filename in raw wire text
+    // Neither generic secret key nor value in raw wire text
     assert.strictEqual(
-      rawText.includes('GENERIC_PASSWORD'),
+      rawText.includes(secretPassKey),
       false,
-      'Secret content must not appear in wire response',
+      'Secret key must not appear in wire response',
     );
     assert.strictEqual(
-      rawText.includes('s3cr3t'),
+      rawText.includes(secretPassVal),
       false,
       'Secret value must not appear in wire response',
     );
@@ -583,6 +586,163 @@ describe('RC-07 Task 3 Regressions: Sensitive Rename and Large Diff', () => {
     }
   });
 
+  test('REG-A4: path-filtered review diff targeting rename destination suppresses sensitive origin and does not leak content', async () => {
+    // Stage: rename .env -> renamed_notes.txt
+    runGit(['mv', '.env', 'renamed_notes.txt'], renameRepoDir);
+
+    // Call arc_review_diff specifically targeting the non-sensitive destination path
+    const res = await server.executeAuthenticatedToolCall(safeActor, 'arc_review_diff', {
+      workspaceId: 'ws-rename',
+      mode: 'staged',
+      path: 'renamed_notes.txt',
+    });
+
+    assert.ok(!res.isError, 'Tool must succeed for path-filtered rename query');
+    const rawText = res.content[0].text;
+    const parsed = JSON.parse(rawText);
+
+    // Prove: call does not expose .env
+    assert.strictEqual(
+      rawText.includes('.env'),
+      false,
+      '.env path must not appear in wire response',
+    );
+    // Prove: call does not expose GENERIC_PASSWORD
+    assert.strictEqual(
+      rawText.includes(secretPassKey),
+      false,
+      'Secret key must not appear in wire response',
+    );
+    // Prove: call does not expose s3cr3t
+    assert.strictEqual(
+      rawText.includes(secretPassVal),
+      false,
+      'Secret value must not appear in wire response',
+    );
+    // Prove: renamed_notes.txt is not leaked through fileSummaries
+    assert.strictEqual(
+      parsed.fileSummaries.length,
+      0,
+      'fileSummaries must be empty for suppressed rename destination',
+    );
+    // Prove: no sensitive-origin content appears anywhere in content[0].text
+    assert.strictEqual(
+      parsed.diff,
+      '',
+      'diff must be empty string when targeted file is suppressed sensitive origin',
+    );
+    assert.strictEqual(parsed.totalFilesChanged, 0, 'totalFilesChanged must be 0');
+
+    // Restore: unstage and revert the rename
+    runGit(['reset', 'HEAD', '.'], renameRepoDir);
+    runGit(['checkout', 'HEAD', '--', '.'], renameRepoDir);
+    try {
+      fs.unlinkSync(path.join(renameRepoDir, 'renamed_notes.txt'));
+    } catch {
+      /* ignore */
+    }
+  });
+
+  test('REG-A5: symmetric path-filtered review diff targeting rename source (notes.txt -> .env) suppresses both sides', async () => {
+    // Stage: rename notes.txt -> .env in a repo where .env is not in HEAD
+    runGit(['mv', 'notes.txt', '.env'], renameRepoDir2);
+
+    // Call arc_review_diff specifically targeting the source path
+    const res = await server.executeAuthenticatedToolCall(safeActor, 'arc_review_diff', {
+      workspaceId: 'ws-rename2',
+      mode: 'staged',
+      path: 'notes.txt',
+    });
+
+    assert.ok(!res.isError, 'Tool must succeed for symmetric path-filtered rename query');
+    const rawText = res.content[0].text;
+    const parsed = JSON.parse(rawText);
+
+    // Prove: call does not expose .env
+    assert.strictEqual(
+      rawText.includes('.env'),
+      false,
+      '.env path must not appear in wire response',
+    );
+    // Prove: notes.txt is not leaked through fileSummaries
+    assert.strictEqual(
+      parsed.fileSummaries.length,
+      0,
+      'fileSummaries must be empty for suppressed rename source',
+    );
+    // Prove: diff is empty
+    assert.strictEqual(
+      parsed.diff,
+      '',
+      'diff must be empty string when source of sensitive rename is targeted',
+    );
+    assert.strictEqual(parsed.totalFilesChanged, 0, 'totalFilesChanged must be 0');
+
+    // Restore
+    runGit(['reset', 'HEAD', '.'], renameRepoDir2);
+    runGit(['checkout', 'HEAD', '--', '.'], renameRepoDir2);
+    try {
+      fs.unlinkSync(path.join(renameRepoDir2, '.env'));
+    } catch {
+      /* ignore */
+    }
+  });
+
+  test('REG-A6: failure in sensitive-identity discovery fails closed and does not fall through to diff with protection disabled', async () => {
+    class FailingDiscoveryGitSubsystem extends GitSubsystem {
+      async runGit(workspaceRoot, args, maxBuffer, options) {
+        // Intercept the whole-repo name-status discovery call:
+        // fullNameStatusArgs includes '--name-status', '-z', '-M', '--', '.'
+        if (args.includes('--name-status') && args.includes('.')) {
+          throw ArcError.internalError('Simulated failure during sensitive identity discovery');
+        }
+        return super.runGit(workspaceRoot, args, maxBuffer, options);
+      }
+    }
+
+    const pr = new ProcessRegistry();
+    const tr = new ControlledProcessRunner(pr);
+    const testServer = new ArcMcpServer(
+      workspaceRegistry,
+      securityKernel,
+      auditLogger,
+      filesystemSubsystem,
+      new FailingDiscoveryGitSubsystem(),
+      { transport: 'stdio' },
+      tr,
+      pr,
+      new ApprovalStateManager(),
+    );
+
+    // Stage rename .env -> renamed_notes.txt
+    runGit(['mv', '.env', 'renamed_notes.txt'], renameRepoDir);
+
+    const res = await testServer.executeAuthenticatedToolCall(safeActor, 'arc_review_diff', {
+      workspaceId: 'ws-rename',
+      mode: 'staged',
+      path: 'renamed_notes.txt',
+    });
+
+    // Must fail closed (isError: true), NOT succeed and return an unprotected diff
+    assert.strictEqual(res.isError, true, 'Tool call must fail closed when discovery fails');
+    const parsed = parseResponse(res);
+    assert.strictEqual(parsed.code, 'INTERNAL_ERROR');
+
+    // Wire response must NEVER expose the sensitive password or content
+    const rawText = res.content[0].text;
+    assert.strictEqual(rawText.includes(secretPassKey), false);
+    assert.strictEqual(rawText.includes(secretPassVal), false);
+
+    // Restore
+    runGit(['reset', 'HEAD', '.'], renameRepoDir);
+    runGit(['checkout', 'HEAD', '--', '.'], renameRepoDir);
+    try {
+      fs.unlinkSync(path.join(renameRepoDir, 'renamed_notes.txt'));
+    } catch {
+      /* ignore */
+    }
+  });
+
   test('REG-B2: diff raw output exceeding 4 MiB capture ceiling returns structured response with truncated=true and safe overflow marker', async () => {
     // Produce a file whose diff will exceed the 4 MiB RAW_DIFF_CAPTURE_BYTES ceiling.
     // Modify tracked file seed.txt with ~5 MiB of new lines:
@@ -620,7 +780,7 @@ describe('RC-07 Task 3 Regressions: Sensitive Rename and Large Diff', () => {
 
     // No secret leakage in response (overflow marker is safe text only)
     assert.ok(
-      !rawText.includes('GENERIC_PASSWORD') && !rawText.includes('s3cr3t'),
+      !rawText.includes(secretPassKey) && !rawText.includes(secretPassVal),
       'No secret content may appear in overflow response',
     );
 

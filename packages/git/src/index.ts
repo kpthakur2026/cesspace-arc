@@ -1200,47 +1200,47 @@ export class GitSubsystem implements IGitSubsystem {
 
     const pathFilter = options.path ? options.path.trim() : '.';
 
-    // 1. Discover all rename/copy pairs WITHOUT pathspec excludes so we can
-    //    detect sensitive origins/destinations that might be hidden by excludes.
-    //    Example: `.env -> notes.txt` rename -- Git with :(exclude)*.env* will show
-    //    only `notes.txt` in the filtered diff. We need to know it came from `.env`.
-    const fullNameStatusArgs = [...baseArgs, '--name-status', '-z', '-M', '--', pathFilter];
-    let renameSensitivePaths: Set<string> | undefined;
-    try {
-      const { stdout: fullNameStatusStdout } = await this.runGit(
-        workspaceRoot,
-        fullNameStatusArgs,
-        undefined,
-        execOptions,
-      );
-      // Parse rename/copy entries; collect any path where EITHER side is sensitive.
-      renameSensitivePaths = new Set<string>();
-      const nsTokensFull = fullNameStatusStdout.split('\0');
-      let nsIdx = 0;
-      while (nsIdx < nsTokensFull.length) {
-        const tok = nsTokensFull[nsIdx];
-        if (!tok) {
-          nsIdx++;
-          continue;
-        }
-        const code = tok.trim();
-        if (code.startsWith('R') || code.startsWith('C')) {
-          const srcPath = nsTokensFull[nsIdx + 1] || '';
-          const dstPath = nsTokensFull[nsIdx + 2] || '';
-          if (isSensitiveGitPath(srcPath) || isSensitiveGitPath(dstPath)) {
-            // Suppress both sides: either may appear in pathspec-filtered diff output
-            if (srcPath) renameSensitivePaths.add(srcPath);
-            if (dstPath) renameSensitivePaths.add(dstPath);
-          }
-          nsIdx += 3;
-        } else {
-          nsIdx += 2;
-        }
+    // 1. Discover all rename/copy pairs across the complete selected Git comparison
+    //    WITHOUT caller path restriction and WITHOUT pathspec excludes.
+    //    Security-sensitive rename/copy discovery MUST NOT be narrowed by the user-provided review path.
+    //    A discovery failure must fail closed immediately rather than silently disabling protection.
+    const fullNameStatusArgs = [...baseArgs, '--name-status', '-z', '-M', '--', '.'];
+    const { stdout: fullNameStatusStdout } = await this.runGit(
+      workspaceRoot,
+      fullNameStatusArgs,
+      undefined,
+      execOptions,
+    );
+
+    // Parse rename/copy entries; collect any path where EITHER side is sensitive.
+    const renameSensitivePaths = new Set<string>();
+    const nsTokensFull = fullNameStatusStdout.split('\0');
+    let nsIdx = 0;
+    while (nsIdx < nsTokensFull.length) {
+      const tok = nsTokensFull[nsIdx];
+      if (!tok) {
+        nsIdx++;
+        continue;
       }
-    } catch {
-      // If this auxiliary call fails, proceed without rename-origin detection.
-      // The standard pathspec excludes and purgeSensitiveDiffBlocks remain active.
-      renameSensitivePaths = undefined;
+      const code = tok.trim();
+      if (code.startsWith('R') || code.startsWith('C')) {
+        const srcPath = nsTokensFull[nsIdx + 1] || '';
+        const dstPath = nsTokensFull[nsIdx + 2] || '';
+        if (isSensitiveGitPath(srcPath) || isSensitiveGitPath(dstPath)) {
+          // Suppress both sides: either may appear in pathspec-filtered diff output
+          if (srcPath) {
+            renameSensitivePaths.add(srcPath);
+            renameSensitivePaths.add(srcPath.replace(/^\.\//, '').replace(/\/$/, '').trim());
+          }
+          if (dstPath) {
+            renameSensitivePaths.add(dstPath);
+            renameSensitivePaths.add(dstPath.replace(/^\.\//, '').replace(/\/$/, '').trim());
+          }
+        }
+        nsIdx += 3;
+      } else {
+        nsIdx += 2;
+      }
     }
 
     if (execOptions?.signal?.aborted) {
@@ -1312,7 +1312,11 @@ export class GitSubsystem implements IGitSubsystem {
     // rename destination as an add (e.g. `.env -> renamed_notes.txt` appears as `A renamed_notes.txt`).
     const fileSummaries =
       renameSensitivePaths && renameSensitivePaths.size > 0
-        ? rawFileSummaries.filter((s) => !renameSensitivePaths!.has(s.path))
+        ? rawFileSummaries.filter((s) => {
+            const rawP = s.path;
+            const normP = rawP.replace(/^\.\//, '').replace(/\/$/, '').trim();
+            return !renameSensitivePaths.has(rawP) && !renameSensitivePaths.has(normP);
+          })
         : rawFileSummaries;
 
     // 5. Defense-in-depth: purge sensitive file diff hunks (including rename origin/destination
