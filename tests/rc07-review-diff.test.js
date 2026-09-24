@@ -43,6 +43,7 @@ let hugeRepoDir;
 let hugeRepoDir2;
 let renameRepoDir;
 let renameRepoDir2;
+let copyRepoDir;
 let server;
 let workspaceRegistry;
 let securityKernel;
@@ -145,6 +146,18 @@ before(() => {
   runGit(['add', '.'], renameRepoDir2);
   runGit(['commit', '-m', 'initial commit'], renameRepoDir2);
 
+  // 8. Copy regression repo: tracked .env containing generic secret
+  copyRepoDir = path.join(tempDir, 'copy_repo');
+  fs.mkdirSync(copyRepoDir, { recursive: true });
+  runGit(['init', '-b', 'main'], copyRepoDir);
+  fs.writeFileSync(
+    path.join(copyRepoDir, '.env'),
+    `${secretPassKey}=${secretPassVal}\nDB_URL=postgres://localhost/db\n`,
+  );
+  fs.writeFileSync(path.join(copyRepoDir, 'README.md'), '# Copy Test Repo\n');
+  runGit(['add', '.'], copyRepoDir);
+  runGit(['commit', '-m', 'initial commit'], copyRepoDir);
+
   // Subsystems & Server setup
   workspaceRegistry = new WorkspaceRegistry();
   workspaceRegistry.registerWorkspace('ws-main', mainRepoDir);
@@ -154,6 +167,7 @@ before(() => {
   workspaceRegistry.registerWorkspace('ws-huge2', hugeRepoDir2);
   workspaceRegistry.registerWorkspace('ws-rename', renameRepoDir);
   workspaceRegistry.registerWorkspace('ws-rename2', renameRepoDir2);
+  workspaceRegistry.registerWorkspace('ws-copy', copyRepoDir);
 
   const procReg = new ProcessRegistry();
   const terminal = new ControlledProcessRunner(procReg);
@@ -738,6 +752,184 @@ describe('RC-07 Task 3 Regressions: Sensitive Rename and Large Diff', () => {
     runGit(['checkout', 'HEAD', '--', '.'], renameRepoDir);
     try {
       fs.unlinkSync(path.join(renameRepoDir, 'renamed_notes.txt'));
+    } catch {
+      /* ignore */
+    }
+  });
+
+  test('REG-A7: copy from unchanged .env -> notes.txt suppresses sensitive origin in whole-repo diff and fileSummaries', async () => {
+    // 1. Verify .env is tracked and intact
+    assert.ok(fs.existsSync(path.join(copyRepoDir, '.env')));
+    const envContentBefore = fs.readFileSync(path.join(copyRepoDir, '.env'), 'utf8');
+
+    // 2. Copy .env to notes.txt, leaving .env intact
+    fs.copyFileSync(path.join(copyRepoDir, '.env'), path.join(copyRepoDir, 'notes.txt'));
+    assert.strictEqual(
+      fs.readFileSync(path.join(copyRepoDir, '.env'), 'utf8'),
+      envContentBefore,
+      '.env must remain completely intact',
+    );
+
+    // 3. Stage notes.txt
+    runGit(['add', 'notes.txt'], copyRepoDir);
+
+    // 4. Invoke arc_review_diff (whole workspace staged diff)
+    const res = await server.executeAuthenticatedToolCall(safeActor, 'arc_review_diff', {
+      workspaceId: 'ws-copy',
+      mode: 'staged',
+    });
+
+    assert.ok(!res.isError, 'Tool must succeed for staged copy query');
+    const rawText = res.content[0].text;
+    const parsed = JSON.parse(rawText);
+
+    // Prove: call does not expose .env path
+    assert.strictEqual(
+      rawText.includes('.env'),
+      false,
+      '.env path must not appear anywhere in wire response',
+    );
+    // Prove: call does not expose GENERIC_PASSWORD
+    assert.strictEqual(
+      rawText.includes(secretPassKey),
+      false,
+      'Secret key must not appear anywhere in wire response',
+    );
+    // Prove: call does not expose s3cr3t
+    assert.strictEqual(
+      rawText.includes(secretPassVal),
+      false,
+      'Secret value must not appear anywhere in wire response',
+    );
+    // Prove: notes.txt is not leaked through fileSummaries when its origin is sensitive
+    assert.strictEqual(
+      parsed.fileSummaries.some((s) => s.path === 'notes.txt'),
+      false,
+      'notes.txt must not appear in fileSummaries when its origin is sensitive',
+    );
+    assert.strictEqual(
+      parsed.fileSummaries.length,
+      0,
+      'fileSummaries must be empty when only change has sensitive origin',
+    );
+    assert.strictEqual(
+      parsed.diff,
+      '',
+      'diff must be empty string when file has sensitive copy origin',
+    );
+    assert.strictEqual(parsed.totalFilesChanged, 0, 'totalFilesChanged must be 0');
+
+    // Cleanup
+    runGit(['reset', 'HEAD', '.'], copyRepoDir);
+    runGit(['checkout', 'HEAD', '--', '.'], copyRepoDir);
+    try {
+      fs.unlinkSync(path.join(copyRepoDir, 'notes.txt'));
+    } catch {
+      /* ignore */
+    }
+  });
+
+  test('REG-A8: path-filtered review diff with path: "notes.txt" on copy from unchanged .env suppresses diff and fileSummaries', async () => {
+    // 1. Copy .env to notes.txt and stage, leaving .env intact
+    fs.copyFileSync(path.join(copyRepoDir, '.env'), path.join(copyRepoDir, 'notes.txt'));
+    runGit(['add', 'notes.txt'], copyRepoDir);
+
+    // 2. Invoke arc_review_diff specifically targeting path: "notes.txt"
+    const res = await server.executeAuthenticatedToolCall(safeActor, 'arc_review_diff', {
+      workspaceId: 'ws-copy',
+      mode: 'staged',
+      path: 'notes.txt',
+    });
+
+    assert.ok(!res.isError, 'Tool must succeed for path-filtered copy query');
+    const rawText = res.content[0].text;
+    const parsed = JSON.parse(rawText);
+
+    // Prove: call does not expose .env path
+    assert.strictEqual(
+      rawText.includes('.env'),
+      false,
+      '.env path must not appear anywhere in wire response',
+    );
+    // Prove: call does not expose GENERIC_PASSWORD
+    assert.strictEqual(
+      rawText.includes(secretPassKey),
+      false,
+      'Secret key must not appear anywhere in wire response',
+    );
+    // Prove: call does not expose s3cr3t
+    assert.strictEqual(
+      rawText.includes(secretPassVal),
+      false,
+      'Secret value must not appear anywhere in wire response',
+    );
+    // Prove: notes.txt in fileSummaries is absent when origin is sensitive
+    assert.strictEqual(
+      parsed.fileSummaries.some((s) => s.path === 'notes.txt'),
+      false,
+      'notes.txt must not appear in fileSummaries when its origin is sensitive',
+    );
+    assert.strictEqual(parsed.fileSummaries.length, 0, 'fileSummaries must be empty');
+    assert.strictEqual(parsed.diff, '', 'diff must be empty string');
+    assert.strictEqual(parsed.totalFilesChanged, 0, 'totalFilesChanged must be 0');
+
+    // Cleanup
+    runGit(['reset', 'HEAD', '.'], copyRepoDir);
+    runGit(['checkout', 'HEAD', '--', '.'], copyRepoDir);
+    try {
+      fs.unlinkSync(path.join(copyRepoDir, 'notes.txt'));
+    } catch {
+      /* ignore */
+    }
+  });
+
+  test('REG-A9: copy from unchanged .env -> notes.txt alongside legitimate staged file preserves safe changes while suppressing copy', async () => {
+    // 1. Copy .env to notes.txt and stage
+    fs.copyFileSync(path.join(copyRepoDir, '.env'), path.join(copyRepoDir, 'notes.txt'));
+    runGit(['add', 'notes.txt'], copyRepoDir);
+
+    // 2. Create and stage a legitimate non-sensitive file
+    fs.writeFileSync(path.join(copyRepoDir, 'safe_code.ts'), 'export const answer = 42;\n');
+    runGit(['add', 'safe_code.ts'], copyRepoDir);
+
+    // 3. Invoke whole-workspace staged diff
+    const res = await server.executeAuthenticatedToolCall(safeActor, 'arc_review_diff', {
+      workspaceId: 'ws-copy',
+      mode: 'staged',
+    });
+
+    assert.ok(!res.isError, 'Tool must succeed');
+    const rawText = res.content[0].text;
+    const parsed = JSON.parse(rawText);
+
+    // Sensitive origin (.env) and secret values must not appear
+    assert.strictEqual(rawText.includes('.env'), false);
+    assert.strictEqual(rawText.includes(secretPassKey), false);
+    assert.strictEqual(rawText.includes(secretPassVal), false);
+
+    // notes.txt must NOT appear in fileSummaries
+    assert.strictEqual(
+      parsed.fileSummaries.some((s) => s.path === 'notes.txt'),
+      false,
+    );
+
+    // Legitimate safe_code.ts MUST appear
+    assert.strictEqual(parsed.fileSummaries.length, 1);
+    assert.strictEqual(parsed.fileSummaries[0].path, 'safe_code.ts');
+    assert.strictEqual(parsed.fileSummaries[0].status, 'added');
+    assert.ok(parsed.diff.includes('export const answer = 42;'));
+    assert.strictEqual(parsed.totalFilesChanged, 1);
+
+    // Cleanup
+    runGit(['reset', 'HEAD', '.'], copyRepoDir);
+    runGit(['checkout', 'HEAD', '--', '.'], copyRepoDir);
+    try {
+      fs.unlinkSync(path.join(copyRepoDir, 'notes.txt'));
+    } catch {
+      /* ignore */
+    }
+    try {
+      fs.unlinkSync(path.join(copyRepoDir, 'safe_code.ts'));
     } catch {
       /* ignore */
     }

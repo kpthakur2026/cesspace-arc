@@ -217,14 +217,14 @@ export function purgeSensitiveDiffBlocksWithCount(
         if (hLine.startsWith('---') || hLine.startsWith('+++') || hLine.startsWith('@@')) {
           break;
         }
-        if (hLine.startsWith('rename from ')) {
-          const p = hLine.slice(12).trim();
+        if (hLine.startsWith('rename from ') || hLine.startsWith('copy from ')) {
+          const p = hLine.slice(hLine.startsWith('rename') ? 12 : 10).trim();
           if (isSensitiveGitPath(p) || (extraSensitivePaths && extraSensitivePaths.has(p))) {
             isSensitive = true;
             break;
           }
-        } else if (hLine.startsWith('rename to ')) {
-          const p = hLine.slice(10).trim();
+        } else if (hLine.startsWith('rename to ') || hLine.startsWith('copy to ')) {
+          const p = hLine.slice(hLine.startsWith('rename') ? 10 : 8).trim();
           if (isSensitiveGitPath(p) || (extraSensitivePaths && extraSensitivePaths.has(p))) {
             isSensitive = true;
             break;
@@ -1204,7 +1204,16 @@ export class GitSubsystem implements IGitSubsystem {
     //    WITHOUT caller path restriction and WITHOUT pathspec excludes.
     //    Security-sensitive rename/copy discovery MUST NOT be narrowed by the user-provided review path.
     //    A discovery failure must fail closed immediately rather than silently disabling protection.
-    const fullNameStatusArgs = [...baseArgs, '--name-status', '-z', '-M', '--', '.'];
+    const fullNameStatusArgs = [
+      ...baseArgs,
+      '--name-status',
+      '-z',
+      '-M',
+      '-C',
+      '--find-copies-harder',
+      '--',
+      '.',
+    ];
     const { stdout: fullNameStatusStdout } = await this.runGit(
       workspaceRoot,
       fullNameStatusArgs,
