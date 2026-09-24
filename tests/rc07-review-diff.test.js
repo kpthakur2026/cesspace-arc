@@ -40,6 +40,9 @@ let mainRepoDir;
 let nonGitDir;
 let secretsRepoDir;
 let hugeRepoDir;
+let hugeRepoDir2;
+let renameRepoDir;
+let renameRepoDir2;
 let server;
 let workspaceRegistry;
 let securityKernel;
@@ -100,7 +103,7 @@ before(() => {
   runGit(['add', '.'], secretsRepoDir);
   runGit(['commit', '-m', 'initial commit'], secretsRepoDir);
 
-  // 4. Huge repo for wire-size tests
+  // 4. Huge repo for wire-size tests (> 512 KiB but < 4 MiB)
   hugeRepoDir = path.join(tempDir, 'huge_repo');
   fs.mkdirSync(hugeRepoDir, { recursive: true });
   runGit(['init', '-b', 'main'], hugeRepoDir);
@@ -108,12 +111,46 @@ before(() => {
   runGit(['add', '.'], hugeRepoDir);
   runGit(['commit', '-m', 'initial commit'], hugeRepoDir);
 
+  // 5. Very large repo for overflow-marker tests (> 4 MiB raw diff)
+  hugeRepoDir2 = path.join(tempDir, 'huge_repo2');
+  fs.mkdirSync(hugeRepoDir2, { recursive: true });
+  runGit(['init', '-b', 'main'], hugeRepoDir2);
+  fs.writeFileSync(path.join(hugeRepoDir2, 'seed.txt'), 'initial\n');
+  runGit(['add', '.'], hugeRepoDir2);
+  runGit(['commit', '-m', 'initial commit'], hugeRepoDir2);
+
+  // 6. Rename regression repo
+  renameRepoDir = path.join(tempDir, 'rename_repo');
+  fs.mkdirSync(renameRepoDir, { recursive: true });
+  runGit(['init', '-b', 'main'], renameRepoDir);
+  // Commit initial files: .env with secret content, and notes.txt with safe content
+  fs.writeFileSync(
+    path.join(renameRepoDir, '.env'),
+    'GENERIC_PASSWORD=s3cr3t\nDB_URL=postgres://localhost/db\n',
+  );
+  fs.writeFileSync(path.join(renameRepoDir, 'notes.txt'), 'safe note content\n');
+  fs.writeFileSync(path.join(renameRepoDir, 'README.md'), '# Test\n');
+  runGit(['add', '.'], renameRepoDir);
+  runGit(['commit', '-m', 'initial commit'], renameRepoDir);
+
+  // 7. Rename regression repo 2 (for testing reverse direction notes.txt -> .env without existing .env)
+  renameRepoDir2 = path.join(tempDir, 'rename_repo2');
+  fs.mkdirSync(renameRepoDir2, { recursive: true });
+  runGit(['init', '-b', 'main'], renameRepoDir2);
+  fs.writeFileSync(path.join(renameRepoDir2, 'notes.txt'), 'safe note content to become env\n');
+  fs.writeFileSync(path.join(renameRepoDir2, 'README.md'), '# Test 2\n');
+  runGit(['add', '.'], renameRepoDir2);
+  runGit(['commit', '-m', 'initial commit'], renameRepoDir2);
+
   // Subsystems & Server setup
   workspaceRegistry = new WorkspaceRegistry();
   workspaceRegistry.registerWorkspace('ws-main', mainRepoDir);
   workspaceRegistry.registerWorkspace('ws-non-git', nonGitDir);
   workspaceRegistry.registerWorkspace('ws-secrets', secretsRepoDir);
   workspaceRegistry.registerWorkspace('ws-huge', hugeRepoDir);
+  workspaceRegistry.registerWorkspace('ws-huge2', hugeRepoDir2);
+  workspaceRegistry.registerWorkspace('ws-rename', renameRepoDir);
+  workspaceRegistry.registerWorkspace('ws-rename2', renameRepoDir2);
 
   const procReg = new ProcessRegistry();
   const terminal = new ControlledProcessRunner(procReg);
@@ -306,16 +343,18 @@ describe('RC-07 Task 3 Negative Controls (RC07-NEG-019..027)', () => {
     runGit(['checkout', 'HEAD', '--', 'keys.ts'], secretsRepoDir);
   });
 
-  test('RC07-NEG-024: Diff exceeds 512 KiB (wire response <= 524,288 bytes, truncated === true)', async () => {
+  test('RC07-NEG-024: Diff exceeds 512 KiB including well above 1 MiB old intermediate buffer (wire response <= 524,288 bytes, truncated === true)', async () => {
     const bigFile = path.join(hugeRepoDir, 'big.txt');
-    const largeContent = '+added line with content for padding \n'.repeat(25000);
+    // Produce a diff of ~2 MiB: 'content line with lots of padding text here\n' is ~47 bytes;
+    // 50000 repetitions = ~2.35 MiB, well above the old MAX_DIFF_BYTES*2 (1 MiB) ceiling.
+    const largeContent = 'content line with lots of padding text here\n'.repeat(50000);
     fs.writeFileSync(bigFile, largeContent);
 
     const res = await server.executeAuthenticatedToolCall(safeActor, 'arc_review_diff', {
       workspaceId: 'ws-huge',
     });
 
-    assert.ok(!res.isError, 'Tool invocation must succeed');
+    assert.ok(!res.isError, 'Tool invocation must succeed even for diffs well above 1 MiB');
     const rawText = res.content[0].text;
     const wireBytes = Buffer.byteLength(rawText, 'utf8');
 
@@ -391,6 +430,208 @@ describe('RC-07 Task 3 Negative Controls (RC07-NEG-019..027)', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Task 3 Regression Tests: Defect A (sensitive rename) & Defect B (large buffer)
+// ---------------------------------------------------------------------------
+
+describe('RC-07 Task 3 Regressions: Sensitive Rename and Large Diff', () => {
+  test('REG-A1: rename .env -> notes.txt does not leak sensitive origin content or filename in diff or fileSummaries', async () => {
+    // Commit: .env contains generic secret content (not matching token regex), notes.txt exists
+    // Stage: rename .env -> renamed_notes.txt using git mv
+    runGit(['mv', '.env', 'renamed_notes.txt'], renameRepoDir);
+
+    const res = await server.executeAuthenticatedToolCall(safeActor, 'arc_review_diff', {
+      workspaceId: 'ws-rename',
+      mode: 'staged',
+    });
+
+    assert.ok(!res.isError, 'Tool must succeed for rename involving sensitive origin');
+    const rawText = res.content[0].text;
+    const parsed = JSON.parse(rawText);
+
+    // .env must NOT appear in fileSummaries
+    const hasDotEnv = parsed.fileSummaries.some(
+      (s) => s.path.includes('.env') || (s.oldPath && s.oldPath.includes('.env')),
+    );
+    assert.strictEqual(
+      hasDotEnv,
+      false,
+      '.env must not appear in fileSummaries (rename origin leak)',
+    );
+
+    // Neither GENERIC_PASSWORD secret content nor .env filename in raw wire text
+    assert.strictEqual(
+      rawText.includes('GENERIC_PASSWORD'),
+      false,
+      'Secret content must not appear in wire response',
+    );
+    assert.strictEqual(
+      rawText.includes('s3cr3t'),
+      false,
+      'Secret value must not appear in wire response',
+    );
+    assert.strictEqual(
+      rawText.includes('.env'),
+      false,
+      '.env path must not appear in wire response (origin leak via rename)',
+    );
+
+    // The non-sensitive destination file renamed_notes.txt should also be suppressed
+    // because it is part of a rename from a sensitive source
+    const hasRenamedNotes = parsed.fileSummaries.some((s) => s.path === 'renamed_notes.txt');
+    assert.strictEqual(
+      hasRenamedNotes,
+      false,
+      'Rename destination must be suppressed when origin is sensitive',
+    );
+
+    // Restore: unstage and revert the rename
+    runGit(['reset', 'HEAD', '.'], renameRepoDir);
+    runGit(['checkout', 'HEAD', '--', '.'], renameRepoDir);
+    try {
+      fs.unlinkSync(path.join(renameRepoDir, 'renamed_notes.txt'));
+    } catch {
+      /* ignore */
+    }
+  });
+
+  test('REG-A2: rename notes.txt -> .env (reverse direction) does not leak sensitive destination or source in diff or fileSummaries', async () => {
+    // Stage: rename notes.txt -> .env in a repo where .env is not in HEAD
+    runGit(['mv', 'notes.txt', '.env'], renameRepoDir2);
+
+    const res = await server.executeAuthenticatedToolCall(safeActor, 'arc_review_diff', {
+      workspaceId: 'ws-rename2',
+      mode: 'staged',
+    });
+
+    assert.ok(!res.isError, 'Tool must succeed for rename involving sensitive destination .env');
+    const rawText = res.content[0].text;
+    const parsed = JSON.parse(rawText);
+
+    // .env must NOT appear in fileSummaries
+    const hasDotEnv = parsed.fileSummaries.some(
+      (s) => s.path.includes('.env') || (s.oldPath && s.oldPath.includes('.env')),
+    );
+    assert.strictEqual(hasDotEnv, false, '.env must not appear in fileSummaries');
+
+    // notes.txt (rename source) must also be suppressed since destination is sensitive
+    const hasNotes = parsed.fileSummaries.some((s) => s.path === 'notes.txt');
+    assert.strictEqual(
+      hasNotes,
+      false,
+      'Rename source (notes.txt) must be suppressed when destination is sensitive',
+    );
+
+    // .env path must not appear in wire text
+    assert.strictEqual(
+      rawText.includes('.env'),
+      false,
+      '.env path must not appear in wire response (destination leak)',
+    );
+
+    // Restore
+    runGit(['reset', 'HEAD', '.'], renameRepoDir2);
+    runGit(['checkout', 'HEAD', '--', '.'], renameRepoDir2);
+    try {
+      fs.unlinkSync(path.join(renameRepoDir2, '.env'));
+    } catch {
+      /* ignore */
+    }
+  });
+
+  test('REG-A3: rename notes.txt -> .env.production does not leak sensitive destination content or filename in diff or fileSummaries', async () => {
+    // Stage: rename notes.txt -> .env.production (a sensitive destination pattern)
+    runGit(['mv', 'notes.txt', '.env.production'], renameRepoDir);
+
+    const res = await server.executeAuthenticatedToolCall(safeActor, 'arc_review_diff', {
+      workspaceId: 'ws-rename',
+      mode: 'staged',
+    });
+
+    assert.ok(!res.isError, 'Tool must succeed for rename involving sensitive destination pattern');
+    const rawText = res.content[0].text;
+    const parsed = JSON.parse(rawText);
+
+    // .env.production must NOT appear in fileSummaries
+    const hasDotEnvProd = parsed.fileSummaries.some(
+      (s) => s.path.includes('.env') || (s.oldPath && s.oldPath.includes('.env')),
+    );
+    assert.strictEqual(hasDotEnvProd, false, '.env.production must not appear in fileSummaries');
+
+    // notes.txt (rename source) should also be suppressed since it's a rename into a sensitive file
+    const hasNotes = parsed.fileSummaries.some((s) => s.path === 'notes.txt');
+    assert.strictEqual(
+      hasNotes,
+      false,
+      'Rename source (notes.txt) must be suppressed when destination is sensitive',
+    );
+
+    // .env path must not appear in wire text
+    assert.strictEqual(
+      rawText.includes('.env'),
+      false,
+      '.env path must not appear in wire response (destination leak)',
+    );
+
+    // Restore
+    runGit(['reset', 'HEAD', '.'], renameRepoDir);
+    runGit(['checkout', 'HEAD', '--', '.'], renameRepoDir);
+    try {
+      fs.unlinkSync(path.join(renameRepoDir, '.env.production'));
+    } catch {
+      /* ignore */
+    }
+  });
+
+  test('REG-B2: diff raw output exceeding 4 MiB capture ceiling returns structured response with truncated=true and safe overflow marker', async () => {
+    // Produce a file whose diff will exceed the 4 MiB RAW_DIFF_CAPTURE_BYTES ceiling.
+    // Modify tracked file seed.txt with ~5 MiB of new lines:
+    const seedFile = path.join(hugeRepoDir2, 'seed.txt');
+    const lineContent = 'X'.repeat(100) + '\n';
+    const hugeContent = lineContent.repeat(50000);
+    fs.writeFileSync(seedFile, hugeContent);
+
+    const res = await server.executeAuthenticatedToolCall(safeActor, 'arc_review_diff', {
+      workspaceId: 'ws-huge2',
+    });
+
+    assert.ok(!res.isError, 'Tool must succeed even when raw diff exceeds 4 MiB capture ceiling');
+    const rawText = res.content[0].text;
+    const wireBytes = Buffer.byteLength(rawText, 'utf8');
+
+    assert.ok(
+      wireBytes <= 524288,
+      `Wire response (${wireBytes} bytes) must be <= 524288 bytes even for overflow case`,
+    );
+
+    const parsed = JSON.parse(rawText);
+    assert.strictEqual(parsed.truncated, true, 'truncated must be true for overflow case');
+    assert.strictEqual(typeof parsed.diff, 'string', 'diff field must be a string');
+
+    // bytes field must accurately reflect the returned diff size
+    assert.strictEqual(
+      parsed.bytes,
+      Buffer.byteLength(parsed.diff, 'utf8'),
+      'bytes field must equal actual UTF-8 byte size of returned diff',
+    );
+
+    // No replacement character (valid UTF-8)
+    assert.strictEqual(parsed.diff.includes('\uFFFD'), false, 'Diff must be valid UTF-8');
+
+    // No secret leakage in response (overflow marker is safe text only)
+    assert.ok(
+      !rawText.includes('GENERIC_PASSWORD') && !rawText.includes('s3cr3t'),
+      'No secret content may appear in overflow response',
+    );
+
+    // Cleanup
+    try {
+      runGit(['checkout', 'HEAD', '--', 'seed.txt'], hugeRepoDir2);
+    } catch {
+      /* ignore */
+    }
+  });
+});
 // ---------------------------------------------------------------------------
 // Positive Flows: RC07-FLOW-06 through RC07-FLOW-08
 // ---------------------------------------------------------------------------

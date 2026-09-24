@@ -21,6 +21,20 @@ const execFileAsync = promisify(execFile);
 export const MAX_DIFF_BYTES = 512 * 1024;
 
 /**
+ * Safe bounded raw diff capture ceiling: 4 MiB.
+ * Large enough to handle multi-MiB diffs while bounding subprocess memory.
+ * If this ceiling is exceeded, a safe truncation marker is substituted.
+ */
+export const RAW_DIFF_CAPTURE_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Placeholder emitted when the raw diff exceeds the capture ceiling.
+ * The overall response still succeeds with truncated === true.
+ */
+const RAW_DIFF_OVERFLOW_MARKER =
+  '[DIFF TOO LARGE TO CAPTURE — raw output exceeded safe intermediate buffer limit; showing file summaries only]';
+
+/**
  * Maximum git_log commit count: 100.
  */
 export const MAX_LOG_COUNT = 100;
@@ -126,16 +140,26 @@ export function isSensitiveGitPath(filePath: string): boolean {
 
 /**
  * Purges file diff hunks belonging to sensitive files (even if tracked in git).
+ * @param diff - raw diff string
+ * @param extraSensitivePaths - optional additional paths to suppress (e.g. rename origins)
  */
-export function purgeSensitiveDiffBlocks(diff: string): string {
-  return purgeSensitiveDiffBlocksWithCount(diff).diff;
+export function purgeSensitiveDiffBlocks(diff: string, extraSensitivePaths?: Set<string>): string {
+  return purgeSensitiveDiffBlocksWithCount(diff, extraSensitivePaths).diff;
 }
 
 /**
  * Purges file diff hunks belonging to sensitive files (even if tracked in git),
  * returning the sanitized diff and the count of suppressed file hunks.
+ *
+ * Accepts an optional set of extra sensitive paths (e.g. rename/copy origins
+ * detected from a full --name-status pass without pathspec excludes) so that
+ * renames involving sensitive paths are suppressed even when Git pathspec excludes
+ * already hid the sensitive side, potentially presenting only the non-sensitive side.
  */
-export function purgeSensitiveDiffBlocksWithCount(diff: string): {
+export function purgeSensitiveDiffBlocksWithCount(
+  diff: string,
+  extraSensitivePaths?: Set<string>,
+): {
   diff: string;
   suppressedCount: number;
 } {
@@ -163,11 +187,65 @@ export function purgeSensitiveDiffBlocksWithCount(diff: string): {
     }
 
     const firstLine = block.split('\n', 1)[0];
-    const isSensitive = sensitivePatterns.some((pattern) => pattern.test(firstLine));
+    let isSensitive = false;
+
+    // 1. Extract paths from diff --git a/<pathA> b/<pathB>
+    const rest = firstLine.slice('diff --git '.length);
+    const bIndex = rest.lastIndexOf(' b/');
+    if (bIndex > 2 && rest.startsWith('a/')) {
+      const pathA = rest.slice(2, bIndex);
+      const pathB = rest.slice(bIndex + 3);
+      if (isSensitiveGitPath(pathA) || isSensitiveGitPath(pathB)) {
+        isSensitive = true;
+      }
+      if (!isSensitive && extraSensitivePaths && extraSensitivePaths.size > 0) {
+        if (extraSensitivePaths.has(pathA) || extraSensitivePaths.has(pathB)) {
+          isSensitive = true;
+        }
+      }
+    }
+
+    // 2. Fallback pattern match against first line
+    if (!isSensitive) {
+      isSensitive = sensitivePatterns.some((pattern) => pattern.test(firstLine));
+    }
+
+    // 3. Check rename headers in block
+    if (!isSensitive) {
+      const headerLines = block.split('\n').slice(0, 10);
+      for (const hLine of headerLines) {
+        if (hLine.startsWith('---') || hLine.startsWith('+++') || hLine.startsWith('@@')) {
+          break;
+        }
+        if (hLine.startsWith('rename from ')) {
+          const p = hLine.slice(12).trim();
+          if (isSensitiveGitPath(p) || (extraSensitivePaths && extraSensitivePaths.has(p))) {
+            isSensitive = true;
+            break;
+          }
+        } else if (hLine.startsWith('rename to ')) {
+          const p = hLine.slice(10).trim();
+          if (isSensitiveGitPath(p) || (extraSensitivePaths && extraSensitivePaths.has(p))) {
+            isSensitive = true;
+            break;
+          }
+        }
+      }
+    }
+
+    // 4. Check extraSensitivePaths substring match in first line
+    if (!isSensitive && extraSensitivePaths && extraSensitivePaths.size > 0) {
+      for (const sensPath of extraSensitivePaths) {
+        if (firstLine.includes(sensPath)) {
+          isSensitive = true;
+          break;
+        }
+      }
+    }
 
     if (isSensitive) {
       suppressedCount++;
-      sanitizedBlocks.push(`${firstLine}\n[SENSITIVE FILE DIFF SUPPRESSED]\n`);
+      // Completely drop the sensitive hunk so no sensitive filename or content is emitted
     } else {
       sanitizedBlocks.push(block);
     }
@@ -178,10 +256,6 @@ export function purgeSensitiveDiffBlocksWithCount(diff: string): {
     suppressedCount,
   };
 }
-
-/**
- * Truncates a UTF-8 string to a maximum byte limit without splitting multi-byte characters.
- */
 export function truncateUtf8ToByteLimit(
   str: string,
   maxBytes: number,
@@ -1125,21 +1199,83 @@ export class GitSubsystem implements IGitSubsystem {
     ];
 
     const pathFilter = options.path ? options.path.trim() : '.';
-    const diffArgs = [...baseArgs, '--', pathFilter, ...secretExcludes];
 
-    // 1. Run git diff for full diff output
-    const { stdout: rawDiffStdout } = await this.runGit(
-      workspaceRoot,
-      diffArgs,
-      MAX_DIFF_BYTES * 2,
-      execOptions,
-    );
+    // 1. Discover all rename/copy pairs WITHOUT pathspec excludes so we can
+    //    detect sensitive origins/destinations that might be hidden by excludes.
+    //    Example: `.env -> notes.txt` rename -- Git with :(exclude)*.env* will show
+    //    only `notes.txt` in the filtered diff. We need to know it came from `.env`.
+    const fullNameStatusArgs = [...baseArgs, '--name-status', '-z', '-M', '--', pathFilter];
+    let renameSensitivePaths: Set<string> | undefined;
+    try {
+      const { stdout: fullNameStatusStdout } = await this.runGit(
+        workspaceRoot,
+        fullNameStatusArgs,
+        undefined,
+        execOptions,
+      );
+      // Parse rename/copy entries; collect any path where EITHER side is sensitive.
+      renameSensitivePaths = new Set<string>();
+      const nsTokensFull = fullNameStatusStdout.split('\0');
+      let nsIdx = 0;
+      while (nsIdx < nsTokensFull.length) {
+        const tok = nsTokensFull[nsIdx];
+        if (!tok) {
+          nsIdx++;
+          continue;
+        }
+        const code = tok.trim();
+        if (code.startsWith('R') || code.startsWith('C')) {
+          const srcPath = nsTokensFull[nsIdx + 1] || '';
+          const dstPath = nsTokensFull[nsIdx + 2] || '';
+          if (isSensitiveGitPath(srcPath) || isSensitiveGitPath(dstPath)) {
+            // Suppress both sides: either may appear in pathspec-filtered diff output
+            if (srcPath) renameSensitivePaths.add(srcPath);
+            if (dstPath) renameSensitivePaths.add(dstPath);
+          }
+          nsIdx += 3;
+        } else {
+          nsIdx += 2;
+        }
+      }
+    } catch {
+      // If this auxiliary call fails, proceed without rename-origin detection.
+      // The standard pathspec excludes and purgeSensitiveDiffBlocks remain active.
+      renameSensitivePaths = undefined;
+    }
 
     if (execOptions?.signal?.aborted) {
       throw ArcError.executionTimeout('Command execution exceeded configured timeout.');
     }
 
-    // 2. Run git diff --name-status -z -M and --numstat -z -M for structured file summaries
+    // 2. Run git diff for full diff output using RAW_DIFF_CAPTURE_BYTES ceiling.
+    //    If the raw diff exceeds the ceiling, substitute a safe truncation marker
+    //    so the structured response remains successful with truncated === true.
+    const diffArgs = [...baseArgs, '--', pathFilter, ...secretExcludes];
+    let rawDiffStdout: string;
+    let rawDiffExceededCeiling = false;
+    try {
+      const { stdout } = await this.runGit(
+        workspaceRoot,
+        diffArgs,
+        RAW_DIFF_CAPTURE_BYTES,
+        execOptions,
+      );
+      rawDiffStdout = stdout;
+    } catch (err: unknown) {
+      if (err instanceof ArcError && err.code === 'PAYLOAD_TOO_LARGE') {
+        // Raw diff exceeds safe capture ceiling -- return a structured truncation marker.
+        rawDiffStdout = RAW_DIFF_OVERFLOW_MARKER;
+        rawDiffExceededCeiling = true;
+      } else {
+        throw err;
+      }
+    }
+
+    if (execOptions?.signal?.aborted) {
+      throw ArcError.executionTimeout('Command execution exceeded configured timeout.');
+    }
+
+    // 3. Run git diff --name-status -z -M and --numstat -z -M for structured file summaries
     const nameStatusArgs = [
       ...baseArgs,
       '--name-status',
@@ -1168,15 +1304,27 @@ export class GitSubsystem implements IGitSubsystem {
       execOptions,
     );
 
-    // 3. Parse name-status -z and numstat -z
-    const fileSummaries = this.parseFileSummaries(nameStatusStdout, numstatStdout);
+    // 4. Parse name-status -z and numstat -z
+    const rawFileSummaries = this.parseFileSummaries(nameStatusStdout, numstatStdout);
 
-    // 4. Defense-in-depth: purge sensitive file diff hunks and mask sensitive tokens/keys
-    const { diff: purgedDiff, suppressedCount } = purgeSensitiveDiffBlocksWithCount(rawDiffStdout);
+    // Post-filter: also remove any entry whose path appears in renameSensitivePaths.
+    // This handles the case where the pathspec-excluded name-status emits the non-sensitive
+    // rename destination as an add (e.g. `.env -> renamed_notes.txt` appears as `A renamed_notes.txt`).
+    const fileSummaries =
+      renameSensitivePaths && renameSensitivePaths.size > 0
+        ? rawFileSummaries.filter((s) => !renameSensitivePaths!.has(s.path))
+        : rawFileSummaries;
+
+    // 5. Defense-in-depth: purge sensitive file diff hunks (including rename origin/destination
+    //    paths discovered in step 1) and mask sensitive tokens/keys
+    const { diff: purgedDiff, suppressedCount } = purgeSensitiveDiffBlocksWithCount(
+      rawDiffStdout,
+      renameSensitivePaths,
+    );
     const { diff: maskedDiff, maskedCount } = maskSensitiveDiffWithCount(purgedDiff);
     const sensitiveBlocksMasked = suppressedCount + maskedCount;
 
-    // 5. Enforce requested maxBytes (bounded by MAX_DIFF_BYTES)
+    // 6. Enforce requested maxBytes (bounded by MAX_DIFF_BYTES)
     const maxBudget =
       options.maxBytes !== undefined ? Math.min(options.maxBytes, MAX_DIFF_BYTES) : MAX_DIFF_BYTES;
 
@@ -1184,7 +1332,7 @@ export class GitSubsystem implements IGitSubsystem {
 
     return {
       diff: boundedDiff,
-      truncated,
+      truncated: truncated || rawDiffExceededCeiling,
       totalFilesChanged: fileSummaries.length,
       fileSummaries,
       sensitiveBlocksMasked,
