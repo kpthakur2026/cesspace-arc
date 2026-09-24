@@ -14,7 +14,13 @@ import path from 'node:path';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 
-import { ArcMcpServer, ALL_TOOL_DEFINITIONS, TOOL_SCHEMAS } from '../apps/mcp-server/dist/index.js';
+import {
+  ArcMcpServer,
+  createArcMcpServer,
+  ALL_TOOL_DEFINITIONS,
+  TOOL_SCHEMAS,
+} from '../apps/mcp-server/dist/index.js';
+import { SERVER_INTERNAL_ACCESS } from '../apps/mcp-server/dist/internal/server-seam.js';
 import {
   WorkspaceRegistry,
   SecurityKernel,
@@ -934,7 +940,7 @@ class FakeSlowGitSubsystem extends GitSubsystem {
 }
 
 describe('RC-07 Task 2: 15-Second Aggregate Timeout & Cancellation Invariants', () => {
-  test('total Task-2 execution is bounded by the configured 15-second ceiling', () => {
+  test('DEFAULT_TASK2_TIMEOUT_MS === 15000', () => {
     assert.equal(
       DEFAULT_TASK2_TIMEOUT_MS,
       15000,
@@ -942,7 +948,151 @@ describe('RC-07 Task 2: 15-Second Aggregate Timeout & Cancellation Invariants', 
     );
   });
 
-  test('deterministic aggregate timeout regression with FakeSlowGitSubsystem', async () => {
+  test('Production ArcServerConfig has no Task-2 timeout override', () => {
+    const indexTs = fs.readFileSync(path.resolve('apps/mcp-server/src/index.ts'), 'utf8');
+    const configMatch = indexTs.match(/export\s+interface\s+ArcServerConfig\s*\{([\s\S]*?)\}/);
+    assert.ok(
+      configMatch,
+      'ArcServerConfig interface must be defined in apps/mcp-server/src/index.ts',
+    );
+    assert.ok(
+      !configMatch[1].includes('task2TimeoutMs'),
+      'ArcServerConfig must not expose task2TimeoutMs property',
+    );
+  });
+
+  test('createArcMcpServer({ task2TimeoutMs: 60000 } as any) cannot increase the effective Task-2 ceiling', () => {
+    const auditConfig = createAuditConfig(tempDir, 'prod-cfg-bypass');
+    const server = createArcMcpServer({
+      transport: 'stdio',
+      authorizedRoots: [{ id: 'ws-prod', path: mainRepoDir }],
+      audit: auditConfig,
+      task2TimeoutMs: 60000,
+    });
+    const seam = SERVER_INTERNAL_ACCESS.get(server);
+    assert.ok(seam, 'Internal test seam must exist on created server');
+    assert.equal(
+      seam.getTask2TimeoutMs(),
+      15000,
+      'Task-2 timeout must remain DEFAULT_TASK2_TIMEOUT_MS (15000) and ignore config.task2TimeoutMs',
+    );
+  });
+
+  test('Direct new ArcMcpServer(..., { task2TimeoutMs: 60000 } as any, ...) cannot increase it either', () => {
+    const registry = new WorkspaceRegistry();
+    registry.registerWorkspace('ws-direct', mainRepoDir);
+    const procReg = new ProcessRegistry();
+    const terminal = new ControlledProcessRunner(procReg);
+    const audit = new AuditLogger();
+    const kernel = new SecurityKernel(registry, procReg);
+
+    const server = new ArcMcpServer(
+      registry,
+      kernel,
+      audit,
+      new FilesystemSubsystem(),
+      new GitSubsystem(),
+      {
+        transport: 'stdio',
+        task2TimeoutMs: 60000,
+      },
+      terminal,
+      procReg,
+      new ApprovalStateManager(),
+    );
+
+    const seam = SERVER_INTERNAL_ACCESS.get(server);
+    assert.ok(seam, 'Internal test seam must exist on created server');
+    assert.equal(
+      seam.getTask2TimeoutMs(),
+      15000,
+      'Task-2 timeout must remain DEFAULT_TASK2_TIMEOUT_MS (15000) and ignore config.task2TimeoutMs',
+    );
+  });
+
+  test('The package-internal test seam can reduce the timeout to 50 ms', () => {
+    const registry = new WorkspaceRegistry();
+    registry.registerWorkspace('ws-seam', mainRepoDir);
+    const procReg = new ProcessRegistry();
+    const terminal = new ControlledProcessRunner(procReg);
+    const audit = new AuditLogger();
+    const kernel = new SecurityKernel(registry, procReg);
+
+    const server = new ArcMcpServer(
+      registry,
+      kernel,
+      audit,
+      new FilesystemSubsystem(),
+      new GitSubsystem(),
+      { transport: 'stdio' },
+      terminal,
+      procReg,
+      new ApprovalStateManager(),
+    );
+
+    const seam = SERVER_INTERNAL_ACCESS.get(server);
+    assert.ok(seam, 'Internal test seam must be available');
+    assert.equal(seam.getTask2TimeoutMs(), 15000, 'Initial timeout must be 15000 ms');
+
+    seam.setTask2TimeoutMs(50);
+    assert.equal(
+      seam.getTask2TimeoutMs(),
+      50,
+      'Internal seam must be able to lower timeout to 50 ms',
+    );
+  });
+
+  test('The internal seam rejects/clamps attempts above 15000', () => {
+    const registry = new WorkspaceRegistry();
+    registry.registerWorkspace('ws-seam-reject', mainRepoDir);
+    const procReg = new ProcessRegistry();
+    const terminal = new ControlledProcessRunner(procReg);
+    const audit = new AuditLogger();
+    const kernel = new SecurityKernel(registry, procReg);
+
+    const server = new ArcMcpServer(
+      registry,
+      kernel,
+      audit,
+      new FilesystemSubsystem(),
+      new GitSubsystem(),
+      { transport: 'stdio' },
+      terminal,
+      procReg,
+      new ApprovalStateManager(),
+    );
+
+    const seam = SERVER_INTERNAL_ACCESS.get(server);
+    assert.ok(seam, 'Internal test seam must be available');
+
+    // 1. Attempts above 15000 are rejected
+    assert.throws(
+      () => seam.setTask2TimeoutMs(60000),
+      /RangeError/,
+      'Attempts to set timeout > 15000 must be rejected',
+    );
+    assert.equal(seam.getTask2TimeoutMs(), 15000);
+
+    // 2. Non-finite values are rejected
+    assert.throws(() => seam.setTask2TimeoutMs(NaN), /TypeError/);
+    assert.throws(() => seam.setTask2TimeoutMs(Infinity), /TypeError/);
+    assert.throws(() => seam.setTask2TimeoutMs(-Infinity), /TypeError/);
+
+    // 3. Zero / negative values are rejected
+    assert.throws(() => seam.setTask2TimeoutMs(0), /RangeError/);
+    assert.throws(() => seam.setTask2TimeoutMs(-100), /RangeError/);
+
+    // 4. Malformed runtime values are rejected
+    assert.throws(() => seam.setTask2TimeoutMs('50'), /TypeError/);
+    assert.throws(() => seam.setTask2TimeoutMs(null), /TypeError/);
+    assert.throws(() => seam.setTask2TimeoutMs({}), /TypeError/);
+
+    // Effective timeout never exceeded 15000
+    assert.ok(seam.getTask2TimeoutMs() <= 15000);
+    assert.equal(seam.getTask2TimeoutMs(), 15000);
+  });
+
+  test('The aggregate AbortController/Git cancellation test still passes', async () => {
     const registry = new WorkspaceRegistry();
     registry.registerWorkspace('ws-timeout', mainRepoDir);
     const procReg = new ProcessRegistry();
@@ -959,13 +1109,17 @@ describe('RC-07 Task 2: 15-Second Aggregate Timeout & Cancellation Invariants', 
       fakeSlowGit,
       {
         transport: 'stdio',
-        // Configure short test deadline (50ms) to keep CI fast while testing real aggregate timeout
-        task2TimeoutMs: 50,
       },
       terminal,
       procReg,
       new ApprovalStateManager(),
     );
+
+    // Set 50ms timeout via internal test seam
+    const seam = SERVER_INTERNAL_ACCESS.get(server);
+    assert.ok(seam, 'SERVER_INTERNAL_ACCESS must be available for internal test');
+    seam.setTask2TimeoutMs(50);
+    assert.equal(seam.getTask2TimeoutMs(), 50);
 
     const startTime = Date.now();
     const res = await server.executeAuthenticatedToolCall(safeActor, 'arc_repo_status', {

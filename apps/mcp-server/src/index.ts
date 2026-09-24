@@ -164,11 +164,6 @@ export interface ArcServerConfig {
    * itself.
    */
   audit?: AuditConfig;
-  /**
-   * Internal/test-configurable aggregate timeout ceiling for Task-2 read-only tools.
-   * Defaults to DEFAULT_TASK2_TIMEOUT_MS (15,000 ms).
-   */
-  task2TimeoutMs?: number;
 }
 
 /** Safe, non-sensitive reason the Layer-2 engine is unavailable. */
@@ -1612,7 +1607,7 @@ export class ArcMcpServer implements IArcMcpServer {
     sessionManager?: SessionManager,
   ) {
     this.#deterministicRegistry = createProductionDeterministicRegistry();
-    this.#task2TimeoutMs = config?.task2TimeoutMs ?? DEFAULT_TASK2_TIMEOUT_MS;
+    this.#task2TimeoutMs = DEFAULT_TASK2_TIMEOUT_MS;
     SERVER_INTERNAL_ACCESS.set(this, {
       setTestCompositeHarness: (harness) => {
         this.#testCompositeHarness = harness;
@@ -1627,6 +1622,21 @@ export class ArcMcpServer implements IArcMcpServer {
       },
       getDeterministicRegistry: () => this.#deterministicRegistry,
       setTask2TimeoutMs: (timeoutMs: number) => {
+        if (
+          typeof timeoutMs !== 'number' ||
+          !Number.isFinite(timeoutMs) ||
+          Number.isNaN(timeoutMs)
+        ) {
+          throw new TypeError('Task-2 timeout must be a finite number.');
+        }
+        if (timeoutMs <= 0) {
+          throw new RangeError(`Task-2 timeout must be > 0 ms (got ${timeoutMs}).`);
+        }
+        if (timeoutMs > DEFAULT_TASK2_TIMEOUT_MS) {
+          throw new RangeError(
+            `Task-2 timeout cannot exceed frozen maximum of ${DEFAULT_TASK2_TIMEOUT_MS} ms (got ${timeoutMs}).`,
+          );
+        }
         this.#task2TimeoutMs = timeoutMs;
       },
       getTask2TimeoutMs: () => this.#task2TimeoutMs,
