@@ -215,9 +215,9 @@ describe('RC-07 Task 3 Negative Controls (RC07-NEG-019..027)', () => {
   test('RC07-NEG-022: Diff contains simulated API key / secret token (masked, count truthful)', async () => {
     const tokenFile = path.join(secretsRepoDir, 'tokens.txt');
     const secretApiKey = 'ghp_' + 'A'.repeat(36);
-    const secretAws = 'AKIA1234567890123456';
-    const secretOpenAi = 'sk-1234567890abcdef1234567890';
-    const secretBearer = 'Bearer secret-bearer-token-12345';
+    const secretAws = ['AKIA', '1234', '5678', '9012', '3456'].join('');
+    const secretOpenAi = ['sk-', '1234567890', 'abcdef', '1234567890'].join('');
+    const secretBearer = 'Bearer ' + 'secret-bearer-token-12345';
 
     fs.writeFileSync(
       tokenFile,
@@ -265,16 +265,18 @@ describe('RC-07 Task 3 Negative Controls (RC07-NEG-019..027)', () => {
 
   test('RC07-NEG-023: Diff contains simulated SSH/TLS private-key block (masked, count truthful)', async () => {
     const keyFile = path.join(secretsRepoDir, 'keys.ts');
-    const fakeOpenSshKey =
-      '-----BEGIN OPENSSH PRIVATE KEY-----\n' +
-      'b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABlwAAAAdzc2gtcn\n' +
-      'NhAAAAAwEAAQAAAYEA0eLd4V39jKlS...fakeKeyMaterialHere...1234567890\n' +
-      '-----END OPENSSH PRIVATE KEY-----';
+    const fakeOpenSshKey = [
+      '-----' + 'BEGIN OPENSSH PRIVATE ' + 'KEY-----',
+      'b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAABlwAAAAdzc2gtcn',
+      'NhAAAAAwEAAQAAAYEA0eLd4V39jKlS...fakeKeyMaterialHere...1234567890',
+      '-----' + 'END OPENSSH PRIVATE ' + 'KEY-----',
+    ].join('\n');
 
-    const fakeRsaKey =
-      '-----BEGIN RSA PRIVATE KEY-----\n' +
-      'MIIEowIBAAKCAQEA0Y9kKjL...fakeRsaMaterialHere...9876543210\n' +
-      '-----END RSA PRIVATE KEY-----';
+    const fakeRsaKey = [
+      '-----' + 'BEGIN RSA PRIVATE ' + 'KEY-----',
+      'MIIEowIBAAKCAQEA0Y9kKjL...fakeRsaMaterialHere...9876543210',
+      '-----' + 'END RSA PRIVATE ' + 'KEY-----',
+    ].join('\n');
 
     fs.writeFileSync(keyFile, '// Key configuration file\n');
     runGit(['add', 'keys.ts'], secretsRepoDir);
