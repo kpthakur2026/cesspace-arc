@@ -103,6 +103,10 @@ export async function spawnAndControlProcess(
   });
 
   const terminateChildWithEscalation = () => {
+    if (record.timedOut || record._killTimer) {
+      return;
+    }
+
     processRegistry.markTimedOut(record.processId);
     try {
       if (child.pid && process.platform !== 'win32') {
@@ -113,17 +117,21 @@ export async function spawnAndControlProcess(
     } catch {
       // ignore
     }
+    processRegistry.notifySigtermSent(record.processId);
+
     record._killTimer = setTimeout(() => {
       try {
-        if (child.exitCode === null && child.signalCode === null) {
-          if (child.pid && process.platform !== 'win32') {
-            process.kill(-child.pid, 'SIGKILL');
-          } else {
-            child.kill('SIGKILL');
-          }
+        if (child.pid && process.platform !== 'win32') {
+          processRegistry.notifySigkillEscalated(record.processId);
+          process.kill(-child.pid, 'SIGKILL');
+        } else if (child.exitCode === null && child.signalCode === null) {
+          processRegistry.notifySigkillEscalated(record.processId);
+          child.kill('SIGKILL');
         }
       } catch {
-        // ignore
+        // ESRCH / already-dead process group should be handled harmlessly
+      } finally {
+        record._killTimer = undefined;
       }
     }, 1000);
     record._killTimer.unref();

@@ -146,6 +146,8 @@ export interface IProcessRegistry {
   markTimedOut(processId: string): void;
   notifySpawnSuccess(processId: string): void;
   markSpawnFailed(processId: string, error?: string): void;
+  notifySigtermSent(processId: string): void;
+  notifySigkillEscalated(processId: string): void;
   checkConcurrency(sessionId: string, workspaceId: string): void;
   flushLifecycleEvents(): Promise<void>;
   clear(): void;
@@ -312,6 +314,34 @@ export class ProcessRegistry implements IProcessRegistry {
       actor: record.actor,
       executable: record.executable,
       error,
+    });
+  }
+
+  public notifySigtermSent(processId: string): void {
+    const record = this.processes.get(processId);
+    if (!record) return;
+    this.emitLifecycleEvent({
+      eventType: 'PROCESS_SIGTERM_SENT',
+      timestamp: new Date().toISOString(),
+      processId: record.processId,
+      workspaceId: record.workspaceId,
+      actor: record.actor,
+      executable: record.executable,
+      signal: 'SIGTERM',
+    });
+  }
+
+  public notifySigkillEscalated(processId: string): void {
+    const record = this.processes.get(processId);
+    if (!record) return;
+    this.emitLifecycleEvent({
+      eventType: 'PROCESS_SIGKILL_ESCALATED',
+      timestamp: new Date().toISOString(),
+      processId: record.processId,
+      workspaceId: record.workspaceId,
+      actor: record.actor,
+      executable: record.executable,
+      signal: 'SIGKILL',
     });
   }
 
@@ -639,7 +669,10 @@ export class ProcessRegistry implements IProcessRegistry {
     if (signal === 'SIGTERM') {
       record._killTimer = setTimeout(() => {
         try {
-          if (child.exitCode === null && child.signalCode === null) {
+          if (
+            (pid && process.platform !== 'win32') ||
+            (child.exitCode === null && child.signalCode === null)
+          ) {
             this.emitLifecycleEvent({
               eventType: 'PROCESS_SIGKILL_ESCALATED',
               timestamp: new Date().toISOString(),
@@ -653,6 +686,8 @@ export class ProcessRegistry implements IProcessRegistry {
           }
         } catch {
           // ignore
+        } finally {
+          record._killTimer = undefined;
         }
       }, 1000);
       record._killTimer.unref();
@@ -673,10 +708,9 @@ export class ProcessRegistry implements IProcessRegistry {
       clearTimeout(record._timeoutTimer);
       record._timeoutTimer = undefined;
     }
-    if (record._killTimer) {
-      clearTimeout(record._killTimer);
-      record._killTimer = undefined;
-    }
+    // Note: Pending escalation timer (_killTimer) must NOT be cancelled on root-process
+    // completion so that any surviving descendants in the process group are reaped
+    // after the grace period expires.
 
     const wasTimedOut = record.timedOut;
     const wasTerminating = record.state === 'TERMINATING';
@@ -735,8 +769,14 @@ export class ProcessRegistry implements IProcessRegistry {
 
   public clear(): void {
     for (const record of this.processes.values()) {
-      if (record._timeoutTimer) clearTimeout(record._timeoutTimer);
-      if (record._killTimer) clearTimeout(record._killTimer);
+      if (record._timeoutTimer) {
+        clearTimeout(record._timeoutTimer);
+        record._timeoutTimer = undefined;
+      }
+      if (record._killTimer) {
+        clearTimeout(record._killTimer);
+        record._killTimer = undefined;
+      }
       const isAlive = record.state === 'RUNNING' || record.state === 'TERMINATING';
       if (isAlive && record._child) {
         try {

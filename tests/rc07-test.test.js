@@ -338,12 +338,20 @@ test('slow test that hangs', async () => {
         `
 const { spawn } = require('node:child_process');
 const test = require('node:test');
+const fs = require('node:fs');
 
-test('spawns grandchild then hangs', async () => {
-  const grandchild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 10000)'], {
-    stdio: 'ignore'
+test('spawns SIGTERM-resistant descendant process then hangs', async () => {
+  const descendantScript = \`
+    const fs = require('node:fs');
+    process.on('SIGTERM', () => {
+      // Explicitly ignore SIGTERM so process only dies upon SIGKILL escalation
+    });
+    fs.writeSync(1, 'DESCENDANT_PID:' + process.pid + '\\\\n');
+    setInterval(() => {}, 10000);
+  \`;
+  const descendant = spawn(process.execPath, ['-e', descendantScript], {
+    stdio: ['ignore', 'inherit', 'ignore'],
   });
-  console.log('GRANDCHILD_PID:' + grandchild.pid);
   await new Promise((resolve) => setTimeout(resolve, 10000));
 });
 `,
@@ -351,7 +359,7 @@ test('spawns grandchild then hangs', async () => {
 
       const reqRes = await server.executeAuthenticatedToolCall(makeSafeActor(), 'arc_test', {
         testPath: 'orphan.test.js',
-        maxDurationMs: 500,
+        maxDurationMs: 1200,
       });
       const reqPayload = JSON.parse(reqRes.content[0].text);
       assert.equal(reqPayload.code, 'APPROVAL_REQUIRED');
@@ -362,7 +370,7 @@ test('spawns grandchild then hangs', async () => {
 
       const execRes = await server.executeAuthenticatedToolCall(makeSafeActor(), 'arc_test', {
         testPath: 'orphan.test.js',
-        maxDurationMs: 500,
+        maxDurationMs: 1200,
         _arcApproval: {
           requestId,
           token: approval.token,
@@ -371,21 +379,54 @@ test('spawns grandchild then hangs', async () => {
 
       const body = JSON.parse(execRes.content[0].text);
       assert.equal(body.status, 'TIMED_OUT');
+      assert.ok(body.processId, 'Response must include processId');
 
-      // Parse grandchild PID if it printed before timeout
-      const match = /GRANDCHILD_PID:(\d+)/.exec(body.outputExcerpt);
-      if (match) {
-        const grandchildPid = parseInt(match[1], 10);
-        // Wait slightly for SIGKILL escalation to ensure cleanup
-        await new Promise((r) => setTimeout(r, 1200));
-        let alive = true;
-        try {
-          process.kill(grandchildPid, 0);
-        } catch {
-          alive = false;
+      // Assert the root ProcessRegistry record is terminal and timedOut === true
+      const procRegistry = server.processRegistry;
+      const procRecord = procRegistry.processes?.get(body.processId);
+      assert.ok(procRecord, 'ProcessRegistry must retain record for timed out execution');
+      assert.equal(procRecord.state, 'TIMED_OUT', 'Root record must be terminal TIMED_OUT');
+      assert.equal(procRecord.timedOut, true, 'Record timedOut must be true');
+
+      // Capture descendant PID deterministically; assertion MUST NOT be conditional
+      const match = /DESCENDANT_PID:(\d+)/.exec(body.outputExcerpt);
+      assert.ok(match, 'Must capture descendant PID deterministically from test output excerpt');
+      const descendantPid = parseInt(match[1], 10);
+      assert.ok(
+        Number.isInteger(descendantPid) && descendantPid > 0,
+        'Descendant PID must be a valid positive integer',
+      );
+
+      // Wait beyond the 1000ms SIGKILL escalation grace period
+      await new Promise((r) => setTimeout(r, 1300));
+
+      // Assert descendant process was forcefully reaped by SIGKILL escalation
+      let descendantAlive = true;
+      try {
+        process.kill(descendantPid, 0);
+      } catch (err) {
+        if (err && err.code === 'ESRCH') {
+          descendantAlive = false;
         }
-        assert.equal(alive, false, 'Grandchild process must not survive timeout');
       }
+      assert.equal(
+        descendantAlive,
+        false,
+        `SIGTERM-resistant descendant PID ${descendantPid} must not survive SIGKILL escalation`,
+      );
+
+      // Assert no RUNNING or TERMINATING ProcessRegistry record remains for the operation
+      const runningRecords = procRegistry.listProcesses({ state: 'RUNNING' });
+      const terminatingRecords = procRegistry.listProcesses({ state: 'TERMINATING' });
+      assert.equal(
+        runningRecords.some((r) => r.processId === body.processId),
+        false,
+      );
+      assert.equal(
+        terminatingRecords.some((r) => r.processId === body.processId),
+        false,
+      );
+      assert.equal(procRecord.state, 'TIMED_OUT');
     });
 
     test('RC07-NEG-045: process output containing simulated private key/tokens is redacted in MCP response', async () => {
@@ -543,19 +584,39 @@ test('ui: skipped test', (t) => { t.skip('skipped'); });
       writeFileSync(
         stubbornTest,
         `
+const { spawn } = require('node:child_process');
 const test = require('node:test');
-process.on('SIGTERM', () => {
-  // Intentionally ignore SIGTERM to force SIGKILL escalation
-});
-test('stubborn test', async () => {
+const fs = require('node:fs');
+
+test('stubborn test requiring SIGKILL escalation', async () => {
+  const childScript = \`
+    const fs = require('node:fs');
+    process.on('SIGTERM', () => {
+      // Ignore SIGTERM to require SIGKILL escalation
+    });
+    fs.writeSync(1, 'STUBBORN_PID:' + process.pid + '\\\\n');
+    setInterval(() => {}, 10000);
+  \`;
+  const child = spawn(process.execPath, ['-e', childScript], {
+    stdio: ['ignore', 'inherit', 'ignore'],
+  });
   await new Promise((resolve) => setTimeout(resolve, 10000));
 });
 `,
       );
 
+      // Register lifecycle sink on server.processRegistry to truthfully observe lifecycle events
+      const lifecycleEvents = [];
+      const procRegistry = server.processRegistry;
+      procRegistry.registerLifecycleSink({
+        onProcessEvent(evt) {
+          lifecycleEvents.push(evt);
+        },
+      });
+
       const reqRes = await server.executeAuthenticatedToolCall(makeSafeActor(), 'arc_test', {
         testPath: 'stubborn.test.js',
-        maxDurationMs: 400,
+        maxDurationMs: 1200,
       });
       const reqPayload = JSON.parse(reqRes.content[0].text);
       assert.equal(reqPayload.code, 'APPROVAL_REQUIRED');
@@ -565,7 +626,7 @@ test('stubborn test', async () => {
 
       const execRes = await server.executeAuthenticatedToolCall(makeSafeActor(), 'arc_test', {
         testPath: 'stubborn.test.js',
-        maxDurationMs: 400,
+        maxDurationMs: 1200,
         _arcApproval: {
           requestId: reqPayload.details.approvalRequestId,
           token: approval.token,
@@ -577,12 +638,63 @@ test('stubborn test', async () => {
       assert.equal(body.status, 'TIMED_OUT');
       assert.ok(body.processId);
 
-      // Verify ProcessRegistry has reaped the process
-      const procRegistry = server.processRegistry;
+      // Deterministically capture stubborn child PID
+      const match = /STUBBORN_PID:(\d+)/.exec(body.outputExcerpt);
+      assert.ok(match, 'Must capture stubborn process PID from output excerpt');
+      const stubbornPid = parseInt(match[1], 10);
+      assert.ok(Number.isInteger(stubbornPid) && stubbornPid > 0);
+
+      // Wait beyond the 1000ms SIGKILL escalation grace period
+      await new Promise((resolve) => setTimeout(resolve, 1300));
+
+      // Assert stubborn process was forcefully reaped by SIGKILL escalation
+      let stubbornAlive = true;
+      try {
+        process.kill(stubbornPid, 0);
+      } catch (err) {
+        if (err && err.code === 'ESRCH') {
+          stubbornAlive = false;
+        }
+      }
+      assert.equal(
+        stubbornAlive,
+        false,
+        `Stubborn child PID ${stubbornPid} must be reaped by SIGKILL escalation`,
+      );
+
+      // Verify truthful lifecycle events recorded through ProcessRegistry
+      const opEvents = lifecycleEvents.filter((e) => e.processId === body.processId);
+      const eventTypes = opEvents.map((e) => e.eventType);
+      assert.ok(
+        eventTypes.includes('PROCESS_TIMEOUT'),
+        `Lifecycle events must contain PROCESS_TIMEOUT: ${JSON.stringify(eventTypes)}`,
+      );
+      assert.ok(
+        eventTypes.includes('PROCESS_SIGTERM_SENT'),
+        `Lifecycle events must contain PROCESS_SIGTERM_SENT: ${JSON.stringify(eventTypes)}`,
+      );
+      assert.ok(
+        eventTypes.includes('PROCESS_SIGKILL_ESCALATED'),
+        `Lifecycle events must contain PROCESS_SIGKILL_ESCALATED: ${JSON.stringify(eventTypes)}`,
+      );
+
+      // Verify ProcessRegistry has reaped the process into terminal TIMED_OUT state
       const procRecord = procRegistry.processes?.get(body.processId);
       assert.ok(procRecord);
       assert.equal(procRecord.state, 'TIMED_OUT');
       assert.equal(procRecord.timedOut, true);
+
+      // Verify no active records remain
+      const runningRecords = procRegistry.listProcesses({ state: 'RUNNING' });
+      const terminatingRecords = procRegistry.listProcesses({ state: 'TERMINATING' });
+      assert.equal(
+        runningRecords.some((r) => r.processId === body.processId),
+        false,
+      );
+      assert.equal(
+        terminatingRecords.some((r) => r.processId === body.processId),
+        false,
+      );
     });
   });
 
