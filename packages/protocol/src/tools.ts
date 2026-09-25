@@ -459,3 +459,26 @@ export interface ArcTestResponse {
   truncated: boolean;
   processId: string;
 }
+
+export interface ArcCiWorkflowInfo {
+  name: string;
+  path: string;
+  jobCount: number;
+  triggers: string[];
+}
+
+export interface ArcCiStatusRequest {
+  workflowName?: string;
+  workspaceId?: string;
+}
+
+export interface ArcCiStatusResponse {
+  localSimulationMode: true;
+  workflowsFound: ArcCiWorkflowInfo[];
+  localBranch: string;
+  headSha: string;
+  workingTreeClean: boolean;
+  localVerificationMatch: boolean;
+  remoteQueryDeferred: true;
+  remoteNotice: string;
+}

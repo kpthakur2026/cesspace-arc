@@ -168,8 +168,8 @@ describe('CesSpace ARC — RC-04 Task 4: MCP Approval, Redemption & Controlled M
   // =========================================================================
 
   describe('Reserved control object', () => {
-    test('RC04-M-01: _arcApproval is advertised on all 23 tool schemas and added nowhere else', () => {
-      assert.equal(ALL_TOOL_DEFINITIONS.length, 23);
+    test('RC04-M-01: _arcApproval is advertised on all 24 tool schemas and added nowhere else', () => {
+      assert.equal(ALL_TOOL_DEFINITIONS.length, 24);
       for (const tool of ALL_TOOL_DEFINITIONS) {
         assert.ok(
           tool.inputSchema.properties._arcApproval,

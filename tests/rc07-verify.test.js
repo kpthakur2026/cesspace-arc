@@ -1037,10 +1037,11 @@ describe('RC-07 Task 4: Positive Acceptance Flows (RC07-FLOW-09, RC07-FLOW-10)',
 // ---------------------------------------------------------------------------
 
 describe('RC-07 Task 4: Invariants, Discovery & Quality Regressions', () => {
-  test('Discovery: Production tool count is exactly 23 (including arc_verify and arc_test)', () => {
-    assert.equal(ALL_TOOL_DEFINITIONS.length, 23);
+  test('Discovery: Production tool count is exactly 24 (including arc_verify, arc_test, and arc_ci_status)', () => {
+    assert.equal(ALL_TOOL_DEFINITIONS.length, 24);
     const names = ALL_TOOL_DEFINITIONS.map((t) => t.name);
 
+    assert.ok(names.includes('arc_ci_status'));
     assert.ok(names.includes('arc_verify'));
     assert.ok(names.includes('arc_test'));
     assert.ok(names.includes('arc_review_diff'));
@@ -1048,7 +1049,6 @@ describe('RC-07 Task 4: Invariants, Discovery & Quality Regressions', () => {
     assert.ok(names.includes('arc_worktree_status'));
 
     // Still absent
-    assert.equal(names.includes('arc_ci_status'), false);
     assert.equal(names.includes('arc_stage_evidence'), false);
   });
 

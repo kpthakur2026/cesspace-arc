@@ -21,6 +21,7 @@ import {
   type SystemStatusResponse,
   type PolicyEvaluationContext,
   type RunCommandRequest,
+  type ArcCiStatusRequest,
 } from '@cesspace-arc/protocol';
 import {
   ApprovalStateManager,
@@ -97,6 +98,7 @@ import {
   projectArcTestResponse,
   validateTestFilter,
 } from './internal/test.js';
+import { handleArcCiStatus } from './internal/ci-status.js';
 import {
   AuditLogger,
   computeSha256,
@@ -468,6 +470,12 @@ export const TOOL_SCHEMAS = {
       filter: z.string().min(1).max(512).optional(),
       testRunner: z.literal('node').optional(),
       maxDurationMs: z.number().int().min(100).max(60000).optional(),
+      workspaceId: WorkspaceIdSchema.optional(),
+    })
+    .strict(),
+  arc_ci_status: z
+    .object({
+      workflowName: z.string().min(1).max(256).optional(),
       workspaceId: WorkspaceIdSchema.optional(),
     })
     .strict(),
@@ -1142,7 +1150,33 @@ export const RC07_TASK5_TOOL_DEFINITIONS: Tool[] = withArcApprovalSchemaOnTools(
 ]);
 
 /**
- * Authoritative complete list of all 23 registered tools (RC-01 + RC-02 + RC-03 + RC-07 Tasks 2, 3, 4, 5).
+ * Definition of the 1 RC-07 Task-6 MCP Tool (CI status inspection).
+ * Advertised as tool #24 in production tool discovery.
+ */
+export const RC07_TASK6_TOOL_DEFINITIONS: Tool[] = withArcApprovalSchemaOnTools([
+  {
+    name: 'arc_ci_status',
+    description:
+      'Inspect local CI workflow definitions and repository readiness without network access or remote CI queries.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        workflowName: {
+          type: 'string',
+          description: 'Logical workflow name to filter by (optional).',
+        },
+        workspaceId: {
+          type: 'string',
+          description: 'Authorized workspace identifier (optional).',
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+]);
+
+/**
+ * Authoritative complete list of all 24 registered tools (RC-01 + RC-02 + RC-03 + RC-07 Tasks 2, 3, 4, 5, 6).
  * Used directly by the ListTools handler.
  */
 export const ALL_TOOL_DEFINITIONS: Tool[] = withArcApprovalSchemaOnTools([
@@ -1153,6 +1187,7 @@ export const ALL_TOOL_DEFINITIONS: Tool[] = withArcApprovalSchemaOnTools([
   ...RC07_TASK3_TOOL_DEFINITIONS,
   ...RC07_TASK4_TOOL_DEFINITIONS,
   ...RC07_TASK5_TOOL_DEFINITIONS,
+  ...RC07_TASK6_TOOL_DEFINITIONS,
 ]);
 
 /**
@@ -2830,7 +2865,7 @@ export class ArcMcpServer implements IArcMcpServer {
     ) {
       let arcErr: ArcError;
       if (
-        toolName === 'arc_worktree_status' &&
+        (toolName === 'arc_worktree_status' || toolName === 'arc_ci_status') &&
         (workspaceUnregistered || targetWorkspace.workspaceId === 'deny-unregistered-workspace')
       ) {
         arcErr = ArcError.workspaceUnregistered(
@@ -3900,6 +3935,22 @@ export class ArcMcpServer implements IArcMcpServer {
                 gitSubsystem: this.gitSubsystem,
                 filesystemSubsystem: this.filesystemSubsystem,
                 timeoutMs: this.#task3TimeoutMs,
+              });
+            });
+            break;
+          }
+
+          case 'arc_ci_status': {
+            result = await enterCompositeInvocation(toolName, async () => {
+              return await handleArcCiStatus({
+                targetWorkspace: {
+                  workspaceId: targetWorkspace.workspaceId,
+                  rootPath: targetWorkspace.rootPath,
+                  isGitRepo: targetWorkspace.isGitRepo,
+                },
+                validatedParams: validatedParams as ArcCiStatusRequest,
+                gitSubsystem: this.gitSubsystem,
+                filesystemSubsystem: this.filesystemSubsystem,
               });
             });
             break;

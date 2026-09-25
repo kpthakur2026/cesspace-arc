@@ -103,11 +103,19 @@ export const RC07_TASK3_READ_ONLY_TOOLS = ['arc_review_diff'] as const;
 export type Rc07Task3ReadOnlyTool = (typeof RC07_TASK3_READ_ONLY_TOOLS)[number];
 
 /**
- * The combined RC-07 read-only engineering-aware inspection tools (Tasks 2 & 3).
+ * The RC-07 Task-6 read-only engineering-aware CI status tool.
+ */
+export const RC07_TASK6_READ_ONLY_TOOLS = ['arc_ci_status'] as const;
+
+export type Rc07Task6ReadOnlyTool = (typeof RC07_TASK6_READ_ONLY_TOOLS)[number];
+
+/**
+ * The combined RC-07 read-only engineering-aware inspection tools (Tasks 2, 3, & 6).
  */
 export const RC07_READ_ONLY_TOOLS = [
   ...RC07_TASK2_READ_ONLY_TOOLS,
   ...RC07_TASK3_READ_ONLY_TOOLS,
+  ...RC07_TASK6_READ_ONLY_TOOLS,
 ] as const;
 
 export type Rc07ReadOnlyTool = (typeof RC07_READ_ONLY_TOOLS)[number];

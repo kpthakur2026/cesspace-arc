@@ -1037,15 +1037,16 @@ describe('RC-07 Task 1: Static Architecture & Boundary Verification', () => {
     );
   });
 
-  test('Zero unowned RC-07 composite tools exposed in TOOL_SCHEMAS or production server list (Task 5: count 23)', async () => {
-    // None of the 2 remaining unowned RC-07 composite tools should be in TOOL_SCHEMAS
+  test('Zero unowned RC-07 composite tools exposed in TOOL_SCHEMAS or production server list (Task 6: count 24)', async () => {
+    // None of the remaining unowned RC-07 composite tools should be in TOOL_SCHEMAS
     const unownedTools = RC07_COMPOSITE_TOOLS.filter(
       (t) =>
         t !== 'arc_repo_status' &&
         t !== 'arc_worktree_status' &&
         t !== 'arc_review_diff' &&
         t !== 'arc_verify' &&
-        t !== 'arc_test',
+        t !== 'arc_test' &&
+        t !== 'arc_ci_status',
     );
     for (const tool of unownedTools) {
       assert.equal(TOOL_SCHEMAS[tool], undefined, `${tool} must not be exposed in TOOL_SCHEMAS`);
@@ -1062,9 +1063,11 @@ describe('RC-07 Task 1: Static Architecture & Boundary Verification', () => {
     assert.ok(toolNames.includes('arc_verify'), 'arc_verify must be in ALL_TOOL_DEFINITIONS');
     assert.ok(TOOL_SCHEMAS.arc_test !== undefined, 'arc_test must be in TOOL_SCHEMAS');
     assert.ok(toolNames.includes('arc_test'), 'arc_test must be in ALL_TOOL_DEFINITIONS');
+    assert.ok(TOOL_SCHEMAS.arc_ci_status !== undefined, 'arc_ci_status must be in TOOL_SCHEMAS');
+    assert.ok(toolNames.includes('arc_ci_status'), 'arc_ci_status must be in ALL_TOOL_DEFINITIONS');
 
-    // Exact count in Task 5 is 23 (18 base + 2 Task 2 tools + 1 Task 3 tool + 1 Task 4 tool + 1 Task 5 tool)
-    assert.equal(ALL_TOOL_DEFINITIONS.length, 23);
+    // Exact count in Task 6 is 24 (18 base + 2 Task 2 tools + 1 Task 3 tool + 1 Task 4 tool + 1 Task 5 tool + 1 Task 6 tool)
+    assert.equal(ALL_TOOL_DEFINITIONS.length, 24);
 
     const prodServer = createArcMcpServer({ transport: 'stdio' });
     assert.equal(prodServer.testCompositeHarness, undefined);

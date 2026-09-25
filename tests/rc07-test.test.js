@@ -703,18 +703,18 @@ test('stubborn test requiring SIGKILL escalation', async () => {
   // =========================================================================
 
   describe('RC-07 Task 5: Invariants, Discovery & Quality Regressions', () => {
-    test('Discovery: Production tool count is exactly 23 (adding only arc_test)', () => {
-      assert.equal(ALL_TOOL_DEFINITIONS.length, 23);
+    test('Discovery: Production tool count is exactly 24 (including arc_test and arc_ci_status)', () => {
+      assert.equal(ALL_TOOL_DEFINITIONS.length, 24);
       const names = ALL_TOOL_DEFINITIONS.map((t) => t.name);
 
+      assert.ok(names.includes('arc_ci_status'), 'arc_ci_status must be advertised');
       assert.ok(names.includes('arc_test'), 'arc_test must be advertised');
       assert.ok(names.includes('arc_verify'));
       assert.ok(names.includes('arc_review_diff'));
       assert.ok(names.includes('arc_repo_status'));
       assert.ok(names.includes('arc_worktree_status'));
 
-      // Tasks 6 & 7 tools remain absent
-      assert.equal(names.includes('arc_ci_status'), false, 'arc_ci_status must remain absent');
+      // Task 7 tool remains absent
       assert.equal(
         names.includes('arc_stage_evidence'),
         false,

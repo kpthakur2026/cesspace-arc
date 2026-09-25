@@ -1635,7 +1635,7 @@ rules: []
           {
             id: 'builtin-allow-rc07-read-only',
             effect: 'ALLOW',
-            tools: ['arc_repo_status', 'arc_worktree_status', 'arc_review_diff'],
+            tools: ['arc_repo_status', 'arc_worktree_status', 'arc_review_diff', 'arc_ci_status'],
           },
         ]),
       );
