@@ -1695,8 +1695,8 @@ describe('CesSpace ARC — RC-04 Task 3: Authenticated Local Admin Channel', () 
       ]) {
         assert.ok(!names.includes(forbidden), `${forbidden} must not be an MCP tool`);
       }
-      // The tool surface is exactly the 18 registered RC-03 tools + 2 RC-07 Task 2 tools + 1 RC-07 Task 3 tool.
-      assert.equal(names.length, 21);
+      // The tool surface is exactly the 18 registered RC-03 tools + 2 RC-07 Task 2 tools + 1 RC-07 Task 3 tool + 1 RC-07 Task 4 tool.
+      assert.equal(names.length, 22);
     });
 
     test('RC04-A-50: plausible admin tool names are denied by dispatch and mutate no state', async () => {

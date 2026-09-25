@@ -528,8 +528,7 @@ describe('RC-07 Task 2: Discovery, Schema & Security Controls', () => {
       'arc_worktree_status must be in production tools/list',
     );
 
-    // Remaining 4 tools must NOT be in production list
-    assert.ok(!toolNames.includes('arc_verify'), 'arc_verify must remain absent from tools/list');
+    // Remaining 3 tools must NOT be in production list
     assert.ok(!toolNames.includes('arc_test'), 'arc_test must remain absent from tools/list');
     assert.ok(
       !toolNames.includes('arc_ci_status'),

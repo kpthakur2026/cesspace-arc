@@ -413,3 +413,27 @@ export interface ArcReviewDiffResponse {
   fileSummaries: ArcReviewDiffFileSummary[];
   sensitiveBlocksMasked: number;
 }
+
+export interface ArcVerifyRequest {
+  suite?: 'all' | 'format' | 'lint' | 'typecheck' | 'test';
+  workspaceId?: string;
+}
+
+export interface ArcVerifyStepResult {
+  stepName: string;
+  executable: string;
+  args: string[];
+  status: 'PASSED' | 'FAILED' | 'SKIPPED' | 'TIMED_OUT';
+  exitCode: number | null;
+  durationMs: number;
+  outputExcerpt: string;
+  truncated: boolean;
+}
+
+export interface ArcVerifyResponse {
+  suite: 'all' | 'format' | 'lint' | 'typecheck' | 'test';
+  status: 'PASSED' | 'FAILED' | 'TIMED_OUT' | 'CANCELLED';
+  totalDurationMs: number;
+  steps: ArcVerifyStepResult[];
+  failedStep?: string;
+}

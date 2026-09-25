@@ -113,6 +113,13 @@ export const RC07_READ_ONLY_TOOLS = [
 export type Rc07ReadOnlyTool = (typeof RC07_READ_ONLY_TOOLS)[number];
 
 /**
+ * The RC-07 Task-4 deterministic verification tool.
+ */
+export const RC07_TASK4_EXECUTION_TOOLS = ['arc_verify'] as const;
+
+export type Rc07Task4ExecutionTool = (typeof RC07_TASK4_EXECUTION_TOOLS)[number];
+
+/**
  * Canonical complete policy vocabulary including registered tools and frozen composite tools.
  */
 export const ALL_POLICY_TOOLS = [...RC03_REGISTERED_TOOLS, ...RC07_COMPOSITE_TOOLS] as const;

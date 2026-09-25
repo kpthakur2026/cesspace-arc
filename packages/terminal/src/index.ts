@@ -335,6 +335,7 @@ export interface DeterministicExecutionStep {
   outputLimitBytes: number;
   projectCodeExecution: boolean;
   sideEffectClass: 'READ_ONLY' | 'EXECUTION';
+  signal?: AbortSignal;
 }
 
 /**
@@ -349,6 +350,7 @@ export interface DeterministicStepResult {
   stderr: string;
   durationMs: number;
   timedOut: boolean;
+  truncated?: boolean;
 }
 
 /**

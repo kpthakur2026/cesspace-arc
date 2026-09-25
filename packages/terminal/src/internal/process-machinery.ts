@@ -26,6 +26,7 @@ export interface InternalProcessExecutionSpec {
   timeoutMs: number;
   outputLimitBytes: number;
   runInBackground?: boolean;
+  signal?: AbortSignal;
 }
 
 export interface InternalProcessExecutionResult {
@@ -37,6 +38,7 @@ export interface InternalProcessExecutionResult {
   stderr: string;
   timedOut: boolean;
   durationMs: number;
+  truncated?: boolean;
 }
 
 /**
@@ -100,8 +102,7 @@ export async function spawnAndControlProcess(
     processRegistry.appendOutput(record.processId, 'stderr', chunk);
   });
 
-  // Timeout Setup
-  record._timeoutTimer = setTimeout(() => {
+  const terminateChildWithEscalation = () => {
     processRegistry.markTimedOut(record.processId);
     try {
       if (child.pid && process.platform !== 'win32') {
@@ -126,8 +127,26 @@ export async function spawnAndControlProcess(
       }
     }, 1000);
     record._killTimer.unref();
-  }, spec.timeoutMs);
+  };
+
+  // Timeout Setup
+  record._timeoutTimer = setTimeout(terminateChildWithEscalation, spec.timeoutMs);
   record._timeoutTimer.unref();
+
+  // AbortSignal Setup
+  if (spec.signal) {
+    if (spec.signal.aborted) {
+      terminateChildWithEscalation();
+    } else {
+      const onAbort = () => {
+        terminateChildWithEscalation();
+      };
+      spec.signal.addEventListener('abort', onAbort, { once: true });
+      child.on('close', () => {
+        spec.signal?.removeEventListener('abort', onAbort);
+      });
+    }
+  }
 
   child.on('close', (code, signal) => {
     processRegistry.markCompleted(record.processId, code, signal);
@@ -189,6 +208,7 @@ export async function spawnAndControlProcess(
         sessionId: spec.actor.sessionId,
         workspaceId: spec.workspaceId,
       });
+      const isTruncated = output.truncated || !output.complete;
       return {
         processId: record.processId,
         state: status.state,
@@ -198,6 +218,7 @@ export async function spawnAndControlProcess(
         stderr: output.stderrChunk,
         timedOut: status.timedOut,
         durationMs: status.durationMs,
+        truncated: isTruncated,
       };
     }
 
@@ -210,6 +231,7 @@ export async function spawnAndControlProcess(
       stderr: '',
       timedOut: false,
       durationMs: 0,
+      truncated: false,
     };
   }
 
@@ -229,6 +251,7 @@ export async function spawnAndControlProcess(
     sessionId: spec.actor.sessionId,
     workspaceId: spec.workspaceId,
   });
+  const isTruncated = output.truncated || !output.complete;
 
   return {
     processId: record.processId,
@@ -239,5 +262,6 @@ export async function spawnAndControlProcess(
     stderr: output.stderrChunk,
     timedOut: status.timedOut,
     durationMs: status.durationMs,
+    truncated: isTruncated,
   };
 }

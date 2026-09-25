@@ -64,11 +64,67 @@ export const TEST_NODE_VERSION_ENTRY: DeterministicRegistryEntry = Object.freeze
 });
 
 /**
+ * Task-4 verification registry entries.
+ */
+export const VERIFY_FORMAT_REGISTRY_ID = 'verify-format-v1';
+export const VERIFY_LINT_REGISTRY_ID = 'verify-lint-v1';
+export const VERIFY_TYPECHECK_REGISTRY_ID = 'verify-typecheck-v1';
+export const VERIFY_TEST_REGISTRY_ID = 'verify-test-v1';
+
+export const VERIFY_FORMAT_ENTRY: DeterministicRegistryEntry = Object.freeze({
+  registryId: VERIFY_FORMAT_REGISTRY_ID,
+  executable: 'prettier',
+  permittedArgvTemplate: Object.freeze(['--check', '.']),
+  sideEffectClass: 'READ_ONLY',
+  projectCodeExecution: true,
+  timeoutCeilingMs: 30_000,
+  maxOutputBytesCeiling: 65_536,
+  allowCwdSubdirectory: false,
+});
+
+export const VERIFY_LINT_ENTRY: DeterministicRegistryEntry = Object.freeze({
+  registryId: VERIFY_LINT_REGISTRY_ID,
+  executable: 'eslint',
+  permittedArgvTemplate: Object.freeze(['.']),
+  sideEffectClass: 'READ_ONLY',
+  projectCodeExecution: true,
+  timeoutCeilingMs: 30_000,
+  maxOutputBytesCeiling: 65_536,
+  allowCwdSubdirectory: false,
+});
+
+export const VERIFY_TYPECHECK_ENTRY: DeterministicRegistryEntry = Object.freeze({
+  registryId: VERIFY_TYPECHECK_REGISTRY_ID,
+  executable: 'tsc',
+  permittedArgvTemplate: Object.freeze(['--noEmit']),
+  sideEffectClass: 'READ_ONLY',
+  projectCodeExecution: true,
+  timeoutCeilingMs: 30_000,
+  maxOutputBytesCeiling: 65_536,
+  allowCwdSubdirectory: false,
+});
+
+export const VERIFY_TEST_ENTRY: DeterministicRegistryEntry = Object.freeze({
+  registryId: VERIFY_TEST_REGISTRY_ID,
+  executable: 'node',
+  permittedArgvTemplate: Object.freeze(['--test']),
+  sideEffectClass: 'READ_ONLY',
+  projectCodeExecution: true,
+  timeoutCeilingMs: 30_000,
+  maxOutputBytesCeiling: 65_536,
+  allowCwdSubdirectory: false,
+});
+
+/**
  * Server-owned catalog of approved deterministic execution registry entries.
  * Any entry not in this catalog is strictly rejected at registry construction.
  */
 const APPROVED_REGISTRY_ENTRIES = new Map<string, DeterministicRegistryEntry>([
   [TEST_NODE_VERSION_REGISTRY_ID, TEST_NODE_VERSION_ENTRY],
+  [VERIFY_FORMAT_REGISTRY_ID, VERIFY_FORMAT_ENTRY],
+  [VERIFY_LINT_REGISTRY_ID, VERIFY_LINT_ENTRY],
+  [VERIFY_TYPECHECK_REGISTRY_ID, VERIFY_TYPECHECK_ENTRY],
+  [VERIFY_TEST_REGISTRY_ID, VERIFY_TEST_ENTRY],
 ]);
 
 export class DeterministicExecutionRegistry {
@@ -117,10 +173,26 @@ export class DeterministicExecutionRegistry {
 
 /**
  * Creates the production deterministic execution registry.
- * In Task 1, contains zero Task-4/Task-5 project execution entries.
+ * Contains only the server-approved Task-4 verification identities.
  */
 export function createProductionDeterministicRegistry(): DeterministicExecutionRegistry {
-  return new DeterministicExecutionRegistry([]);
+  return new DeterministicExecutionRegistry([
+    VERIFY_FORMAT_ENTRY,
+    VERIFY_LINT_ENTRY,
+    VERIFY_TYPECHECK_ENTRY,
+    VERIFY_TEST_ENTRY,
+  ]);
+}
+
+/**
+ * Rejects control tokens, shell metacharacters, and command separators in deterministic arguments (RC07-NEG-030).
+ */
+export function validateDeterministicArgToken(token: string): void {
+  if (/[;&|`$><\r\n]/.test(token) || token.includes('$(')) {
+    throw ArcError.policyDenied(
+      `Registry violation: deterministic argument contains forbidden shell or control token: '${token}'.`,
+    );
+  }
 }
 
 /**
@@ -131,6 +203,11 @@ export function validateStepAgainstRegistry(
   step: CanonicalPlanStep,
   registry: DeterministicExecutionRegistry,
 ): void {
+  validateDeterministicArgToken(step.executable);
+  for (const arg of step.argv) {
+    validateDeterministicArgToken(arg);
+  }
+
   const entry = registry.getEntry(step.toolRegistryId);
   if (!entry) {
     throw ArcError.policyDenied(
@@ -254,6 +331,11 @@ export function validateStepExecutionAgainstPlan(
     throw ArcError.policyDenied(
       `Plan execution deviation: step index ${stepIndex} out of bounds for plan '${plan.planId}' (total steps: ${plan.steps.length}).`,
     );
+  }
+
+  validateDeterministicArgToken(candidate.executable);
+  for (const arg of candidate.argv) {
+    validateDeterministicArgToken(arg);
   }
 
   const expected = plan.steps[stepIndex];
@@ -438,7 +520,7 @@ export function isAuthorizedDeterministicExecutor(candidate: unknown): boolean {
 export interface CompositeStepExecutionResult {
   stepId: string;
   toolRegistryId: string;
-  status: 'PASSED' | 'FAILED' | 'SKIPPED';
+  status: 'PASSED' | 'FAILED' | 'SKIPPED' | 'TIMED_OUT';
   durationMs: number;
   exitCode: number | null;
   signal: NodeJS.Signals | null;
@@ -446,15 +528,17 @@ export interface CompositeStepExecutionResult {
   stderr: string;
   processId?: string;
   errorMessage?: string;
+  truncated?: boolean;
 }
 
 export interface CompositeExecutionResult {
   toolName: string;
   planId: string;
   planHash: string;
-  status: 'SUCCESS' | 'FAILED';
+  status: 'SUCCESS' | 'FAILED' | 'TIMED_OUT';
   totalDurationMs: number;
   steps: CompositeStepExecutionResult[];
+  aggregateTimedOut?: boolean;
 }
 
 export async function executeCompositePlan(options: {
@@ -465,6 +549,7 @@ export async function executeCompositePlan(options: {
   internalExecutor?: IInternalDeterministicExecutor;
   registry: DeterministicExecutionRegistry;
   testPostAdmissionMutationHook?: (plan: CanonicalCompositePlan) => CanonicalCompositePlan | void;
+  aggregateTimeoutMs?: number;
 }): Promise<CompositeExecutionResult> {
   const {
     admittedPlanHash,
@@ -473,6 +558,7 @@ export async function executeCompositePlan(options: {
     internalExecutor,
     registry,
     testPostAdmissionMutationHook,
+    aggregateTimeoutMs,
   } = options;
 
   // 1. Validate Active Server Admission Ticket (Defect 2, Proof D, Proof E)
@@ -505,6 +591,7 @@ export async function executeCompositePlan(options: {
   const startMs = Date.now();
   const stepResults: CompositeStepExecutionResult[] = [];
   let overallFailed = false;
+  let overallTimedOut = false;
 
   // TEST-ONLY in-process seam: attempt post-admission alteration before execution
   if (testPostAdmissionMutationHook) {
@@ -527,11 +614,22 @@ export async function executeCompositePlan(options: {
     validateStepAgainstRegistry(step, registry);
   }
 
+  const maxAggregateTimeout = Math.min(Math.max(100, aggregateTimeoutMs ?? 120_000), 120_000);
+  const aggregateController = new AbortController();
+  const aggregateTimer = setTimeout(() => {
+    aggregateController.abort();
+  }, maxAggregateTimeout);
+  aggregateTimer.unref();
+
   try {
     for (let i = 0; i < plan.steps.length; i++) {
       const step = plan.steps[i];
 
-      if (overallFailed) {
+      if (overallTimedOut || overallFailed || aggregateController.signal.aborted) {
+        if (aggregateController.signal.aborted) {
+          overallTimedOut = true;
+          overallFailed = true;
+        }
         stepResults.push({
           stepId: step.stepId,
           toolRegistryId: step.toolRegistryId,
@@ -559,6 +657,7 @@ export async function executeCompositePlan(options: {
           outputLimitBytes: step.outputLimitBytes,
           projectCodeExecution: step.projectCodeExecution,
           sideEffectClass: step.sideEffectClass,
+          signal: aggregateController.signal,
         };
 
         const result: DeterministicStepResult = await internalExecutor.executeDeterministicStep(
@@ -567,22 +666,32 @@ export async function executeCompositePlan(options: {
           targetWorkspace,
         );
 
-        const stepPassed = result.exitCode === 0 && !result.timedOut;
-        if (!stepPassed) {
+        const stepTimedOut = result.timedOut || aggregateController.signal.aborted;
+        if (stepTimedOut) {
+          overallTimedOut = true;
+          overallFailed = true;
+        } else if (result.exitCode !== 0) {
           overallFailed = true;
         }
+
+        const stepStatus: 'PASSED' | 'FAILED' | 'TIMED_OUT' = stepTimedOut
+          ? 'TIMED_OUT'
+          : result.exitCode === 0
+            ? 'PASSED'
+            : 'FAILED';
 
         stepResults.push({
           stepId: step.stepId,
           toolRegistryId: step.toolRegistryId,
-          status: stepPassed ? 'PASSED' : 'FAILED',
+          status: stepStatus,
           durationMs: Date.now() - stepStart,
           exitCode: result.exitCode,
           signal: result.signal,
           stdout: result.stdout,
           stderr: result.stderr,
           processId: result.processId,
-          errorMessage: result.timedOut
+          truncated: result.truncated,
+          errorMessage: stepTimedOut
             ? 'Process execution timed out.'
             : result.exitCode !== 0
               ? `Process exited with code ${result.exitCode}.`
@@ -605,6 +714,7 @@ export async function executeCompositePlan(options: {
       }
     }
   } finally {
+    clearTimeout(aggregateTimer);
     activeTicket.consumed = true;
   }
 
@@ -612,8 +722,9 @@ export async function executeCompositePlan(options: {
     toolName: plan.compositeTool,
     planId: plan.planId,
     planHash: admittedPlanHash,
-    status: overallFailed ? 'FAILED' : 'SUCCESS',
+    status: overallTimedOut ? 'TIMED_OUT' : overallFailed ? 'FAILED' : 'SUCCESS',
     totalDurationMs: Date.now() - startMs,
     steps: stepResults,
+    aggregateTimedOut: aggregateController.signal.aborted,
   };
 }

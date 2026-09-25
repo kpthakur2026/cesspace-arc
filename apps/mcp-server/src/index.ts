@@ -87,6 +87,12 @@ import {
 } from './internal/repo-worktree-status.js';
 import { handleArcReviewDiff, DEFAULT_TASK3_TIMEOUT_MS } from './internal/review-diff.js';
 import {
+  DEFAULT_TASK4_STEP_TIMEOUT_MS,
+  DEFAULT_TASK4_AGGREGATE_TIMEOUT_MS,
+  materializeArcVerifyPlan,
+  projectArcVerifyResponse,
+} from './internal/verify.js';
+import {
   AuditLogger,
   computeSha256,
   canonicalJson,
@@ -442,6 +448,12 @@ export const TOOL_SCHEMAS = {
       targetRevision: z.string().min(1).max(256).optional(),
       path: z.string().min(1).optional(),
       maxBytes: z.number().int().positive().max(MAX_DIFF_BYTES).optional(),
+      workspaceId: WorkspaceIdSchema.optional(),
+    })
+    .strict(),
+  arc_verify: z
+    .object({
+      suite: z.enum(['all', 'format', 'lint', 'typecheck', 'test']).optional(),
       workspaceId: WorkspaceIdSchema.optional(),
     })
     .strict(),
@@ -1045,7 +1057,35 @@ export const RC07_TASK3_TOOL_DEFINITIONS: Tool[] = withArcApprovalSchemaOnTools(
 ]);
 
 /**
- * Authoritative complete list of all 21 registered tools (RC-01 + RC-02 + RC-03 + RC-07 Tasks 2 & 3).
+ * Definition of the 1 RC-07 Task-4 MCP Tool (verification).
+ * Advertised as tool #22 in production tool discovery.
+ */
+export const RC07_TASK4_TOOL_DEFINITIONS: Tool[] = withArcApprovalSchemaOnTools([
+  {
+    name: 'arc_verify',
+    description:
+      'Execute deterministic engineering verification suite (format, lint, typecheck, test) in an isolated, check-only environment.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        suite: {
+          type: 'string',
+          enum: ['all', 'format', 'lint', 'typecheck', 'test'],
+          description:
+            "Verification suite to run ('all', 'format', 'lint', 'typecheck', 'test'). Defaults to 'all'.",
+        },
+        workspaceId: {
+          type: 'string',
+          description: 'Authorized workspace identifier (optional).',
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+]);
+
+/**
+ * Authoritative complete list of all 22 registered tools (RC-01 + RC-02 + RC-03 + RC-07 Tasks 2, 3, 4).
  * Used directly by the ListTools handler.
  */
 export const ALL_TOOL_DEFINITIONS: Tool[] = withArcApprovalSchemaOnTools([
@@ -1054,6 +1094,7 @@ export const ALL_TOOL_DEFINITIONS: Tool[] = withArcApprovalSchemaOnTools([
   ...RC03_TOOL_DEFINITIONS,
   ...RC07_TASK2_TOOL_DEFINITIONS,
   ...RC07_TASK3_TOOL_DEFINITIONS,
+  ...RC07_TASK4_TOOL_DEFINITIONS,
 ]);
 
 /**
@@ -1620,6 +1661,10 @@ export class ArcMcpServer implements IArcMcpServer {
   #task2TimeoutMs: number;
   /** Aggregate execution timeout ceiling for Task-3 read-only tools. */
   #task3TimeoutMs: number;
+  /** Per-step execution timeout ceiling for Task-4 verification steps. */
+  #task4StepTimeoutMs: number;
+  /** Aggregate execution timeout ceiling for Task-4 verification suite. */
+  #task4AggregateTimeoutMs: number;
 
   constructor(
     public readonly workspaceRegistry: WorkspaceRegistry,
@@ -1665,6 +1710,11 @@ export class ArcMcpServer implements IArcMcpServer {
     this.#deterministicRegistry = createProductionDeterministicRegistry();
     this.#task2TimeoutMs = DEFAULT_TASK2_TIMEOUT_MS;
     this.#task3TimeoutMs = DEFAULT_TASK3_TIMEOUT_MS;
+    this.#task4StepTimeoutMs = DEFAULT_TASK4_STEP_TIMEOUT_MS;
+    this.#task4AggregateTimeoutMs = DEFAULT_TASK4_AGGREGATE_TIMEOUT_MS;
+    if (terminalSubsystem && terminalSubsystem instanceof ControlledProcessRunner) {
+      this.#internalDeterministicExecutor = createServerDeterministicExecutor(terminalSubsystem);
+    }
     SERVER_INTERNAL_ACCESS.set(this, {
       setTestCompositeHarness: (harness) => {
         this.#testCompositeHarness = harness;
@@ -1716,6 +1766,44 @@ export class ArcMcpServer implements IArcMcpServer {
         this.#task3TimeoutMs = timeoutMs;
       },
       getTask3TimeoutMs: () => this.#task3TimeoutMs,
+      setTask4StepTimeoutMs: (timeoutMs: number) => {
+        if (
+          typeof timeoutMs !== 'number' ||
+          !Number.isFinite(timeoutMs) ||
+          Number.isNaN(timeoutMs)
+        ) {
+          throw new TypeError('Task-4 step timeout must be a finite number.');
+        }
+        if (timeoutMs <= 0) {
+          throw new RangeError(`Task-4 step timeout must be > 0 ms (got ${timeoutMs}).`);
+        }
+        if (timeoutMs > DEFAULT_TASK4_STEP_TIMEOUT_MS) {
+          throw new RangeError(
+            `Task-4 step timeout cannot exceed frozen maximum of ${DEFAULT_TASK4_STEP_TIMEOUT_MS} ms (got ${timeoutMs}).`,
+          );
+        }
+        this.#task4StepTimeoutMs = timeoutMs;
+      },
+      getTask4StepTimeoutMs: () => this.#task4StepTimeoutMs,
+      setTask4AggregateTimeoutMs: (timeoutMs: number) => {
+        if (
+          typeof timeoutMs !== 'number' ||
+          !Number.isFinite(timeoutMs) ||
+          Number.isNaN(timeoutMs)
+        ) {
+          throw new TypeError('Task-4 aggregate timeout must be a finite number.');
+        }
+        if (timeoutMs <= 0) {
+          throw new RangeError(`Task-4 aggregate timeout must be > 0 ms (got ${timeoutMs}).`);
+        }
+        if (timeoutMs > DEFAULT_TASK4_AGGREGATE_TIMEOUT_MS) {
+          throw new RangeError(
+            `Task-4 aggregate timeout cannot exceed frozen maximum of ${DEFAULT_TASK4_AGGREGATE_TIMEOUT_MS} ms (got ${timeoutMs}).`,
+          );
+        }
+        this.#task4AggregateTimeoutMs = timeoutMs;
+      },
+      getTask4AggregateTimeoutMs: () => this.#task4AggregateTimeoutMs,
     });
     // Transport mode is resolved once, at construction, and is immutable. A
     // remote configuration supplied alongside stdio is NOT activated.
@@ -2208,8 +2296,9 @@ export class ArcMcpServer implements IArcMcpServer {
       (RC07_COMPOSITE_TOOLS as readonly string[]).includes(toolName) ||
       this.#testCompositeHarness?.toolName === toolName;
     const schema =
-      (TOOL_SCHEMAS as Record<string, z.ZodTypeAny | undefined>)[toolName] ??
-      (isCompositeTool ? this.#testCompositeHarness?.schema : undefined);
+      (this.#testCompositeHarness?.toolName === toolName
+        ? this.#testCompositeHarness.schema
+        : undefined) ?? (TOOL_SCHEMAS as Record<string, z.ZodTypeAny | undefined>)[toolName];
     if (!schema) {
       const arcErr = ArcError.policyDenied(
         `Tool '${toolName}' is not permitted in RC-01 stage (read-only inspection core only).`,
@@ -2713,13 +2802,27 @@ export class ArcMcpServer implements IArcMcpServer {
     // Materialize authoritative deterministic plan for composite tools
     let compositePlan: CanonicalCompositePlan | undefined;
     let compositePlanHash: string | undefined;
-    if (isCompositeTool && this.#testCompositeHarness) {
+    if (this.#testCompositeHarness?.toolName === toolName) {
       compositePlan = this.#testCompositeHarness.materializer({
         compositeTool: toolName,
         businessParameters: validatedParams,
         workspaceId: targetWorkspace.workspaceId,
         workspaceRoot: targetWorkspace.rootPath,
         registry: this.#deterministicRegistry,
+      });
+      // Validate all materialized steps against the closed registry
+      for (const step of compositePlan.steps) {
+        validateStepAgainstRegistry(step, this.#deterministicRegistry);
+      }
+      compositePlan = deepFreezePlan(compositePlan);
+      compositePlanHash = computePlanHash(compositePlan);
+    } else if (toolName === 'arc_verify') {
+      compositePlan = materializeArcVerifyPlan({
+        suite: validatedParams.suite as string | undefined,
+        workspaceId: targetWorkspace.workspaceId,
+        workspaceRoot: targetWorkspace.rootPath,
+        registry: this.#deterministicRegistry,
+        stepTimeoutMs: this.#task4StepTimeoutMs,
       });
       // Validate all materialized steps against the closed registry
       for (const step of compositePlan.steps) {
@@ -3383,6 +3486,7 @@ export class ArcMcpServer implements IArcMcpServer {
 
     let result: unknown;
     let arcError: ArcError | undefined;
+    let auditArcError: ArcError | undefined;
     let bytesRead = 0;
 
     try {
@@ -3395,7 +3499,7 @@ export class ArcMcpServer implements IArcMcpServer {
             operationId: lifecycleOperationId || 'composite-operation',
           });
 
-          result = await enterCompositeInvocation(toolName, async () => {
+          const compositeResult = await enterCompositeInvocation(toolName, async () => {
             return await runWithCompositeAdmissionTicket(admissionTicket, async () => {
               return await executeCompositePlan({
                 plan: compositePlan!,
@@ -3404,13 +3508,37 @@ export class ArcMcpServer implements IArcMcpServer {
                 targetWorkspace,
                 internalExecutor: this.#internalDeterministicExecutor,
                 registry: this.#deterministicRegistry,
+                aggregateTimeoutMs: this.#task4AggregateTimeoutMs,
                 testPostAdmissionMutationHook:
                   this.#testCompositeHarness?.testPostAdmissionMutationHook,
               });
             });
           });
-          if ((result as { status?: string }).status === 'FAILED') {
-            arcError = ArcError.internalError(`Composite tool '${toolName}' execution failed.`);
+
+          if (this.#testCompositeHarness?.toolName === toolName) {
+            result = compositeResult;
+            if (compositeResult.status === 'FAILED') {
+              arcError = ArcError.internalError(`Composite tool '${toolName}' execution failed.`);
+            }
+          } else {
+            const suite = (validatedParams.suite || 'all') as
+              'all' | 'format' | 'lint' | 'typecheck' | 'test';
+            const verifyResponse = projectArcVerifyResponse(compositeResult, suite);
+            result = verifyResponse;
+
+            if (compositeResult.aggregateTimedOut) {
+              auditArcError = ArcError.compositeTimeout(
+                'Composite verification exceeded aggregate timeout ceiling.',
+              );
+            } else if (verifyResponse.status === 'TIMED_OUT') {
+              auditArcError = ArcError.executionTimeout(
+                `Verification step '${verifyResponse.failedStep || 'unknown'}' timed out.`,
+              );
+            } else if (verifyResponse.status === 'FAILED') {
+              auditArcError = ArcError.internalError(
+                `Verification step '${verifyResponse.failedStep || 'unknown'}' failed.`,
+              );
+            }
           }
         } catch (execErr: unknown) {
           arcError =
@@ -3806,10 +3934,11 @@ export class ArcMcpServer implements IArcMcpServer {
     // durable chain receives the same minimized, redacted projection the
     // in-memory chain has always received — there is no second, weaker
     // serialization path.
+    const effectiveAuditError = auditArcError ?? arcError;
     const terminalExecution: AuditRecord['execution'] = {
       // Truthful terminal outcome (rc06 §34): an execution failure is still a
       // completed invocation, and a timeout is a timeout, not a generic error.
-      status: deriveTerminalExecutionStatus(arcError),
+      status: deriveTerminalExecutionStatus(effectiveAuditError),
       startTime,
       endTime,
       durationMs: endMs - startMs,
@@ -3817,8 +3946,11 @@ export class ArcMcpServer implements IArcMcpServer {
     };
     const terminalBody = buildInvocationRecordBody(
       terminalExecution,
-      arcError
-        ? { code: arcError.code, message: sanitizeClientErrorMessage(arcError.message) }
+      effectiveAuditError
+        ? {
+            code: effectiveAuditError.code,
+            message: sanitizeClientErrorMessage(effectiveAuditError.message),
+          }
         : undefined,
     );
 
@@ -3853,7 +3985,9 @@ export class ArcMcpServer implements IArcMcpServer {
     // committed before the MCP response returns.
     if (consumedApprovalContext !== undefined) {
       this.approvalAuditSink.onApprovalLifecycleEvent({
-        eventType: arcError ? 'APPROVED_EXECUTION_FAILED' : 'APPROVED_EXECUTION_SUCCEEDED',
+        eventType: effectiveAuditError
+          ? 'APPROVED_EXECUTION_FAILED'
+          : 'APPROVED_EXECUTION_SUCCEEDED',
         requestId: consumedApprovalContext.requestId,
         state: 'CONSUMED',
         toolName: consumedApprovalContext.toolName,
@@ -4358,7 +4492,9 @@ export function deriveTerminalExecutionStatus(
   arcError: ArcError | undefined,
 ): 'SUCCESS' | 'ERROR' | 'TIMEOUT' {
   if (arcError === undefined) return 'SUCCESS';
-  return arcError.code === 'EXECUTION_TIMEOUT' ? 'TIMEOUT' : 'ERROR';
+  return arcError.code === 'EXECUTION_TIMEOUT' || arcError.code === 'COMPOSITE_TIMEOUT'
+    ? 'TIMEOUT'
+    : 'ERROR';
 }
 
 /**

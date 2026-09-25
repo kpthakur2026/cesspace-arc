@@ -7,7 +7,8 @@
  */
 
 import { existsSync, realpathSync } from 'node:fs';
-import { basename, resolve, sep } from 'node:path';
+import { createRequire } from 'node:module';
+import { basename, dirname, resolve, sep } from 'node:path';
 
 import { ArcError, type PolicyEvaluationContext } from '@cesspace-arc/protocol';
 import { MAX_OUTPUT_READ_BYTES } from '@cesspace-arc/processes';
@@ -19,6 +20,23 @@ import type {
 import { spawnAndControlProcess } from './process-machinery.js';
 
 export const TERMINAL_EXECUTION_SEAM_TOKEN = Symbol('arc.terminal.executionSeamToken');
+
+const seamRequire = createRequire(import.meta.url);
+
+function resolveServerCliEntrypoint(pkgName: string, subpath: string): string {
+  try {
+    const pkgJsonPath = seamRequire.resolve(`${pkgName}/package.json`);
+    const entrypoint = resolve(dirname(pkgJsonPath), subpath);
+    if (existsSync(entrypoint)) {
+      return entrypoint;
+    }
+  } catch {
+    // fail closed below
+  }
+  throw ArcError.internalError(
+    `Server-approved tool entrypoint for '${pkgName}' could not be resolved.`,
+  );
+}
 
 /**
  * Executes a deterministic step by dispatching to the terminal subsystem's low-level
@@ -79,11 +97,26 @@ export async function executeDeterministicStepCore(
     executionCwd = canonicalCwd;
   }
 
-  const args = step.args || [];
+  let physicalExecutable = step.executable;
+  let physicalArgs = step.args || [];
+
+  if (step.executable === 'prettier') {
+    physicalExecutable = 'node';
+    const entrypoint = resolveServerCliEntrypoint('prettier', 'bin/prettier.cjs');
+    physicalArgs = [entrypoint, ...(step.args || [])];
+  } else if (step.executable === 'eslint') {
+    physicalExecutable = 'node';
+    const entrypoint = resolveServerCliEntrypoint('eslint', 'bin/eslint.js');
+    physicalArgs = [entrypoint, ...(step.args || [])];
+  } else if (step.executable === 'tsc') {
+    physicalExecutable = 'node';
+    const entrypoint = resolveServerCliEntrypoint('typescript', 'bin/tsc');
+    physicalArgs = [entrypoint, ...(step.args || [])];
+  }
 
   // 2. Executable resolution via runner's resolver
   const resolvedExecutable = runner.executableResolver.resolveExecutable(
-    step.executable,
+    physicalExecutable,
     workspaceRoot,
   );
 
@@ -119,12 +152,13 @@ export async function executeDeterministicStepCore(
     },
     resolvedExecutable,
     rawExecutableName: step.executable,
-    args,
+    args: physicalArgs,
     executionCwd,
     env: sanitizedEnv,
     timeoutMs,
     outputLimitBytes: maxOutputBytes,
     runInBackground: false,
+    signal: step.signal,
   });
 
   return {
@@ -136,5 +170,6 @@ export async function executeDeterministicStepCore(
     stderr: result.stderr,
     durationMs: result.durationMs,
     timedOut: result.timedOut,
+    truncated: result.truncated,
   };
 }

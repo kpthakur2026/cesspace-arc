@@ -20,6 +20,10 @@ export interface ServerInternalAccess {
   getTask2TimeoutMs(): number;
   setTask3TimeoutMs(timeoutMs: number): void;
   getTask3TimeoutMs(): number;
+  setTask4StepTimeoutMs(timeoutMs: number): void;
+  getTask4StepTimeoutMs(): number;
+  setTask4AggregateTimeoutMs(timeoutMs: number): void;
+  getTask4AggregateTimeoutMs(): number;
 }
 
 export const SERVER_INTERNAL_ACCESS = new WeakMap<ArcMcpServer, ServerInternalAccess>();
@@ -54,4 +58,36 @@ export function getTask3TimeoutForTest(server: ArcMcpServer): number {
     throw new Error('Invalid ArcMcpServer instance: internal test access unavailable');
   }
   return access.getTask3TimeoutMs();
+}
+
+export function setTask4StepTimeoutForTest(server: ArcMcpServer, timeoutMs: number): void {
+  const access = SERVER_INTERNAL_ACCESS.get(server);
+  if (!access) {
+    throw new Error('Invalid ArcMcpServer instance: internal test access unavailable');
+  }
+  access.setTask4StepTimeoutMs(timeoutMs);
+}
+
+export function getTask4StepTimeoutForTest(server: ArcMcpServer): number {
+  const access = SERVER_INTERNAL_ACCESS.get(server);
+  if (!access) {
+    throw new Error('Invalid ArcMcpServer instance: internal test access unavailable');
+  }
+  return access.getTask4StepTimeoutMs();
+}
+
+export function setTask4AggregateTimeoutForTest(server: ArcMcpServer, timeoutMs: number): void {
+  const access = SERVER_INTERNAL_ACCESS.get(server);
+  if (!access) {
+    throw new Error('Invalid ArcMcpServer instance: internal test access unavailable');
+  }
+  access.setTask4AggregateTimeoutMs(timeoutMs);
+}
+
+export function getTask4AggregateTimeoutForTest(server: ArcMcpServer): number {
+  const access = SERVER_INTERNAL_ACCESS.get(server);
+  if (!access) {
+    throw new Error('Invalid ArcMcpServer instance: internal test access unavailable');
+  }
+  return access.getTask4AggregateTimeoutMs();
 }

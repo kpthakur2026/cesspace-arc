@@ -60,6 +60,7 @@ export type ArcErrorCode =
   | 'PAYLOAD_TOO_LARGE'
   | 'RATE_LIMIT_EXCEEDED'
   | 'RESOURCE_EXHAUSTED'
+  | 'COMPOSITE_TIMEOUT'
 
   // Internal Errors
   | 'INTERNAL_ERROR'
@@ -335,6 +336,20 @@ export class ArcError extends Error implements ArcErrorPayload {
       message,
       retryable: true,
       remediationHint: 'Wait for active processes to complete before launching new ones.',
+    });
+  }
+
+  public static compositeTimeout(
+    message = 'Composite execution exceeded aggregate timeout.',
+    details?: Record<string, string | number | boolean>,
+  ): ArcError {
+    return new ArcError({
+      code: 'COMPOSITE_TIMEOUT',
+      category: 'RESOURCE',
+      message,
+      details,
+      retryable: false,
+      remediationHint: 'Reduce verification suite scope or investigate long-running step.',
     });
   }
 
