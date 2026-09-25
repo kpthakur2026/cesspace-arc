@@ -27,6 +27,7 @@ import {
   ALL_POLICY_TOOLS,
   RC07_READ_ONLY_TOOLS,
   RC07_TASK4_EXECUTION_TOOLS,
+  RC07_TASK5_EXECUTION_TOOLS,
 } from './index.js';
 import {
   MAX_PATTERN_LENGTH,
@@ -995,6 +996,11 @@ function buildBuiltInDocument(): ParsedDocument {
         id: 'builtin-require-approval-rc07-verify',
         effect: 'REQUIRE_APPROVAL',
         tools: [...RC07_TASK4_EXECUTION_TOOLS],
+      },
+      {
+        id: 'builtin-require-approval-rc07-test',
+        effect: 'REQUIRE_APPROVAL',
+        tools: [...RC07_TASK5_EXECUTION_TOOLS],
       },
       {
         id: 'builtin-allow-rc07-read-only',

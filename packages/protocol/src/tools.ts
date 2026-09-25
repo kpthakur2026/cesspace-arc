@@ -437,3 +437,25 @@ export interface ArcVerifyResponse {
   steps: ArcVerifyStepResult[];
   failedStep?: string;
 }
+
+export interface ArcTestRequest {
+  testPath?: string;
+  filter?: string;
+  testRunner?: 'node';
+  maxDurationMs?: number;
+  workspaceId?: string;
+}
+
+export interface ArcTestResponse {
+  testRunner: 'node';
+  target: string;
+  status: 'PASSED' | 'FAILED' | 'TIMED_OUT' | 'CANCELLED';
+  exitCode: number | null;
+  durationMs: number;
+  passedCount?: number;
+  failedCount?: number;
+  skippedCount?: number;
+  outputExcerpt: string;
+  truncated: boolean;
+  processId: string;
+}

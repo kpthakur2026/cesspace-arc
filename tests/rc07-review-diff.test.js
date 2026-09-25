@@ -1142,17 +1142,17 @@ describe('RC-07 Task 3 Positive Flows (RC07-FLOW-06..08)', () => {
 // ---------------------------------------------------------------------------
 
 describe('RC-07 Task 3 Additional Regressions', () => {
-  test('Production tool discovery advertises exactly 22 tools', () => {
-    assert.strictEqual(ALL_TOOL_DEFINITIONS.length, 22);
+  test('Production tool discovery advertises exactly 23 tools', () => {
+    assert.strictEqual(ALL_TOOL_DEFINITIONS.length, 23);
     const names = ALL_TOOL_DEFINITIONS.map((t) => t.name);
 
+    assert.ok(names.includes('arc_test'));
     assert.ok(names.includes('arc_verify'));
     assert.ok(names.includes('arc_review_diff'));
     assert.ok(names.includes('arc_repo_status'));
     assert.ok(names.includes('arc_worktree_status'));
 
     // Verify unadvertised tools remain absent
-    assert.strictEqual(names.includes('arc_test'), false);
     assert.strictEqual(names.includes('arc_ci_status'), false);
     assert.strictEqual(names.includes('arc_stage_evidence'), false);
   });

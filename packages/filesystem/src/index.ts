@@ -5,6 +5,7 @@ import {
   openSync,
   readSync,
   closeSync,
+  existsSync,
   type Stats,
 } from 'node:fs';
 import { resolve, normalize, sep, relative, join, dirname } from 'node:path';
@@ -74,6 +75,7 @@ export interface IFilesystemSubsystem {
   applyPatch(workspaceRoot: string, request: ApplyPatchRequest): Promise<ApplyPatchResponse>;
   validateWorkspaceContainment(workspaceRoot: string, targetPath: string): Promise<string>;
   validateReviewDiffPath(workspaceRoot: string, targetPath: string): Promise<string>;
+  validateTestPath(workspaceRoot: string, targetPath: string): Promise<string>;
 }
 
 /**
@@ -403,6 +405,88 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
     }
 
     return relFromRoot.length > 0 ? relFromRoot : '.';
+  }
+
+  /**
+   * Dedicated read-only test path validator for arc_test (RC-07 Task 5).
+   * Validates workspace containment, symlink safety, sensitive path blacklist,
+   * and verifies that the target exists on disk.
+   * Returns normalized workspace-relative test path.
+   */
+  public async validateTestPath(workspaceRoot: string, requestedPath: string): Promise<string> {
+    if (!requestedPath || typeof requestedPath !== 'string') {
+      throw ArcError.invalidRequestSchema('Path parameter is required and must be a string.');
+    }
+
+    const trimmed = requestedPath.trim();
+    if (trimmed.length === 0) {
+      throw ArcError.invalidRequestSchema('Path parameter must not be empty.');
+    }
+
+    // 1. Syntactic Null Byte & Traversal Pre-checks
+    if (trimmed.includes('\0')) {
+      throw ArcError.invalidPathChars('Path contains invalid null byte.');
+    }
+    if (/%2e%2e|%2f|%5c/i.test(trimmed)) {
+      throw ArcError.invalidPathChars('Path contains forbidden URL-encoded traversal characters.');
+    }
+    // RC07-NEG-038: directory traversal (..) rejected with PATH_OUTSIDE_WORKSPACE
+    if (/(^|[/\\])\.\.([/\\]|$)/.test(trimmed)) {
+      throw ArcError.pathOutsideWorkspace('Directory traversal (..) is forbidden in test path.');
+    }
+
+    // 2. Canonicalize Workspace Root
+    let canonicalRoot: string;
+    try {
+      canonicalRoot = realpathSync(resolve(workspaceRoot));
+    } catch {
+      throw ArcError.noWorkspaceConfigured('Workspace root directory does not exist.');
+    }
+
+    // 3. Workspace Root Join & Absolute Escape Check
+    if (trimmed.startsWith('/') || /^[a-zA-Z]:\\/.test(trimmed)) {
+      throw ArcError.pathOutsideWorkspace(
+        'Security violation: Absolute path is forbidden in test path.',
+      );
+    }
+
+    const candidatePath = resolve(canonicalRoot, trimmed);
+    const norm = normalize(candidatePath);
+    if (norm !== canonicalRoot && !norm.startsWith(canonicalRoot + sep)) {
+      throw ArcError.pathOutsideWorkspace(
+        'Security violation: Path resides outside authorized workspace boundary.',
+      );
+    }
+
+    // 4. Verify existence
+    if (!existsSync(candidatePath)) {
+      throw ArcError.fileNotFound(`Target test path does not exist: '${trimmed}'.`);
+    }
+
+    // 5. Canonicalize target and verify symlink containment
+    let canonicalTarget: string;
+    try {
+      canonicalTarget = realpathSync(candidatePath);
+    } catch {
+      throw ArcError.fileNotFound(`Target test path does not exist: '${trimmed}'.`);
+    }
+
+    if (canonicalTarget !== canonicalRoot && !canonicalTarget.startsWith(canonicalRoot + sep)) {
+      throw ArcError.symlinkEscapeDetected(
+        'Symlink resolves outside authorized workspace boundary.',
+      );
+    }
+
+    // 6. Blacklist & Sensitive Path Enforcement
+    const relFromRoot = relative(canonicalRoot, canonicalTarget);
+    if (isBlacklistedPath(canonicalTarget, relFromRoot) || isBlacklistedPath(trimmed)) {
+      throw ArcError.accessDenied(
+        'Access denied: Target test path matches sensitive credential or system blacklist pattern.',
+      );
+    }
+
+    const normalizedRel = normalize(relFromRoot);
+    return normalizedRel.length > 0 ? normalizedRel : '.';
   }
 
   public async listDirectory(

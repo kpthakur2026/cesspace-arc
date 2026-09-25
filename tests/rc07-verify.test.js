@@ -1037,26 +1037,26 @@ describe('RC-07 Task 4: Positive Acceptance Flows (RC07-FLOW-09, RC07-FLOW-10)',
 // ---------------------------------------------------------------------------
 
 describe('RC-07 Task 4: Invariants, Discovery & Quality Regressions', () => {
-  test('Discovery: Production tool count is exactly 22 (adding only arc_verify)', () => {
-    assert.equal(ALL_TOOL_DEFINITIONS.length, 22);
+  test('Discovery: Production tool count is exactly 23 (including arc_verify and arc_test)', () => {
+    assert.equal(ALL_TOOL_DEFINITIONS.length, 23);
     const names = ALL_TOOL_DEFINITIONS.map((t) => t.name);
 
     assert.ok(names.includes('arc_verify'));
+    assert.ok(names.includes('arc_test'));
     assert.ok(names.includes('arc_review_diff'));
     assert.ok(names.includes('arc_repo_status'));
     assert.ok(names.includes('arc_worktree_status'));
 
     // Still absent
-    assert.equal(names.includes('arc_test'), false);
     assert.equal(names.includes('arc_ci_status'), false);
     assert.equal(names.includes('arc_stage_evidence'), false);
   });
 
-  test('Production deterministic registry contains exactly the 4 Task-4 verification entries', () => {
+  test('Production deterministic registry contains the 4 Task-4 verification entries and Task-5 entry', () => {
     const reg = createProductionDeterministicRegistry();
     const ids = reg.listEntryIds();
 
-    assert.equal(ids.length, 4);
+    assert.equal(ids.length, 5);
     assert.ok(ids.includes(VERIFY_FORMAT_REGISTRY_ID));
     assert.ok(ids.includes(VERIFY_LINT_REGISTRY_ID));
     assert.ok(ids.includes(VERIFY_TYPECHECK_REGISTRY_ID));

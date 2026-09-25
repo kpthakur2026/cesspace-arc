@@ -116,6 +116,22 @@ export const VERIFY_TEST_ENTRY: DeterministicRegistryEntry = Object.freeze({
 });
 
 /**
+ * Task-5 test execution registry entry.
+ */
+export const ARC_TEST_NODE_REGISTRY_ID = 'arc-test-node-v1';
+
+export const ARC_TEST_NODE_ENTRY: DeterministicRegistryEntry = Object.freeze({
+  registryId: ARC_TEST_NODE_REGISTRY_ID,
+  executable: 'node',
+  permittedArgvTemplate: Object.freeze(['--test', '--test-reporter=tap']),
+  sideEffectClass: 'EXECUTION',
+  projectCodeExecution: true,
+  timeoutCeilingMs: 60_000,
+  maxOutputBytesCeiling: 262_144,
+  allowCwdSubdirectory: false,
+});
+
+/**
  * Server-owned catalog of approved deterministic execution registry entries.
  * Any entry not in this catalog is strictly rejected at registry construction.
  */
@@ -125,6 +141,7 @@ const APPROVED_REGISTRY_ENTRIES = new Map<string, DeterministicRegistryEntry>([
   [VERIFY_LINT_REGISTRY_ID, VERIFY_LINT_ENTRY],
   [VERIFY_TYPECHECK_REGISTRY_ID, VERIFY_TYPECHECK_ENTRY],
   [VERIFY_TEST_REGISTRY_ID, VERIFY_TEST_ENTRY],
+  [ARC_TEST_NODE_REGISTRY_ID, ARC_TEST_NODE_ENTRY],
 ]);
 
 export class DeterministicExecutionRegistry {
@@ -181,6 +198,7 @@ export function createProductionDeterministicRegistry(): DeterministicExecutionR
     VERIFY_LINT_ENTRY,
     VERIFY_TYPECHECK_ENTRY,
     VERIFY_TEST_ENTRY,
+    ARC_TEST_NODE_ENTRY,
   ]);
 }
 
@@ -219,14 +237,70 @@ export function validateStepAgainstRegistry(
       `Registry violation: executable '${step.executable}' does not match registry entry '${entry.registryId}' ('${entry.executable}').`,
     );
   }
-  if (
-    step.argv.length !== entry.permittedArgvTemplate.length ||
-    step.argv.some((arg, idx) => arg !== entry.permittedArgvTemplate[idx])
-  ) {
-    throw ArcError.policyDenied(
-      `Registry violation: argv does not match permitted template for registry entry '${entry.registryId}'.`,
-    );
+
+  if (step.toolRegistryId === ARC_TEST_NODE_REGISTRY_ID) {
+    // Narrowly typed dynamic slots for arc-test-node-v1:
+    // Permitted template: ['--test', '--test-reporter=tap', ?--test-name-pattern=<filter>, ?<testPath>]
+    if (step.argv.length < 2 || step.argv.length > 4) {
+      throw ArcError.policyDenied(
+        `Registry violation: argv length ${step.argv.length} is invalid for '${entry.registryId}'. Expected 2 to 4 arguments.`,
+      );
+    }
+    if (step.argv[0] !== '--test' || step.argv[1] !== '--test-reporter=tap') {
+      throw ArcError.policyDenied(
+        `Registry violation: argv prefix does not match required ['--test', '--test-reporter=tap'] for '${entry.registryId}'.`,
+      );
+    }
+
+    let remainingIdx = 2;
+    if (
+      remainingIdx < step.argv.length &&
+      step.argv[remainingIdx].startsWith('--test-name-pattern=')
+    ) {
+      const patternValue = step.argv[remainingIdx].slice('--test-name-pattern='.length);
+      if (
+        patternValue.includes('../') ||
+        patternValue.includes('..\\') ||
+        patternValue.includes('\0')
+      ) {
+        throw ArcError.policyDenied(
+          `Registry violation: filter contains forbidden traversal pattern for '${entry.registryId}'.`,
+        );
+      }
+      remainingIdx++;
+    }
+
+    if (remainingIdx < step.argv.length) {
+      const targetArg = step.argv[remainingIdx];
+      if (targetArg.startsWith('-')) {
+        throw ArcError.policyDenied(
+          `Registry violation: arbitrary Node flags not permitted for '${entry.registryId}': '${targetArg}'.`,
+        );
+      }
+      if (targetArg.includes('..') || targetArg.startsWith('/') || /^[a-zA-Z]:\\/.test(targetArg)) {
+        throw ArcError.policyDenied(
+          `Registry violation: target path escapes workspace boundary for '${entry.registryId}': '${targetArg}'.`,
+        );
+      }
+      remainingIdx++;
+    }
+
+    if (remainingIdx !== step.argv.length) {
+      throw ArcError.policyDenied(
+        `Registry violation: unexpected extra arguments for '${entry.registryId}'.`,
+      );
+    }
+  } else {
+    if (
+      step.argv.length !== entry.permittedArgvTemplate.length ||
+      step.argv.some((arg, idx) => arg !== entry.permittedArgvTemplate[idx])
+    ) {
+      throw ArcError.policyDenied(
+        `Registry violation: argv does not match permitted template for registry entry '${entry.registryId}'.`,
+      );
+    }
   }
+
   if (step.sideEffectClass !== entry.sideEffectClass) {
     throw ArcError.policyDenied(
       `Registry violation: sideEffectClass mismatch for '${entry.registryId}'.`,
@@ -698,6 +772,12 @@ export async function executeCompositePlan(options: {
               : undefined,
         });
       } catch (stepErr: unknown) {
+        if (
+          stepErr instanceof ArcError &&
+          (stepErr.code === 'RESOURCE_EXHAUSTED' || stepErr.code === 'CONCURRENCY_EXCEEDED')
+        ) {
+          throw stepErr;
+        }
         overallFailed = true;
         const errMsg = stepErr instanceof Error ? stepErr.message : String(stepErr);
         stepResults.push({

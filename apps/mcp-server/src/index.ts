@@ -93,6 +93,11 @@ import {
   projectArcVerifyResponse,
 } from './internal/verify.js';
 import {
+  materializeArcTestPlan,
+  projectArcTestResponse,
+  validateTestFilter,
+} from './internal/test.js';
+import {
   AuditLogger,
   computeSha256,
   canonicalJson,
@@ -454,6 +459,15 @@ export const TOOL_SCHEMAS = {
   arc_verify: z
     .object({
       suite: z.enum(['all', 'format', 'lint', 'typecheck', 'test']).optional(),
+      workspaceId: WorkspaceIdSchema.optional(),
+    })
+    .strict(),
+  arc_test: z
+    .object({
+      testPath: z.string().min(1).max(1024).optional(),
+      filter: z.string().min(1).max(512).optional(),
+      testRunner: z.literal('node').optional(),
+      maxDurationMs: z.number().int().min(100).max(60000).optional(),
       workspaceId: WorkspaceIdSchema.optional(),
     })
     .strict(),
@@ -1085,7 +1099,50 @@ export const RC07_TASK4_TOOL_DEFINITIONS: Tool[] = withArcApprovalSchemaOnTools(
 ]);
 
 /**
- * Authoritative complete list of all 22 registered tools (RC-01 + RC-02 + RC-03 + RC-07 Tasks 2, 3, 4).
+ * Definition of the 1 RC-07 Task-5 MCP Tool (testing).
+ * Advertised as tool #23 in production tool discovery.
+ */
+export const RC07_TASK5_TOOL_DEFINITIONS: Tool[] = withArcApprovalSchemaOnTools([
+  {
+    name: 'arc_test',
+    description:
+      'Execute tests using the kernel-bound Node test runner with deterministic arguments and structured TAP reporting under policy control.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        testPath: {
+          type: 'string',
+          description:
+            'Workspace-relative path to a test file or directory (optional, defaults to workspace test discovery).',
+        },
+        filter: {
+          type: 'string',
+          description: 'Test name pattern filter (optional).',
+        },
+        testRunner: {
+          type: 'string',
+          enum: ['node'],
+          description: "Test runner to execute (strictly 'node', defaults to 'node').",
+        },
+        maxDurationMs: {
+          type: 'integer',
+          minimum: 100,
+          maximum: 60000,
+          description:
+            'Maximum execution duration in milliseconds (100 to 60000, defaults to 60000).',
+        },
+        workspaceId: {
+          type: 'string',
+          description: 'Authorized workspace identifier (optional).',
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+]);
+
+/**
+ * Authoritative complete list of all 23 registered tools (RC-01 + RC-02 + RC-03 + RC-07 Tasks 2, 3, 4, 5).
  * Used directly by the ListTools handler.
  */
 export const ALL_TOOL_DEFINITIONS: Tool[] = withArcApprovalSchemaOnTools([
@@ -1095,6 +1152,7 @@ export const ALL_TOOL_DEFINITIONS: Tool[] = withArcApprovalSchemaOnTools([
   ...RC07_TASK2_TOOL_DEFINITIONS,
   ...RC07_TASK3_TOOL_DEFINITIONS,
   ...RC07_TASK4_TOOL_DEFINITIONS,
+  ...RC07_TASK5_TOOL_DEFINITIONS,
 ]);
 
 /**
@@ -2830,6 +2888,54 @@ export class ArcMcpServer implements IArcMcpServer {
       }
       compositePlan = deepFreezePlan(compositePlan);
       compositePlanHash = computePlanHash(compositePlan);
+    } else if (toolName === 'arc_test') {
+      let normalizedTestPath: string | undefined;
+      if (validatedParams.testPath !== undefined) {
+        try {
+          normalizedTestPath = await this.filesystemSubsystem.validateTestPath(
+            targetWorkspace.rootPath,
+            validatedParams.testPath as string,
+          );
+        } catch (pathErr: unknown) {
+          const arcErr =
+            pathErr instanceof ArcError ? pathErr : ArcError.invalidRequestSchema(String(pathErr));
+          return denyWith(arcErr, 'deny-invalid-test-path', 'DENY', validatedParams, {
+            workspaceId: targetWorkspace.workspaceId,
+            workspacePath: targetWorkspace.rootPath,
+          });
+        }
+      }
+
+      if (validatedParams.filter !== undefined) {
+        try {
+          validateTestFilter(validatedParams.filter as string);
+        } catch (filterErr: unknown) {
+          const arcErr =
+            filterErr instanceof ArcError
+              ? filterErr
+              : ArcError.invalidRequestSchema(String(filterErr));
+          return denyWith(arcErr, 'deny-invalid-test-filter', 'DENY', validatedParams, {
+            workspaceId: targetWorkspace.workspaceId,
+            workspacePath: targetWorkspace.rootPath,
+          });
+        }
+      }
+
+      compositePlan = materializeArcTestPlan({
+        testPath: normalizedTestPath,
+        filter: validatedParams.filter as string | undefined,
+        testRunner: validatedParams.testRunner as 'node' | undefined,
+        maxDurationMs: validatedParams.maxDurationMs as number | undefined,
+        workspaceId: targetWorkspace.workspaceId,
+        workspaceRoot: targetWorkspace.rootPath,
+        registry: this.#deterministicRegistry,
+      });
+
+      for (const step of compositePlan.steps) {
+        validateStepAgainstRegistry(step, this.#deterministicRegistry);
+      }
+      compositePlan = deepFreezePlan(compositePlan);
+      compositePlanHash = computePlanHash(compositePlan);
     }
 
     const context: PolicyEvaluationContext = {
@@ -3520,7 +3626,7 @@ export class ArcMcpServer implements IArcMcpServer {
             if (compositeResult.status === 'FAILED') {
               arcError = ArcError.internalError(`Composite tool '${toolName}' execution failed.`);
             }
-          } else {
+          } else if (toolName === 'arc_verify') {
             const suite = (validatedParams.suite || 'all') as
               'all' | 'format' | 'lint' | 'typecheck' | 'test';
             const verifyResponse = projectArcVerifyResponse(compositeResult, suite);
@@ -3539,10 +3645,45 @@ export class ArcMcpServer implements IArcMcpServer {
                 `Verification step '${verifyResponse.failedStep || 'unknown'}' failed.`,
               );
             }
+          } else if (toolName === 'arc_test') {
+            const stepResult = compositeResult.steps[0];
+            if (
+              stepResult?.status === 'FAILED' &&
+              stepResult.errorMessage?.includes('Workspace process limit reached')
+            ) {
+              throw ArcError.concurrencyExceeded(stepResult.errorMessage);
+            }
+
+            const requestedTarget = (
+              validatedParams.testPath
+                ? (compositePlan.steps[0]?.argv.find(
+                    (a) =>
+                      !a.startsWith('-') && a !== '--test' && !a.startsWith('--test-reporter='),
+                  ) ?? '.')
+                : '.'
+            ) as string;
+
+            const testResponse = projectArcTestResponse(compositeResult, requestedTarget);
+            result = testResponse;
+
+            if (testResponse.status === 'TIMED_OUT') {
+              auditArcError = ArcError.executionTimeout('Test execution timed out.');
+            } else if (testResponse.status === 'FAILED') {
+              auditArcError = ArcError.internalError('Test execution failed.');
+            }
           }
         } catch (execErr: unknown) {
-          arcError =
-            execErr instanceof ArcError ? execErr : ArcError.internalError(String(execErr));
+          if (
+            toolName === 'arc_test' &&
+            execErr instanceof ArcError &&
+            execErr.code === 'RESOURCE_EXHAUSTED' &&
+            execErr.message.includes('Workspace process limit reached')
+          ) {
+            arcError = ArcError.concurrencyExceeded(execErr.message);
+          } else {
+            arcError =
+              execErr instanceof ArcError ? execErr : ArcError.internalError(String(execErr));
+          }
         }
       } else {
         switch (toolName) {

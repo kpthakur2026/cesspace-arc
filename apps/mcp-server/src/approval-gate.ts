@@ -453,6 +453,9 @@ export function deriveCanonicalPathTargets(
     case 'git_log':
       return single(params.path);
 
+    case 'arc_test':
+      return single(params.testPath);
+
     default:
       return { paths: [], blocked: false };
   }

@@ -1628,6 +1628,11 @@ rules: []
             tools: ['arc_verify'],
           },
           {
+            id: 'builtin-require-approval-rc07-test',
+            effect: 'REQUIRE_APPROVAL',
+            tools: ['arc_test'],
+          },
+          {
             id: 'builtin-allow-rc07-read-only',
             effect: 'ALLOW',
             tools: ['arc_repo_status', 'arc_worktree_status', 'arc_review_diff'],

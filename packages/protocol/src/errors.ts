@@ -60,6 +60,7 @@ export type ArcErrorCode =
   | 'PAYLOAD_TOO_LARGE'
   | 'RATE_LIMIT_EXCEEDED'
   | 'RESOURCE_EXHAUSTED'
+  | 'CONCURRENCY_EXCEEDED'
   | 'COMPOSITE_TIMEOUT'
 
   // Internal Errors
@@ -336,6 +337,21 @@ export class ArcError extends Error implements ArcErrorPayload {
       message,
       retryable: true,
       remediationHint: 'Wait for active processes to complete before launching new ones.',
+    });
+  }
+
+  public static concurrencyExceeded(
+    message = 'Concurrent execution limit exceeded for this workspace.',
+    details?: Record<string, string | number | boolean>,
+  ): ArcError {
+    return new ArcError({
+      code: 'CONCURRENCY_EXCEEDED',
+      category: 'RESOURCE',
+      message,
+      retryable: true,
+      remediationHint:
+        'Wait for active workspace test processes to finish before running additional tests.',
+      ...(details ? { details } : {}),
     });
   }
 
