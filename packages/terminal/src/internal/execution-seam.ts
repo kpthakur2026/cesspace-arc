@@ -9,6 +9,7 @@
 import { existsSync, realpathSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { basename, dirname, resolve, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { ArcError, type PolicyEvaluationContext } from '@cesspace-arc/protocol';
 import { MAX_OUTPUT_READ_BYTES } from '@cesspace-arc/processes';
@@ -35,6 +36,23 @@ function resolveServerCliEntrypoint(pkgName: string, subpath: string): string {
   }
   throw ArcError.internalError(
     `Server-approved tool entrypoint for '${pkgName}' could not be resolved.`,
+  );
+}
+
+function resolveServerTypecheckEntrypoint(): string {
+  const currentDir = dirname(fileURLToPath(import.meta.url));
+  const candidates = [
+    resolve(currentDir, 'solution-typecheck.js'),
+    resolve(currentDir, '../dist/internal/solution-typecheck.js'),
+    resolve(currentDir, '../../dist/internal/solution-typecheck.js'),
+  ];
+  for (const candidate of candidates) {
+    if (existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  throw ArcError.internalError(
+    'Server-approved solution typecheck entrypoint could not be resolved.',
   );
 }
 
@@ -110,7 +128,7 @@ export async function executeDeterministicStepCore(
     physicalArgs = [entrypoint, ...(step.args || [])];
   } else if (step.executable === 'tsc') {
     physicalExecutable = 'node';
-    const entrypoint = resolveServerCliEntrypoint('typescript', 'bin/tsc');
+    const entrypoint = resolveServerTypecheckEntrypoint();
     physicalArgs = [entrypoint, ...(step.args || [])];
   }
 

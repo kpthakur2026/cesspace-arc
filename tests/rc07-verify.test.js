@@ -181,6 +181,52 @@ function setupCleanWorkspace(targetDir) {
   cp.spawnSync(process.execPath, [prettierBin, '--write', '.'], { cwd: targetDir });
 }
 
+function setupSolutionWorkspace(targetDir) {
+  const pkgDir = path.join(targetDir, 'packages', 'a');
+  const srcDir = path.join(pkgDir, 'src');
+  fs.mkdirSync(srcDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(targetDir, 'package.json'),
+    JSON.stringify({ name: 'solution-fixture', type: 'module' }, null, 2) + '\n',
+  );
+  fs.writeFileSync(
+    path.join(targetDir, 'tsconfig.json'),
+    JSON.stringify(
+      {
+        files: [],
+        references: [{ path: './packages/a' }],
+      },
+      null,
+      2,
+    ) + '\n',
+  );
+  fs.writeFileSync(
+    path.join(pkgDir, 'package.json'),
+    JSON.stringify({ name: 'pkg-a', type: 'module' }, null, 2) + '\n',
+  );
+  fs.writeFileSync(
+    path.join(pkgDir, 'tsconfig.json'),
+    JSON.stringify(
+      {
+        compilerOptions: {
+          target: 'ES2022',
+          module: 'NodeNext',
+          moduleResolution: 'NodeNext',
+          composite: true,
+          declaration: true,
+          outDir: './dist',
+          rootDir: './src',
+          strict: true,
+        },
+        include: ['src/**/*'],
+      },
+      null,
+      2,
+    ) + '\n',
+  );
+  fs.writeFileSync(path.join(srcDir, 'index.ts'), 'export const answer: number = 42;\n');
+}
+
 function snapshotDirectory(dir) {
   const snapshot = new Map();
   function walk(current) {
@@ -867,6 +913,119 @@ describe('RC-07 Task 4: Positive Acceptance Flows (RC07-FLOW-09, RC07-FLOW-10)',
 
       // Exactly 3 processes spawned (test was skipped)
       assert.equal(processRegistry.listProcesses().length, 3);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test('Solution-style project references: traverses and typechecks referenced projects without disk mutations', async () => {
+    const wsDir = path.join(tempRoot, 'solution-ref-ws');
+    setupSolutionWorkspace(wsDir);
+
+    const operator = generateOperator();
+    const adminSocket = path.join(tempRoot, 'solution-ref-admin.sock');
+    const { server, processRegistry } = createTestHarnessServer(wsDir, {
+      adminSocket,
+      operatorPublicKeyB64: operator.publicKeyB64,
+    });
+
+    await server.start();
+    try {
+      // 1. Snapshot workspace before valid execution
+      const snapshotBeforeValid = snapshotDirectory(wsDir);
+
+      // Request approval
+      const call1 = await server.executeAuthenticatedToolCall(safeActor, 'arc_verify', {
+        suite: 'typecheck',
+      });
+      const requestId1 = parseResponse(call1).details.approvalRequestId;
+      const adminRes1 = await adminRequest(adminSocket, operator.privateKey, 'approval.approve', {
+        requestId: requestId1,
+      });
+
+      // Execute approved suite: 'typecheck'
+      const call2 = await server.executeAuthenticatedToolCall(safeActor, 'arc_verify', {
+        suite: 'typecheck',
+        _arcApproval: { requestId: requestId1, token: adminRes1.result.token },
+      });
+      assert.ok(!call2.isError);
+      const body2 = parseResponse(call2);
+
+      assert.equal(body2.status, 'PASSED');
+      assert.equal(body2.steps.length, 1);
+      assert.equal(body2.steps[0].stepName, 'typecheck');
+      assert.equal(body2.steps[0].executable, 'tsc');
+      assert.equal(body2.steps[0].status, 'PASSED');
+      assert.equal(body2.steps[0].exitCode, 0);
+
+      // Snapshot workspace after valid execution and assert exact identity
+      const snapshotAfterValid = snapshotDirectory(wsDir);
+      assert.equal(snapshotAfterValid.size, snapshotBeforeValid.size);
+      for (const [filePath, content] of snapshotBeforeValid) {
+        assert.equal(snapshotAfterValid.get(filePath), content);
+      }
+      // Prove no dist, JS/DTS, or .tsbuildinfo was written
+      for (const filePath of snapshotAfterValid.keys()) {
+        assert.ok(!filePath.includes('dist'), `No dist file allowed: ${filePath}`);
+        assert.ok(!filePath.endsWith('.d.ts'), `No .d.ts file allowed: ${filePath}`);
+        assert.ok(!filePath.endsWith('.js'), `No .js file allowed: ${filePath}`);
+        assert.ok(!filePath.endsWith('.tsbuildinfo'), `No .tsbuildinfo allowed: ${filePath}`);
+      }
+
+      // 2. Introduce genuine TypeScript error only inside the referenced project (packages/a/src/index.ts)
+      fs.writeFileSync(
+        path.join(wsDir, 'packages', 'a', 'src', 'index.ts'),
+        'export const answer: number = "definitely-not-a-number";\n',
+      );
+
+      const snapshotBeforeError = snapshotDirectory(wsDir);
+
+      // Request approval for second run
+      const call3 = await server.executeAuthenticatedToolCall(safeActor, 'arc_verify', {
+        suite: 'typecheck',
+      });
+      const requestId2 = parseResponse(call3).details.approvalRequestId;
+      const adminRes2 = await adminRequest(adminSocket, operator.privateKey, 'approval.approve', {
+        requestId: requestId2,
+      });
+
+      // Execute approved suite: 'typecheck'
+      const call4 = await server.executeAuthenticatedToolCall(safeActor, 'arc_verify', {
+        suite: 'typecheck',
+        _arcApproval: { requestId: requestId2, token: adminRes2.result.token },
+      });
+      assert.ok(!call4.isError);
+      const body4 = parseResponse(call4);
+
+      assert.equal(body4.status, 'FAILED');
+      assert.equal(body4.failedStep, 'typecheck');
+      assert.equal(body4.steps.length, 1);
+      assert.equal(body4.steps[0].stepName, 'typecheck');
+      assert.equal(body4.steps[0].status, 'FAILED');
+      assert.notEqual(body4.steps[0].exitCode, 0);
+      assert.ok(
+        body4.steps[0].outputExcerpt.includes('TS2322') ||
+          body4.steps[0].outputExcerpt.includes('Type'),
+        `Diagnostic excerpt should mention TS2322 or Type error: ${body4.steps[0].outputExcerpt}`,
+      );
+
+      // Prove child process tracked through ProcessRegistry
+      const processes = processRegistry.listProcesses();
+      assert.ok(processes.length >= 2);
+      assert.ok(processes.some((p) => p.exitCode !== 0));
+
+      // Snapshot workspace after error run and assert zero mutations
+      const snapshotAfterError = snapshotDirectory(wsDir);
+      assert.equal(snapshotAfterError.size, snapshotBeforeError.size);
+      for (const [filePath, content] of snapshotBeforeError) {
+        assert.equal(snapshotAfterError.get(filePath), content);
+      }
+      for (const filePath of snapshotAfterError.keys()) {
+        assert.ok(!filePath.includes('dist'), `No dist file allowed: ${filePath}`);
+        assert.ok(!filePath.endsWith('.d.ts'), `No .d.ts file allowed: ${filePath}`);
+        assert.ok(!filePath.endsWith('.js'), `No .js file allowed: ${filePath}`);
+        assert.ok(!filePath.endsWith('.tsbuildinfo'), `No .tsbuildinfo allowed: ${filePath}`);
+      }
     } finally {
       await server.stop();
     }
