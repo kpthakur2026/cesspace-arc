@@ -528,10 +528,10 @@ describe('RC-07 Task 2: Discovery, Schema & Security Controls', () => {
       'arc_worktree_status must be in production tools/list',
     );
 
-    // Remaining 1 unowned RC-07 tool must NOT be in production list
+    // All 7 RC-07 tools are now present
     assert.ok(
-      !toolNames.includes('arc_stage_evidence'),
-      'arc_stage_evidence must remain absent from tools/list',
+      toolNames.includes('arc_stage_evidence'),
+      'arc_stage_evidence must be in production tools/list',
     );
   });
 

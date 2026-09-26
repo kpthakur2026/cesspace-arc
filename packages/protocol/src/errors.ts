@@ -72,7 +72,9 @@ export type ArcErrorCode =
   | 'PATH_OUTSIDE_WORKSPACE'
   | 'SYMLINK_ESCAPE_DETECTED'
   | 'WORKSPACE_UNREGISTERED'
-  | 'INVALID_GIT_ARGUMENT';
+  | 'INVALID_GIT_ARGUMENT'
+  | 'EVIDENCE_NOT_MET'
+  | 'STAGE_NOT_FOUND';
 
 /**
  * Canonical structured error payload emitted across the control plane.
@@ -645,6 +647,29 @@ export class ArcError extends Error implements ArcErrorPayload {
       remediationHint:
         remediationHint ??
         'Provide a valid Git revision or argument without leading dashes or shell metacharacters.',
+    });
+  }
+
+  public static evidenceNotMet(
+    message = 'Durable audit evidence is not met or unavailable.',
+  ): ArcError {
+    return new ArcError({
+      code: 'EVIDENCE_NOT_MET',
+      category: 'RESOURCE',
+      message,
+      retryable: false,
+      remediationHint:
+        'Ensure the persistent audit runtime is configured and has recorded durable evidence.',
+    });
+  }
+
+  public static stageNotFound(message = 'Target stage not found in closed catalog.'): ArcError {
+    return new ArcError({
+      code: 'STAGE_NOT_FOUND',
+      category: 'PROTOCOL',
+      message,
+      retryable: false,
+      remediationHint: 'Provide a valid stage name from the closed catalog (RC-00 through RC-07).',
     });
   }
 }

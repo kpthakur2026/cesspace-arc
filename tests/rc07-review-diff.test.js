@@ -1142,8 +1142,8 @@ describe('RC-07 Task 3 Positive Flows (RC07-FLOW-06..08)', () => {
 // ---------------------------------------------------------------------------
 
 describe('RC-07 Task 3 Additional Regressions', () => {
-  test('Production tool discovery advertises exactly 24 tools', () => {
-    assert.strictEqual(ALL_TOOL_DEFINITIONS.length, 24);
+  test('Production tool discovery advertises exactly 25 tools', () => {
+    assert.strictEqual(ALL_TOOL_DEFINITIONS.length, 25);
     const names = ALL_TOOL_DEFINITIONS.map((t) => t.name);
 
     assert.ok(names.includes('arc_ci_status'));
@@ -1153,8 +1153,8 @@ describe('RC-07 Task 3 Additional Regressions', () => {
     assert.ok(names.includes('arc_repo_status'));
     assert.ok(names.includes('arc_worktree_status'));
 
-    // Verify unadvertised tools remain absent
-    assert.strictEqual(names.includes('arc_stage_evidence'), false);
+    // Verify Task 7 tool is present
+    assert.strictEqual(names.includes('arc_stage_evidence'), true);
   });
 
   test('Strict schema rejects unknown properties on arc_review_diff', async () => {

@@ -683,6 +683,7 @@ export {
   type AuditHealthMetadata,
   type AuditRuntime,
   type AuditStartupStage,
+  type BoundedAuditEvidenceSummary,
 } from './startup.js';
 
 /* -------------------------------------------------------------------------- *

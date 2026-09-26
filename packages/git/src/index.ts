@@ -402,6 +402,11 @@ export interface IGitSubsystem {
     options: GitReviewDiffOptions,
     execOptions?: GitExecutionOptions,
   ): Promise<GitReviewDiffResult>;
+  isTrackedFileAtHead(
+    workspaceRoot: string,
+    repoRelativePath: string,
+    options?: GitExecutionOptions,
+  ): Promise<boolean>;
 }
 
 /**
@@ -633,6 +638,36 @@ export class GitSubsystem implements IGitSubsystem {
     }
     await this.verifyRepositoryBoundary(canonicalRoot, options);
     return this.runRawGit(canonicalRoot, args, maxBuffer, options);
+  }
+
+  /**
+   * Dedicated read-only helper for arc_stage_evidence (RC-07 Task 7).
+   * Confirms whether an exact server-derived repository-relative path exists
+   * as a tracked regular file (blob) at current HEAD.
+   */
+  public async isTrackedFileAtHead(
+    workspaceRoot: string,
+    repoRelativePath: string,
+    options?: GitExecutionOptions,
+  ): Promise<boolean> {
+    if (!repoRelativePath || typeof repoRelativePath !== 'string') {
+      return false;
+    }
+    const cleanPath = repoRelativePath.trim().replace(/\\/g, '/');
+    if (cleanPath.startsWith('/') || /(^|\/)\.\.(\/|$)/.test(cleanPath)) {
+      return false;
+    }
+    try {
+      const { stdout } = await this.runGit(
+        workspaceRoot,
+        ['cat-file', '-t', `HEAD:${cleanPath}`],
+        undefined,
+        options,
+      );
+      return stdout.trim() === 'blob';
+    } catch {
+      return false;
+    }
   }
 
   public async getStatus(

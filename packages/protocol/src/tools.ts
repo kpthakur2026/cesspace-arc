@@ -482,3 +482,49 @@ export interface ArcCiStatusResponse {
   remoteQueryDeferred: true;
   remoteNotice: string;
 }
+
+export const RC07_STAGE_CATALOG = [
+  'RC-00',
+  'RC-01',
+  'RC-02',
+  'RC-03',
+  'RC-04',
+  'RC-05',
+  'RC-06',
+  'RC-07',
+] as const;
+
+export type Rc07Stage = (typeof RC07_STAGE_CATALOG)[number];
+
+export interface ArcStageEvidenceRequest {
+  targetStage: string;
+  workspaceId?: string;
+}
+
+export interface ArcStageEvidenceResponse {
+  stage: string;
+  timestamp: string;
+  repository: {
+    branch: string;
+    headSha: string;
+    isClean: boolean;
+  };
+  auditLedger: {
+    sequence: number;
+    integrity: 'VERIFIED' | 'FAILED';
+    lastCheckpointSequence: number | null;
+    storeId: string;
+  };
+  verification: {
+    scriptPresent: boolean;
+    scriptPath?: string;
+    verifiedLocally: boolean;
+  };
+  acceptanceMet: boolean;
+  references: {
+    auditStoreId: string;
+    terminalRecordHash: string;
+    checkpointHash?: string;
+  };
+  disclaimer: string;
+}

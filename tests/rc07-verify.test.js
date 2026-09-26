@@ -1037,8 +1037,8 @@ describe('RC-07 Task 4: Positive Acceptance Flows (RC07-FLOW-09, RC07-FLOW-10)',
 // ---------------------------------------------------------------------------
 
 describe('RC-07 Task 4: Invariants, Discovery & Quality Regressions', () => {
-  test('Discovery: Production tool count is exactly 24 (including arc_verify, arc_test, and arc_ci_status)', () => {
-    assert.equal(ALL_TOOL_DEFINITIONS.length, 24);
+  test('Discovery: Production tool count is exactly 25 (including arc_verify, arc_test, arc_ci_status, and arc_stage_evidence)', () => {
+    assert.equal(ALL_TOOL_DEFINITIONS.length, 25);
     const names = ALL_TOOL_DEFINITIONS.map((t) => t.name);
 
     assert.ok(names.includes('arc_ci_status'));
@@ -1048,8 +1048,8 @@ describe('RC-07 Task 4: Invariants, Discovery & Quality Regressions', () => {
     assert.ok(names.includes('arc_repo_status'));
     assert.ok(names.includes('arc_worktree_status'));
 
-    // Still absent
-    assert.equal(names.includes('arc_stage_evidence'), false);
+    // Task 7 tool is present
+    assert.equal(names.includes('arc_stage_evidence'), true);
   });
 
   test('Production deterministic registry contains the 4 Task-4 verification entries and Task-5 entry', () => {

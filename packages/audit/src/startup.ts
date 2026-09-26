@@ -61,7 +61,11 @@ import fsConstants from 'node:constants';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 
-import type { AuditStoreMetadataV1, PersistentAuditRecordV1 } from '@cesspace-arc/protocol';
+import {
+  ArcError,
+  type AuditStoreMetadataV1,
+  type PersistentAuditRecordV1,
+} from '@cesspace-arc/protocol';
 
 import {
   ACTIVE_SEGMENT_FILENAME,
@@ -103,6 +107,7 @@ import {
 } from './anchor.js';
 import { RECOVERY_HANDOFF_TOKEN } from './internal/recovery-capability.js';
 import { buildRecoveryIndeterminateRecord, repairTornActiveTailInternal } from './recovery.js';
+import { verifyOfflineStore } from './verify.js';
 import {
   AUDIT_RUNTIME_TEST_TOKEN,
   type AuditRuntimeCompositionSeams,
@@ -207,6 +212,18 @@ export interface AuditHealthMetadata {
   indeterminateRecoveries: number;
 }
 
+/**
+ * Bounded audit evidence summary for stage evidence inspection (RC-07 Task 7).
+ */
+export interface BoundedAuditEvidenceSummary {
+  storeId: string;
+  sequence: number;
+  integrity: 'VERIFIED' | 'FAILED';
+  terminalRecordHash: string;
+  lastCheckpointSequence: number | null;
+  checkpointHash?: string;
+}
+
 /* -------------------------------------------------------------------------- *
  * Runtime surface
  * -------------------------------------------------------------------------- */
@@ -280,6 +297,12 @@ export interface AuditRuntime {
 
   /** Closes every resource in one deterministic order. Idempotent. */
   close(): Promise<void>;
+
+  /**
+   * Performs an authoritative, machine-verifiable inspection of the persistent audit ledger
+   * for stage evidence aggregation (RC-07 Task 7).
+   */
+  inspectStageEvidence(): Promise<BoundedAuditEvidenceSummary>;
 
   /**
    * The startup stages this runtime actually executed, in order.
@@ -369,6 +392,8 @@ class AuditRuntimeImpl implements AuditRuntime {
   private readonly anchor: Tier3AnchorEngine | null;
   private readonly stages: AuditStartupStage[];
   private readonly indeterminateRecoveries: number;
+  private readonly publicKeyPath: string;
+  private readonly anchorReceiptPublicKeyPath?: string;
 
   /**
    * The runtime append fault seam, or `undefined` in production.
@@ -448,6 +473,8 @@ class AuditRuntimeImpl implements AuditRuntime {
     indeterminateRecoveries: number;
     /** The queue the checkpoint engine hands durable checkpoints to. */
     checkpointQueue: AuditCheckpointV1[];
+    publicKeyPath: string;
+    anchorReceiptPublicKeyPath?: string;
     failAppendPhase?: 'STARTED' | 'COMPLETED' | 'DENIED';
     failAppendErrorCode?: string;
   }) {
@@ -461,6 +488,8 @@ class AuditRuntimeImpl implements AuditRuntime {
     this.stages = init.stages;
     this.indeterminateRecoveries = init.indeterminateRecoveries;
     this.checkpointQueue = init.checkpointQueue;
+    this.publicKeyPath = init.publicKeyPath;
+    this.anchorReceiptPublicKeyPath = init.anchorReceiptPublicKeyPath;
     this.failAppendPhase = init.failAppendPhase;
     this.failAppendErrorCode = init.failAppendErrorCode ?? 'AUDIT_APPEND_FAILED';
   }
@@ -660,6 +689,57 @@ class AuditRuntimeImpl implements AuditRuntime {
         anchorStatus === undefined ? 'DISABLED' : toHealthAnchorState(anchorStatus.anchorState),
       indeterminateRecoveries: this.indeterminateRecoveries,
     };
+  }
+
+  public async inspectStageEvidence(): Promise<BoundedAuditEvidenceSummary> {
+    const genesisHash = '0000000000000000000000000000000000000000000000000000000000000000';
+    const storeId = this.storage.getMetadata()?.storeId ?? 'unknown';
+
+    if (
+      this.storage.getCurrentSequence() <= 1 &&
+      this.storage.getLastRecordHash() === genesisHash
+    ) {
+      throw ArcError.evidenceNotMet('Audit store contains zero durable records.');
+    }
+
+    try {
+      const verification = await verifyOfflineStore({
+        directory: this.auditDir,
+        checkpointPublicKeyPath: this.publicKeyPath,
+        anchorReceiptPublicKeyPath: this.anchorReceiptPublicKeyPath,
+        expectedUid: this.expectedUid,
+      });
+
+      if (verification.primary.recordCount === 0) {
+        throw ArcError.evidenceNotMet('Audit store contains zero durable records.');
+      }
+
+      return {
+        storeId: verification.storeId,
+        sequence: verification.primary.terminalSequence,
+        integrity: 'VERIFIED',
+        terminalRecordHash: verification.primary.terminalRecordHash,
+        lastCheckpointSequence: verification.checkpoints.lastCheckpointSequence,
+        ...(verification.checkpoints.lastCheckpointHash
+          ? { checkpointHash: verification.checkpoints.lastCheckpointHash }
+          : {}),
+      };
+    } catch (err: unknown) {
+      if (err instanceof ArcError && err.code === 'EVIDENCE_NOT_MET') {
+        throw err;
+      }
+      const seq = Math.max(0, this.storage.getCurrentSequence() - 1);
+      const lastHash = this.storage.getLastRecordHash();
+      const lastCpSeq = this.checkpoints.getCheckpointState().lastCheckpointSequence;
+
+      return {
+        storeId,
+        sequence: seq,
+        integrity: 'FAILED',
+        terminalRecordHash: lastHash,
+        lastCheckpointSequence: lastCpSeq,
+      };
+    }
   }
 
   public async close(): Promise<void> {
@@ -971,6 +1051,8 @@ async function executeStartup(
       stages,
       indeterminateRecoveries,
       checkpointQueue,
+      publicKeyPath: config.publicKeyPath,
+      anchorReceiptPublicKeyPath: config.anchorReceiptPublicKeyPath,
       ...(token === undefined
         ? {}
         : {
