@@ -684,6 +684,7 @@ export {
   type AuditRuntime,
   type AuditStartupStage,
   type BoundedAuditEvidenceSummary,
+  type StageEvidenceInspectionOptions,
 } from './startup.js';
 
 /* -------------------------------------------------------------------------- *

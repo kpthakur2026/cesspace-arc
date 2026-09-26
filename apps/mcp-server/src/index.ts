@@ -4005,6 +4005,7 @@ export class ArcMcpServer implements IArcMcpServer {
                 validatedParams: validatedParams as unknown as ArcStageEvidenceRequest,
                 gitSubsystem: this.gitSubsystem,
                 auditRuntime: this.auditRuntime,
+                currentOperationId: lifecycleOperationId,
               });
             });
             break;

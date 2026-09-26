@@ -93,9 +93,11 @@ import {
   type RetainedPrimaryHistoryVerificationResult,
 } from './rotation.js';
 import {
+  CHECKPOINT_FILENAME,
   Tier2CheckpointEngine,
   computeCheckpointPublicKeyFingerprint,
   openTier2CheckpointEngine,
+  parseAndValidateCheckpointLineV1,
   type AuditCheckpointV1,
 } from './checkpoint.js';
 import {
@@ -107,7 +109,12 @@ import {
 } from './anchor.js';
 import { RECOVERY_HANDOFF_TOKEN } from './internal/recovery-capability.js';
 import { buildRecoveryIndeterminateRecord, repairTornActiveTailInternal } from './recovery.js';
-import { verifyOfflineStore } from './verify.js';
+import {
+  listRetainedSegmentSources,
+  streamLedgerLines,
+  streamRetainedRecords,
+  verifyOfflineStore,
+} from './verify.js';
 import {
   AUDIT_RUNTIME_TEST_TOKEN,
   type AuditRuntimeCompositionSeams,
@@ -224,6 +231,17 @@ export interface BoundedAuditEvidenceSummary {
   checkpointHash?: string;
 }
 
+/**
+ * Options for stage evidence inspection (RC-07 Task 7).
+ */
+export interface StageEvidenceInspectionOptions {
+  /**
+   * The operationId of the current arc_stage_evidence invocation's STARTED record,
+   * which must be excluded from pre-existing evidence calculations.
+   */
+  excludeOperationId?: string;
+}
+
 /* -------------------------------------------------------------------------- *
  * Runtime surface
  * -------------------------------------------------------------------------- */
@@ -302,7 +320,9 @@ export interface AuditRuntime {
    * Performs an authoritative, machine-verifiable inspection of the persistent audit ledger
    * for stage evidence aggregation (RC-07 Task 7).
    */
-  inspectStageEvidence(): Promise<BoundedAuditEvidenceSummary>;
+  inspectStageEvidence(
+    options?: StageEvidenceInspectionOptions,
+  ): Promise<BoundedAuditEvidenceSummary>;
 
   /**
    * The startup stages this runtime actually executed, in order.
@@ -691,7 +711,9 @@ class AuditRuntimeImpl implements AuditRuntime {
     };
   }
 
-  public async inspectStageEvidence(): Promise<BoundedAuditEvidenceSummary> {
+  public async inspectStageEvidence(
+    options?: StageEvidenceInspectionOptions,
+  ): Promise<BoundedAuditEvidenceSummary> {
     const genesisHash = '0000000000000000000000000000000000000000000000000000000000000000';
     const storeId = this.storage.getMetadata()?.storeId ?? 'unknown';
 
@@ -712,6 +734,72 @@ class AuditRuntimeImpl implements AuditRuntime {
 
       if (verification.primary.recordCount === 0) {
         throw ArcError.evidenceNotMet('Audit store contains zero durable records.');
+      }
+
+      if (options?.excludeOperationId) {
+        const recent = this.store.getRecentRecords();
+        let startedRecord = recent.find(
+          (r) =>
+            r.lifecycle?.operationId === options.excludeOperationId &&
+            r.lifecycle?.phase === 'STARTED',
+        );
+
+        if (!startedRecord) {
+          const sources = listRetainedSegmentSources(this.auditDir, this.expectedUid);
+          for await (const rec of streamRetainedRecords(sources, {
+            expectedUid: this.expectedUid,
+          })) {
+            if (
+              rec.lifecycle?.operationId === options.excludeOperationId &&
+              rec.lifecycle?.phase === 'STARTED'
+            ) {
+              startedRecord = rec;
+              break;
+            }
+          }
+        }
+
+        if (startedRecord) {
+          if (startedRecord.sequenceNumber <= 1) {
+            throw ArcError.evidenceNotMet(
+              'Audit store contains zero durable records prior to this invocation.',
+            );
+          }
+
+          const precedingSequence = startedRecord.sequenceNumber - 1;
+          const precedingHash = startedRecord.integrity.previousRecordHash;
+
+          let precedingCpSequence: number | null = null;
+          let precedingCpHash: string | undefined = undefined;
+
+          const cpPath = path.join(this.auditDir, CHECKPOINT_FILENAME);
+          if (fs.existsSync(cpPath)) {
+            for await (const line of streamLedgerLines(
+              cpPath,
+              CHECKPOINT_FILENAME,
+              this.expectedUid,
+            )) {
+              try {
+                const { checkpoint } = parseAndValidateCheckpointLineV1(`${line}\n`);
+                if (checkpoint.sequenceEnd < startedRecord.sequenceNumber) {
+                  precedingCpSequence = checkpoint.sequenceEnd;
+                  precedingCpHash = checkpoint.checkpointHash;
+                }
+              } catch {
+                // Ignore line parsing errors here; verifyOfflineStore would have failed if invalid
+              }
+            }
+          }
+
+          return {
+            storeId: verification.storeId,
+            sequence: precedingSequence,
+            integrity: 'VERIFIED',
+            terminalRecordHash: precedingHash,
+            lastCheckpointSequence: precedingCpSequence,
+            ...(precedingCpHash ? { checkpointHash: precedingCpHash } : {}),
+          };
+        }
       }
 
       return {

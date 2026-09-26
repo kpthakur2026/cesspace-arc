@@ -11,10 +11,11 @@
 
 import { describe, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, readdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 
 import {
   createArcMcpServer,
@@ -23,6 +24,16 @@ import {
 } from '../apps/mcp-server/dist/index.js';
 import { ArcError } from '../packages/protocol/dist/index.js';
 import { DeclarativePolicyEngine, WorkspaceRegistry } from '../packages/policy/dist/index.js';
+import {
+  CHECKPOINT_FILENAME,
+  computeCheckpointHash,
+  listRetainedSegmentSources,
+  parseAndValidateCheckpointLineV1,
+  serializeCheckpointV1,
+  streamRetainedRecords,
+  verifyCheckpointHistory,
+  verifyOfflineStore,
+} from '../packages/audit/dist/index.js';
 import { createAuditConfig } from './helpers/rc06-audit-runtime.mjs';
 import {
   MAX_STAGE_EVIDENCE_RESPONSE_BYTES,
@@ -129,7 +140,7 @@ describe('CesSpace ARC — RC-07 Task 7: arc_stage_evidence Test Suite', () => {
       const err = parseResponse(res);
       assert.equal(err.code, 'EVIDENCE_NOT_MET');
 
-      // Also verify when audit runtime exists but store contains zero records
+      // Also verify when audit runtime exists with a REAL persistent audit store with ZERO records before invocation
       const emptyAuditConfig = createAuditConfig(tempRoot, 'empty-audit');
       const emptyServer = createArcMcpServer({
         transport: 'stdio',
@@ -140,36 +151,97 @@ describe('CesSpace ARC — RC-07 Task 7: arc_stage_evidence Test Suite', () => {
       await emptyServer.start();
 
       try {
-        // Direct inspection on empty runtime throws EVIDENCE_NOT_MET
-        await assert.rejects(
-          async () => {
-            await emptyServer.auditRuntime.inspectStageEvidence();
-          },
-          (err) => {
-            return err instanceof ArcError && err.code === 'EVIDENCE_NOT_MET';
-          },
+        // Assert store has 0 records before invocation
+        assert.equal(emptyServer.auditRuntime.getNextSequence(), 1);
+
+        // Production MCP execution must fail closed with EVIDENCE_NOT_MET
+        const mcpRes = await emptyServer.executeAuthenticatedToolCall(
+          safeActor,
+          'arc_stage_evidence',
+          { targetStage: 'RC-06' },
         );
+        assert.equal(mcpRes.isError, true);
+        const mcpErr = parseResponse(mcpRes);
+        assert.equal(mcpErr.code, 'EVIDENCE_NOT_MET');
+
+        // Prove the failed call still produces the correct root STARTED -> COMPLETED audit lifecycle
+        const sources = listRetainedSegmentSources(emptyAuditConfig.directory);
+        const records = [];
+        for await (const rec of streamRetainedRecords(sources)) {
+          records.push(rec);
+        }
+
+        assert.equal(records.length, 2, 'Failed invocation must record root STARTED and COMPLETED');
+        const [startedRec, completedRec] = records;
+        assert.equal(startedRec.lifecycle.phase, 'STARTED');
+        assert.equal(completedRec.lifecycle.phase, 'COMPLETED');
+        assert.equal(startedRec.lifecycle.operationId, completedRec.lifecycle.operationId);
+        assert.equal(startedRec.invocation.payloadHash, completedRec.invocation.payloadHash);
+        assert.equal(completedRec.execution.status, 'ERROR');
+        assert.equal(completedRec.error?.code, 'EVIDENCE_NOT_MET');
+
+        // Cryptographic verification of the resulting 2-record store
+        const verification = await verifyOfflineStore({
+          directory: emptyAuditConfig.directory,
+          checkpointPublicKeyPath: emptyAuditConfig.publicKeyPath,
+        });
+        assert.equal(verification.status, 'VERIFIED');
       } finally {
         await emptyServer.stop();
       }
     });
 
     test('RC07-NEG-055: arc_stage_evidence treats a single green test execution as sufficient for stage approval. Prohibited by anti-fabrication invariant', async () => {
-      // Run a benign tool that completes successfully and appends records
-      const repoRes = await server.executeAuthenticatedToolCall(safeActor, 'arc_repo_status', {});
-      assert.ok(!repoRes.isError);
+      // Create a tiny passing Node test file
+      const passingTest = join(workspaceDir, 'passing-neg055.test.js');
+      writeFileSync(
+        passingTest,
+        'const test = require("node:test"); test("neg055 pass", () => {});\n',
+      );
 
-      // Now query arc_stage_evidence
-      const res = await server.executeAuthenticatedToolCall(safeActor, 'arc_stage_evidence', {
-        targetStage: 'RC-06',
-      });
-      assert.ok(!res.isError);
-      const body = parseResponse(res);
+      try {
+        // Run full approval lifecycle for real arc_test
+        // 1. call arc_test
+        const reqRes = await server.executeAuthenticatedToolCall(safeActor, 'arc_test', {
+          testPath: 'passing-neg055.test.js',
+        });
+        assert.equal(reqRes.isError, true);
+        const reqBody = parseResponse(reqRes);
+        assert.equal(reqBody.code, 'APPROVAL_REQUIRED');
+        const requestId = reqBody.details.approvalRequestId;
+        assert.ok(requestId);
 
-      // Anti-fabrication invariant: acceptanceMet MUST remain false
-      assert.equal(body.acceptanceMet, false, 'acceptanceMet must never be synthesized as true');
-      assert.equal(body.verification.verifiedLocally, false, 'verifiedLocally must remain false');
-      assert.equal(body.disclaimer, STAGE_EVIDENCE_DISCLAIMER);
+        // 2. approve through real ApprovalStateManager
+        const approval = server.approvalStateManager.approve(requestId);
+
+        // 3. redeem approval and run child process
+        const execRes = await server.executeAuthenticatedToolCall(safeActor, 'arc_test', {
+          testPath: 'passing-neg055.test.js',
+          _arcApproval: {
+            requestId,
+            token: approval.token,
+          },
+        });
+        assert.ok(!execRes.isError);
+        const testResult = parseResponse(execRes);
+        assert.equal(testResult.status, 'PASSED');
+        const childProcessId = testResult.processId;
+        assert.equal(typeof childProcessId, 'string');
+
+        // 4. Then call arc_stage_evidence
+        const res = await server.executeAuthenticatedToolCall(safeActor, 'arc_stage_evidence', {
+          targetStage: 'RC-06',
+        });
+        assert.ok(!res.isError);
+        const body = parseResponse(res);
+
+        // Anti-fabrication invariant: one green test is NOT stage approval
+        assert.equal(body.verification.verifiedLocally, false);
+        assert.equal(body.acceptanceMet, false);
+        assert.equal(body.disclaimer, STAGE_EVIDENCE_DISCLAIMER);
+      } finally {
+        rmSync(passingTest, { force: true });
+      }
     });
 
     test('RC07-NEG-056: arc_stage_evidence attempts to read an unverified, tampered audit ledger. Invariant check halts; reports integrity: FAILED', async () => {
@@ -216,26 +288,100 @@ describe('CesSpace ARC — RC-07 Task 7: arc_stage_evidence Test Suite', () => {
     });
 
     test('RC07-NEG-057: arc_stage_evidence embeds uncompressed multi-megabyte audit segment into response. Prohibited; hashes referenced only', async () => {
-      const res = await server.executeAuthenticatedToolCall(safeActor, 'arc_stage_evidence', {
-        targetStage: 'RC-06',
+      // Create dedicated server with real audit config
+      const largeAuditConfig = createAuditConfig(tempRoot, 'large-audit');
+      const largeServer = createArcMcpServer({
+        transport: 'stdio',
+        authorizedRoots: [{ id: 'ws-large', path: workspaceDir }],
+        defaultWorkspaceId: 'ws-large',
+        audit: largeAuditConfig,
       });
-      assert.ok(!res.isError);
-      const body = parseResponse(res);
+      await largeServer.start();
 
-      // Verify only references are returned
-      assert.ok(body.references, 'references object must be present');
-      assert.ok(body.references.auditStoreId, 'auditStoreId reference must be present');
-      assert.ok(body.references.terminalRecordHash, 'terminalRecordHash reference must be present');
+      try {
+        // Populate valid persistent audit history >= 2 MiB using existing audit authorities
+        // Each record ~45 KiB payload. 50 records * 45 KiB > 2.25 MiB.
+        const chunk = 'x'.repeat(45 * 1024);
+        for (let i = 0; i < 50; i++) {
+          await largeServer.auditRuntime.appendRecord({
+            eventId: randomUUID(),
+            timestamp: new Date().toISOString(),
+            actor: {
+              clientId: safeActor.clientId,
+              clientType: safeActor.clientType,
+              sessionId: safeActor.sessionId,
+              deviceId: safeActor.deviceId,
+            },
+            target: { workspaceId: 'ws-large', workspacePath: workspaceDir },
+            invocation: {
+              toolName: 'git_status',
+              parametersRedacted: { chunk, index: i },
+              payloadHash: '0000000000000000000000000000000000000000000000000000000000000000',
+            },
+            policy: { decision: 'ALLOW', ruleId: 'builtin-allow', evaluationDurationMs: 0 },
+            execution: {
+              status: 'SUCCESS',
+              startTime: new Date().toISOString(),
+              endTime: new Date().toISOString(),
+              durationMs: 1,
+            },
+          });
+        }
 
-      // Prohibited: No raw ledger lines or segments embedded
-      assert.equal(body.records, undefined);
-      assert.equal(body.segments, undefined);
-      assert.equal(body.rawLog, undefined);
-      assert.equal(body.content, undefined);
+        // Verify the store is physically >= 2 MiB
+        const activePath = join(largeAuditConfig.directory, 'audit-active.jsonl');
+        const storeBytes = statSync(activePath).size;
+        assert.ok(
+          storeBytes >= 2 * 1024 * 1024,
+          `Expected store >= 2 MiB, got ${storeBytes} bytes`,
+        );
 
-      // Total response size is tiny (< 2 KiB)
-      const byteLen = Buffer.byteLength(JSON.stringify(body), 'utf8');
-      assert.ok(byteLen < 4096, `Expected compact response (<4 KiB), got ${byteLen} bytes`);
+        // The large store must successfully verify through packages/audit
+        const verifyResult = await verifyOfflineStore({
+          directory: largeAuditConfig.directory,
+          checkpointPublicKeyPath: largeAuditConfig.publicKeyPath,
+        });
+        assert.equal(verifyResult.status, 'VERIFIED');
+        assert.equal(verifyResult.primary.recordCount, 50);
+
+        // Call arc_stage_evidence
+        const res = await largeServer.executeAuthenticatedToolCall(
+          safeActor,
+          'arc_stage_evidence',
+          {
+            targetStage: 'RC-06',
+          },
+        );
+        assert.ok(!res.isError);
+        const body = parseResponse(res);
+
+        // Prove audit verification succeeds
+        assert.equal(body.auditLedger.integrity, 'VERIFIED');
+
+        // Prove only bounded references are returned
+        assert.ok(body.references, 'references object must be present');
+        assert.ok(body.references.auditStoreId, 'auditStoreId reference must be present');
+        assert.ok(
+          body.references.terminalRecordHash,
+          'terminalRecordHash reference must be present',
+        );
+
+        // Prohibited: No raw ledger lines or segments embedded
+        assert.equal(body.records, undefined);
+        assert.equal(body.segments, undefined);
+        assert.equal(body.rawLog, undefined);
+        assert.equal(body.content, undefined);
+        assert.equal(body.checkpoints, undefined);
+        assert.equal(body.receipts, undefined);
+
+        // Prove exact MCP response < 524288 bytes and does not scale with audit-history size (< 4 KiB)
+        const serialized = JSON.stringify(body, null, 2);
+        const byteLen = Buffer.byteLength(serialized, 'utf8');
+        assert.ok(byteLen < 524288, `Must be under 512 KiB cap, got ${byteLen}`);
+        assert.ok(byteLen < 4096, `Expected compact bounded response (<4 KiB), got ${byteLen}`);
+      } finally {
+        await largeServer.stop();
+      }
     });
 
     test('RC07-NEG-058: arc_stage_evidence reports success on a dirty Git working tree. Must accurately report isClean: false', async () => {
@@ -258,7 +404,7 @@ describe('CesSpace ARC — RC-07 Task 7: arc_stage_evidence Test Suite', () => {
     });
 
     test('RC07-NEG-059: arc_stage_evidence reports success on an unverified checkpoint signature. Invariant violation; reports unverified / FAILED', async () => {
-      // Create a server where checkpoint file is corrupted/tampered
+      // 1. Create a REAL valid signed checkpoint using existing RC-06 checkpoint authority/helpers
       const cpAuditConfig = createAuditConfig(tempRoot, 'cp-corrupt-audit');
       const cpServer = createArcMcpServer({
         transport: 'stdio',
@@ -269,25 +415,50 @@ describe('CesSpace ARC — RC-07 Task 7: arc_stage_evidence Test Suite', () => {
       await cpServer.start();
 
       try {
-        // Execute an operation
+        // Execute an operation to establish durable records
         await cpServer.executeAuthenticatedToolCall(safeActor, 'arc_repo_status', {});
 
-        // Artificially inject an invalid checkpoint file
-        const checkpointFile = join(cpAuditConfig.directory, 'audit-checkpoints.jsonl');
-        writeFileSync(
-          checkpointFile,
-          JSON.stringify({
-            schemaVersion: 1,
-            sequenceNumber: 1,
-            timestamp: new Date().toISOString(),
-            checkpointHash: '1111111111111111111111111111111111111111111111111111111111111111',
-            coveredRange: { start: 1, end: 1 },
-            terminalRecordHash: '2222222222222222222222222222222222222222222222222222222222222222',
-            signature: Buffer.alloc(64, 0xaa).toString('base64'),
-            publicKeyFingerprint: 'invalid-fingerprint',
-          }) + '\n',
+        // Seal a real signed checkpoint via segment rotation authority
+        await cpServer.auditRuntime.store.rotateNow('SIZE_THRESHOLD');
+
+        // 2. Prove the untouched store verifies successfully
+        const untouchedResult = await verifyOfflineStore({
+          directory: cpAuditConfig.directory,
+          checkpointPublicKeyPath: cpAuditConfig.publicKeyPath,
+        });
+        assert.equal(untouchedResult.status, 'VERIFIED');
+        assert.ok(untouchedResult.checkpoints.checkpointCount >= 1);
+
+        // 3. Tamper ONLY the signature or another signature-bound byte while preserving valid checkpoint schema
+        const checkpointFile = join(cpAuditConfig.directory, CHECKPOINT_FILENAME);
+        const rawLines = readFileSync(checkpointFile, 'utf8').trim().split('\n').filter(Boolean);
+        assert.ok(rawLines.length >= 1);
+
+        const { checkpoint } = parseAndValidateCheckpointLineV1(`${rawLines[0]}\n`);
+
+        // Create a well-formed 64-byte signature that fails Ed25519 verification,
+        // with the checkpointHash recomputed so the artifact schema and hash preimage match
+        const wrongSignature = Buffer.alloc(64, 0x5a).toString('base64url');
+        const tamperedCheckpoint = {
+          ...checkpoint,
+          signature: wrongSignature,
+        };
+        tamperedCheckpoint.checkpointHash = computeCheckpointHash(tamperedCheckpoint);
+        const tamperedLine = serializeCheckpointV1(tamperedCheckpoint);
+        writeFileSync(checkpointFile, tamperedLine);
+
+        // Prove packages/audit rejected the checkpoint through genuine signature verification
+        await assert.rejects(
+          async () => {
+            await verifyCheckpointHistory({
+              directory: cpAuditConfig.directory,
+              publicKeyPath: cpAuditConfig.publicKeyPath,
+            });
+          },
+          (err) => err.code === 'AUDIT_CHECKPOINT_SIGNATURE_INVALID',
         );
 
+        // 4. Invoke arc_stage_evidence
         const res = await cpServer.executeAuthenticatedToolCall(safeActor, 'arc_stage_evidence', {
           targetStage: 'RC-06',
         });
@@ -400,45 +571,165 @@ describe('CesSpace ARC — RC-07 Task 7: arc_stage_evidence Test Suite', () => {
     });
 
     test('RC07-FLOW-15: Composite Audit Evidence & Step Tracking', async () => {
-      // Execute a tool invocation through the server
-      const invokeRes = await server.executeAuthenticatedToolCall(safeActor, 'arc_repo_status', {});
-      assert.ok(!invokeRes.isError);
+      // Tiny passing Node test file
+      const flowTestFile = join(workspaceDir, 'flow15.test.js');
+      writeFileSync(
+        flowTestFile,
+        'const test = require("node:test"); test("flow15 test", () => {});\n',
+      );
 
-      // Inspect durable audit ledger JSONL records
-      const auditFiles = readdirSync(auditConfig.directory).filter((f) => f.endsWith('.jsonl'));
-      assert.ok(auditFiles.length > 0, 'Audit files must be present');
+      try {
+        // Execute full approval lifecycle for real arc_test
+        // 1. arc_test request
+        const reqRes = await server.executeAuthenticatedToolCall(safeActor, 'arc_test', {
+          testPath: 'flow15.test.js',
+        });
+        assert.equal(reqRes.isError, true);
+        const reqPayload = parseResponse(reqRes);
+        assert.equal(reqPayload.code, 'APPROVAL_REQUIRED');
+        const requestId = reqPayload.details.approvalRequestId;
+        assert.ok(requestId);
 
-      let allRecords = [];
-      for (const file of auditFiles) {
-        const lines = readFileSync(join(auditConfig.directory, file), 'utf8')
-          .trim()
-          .split('\n')
-          .filter(Boolean);
-        for (const line of lines) {
-          try {
-            allRecords.push(JSON.parse(line));
-          } catch {
-            // skip non-json
-          }
+        // 2. ApprovalStateManager approval
+        const approval = server.approvalStateManager.approve(requestId);
+
+        // 3. redemption & real child execution
+        const execRes = await server.executeAuthenticatedToolCall(safeActor, 'arc_test', {
+          testPath: 'flow15.test.js',
+          _arcApproval: {
+            requestId,
+            token: approval.token,
+          },
+        });
+        assert.ok(!execRes.isError);
+        const execBody = parseResponse(execRes);
+        assert.equal(execBody.status, 'PASSED');
+
+        // 4. Capture returnedProcessId
+        const returnedProcessId = execBody.processId;
+        assert.ok(returnedProcessId, 'arc_test must return processId');
+
+        // 5. Establish cryptographic ledger verification through packages/audit
+        const verification = await verifyOfflineStore({
+          directory: auditConfig.directory,
+          checkpointPublicKeyPath: auditConfig.publicKeyPath,
+        });
+        assert.equal(verification.status, 'VERIFIED');
+
+        // Stream verified records across the persistent ledger
+        const sources = listRetainedSegmentSources(auditConfig.directory);
+        const verifiedRecords = [];
+        for await (const rec of streamRetainedRecords(sources)) {
+          verifiedRecords.push(rec);
         }
+
+        // ROOT LIFECYCLE:
+        const arcTestStarted = verifiedRecords.filter(
+          (r) =>
+            r.invocation?.toolName === 'arc_test' &&
+            r.lifecycle?.phase === 'STARTED' &&
+            r.approval?.requestId === requestId,
+        );
+        const arcTestCompleted = verifiedRecords.filter(
+          (r) =>
+            r.invocation?.toolName === 'arc_test' &&
+            r.lifecycle?.phase === 'COMPLETED' &&
+            r.approval?.requestId === requestId,
+        );
+
+        assert.equal(
+          arcTestStarted.length,
+          1,
+          'Exactly one root STARTED record for this invocation',
+        );
+        assert.equal(
+          arcTestCompleted.length,
+          1,
+          'Exactly one root COMPLETED record for this invocation',
+        );
+
+        const startedRec = arcTestStarted[0];
+        const completedRec = arcTestCompleted[0];
+
+        assert.equal(
+          startedRec.lifecycle.operationId,
+          completedRec.lifecycle.operationId,
+          'STARTED and COMPLETED must share identical lifecycle.operationId',
+        );
+        assert.equal(
+          startedRec.invocation.payloadHash,
+          completedRec.invocation.payloadHash,
+          'STARTED and COMPLETED must share identical invocation.payloadHash',
+        );
+        assert.equal(
+          completedRec.execution.status,
+          'SUCCESS',
+          'COMPLETED.execution.status must be truthful SUCCESS',
+        );
+        assert.ok(
+          !startedRec.lifecycle.parentOperationId,
+          'Root invocation must have no parentOperationId',
+        );
+        assert.ok(
+          !completedRec.lifecycle.parentOperationId,
+          'Root invocation must have no parentOperationId',
+        );
+
+        // No root lifecycle phase FAILED
+        const rootFailed = verifiedRecords.filter(
+          (r) =>
+            r.lifecycle?.operationId === startedRec.lifecycle.operationId &&
+            r.lifecycle?.phase === 'FAILED',
+        );
+        assert.equal(rootFailed.length, 0, 'No root lifecycle phase FAILED must exist');
+
+        // PROCESS EVIDENCE:
+        const procRecords = verifiedRecords.filter(
+          (r) => r.invocation?.parametersRedacted?.processId === returnedProcessId,
+        );
+        assert.ok(
+          procRecords.length >= 2,
+          'Durable process lifecycle records must be present for processId',
+        );
+
+        for (const pr of procRecords) {
+          assert.equal(
+            pr.invocation.parametersRedacted.processId,
+            returnedProcessId,
+            'Durable process record processId must match returnedProcessId',
+          );
+          assert.notEqual(
+            pr.lifecycle?.operationId,
+            startedRec.lifecycle.operationId,
+            'Process evidence is a separate audit record from root lifecycle',
+          );
+        }
+
+        const procEventTypes = procRecords.map((r) => r.invocation.toolName);
+        assert.ok(
+          procEventTypes.includes('PROCESS_SPAWN_SUCCEEDED'),
+          'Must contain PROCESS_SPAWN_SUCCEEDED event for the child process',
+        );
+        assert.ok(
+          procEventTypes.includes('PROCESS_EXITED'),
+          'Must contain PROCESS_EXITED event for the child process',
+        );
+
+        // STAGE EVIDENCE INTEGRATION:
+        const stageRes = await server.executeAuthenticatedToolCall(
+          safeActor,
+          'arc_stage_evidence',
+          {
+            targetStage: 'RC-06',
+          },
+        );
+        assert.ok(!stageRes.isError);
+        const stageBody = parseResponse(stageRes);
+        assert.equal(stageBody.verification.verifiedLocally, false);
+        assert.equal(stageBody.acceptanceMet, false);
+      } finally {
+        rmSync(flowTestFile, { force: true });
       }
-
-      // Find lifecycle records for arc_repo_status
-      const repoRecords = allRecords.filter(
-        (r) => r.invocation && r.invocation.toolName === 'arc_repo_status',
-      );
-      assert.ok(repoRecords.length >= 2, 'Must have at least STARTED and COMPLETED records');
-
-      const started = repoRecords.find((r) => r.lifecycle && r.lifecycle.phase === 'STARTED');
-      const completed = repoRecords.find((r) => r.lifecycle && r.lifecycle.phase === 'COMPLETED');
-
-      assert.ok(started, 'Must have a STARTED lifecycle record');
-      assert.ok(completed, 'Must have a COMPLETED lifecycle record');
-      assert.equal(
-        started.lifecycle.operationId,
-        completed.lifecycle.operationId,
-        'operationId must match across STARTED and COMPLETED',
-      );
     });
   });
 

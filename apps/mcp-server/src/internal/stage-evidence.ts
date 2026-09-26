@@ -46,6 +46,7 @@ export interface StageEvidenceHandlerParams {
   validatedParams: ArcStageEvidenceRequest;
   gitSubsystem: GitSubsystem;
   auditRuntime?: AuditRuntime;
+  currentOperationId?: string;
 }
 
 /**
@@ -54,7 +55,8 @@ export interface StageEvidenceHandlerParams {
 export async function handleArcStageEvidence(
   params: StageEvidenceHandlerParams,
 ): Promise<ArcStageEvidenceResponse> {
-  const { targetWorkspace, validatedParams, gitSubsystem, auditRuntime } = params;
+  const { targetWorkspace, validatedParams, gitSubsystem, auditRuntime, currentOperationId } =
+    params;
 
   // 1. Target must be a valid Git repository
   if (!targetWorkspace.isGitRepo) {
@@ -74,7 +76,9 @@ export async function handleArcStageEvidence(
     throw ArcError.evidenceNotMet('Persistent audit runtime is not available or configured.');
   }
 
-  const auditEvidence = await auditRuntime.inspectStageEvidence();
+  const auditEvidence = await auditRuntime.inspectStageEvidence(
+    currentOperationId ? { excludeOperationId: currentOperationId } : undefined,
+  );
 
   // 4. Gather Git repository status and verify HEAD commit hash against Git log
   const statusRes = await gitSubsystem.getStatus(targetWorkspace.rootPath);
