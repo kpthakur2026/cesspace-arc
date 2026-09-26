@@ -123,6 +123,7 @@ export interface IProcessRegistry {
     workspaceId?: string;
     state?: ProcessState;
   }): ProcessRecord[];
+  getActiveProcesses(filter?: { sessionId?: string; workspaceId?: string }): ProcessRecord[];
   appendOutput(processId: string, stream: 'stdout' | 'stderr', chunk: Buffer): void;
   getProcessStatus(processId: string, owner?: ProcessOwnerIdentity): ProcessStatusResponse;
   getProcessOutput(
@@ -235,8 +236,8 @@ export class ProcessRegistry implements IProcessRegistry {
     this.processStateDir = dir;
   }
 
-  public persistProcessState(record: ProcessRecord, pid: number): void {
-    if (!this.processStateDir) return;
+  public persistProcessState(record: ProcessRecord, pid: number): boolean {
+    if (!this.processStateDir) return true;
     try {
       if (!fs.existsSync(this.processStateDir)) {
         fs.mkdirSync(this.processStateDir, { recursive: true, mode: 0o700 });
@@ -254,8 +255,9 @@ export class ProcessRegistry implements IProcessRegistry {
         workspaceId: record.workspaceId,
       };
       fs.writeFileSync(filePath, JSON.stringify(state, null, 2), { mode: 0o600 });
+      return true;
     } catch {
-      // Persistence error should not prevent process execution
+      return false;
     }
   }
 
@@ -415,14 +417,21 @@ export class ProcessRegistry implements IProcessRegistry {
     return result;
   }
 
-  public countRunning(filter?: { sessionId?: string; workspaceId?: string }): number {
+  public getActiveProcesses(filter?: {
+    sessionId?: string;
+    workspaceId?: string;
+  }): ProcessRecord[] {
     return Array.from(this.processes.values()).filter((p) => {
       const isAlive = p.state === 'RUNNING' || p.state === 'TERMINATING';
       if (!isAlive) return false;
       if (filter?.sessionId && p.actor.sessionId !== filter.sessionId) return false;
       if (filter?.workspaceId && p.workspaceId !== filter.workspaceId) return false;
       return true;
-    }).length;
+    });
+  }
+
+  public countRunning(filter?: { sessionId?: string; workspaceId?: string }): number {
+    return this.getActiveProcesses(filter).length;
   }
 
   public checkConcurrency(sessionId: string, workspaceId: string): void {
@@ -759,11 +768,14 @@ export class ProcessRegistry implements IProcessRegistry {
 
     const wasTimedOut = record.timedOut;
     const wasTerminating = record.state === 'TERMINATING';
+    const wasFailed = record.state === 'FAILED';
 
     if (wasTimedOut) {
       record.state = 'TIMED_OUT';
     } else if (wasTerminating) {
       record.state = 'TERMINATED';
+    } else if (wasFailed) {
+      record.state = 'FAILED';
     } else {
       record.state = exitCode === 0 ? 'COMPLETED' : 'FAILED';
     }

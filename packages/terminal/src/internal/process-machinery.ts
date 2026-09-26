@@ -84,10 +84,31 @@ export async function spawnAndControlProcess(
     // Only emit PROCESS_SPAWN_SUCCEEDED after the child process actually emits the Node 'spawn' event.
     // An asynchronous spawn failure must never produce a false success event.
     child.once('spawn', () => {
-      spawnSucceeded = true;
       if (child.pid && typeof processRegistry.persistProcessState === 'function') {
-        processRegistry.persistProcessState(record, child.pid);
+        let persisted: boolean;
+        try {
+          persisted = processRegistry.persistProcessState(record, child.pid) !== false;
+        } catch {
+          persisted = false;
+        }
+        if (!persisted) {
+          try {
+            if (process.platform !== 'win32') {
+              process.kill(-child.pid, 'SIGKILL');
+            } else {
+              child.kill('SIGKILL');
+            }
+          } catch {
+            /* ignore */
+          }
+          processRegistry.markSpawnFailed(
+            record.processId,
+            'Failed to persist process ownership state.',
+          );
+          return;
+        }
       }
+      spawnSucceeded = true;
       processRegistry.notifySpawnSuccess(record.processId);
     });
   } catch (err: unknown) {
@@ -105,12 +126,17 @@ export async function spawnAndControlProcess(
     processRegistry.appendOutput(record.processId, 'stderr', chunk);
   });
 
-  const terminateChildWithEscalation = () => {
-    if (record.timedOut || record._killTimer) {
+  const terminateChildWithEscalation = (isTimeout = true) => {
+    if (record.timedOut || record.state === 'TERMINATING' || record._killTimer) {
       return;
     }
 
-    processRegistry.markTimedOut(record.processId);
+    if (isTimeout) {
+      processRegistry.markTimedOut(record.processId);
+    } else {
+      record.state = 'TERMINATING';
+    }
+
     try {
       if (child.pid && process.platform !== 'win32') {
         process.kill(-child.pid, 'SIGTERM');
@@ -141,16 +167,16 @@ export async function spawnAndControlProcess(
   };
 
   // Timeout Setup
-  record._timeoutTimer = setTimeout(terminateChildWithEscalation, spec.timeoutMs);
+  record._timeoutTimer = setTimeout(() => terminateChildWithEscalation(true), spec.timeoutMs);
   record._timeoutTimer.unref();
 
   // AbortSignal Setup
   if (spec.signal) {
     if (spec.signal.aborted) {
-      terminateChildWithEscalation();
+      terminateChildWithEscalation(false);
     } else {
       const onAbort = () => {
-        terminateChildWithEscalation();
+        terminateChildWithEscalation(false);
       };
       spec.signal.addEventListener('abort', onAbort, { once: true });
       child.on('close', () => {
@@ -251,6 +277,12 @@ export async function spawnAndControlProcess(
     child.on('close', () => resolvePromise());
     child.on('error', () => resolvePromise());
   });
+
+  if (!spawnSucceeded) {
+    throw ArcError.internalError(
+      'Process execution failed: unable to persist process ownership state.',
+    );
+  }
 
   const status = processRegistry.getProcessStatus(record.processId, {
     clientId: spec.actor.clientId,

@@ -22,12 +22,12 @@
 
 | Task | Deliverable                                                                                                                                                                | Commits                       |
 | :--- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :---------------------------- |
-| 1    | Composite Invocation Framework (`arc_repo_status`, deterministic execution registry, policy engine mediation, workspace jailing, `RC07-NEG-001..012`, `RC07-FLOW-01..02`). | Task 1 commit                 |
-| 2    | Repository & Worktree Status (`arc_worktree_status`, multi-worktree inspection, Git subsystem containment, `RC07-NEG-013..021`, `RC07-FLOW-03..05`).                       | Task 2 commit                 |
-| 3    | Sandboxed Diff Review & Secret Masking (`arc_review_diff`, hunk trimming, unified diff parsing, regex redaction, `RC07-NEG-022..029`, `RC07-FLOW-06..08`).                 | Task 3 commit                 |
-| 4    | Project Verification Suite (`arc_verify`, solution-aware no-write typechecking, format/lint/test suite execution, `RC07-NEG-030..042`, `RC07-FLOW-09..10`).                | Task 4 commit                 |
-| 5    | Isolated Test Execution (`arc_test`, deterministic Node tap runner, process tree interruption, `RC07-NEG-043..050`, `RC07-FLOW-11..12`).                                   | Task 5 commit                 |
-| 6    | Zero-Network CI Inspection (`arc_ci_status`, canonical `.github/workflows` confinement, symlink traversal prevention, `RC07-NEG-051..053`, `RC07-FLOW-13`).                | Task 6 commit                 |
+| 1    | Composite Invocation Framework (`arc_repo_status`, deterministic execution registry, policy engine mediation, workspace jailing, `RC07-NEG-001..010`, `RC07-FLOW-01..02`). | Task 1 commit                 |
+| 2    | Repository & Worktree Status (`arc_worktree_status`, multi-worktree inspection, Git subsystem containment, `RC07-NEG-011..018`, `RC07-FLOW-03..05`).                       | Task 2 commit                 |
+| 3    | Sandboxed Diff Review & Secret Masking (`arc_review_diff`, hunk trimming, unified diff parsing, regex redaction, `RC07-NEG-019..027`, `RC07-FLOW-06..08`).                 | Task 3 commit                 |
+| 4    | Project Verification Suite (`arc_verify`, solution-aware no-write typechecking, format/lint/test suite execution, `RC07-NEG-028..037`, `RC07-FLOW-09..10`).                | Task 4 commit                 |
+| 5    | Isolated Test Execution (`arc_test`, deterministic Node tap runner, process tree interruption, `RC07-NEG-038..046`, `RC07-FLOW-11..12`).                                   | Task 5 commit                 |
+| 6    | Zero-Network CI Inspection (`arc_ci_status`, canonical `.github/workflows` confinement, symlink traversal prevention, `RC07-NEG-047..053`, `RC07-FLOW-13`).                | Task 6 commit                 |
 | 7    | Stage Evidence Aggregation (`arc_stage_evidence`, verified pre-existing ledger boundary, anti-self-referencing check, `RC07-NEG-054..061`, `RC07-FLOW-14..15`).            | `bce4a0d`, `f1d7c3d`          |
 | 8    | Security Hardening, Transport Parity, Acceptance & Promotion (`RC07-NEG-062..075`, `RC07-FLOW-16..20`, `scripts/verify-rc07.sh`, version `0.7.0-rc07`, stage `RC-07`).     | Commit containing this report |
 
@@ -85,12 +85,12 @@ All 75 frozen negative controls defined in `docs/architecture/rc07-scope-accepta
 
 | Control Range       | Domain                                                                                          | Primary Suite                             | Status |
 | :------------------ | :---------------------------------------------------------------------------------------------- | :---------------------------------------- | :----- |
-| `RC07-NEG-001..012` | Composite framework foundation, plan authorization, policy denial, registry injection rejection | `tests/rc07-composite-framework.test.js`  | PASS   |
-| `RC07-NEG-013..021` | Repository & worktree status, detached HEAD, submodules, unborn branches, uncommitted mutations | `tests/rc07-repo-worktree-status.test.js` | PASS   |
-| `RC07-NEG-022..029` | Diff review, hunk trimming, secret masking, binary files, symlink traversal, path confinement   | `tests/rc07-review-diff.test.js`          | PASS   |
-| `RC07-NEG-030..042` | Verification suite, deterministic arguments, timeout bounds, output truncation, no-write check  | `tests/rc07-verify.test.js`               | PASS   |
-| `RC07-NEG-043..050` | Isolated test runner, TAP parsing, non-zero exits, test timeouts, child cleanup                 | `tests/rc07-test.test.js`                 | PASS   |
-| `RC07-NEG-051..053` | CI status inspection, unparseable YAML, symlinked workflow directories, external path escapes   | `tests/rc07-ci-status.test.js`            | PASS   |
+| `RC07-NEG-001..010` | Composite framework foundation, plan authorization, policy denial, registry injection rejection | `tests/rc07-composite-framework.test.js`  | PASS   |
+| `RC07-NEG-011..018` | Repository & worktree status, detached HEAD, submodules, unborn branches, uncommitted mutations | `tests/rc07-repo-worktree-status.test.js` | PASS   |
+| `RC07-NEG-019..027` | Diff review, hunk trimming, secret masking, binary files, symlink traversal, path confinement   | `tests/rc07-review-diff.test.js`          | PASS   |
+| `RC07-NEG-028..037` | Verification suite, deterministic arguments, timeout bounds, output truncation, no-write check  | `tests/rc07-verify.test.js`               | PASS   |
+| `RC07-NEG-038..046` | Isolated test runner, TAP parsing, non-zero exits, test timeouts, child cleanup                 | `tests/rc07-test.test.js`                 | PASS   |
+| `RC07-NEG-047..053` | CI status inspection, unparseable YAML, symlinked workflow directories, external path escapes   | `tests/rc07-ci-status.test.js`            | PASS   |
 | `RC07-NEG-054..061` | Stage evidence inspection, invalid stages, zero evidence, unanchored stores, tampering          | `tests/rc07-stage-evidence.test.js`       | PASS   |
 | `RC07-NEG-062..075` | Security hardening, Layer C admission, revoked sessions, untrusted devices, orphan processes    | `tests/rc07-hardening.test.js`            | PASS   |
 
@@ -146,7 +146,7 @@ All 20 frozen positive acceptance flows defined in `docs/architecture/rc07-scope
 - **Gate 15:** Negative-Control Contiguity & Completeness (`RC07-NEG-001..075`, 75 unique controls)
 - **Gate 16:** Positive-Flow Contiguity & Completeness (`RC07-FLOW-01..20`, 20 unique flows)
 - **Gate 17:** No Disabled or Deferred RC-07 Tests (`test.skip`, `test.todo`, `describe.skip`, `it.skip`)
-- **Gate 18:** Security-Scanner Suppression Check (`gitleaks:allow`, `pragma: allowlist secret`)
+- **Gate 18:** Security-Scanner Suppression Check (Zero inline security scanner suppressions)
 - **Gate 19:** Verification Script Integrity Self-Check (no `|| true` masking)
 - **Gate 20:** Package Version Consistency (`0.7.0-rc07` across `package.json`, `apps/mcp-server/package.json`, `apps/cli/package.json`, `apps/cli/src/index.ts`, `apps/mcp-server/src/index.ts`)
 - **Gate 21:** Health Version & Stage Consistency (`version: 0.7.0-rc07`, `stage: RC-07`)

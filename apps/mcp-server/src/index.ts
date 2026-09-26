@@ -4595,6 +4595,7 @@ export class ArcMcpServer implements IArcMcpServer {
             admission: requestContext.admission,
             toolName,
             parameters,
+            signal: requestContext.signal,
           }),
         );
       } catch (err: unknown) {

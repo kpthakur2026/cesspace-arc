@@ -157,6 +157,11 @@ export interface RemoteRequestContext {
    * proceed without one.
    */
   admission: AdmittedRemoteRequest;
+  /**
+   * Request-scoped, server-owned abort signal for premature client disconnect /
+   * socket destruction.
+   */
+  signal?: AbortSignal;
 }
 
 /**
@@ -282,7 +287,7 @@ export function readRemoteRequestContext(
   if (extra === undefined || extra === null) {
     return null;
   }
-  const { spkiPin, presentedSessionId, authorizationHeader, admission } = extra as Record<
+  const { spkiPin, presentedSessionId, authorizationHeader, admission, signal } = extra as Record<
     string,
     unknown
   >;
@@ -294,11 +299,13 @@ export function readRemoteRequestContext(
   }
   const sessionId = typeof presentedSessionId === 'string' ? presentedSessionId : null;
   const authorization = typeof authorizationHeader === 'string' ? authorizationHeader : null;
+  const abortSignal = signal instanceof AbortSignal ? signal : undefined;
   return {
     spkiPin,
     presentedSessionId: sessionId,
     authorizationHeader: authorization,
     admission,
+    signal: abortSignal,
   };
 }
 
@@ -758,6 +765,36 @@ export class RemoteMcpSurface {
 
     this.holdAdmission(res, admission);
 
+    // Request-scoped, server-owned AbortController for this admitted HTTP exchange.
+    // Triggered ONLY on premature client disconnect (req aborted / premature socket close),
+    // and never on a normal completed response.
+    const abortController = new AbortController();
+    let exchangeSettled = false;
+
+    const onFinish = () => {
+      exchangeSettled = true;
+      cleanupDisconnectListeners();
+    };
+
+    const onPrematureDisconnect = () => {
+      if (!exchangeSettled && !res.writableEnded) {
+        abortController.abort();
+      }
+      cleanupDisconnectListeners();
+    };
+
+    const cleanupDisconnectListeners = () => {
+      res.removeListener('finish', onFinish);
+      res.removeListener('close', onPrematureDisconnect);
+      req.removeListener('close', onPrematureDisconnect);
+      req.removeListener('aborted', onPrematureDisconnect);
+    };
+
+    res.once('finish', onFinish);
+    res.once('close', onPrematureDisconnect);
+    req.once('close', onPrematureDisconnect);
+    req.once('aborted', onPrematureDisconnect);
+
     // The SDK copies this to `options.authInfo` and the request handler receives
     // it as `extra.authInfo`, so the context is scoped to THIS request.
     (req as IncomingMessage & { auth?: AuthInfo }).auth = {
@@ -769,6 +806,7 @@ export class RemoteMcpSurface {
         presentedSessionId: context.presentedSessionId,
         authorizationHeader: context.authorizationHeader,
         admission,
+        signal: abortController.signal,
       },
     };
 
