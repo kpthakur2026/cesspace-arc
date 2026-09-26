@@ -1136,7 +1136,7 @@ rules:
       const healthBody = body(health);
       assert.equal(healthBody.status, 'UNHEALTHY');
       assert.equal(healthBody.policyEngineActive, false);
-      assert.equal(healthBody.stage, 'RC-06');
+      assert.equal(healthBody.stage, 'RC-07');
 
       // Every non-diagnostic operation fails closed with no approval creation.
       for (const [tool, params] of [
@@ -1448,7 +1448,7 @@ rules:
       const healthBody = JSON.parse(health.content[0].text);
       assert.equal(healthBody.status, 'HEALTHY');
       assert.equal(healthBody.policyEngineActive, true);
-      assert.equal(healthBody.stage, 'RC-06');
+      assert.equal(healthBody.stage, 'RC-07');
 
       // The external rule permits the read...
       const read = await server.dispatchToolCall('read_file', {
@@ -2010,13 +2010,13 @@ rules: []
       assert.equal(serverInfo.name, 'cesspace-arc');
       assert.equal(
         serverInfo.version,
-        '0.6.0-rc06',
-        'the advertised MCP server metadata must report the RC-06 stage version',
+        '0.7.0-rc07',
+        'the advertised MCP server metadata must report the RC-07 stage version',
       );
       assert.notEqual(
         serverInfo.version,
-        '0.5.0-rc05',
-        'the advertised MCP server metadata must not still report the RC-05 version',
+        '0.6.0-rc06',
+        'the advertised MCP server metadata must not still report the RC-06 version',
       );
     });
   });

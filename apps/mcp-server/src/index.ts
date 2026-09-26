@@ -2,6 +2,7 @@
 import { platform, arch, cpus, totalmem, freemem } from 'node:os';
 import { statfsSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
+import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -114,6 +115,7 @@ import { FilesystemSubsystem } from '@cesspace-arc/filesystem';
 import { GitSubsystem, MAX_DIFF_BYTES } from '@cesspace-arc/git';
 import {
   ProcessRegistry,
+  sweepOrphanProcesses,
   type IProcessLifecycleSink,
   type ProcessLifecycleEvent,
 } from '@cesspace-arc/processes';
@@ -180,6 +182,11 @@ export interface ArcServerConfig {
    * itself.
    */
   audit?: AuditConfig;
+  /**
+   * Optional process state directory for durable tracking and orphan cleanup.
+   * Defaults to `${auditConfig.directory}/process-state` when auditConfig is present.
+   */
+  processStateDir?: string;
 }
 
 /** Safe, non-sensitive reason the Layer-2 engine is unavailable. */
@@ -1794,6 +1801,7 @@ export class ArcMcpServer implements IArcMcpServer {
   #task4StepTimeoutMs: number;
   /** Aggregate execution timeout ceiling for Task-4 verification suite. */
   #task4AggregateTimeoutMs: number;
+  public readonly processStateDir?: string;
 
   constructor(
     public readonly workspaceRegistry: WorkspaceRegistry,
@@ -1986,6 +1994,7 @@ export class ArcMcpServer implements IArcMcpServer {
     this.authenticatedRequestLimiter = createAuthenticatedRequestLimiter();
 
     this.defaultWorkspaceId = config?.defaultWorkspaceId;
+    this.processStateDir = config?.processStateDir;
     this.processRegistry =
       processRegistry ||
       (terminalSubsystem && 'processRegistry' in terminalSubsystem
@@ -1995,6 +2004,14 @@ export class ArcMcpServer implements IArcMcpServer {
     if (this.processRegistry) {
       const sink = new ProcessAuditSink(this.auditLogger, this.workspaceRegistry);
       this.processRegistry.registerLifecycleSink(sink);
+      const stateDir =
+        this.processStateDir ??
+        (this.auditConfig?.directory
+          ? path.join(path.dirname(this.auditConfig.directory), 'process-state')
+          : undefined);
+      if (stateDir) {
+        this.processRegistry.setProcessStateDir(stateDir);
+      }
     }
 
     if (config?.authorizedRoots) {
@@ -2039,7 +2056,7 @@ export class ArcMcpServer implements IArcMcpServer {
     this.server = new Server(
       {
         name: 'cesspace-arc',
-        version: '0.6.0-rc06',
+        version: '0.7.0-rc07',
       },
       {
         capabilities: {
@@ -2077,7 +2094,7 @@ export class ArcMcpServer implements IArcMcpServer {
       };
     });
 
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    this.server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
       const toolName = request.params.name;
       // The generic registered-tool gate. An unregistered name is a JSON-RPC
       // `-32601` here, at the protocol boundary, and never becomes a tool
@@ -2088,7 +2105,7 @@ export class ArcMcpServer implements IArcMcpServer {
         throw unknownToolError();
       }
       const params = (request.params.arguments || {}) as Record<string, unknown>;
-      return this.dispatchToolCall(toolName, params);
+      return this.dispatchToolCall(toolName, params, extra?.signal);
     });
   }
 
@@ -2255,8 +2272,18 @@ export class ArcMcpServer implements IArcMcpServer {
   public async dispatchToolCall(
     toolName: string,
     parameters: Record<string, unknown>,
-    actorOverride?: Partial<PolicyEvaluationContext['actor']>,
+    actorOverrideOrSignal?: Partial<PolicyEvaluationContext['actor']> | AbortSignal,
+    maybeSignal?: AbortSignal,
   ): Promise<{ isError?: boolean; content: Array<{ type: 'text'; text: string }> }> {
+    let actorOverride: Partial<PolicyEvaluationContext['actor']> | undefined;
+    let signal: AbortSignal | undefined;
+    if (actorOverrideOrSignal && 'aborted' in actorOverrideOrSignal) {
+      signal = actorOverrideOrSignal as AbortSignal;
+    } else {
+      actorOverride = actorOverrideOrSignal as
+        Partial<PolicyEvaluationContext['actor']> | undefined;
+      signal = maybeSignal;
+    }
     const actor: CompleteActor = {
       clientId: actorOverride?.clientId ?? 'local-stdio-caller',
       clientType: actorOverride?.clientType ?? 'mcp-client',
@@ -2264,7 +2291,12 @@ export class ArcMcpServer implements IArcMcpServer {
       deviceId: actorOverride?.deviceId ?? 'local-machine',
       authenticated: actorOverride?.authenticated ?? true,
     };
-    return this.executeAuthenticatedToolCall(actor, toolName, parameters);
+    return this.executeAuthenticatedToolCall(
+      actor,
+      toolName,
+      parameters,
+      signal ? { signal } : undefined,
+    );
   }
 
   /**
@@ -2288,9 +2320,10 @@ export class ArcMcpServer implements IArcMcpServer {
     actor: CompleteActor,
     toolName: string,
     parameters: Record<string, unknown>,
+    options?: { signal?: AbortSignal },
   ): Promise<{ isError?: boolean; content: Array<{ type: 'text'; text: string }> }> {
     try {
-      return await this.executeToolCallPipeline(actor, toolName, parameters);
+      return await this.executeToolCallPipeline(actor, toolName, parameters, options);
     } catch (cause: unknown) {
       // The ONE place a failed durable denial becomes a response (rc06 §22, §26,
       // §44). Every DENIED branch in the pipeline records its refusal through
@@ -2324,6 +2357,7 @@ export class ArcMcpServer implements IArcMcpServer {
     actor: CompleteActor,
     toolName: string,
     parameters: Record<string, unknown>,
+    options?: { signal?: AbortSignal },
   ): Promise<{ isError?: boolean; content: Array<{ type: 'text'; text: string }> }> {
     const startTime = new Date().toISOString();
     const startMs = Date.now();
@@ -3690,6 +3724,7 @@ export class ArcMcpServer implements IArcMcpServer {
                 aggregateTimeoutMs: this.#task4AggregateTimeoutMs,
                 testPostAdmissionMutationHook:
                   this.#testCompositeHarness?.testPostAdmissionMutationHook,
+                signal: options?.signal,
               });
             });
           });
@@ -3779,8 +3814,8 @@ export class ArcMcpServer implements IArcMcpServer {
                 : gatewayDegradedForHealth || this.auditRuntime?.isDegraded() === true
                   ? 'DEGRADED'
                   : 'HEALTHY',
-              version: '0.6.0-rc06',
-              stage: 'RC-06',
+              version: '0.7.0-rc07',
+              stage: 'RC-07',
               policyEngineActive,
               // A chain is always active: the durable RC-06 chain on a started
               // server, the in-memory chain otherwise. The durable chain's own
@@ -4306,6 +4341,18 @@ export class ArcMcpServer implements IArcMcpServer {
     // and `start()` has released everything stage 1..11 acquired.
     await this.startAuditRuntime();
 
+    const stateDir =
+      this.processStateDir ??
+      (this.auditConfig?.directory
+        ? path.join(path.dirname(this.auditConfig.directory), 'process-state')
+        : undefined);
+    if (stateDir) {
+      if (this.processRegistry) {
+        this.processRegistry.setProcessStateDir(stateDir);
+      }
+      await sweepOrphanProcesses(stateDir);
+    }
+
     // Exactly one transport mode runs per process (§4 L-4). In remote mode the
     // stdio transport is never connected, so there is no second listener and no
     // way for a remote failure to fall back to stdio.
@@ -4486,7 +4533,7 @@ export class ArcMcpServer implements IArcMcpServer {
     const server = new Server(
       {
         name: 'cesspace-arc',
-        version: '0.6.0-rc06',
+        version: '0.7.0-rc07',
       },
       {
         capabilities: {

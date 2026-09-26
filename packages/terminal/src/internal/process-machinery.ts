@@ -85,6 +85,9 @@ export async function spawnAndControlProcess(
     // An asynchronous spawn failure must never produce a false success event.
     child.once('spawn', () => {
       spawnSucceeded = true;
+      if (child.pid && typeof processRegistry.persistProcessState === 'function') {
+        processRegistry.persistProcessState(record, child.pid);
+      }
       processRegistry.notifySpawnSuccess(record.processId);
     });
   } catch (err: unknown) {

@@ -736,7 +736,13 @@ describe('CesSpace ARC — RC-05 Task 8 correction: gateway admission gaps', () 
       const result = assertSucceeded(call, 3, 'tools/call');
       const health = JSON.parse(result.content[0].text);
       assert.equal(health.enrolledDevicesCount, 1, 'the shared pipeline really ran');
-      const spent = before - effectiveTokens(limiter, key);
+
+      // Read the raw token value stored in the bucket right after the consume
+      // (no lazy-refill projection — wall-clock accrual during the async HTTP
+      // round trip would otherwise make the delta appear less than 1).
+      const bucketAfter = limiter.getBucket(key);
+      assert.ok(bucketAfter, 'bucket must still be retained after the call');
+      const spent = before - bucketAfter.tokens;
 
       // Exactly one: zero would mean the transport bypassed Layer C for a tool
       // call, and two would mean the call was charged once at the transport and

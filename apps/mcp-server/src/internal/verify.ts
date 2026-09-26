@@ -206,7 +206,10 @@ export function projectArcVerifyResponse(
       logicalArgs = ['--test'];
     }
 
-    const rawCombinedOutput = [s.stdout, s.stderr].filter(Boolean).join('\n').trim();
+    const rawCombinedOutput = [s.stdout, s.stderr, s.errorMessage]
+      .filter(Boolean)
+      .join('\n')
+      .trim();
     const scrubbed = sanitizeVerificationOutput(rawCombinedOutput);
     const isTruncated = Boolean(s.truncated);
     let outputExcerpt = scrubbed;

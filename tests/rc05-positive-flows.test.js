@@ -350,8 +350,8 @@ describe('CesSpace ARC — RC-05 Eleven Positive Acceptance Flows', () => {
     try {
       const health = await getHealth(server);
       assert.equal(health.status, 'HEALTHY');
-      assert.equal(health.version, '0.6.0-rc06');
-      assert.equal(health.stage, 'RC-06');
+      assert.equal(health.version, '0.7.0-rc07');
+      assert.equal(health.stage, 'RC-07');
       assert.equal(health.transportMode, 'stdio');
       assert.equal(health.remoteGatewayActive, false);
       assert.equal(health.authenticationActive, false);

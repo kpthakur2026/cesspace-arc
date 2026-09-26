@@ -32,6 +32,8 @@ REQUIRED_DOCS=(
   "docs/architecture/rc05-final-integration-report.md"
   "docs/architecture/rc06-scope-acceptance.md"
   "docs/architecture/rc06-final-integration-report.md"
+  "docs/architecture/rc07-scope-acceptance.md"
+  "docs/architecture/rc07-final-integration-report.md"
   "docs/threat-model/threat-model.md"
   "docs/adr/README.md"
   "docs/adr/0001-mcp-as-standard-protocol.md"

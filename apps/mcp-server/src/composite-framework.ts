@@ -23,6 +23,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { ArcError, type PolicyEvaluationContext } from '@cesspace-arc/protocol';
 import type { CompleteActor } from './remote-execution.js';
 import { canonicalJson, sha256Hex } from '@cesspace-arc/policy';
+import { scrubOutput } from '@cesspace-arc/processes';
 import type {
   DeterministicExecutionStep,
   DeterministicStepResult,
@@ -624,6 +625,7 @@ export async function executeCompositePlan(options: {
   registry: DeterministicExecutionRegistry;
   testPostAdmissionMutationHook?: (plan: CanonicalCompositePlan) => CanonicalCompositePlan | void;
   aggregateTimeoutMs?: number;
+  signal?: AbortSignal;
 }): Promise<CompositeExecutionResult> {
   const {
     admittedPlanHash,
@@ -633,6 +635,7 @@ export async function executeCompositePlan(options: {
     registry,
     testPostAdmissionMutationHook,
     aggregateTimeoutMs,
+    signal,
   } = options;
 
   // 1. Validate Active Server Admission Ticket (Defect 2, Proof D, Proof E)
@@ -694,6 +697,21 @@ export async function executeCompositePlan(options: {
     aggregateController.abort();
   }, maxAggregateTimeout);
   aggregateTimer.unref();
+
+  let signalCleanup: (() => void) | undefined;
+  if (signal) {
+    if (signal.aborted) {
+      aggregateController.abort();
+    } else {
+      const onAbort = () => {
+        aggregateController.abort();
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+      signalCleanup = () => {
+        signal.removeEventListener('abort', onAbort);
+      };
+    }
+  }
 
   try {
     for (let i = 0; i < plan.steps.length; i++) {
@@ -789,12 +807,13 @@ export async function executeCompositePlan(options: {
           signal: null,
           stdout: '',
           stderr: '',
-          errorMessage: errMsg,
+          errorMessage: scrubOutput(errMsg),
         });
       }
     }
   } finally {
     clearTimeout(aggregateTimer);
+    signalCleanup?.();
     activeTicket.consumed = true;
   }
 

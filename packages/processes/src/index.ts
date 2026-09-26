@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { ChildProcess } from 'node:child_process';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import {
   ArcError,
   type ProcessStatusResponse,
@@ -221,10 +223,51 @@ export class ProcessRegistry implements IProcessRegistry {
   private processes = new Map<string, ProcessRecord>();
   private lifecycleSinks: IProcessLifecycleSink[] = [];
   private inFlightSinks = new Set<Promise<void>>();
+  public processStateDir?: string;
 
   constructor(sinks?: IProcessLifecycleSink[]) {
     if (sinks) {
       this.lifecycleSinks = [...sinks];
+    }
+  }
+
+  public setProcessStateDir(dir: string): void {
+    this.processStateDir = dir;
+  }
+
+  public persistProcessState(record: ProcessRecord, pid: number): void {
+    if (!this.processStateDir) return;
+    try {
+      if (!fs.existsSync(this.processStateDir)) {
+        fs.mkdirSync(this.processStateDir, { recursive: true, mode: 0o700 });
+      }
+      const filePath = path.join(this.processStateDir, `${record.processId}.json`);
+      const statStartTime = getProcessStatStartTime(pid);
+      const cmdline = getProcessCmdline(pid);
+      const state: ActiveProcessPersistedState = {
+        processId: record.processId,
+        pid,
+        statStartTime,
+        cmdline,
+        executable: record.executable,
+        startedAt: record.startedAt,
+        workspaceId: record.workspaceId,
+      };
+      fs.writeFileSync(filePath, JSON.stringify(state, null, 2), { mode: 0o600 });
+    } catch {
+      // Persistence error should not prevent process execution
+    }
+  }
+
+  public unpersistProcessState(processId: string): void {
+    if (!this.processStateDir) return;
+    try {
+      const filePath = path.join(this.processStateDir, `${processId}.json`);
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+      }
+    } catch {
+      // ignore
     }
   }
 
@@ -302,6 +345,7 @@ export class ProcessRegistry implements IProcessRegistry {
   }
 
   public markSpawnFailed(processId: string, error?: string): void {
+    this.unpersistProcessState(processId);
     const record = this.processes.get(processId);
     if (!record) return;
     record.state = 'FAILED';
@@ -701,6 +745,7 @@ export class ProcessRegistry implements IProcessRegistry {
   }
 
   public markCompleted(processId: string, exitCode: number | null, signal: string | null): void {
+    this.unpersistProcessState(processId);
     const record = this.processes.get(processId);
     if (!record) return;
 
@@ -769,6 +814,7 @@ export class ProcessRegistry implements IProcessRegistry {
 
   public clear(): void {
     for (const record of this.processes.values()) {
+      this.unpersistProcessState(record.processId);
       if (record._timeoutTimer) {
         clearTimeout(record._timeoutTimer);
         record._timeoutTimer = undefined;
@@ -792,4 +838,252 @@ export class ProcessRegistry implements IProcessRegistry {
     }
     this.processes.clear();
   }
+}
+
+export interface ActiveProcessPersistedState {
+  processId: string;
+  pid: number;
+  statStartTime?: string;
+  cmdline?: string;
+  executable: string;
+  startedAt: string;
+  workspaceId: string;
+}
+
+export interface OrphanSweepReport {
+  swept: Array<{ processId: string; pid: number; terminationSignal: 'SIGTERM' | 'SIGKILL' }>;
+  skipped: Array<{ processId: string; pid: number; reason: string }>;
+  errors: Array<{ processId: string; pid?: number; error: string }>;
+}
+
+export function getProcessStatStartTime(pid: number): string | undefined {
+  if (process.platform !== 'linux') return undefined;
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const lastParen = stat.lastIndexOf(')');
+    if (lastParen === -1) return undefined;
+    const rest = stat
+      .slice(lastParen + 2)
+      .trim()
+      .split(/\s+/);
+    return rest[19];
+  } catch {
+    return undefined;
+  }
+}
+
+export function getProcessCmdline(pid: number): string | undefined {
+  if (process.platform !== 'linux') return undefined;
+  try {
+    const raw = fs.readFileSync(`/proc/${pid}/cmdline`);
+    return raw.toString('utf8').replace(/\0/g, ' ').trim();
+  } catch {
+    return undefined;
+  }
+}
+
+export async function sweepOrphanProcesses(
+  processStateDir: string,
+  options?: {
+    gracePeriodMs?: number;
+    auditSink?: (event: {
+      eventType: string;
+      message: string;
+      details: Record<string, unknown>;
+    }) => void | Promise<void>;
+  },
+): Promise<OrphanSweepReport> {
+  const report: OrphanSweepReport = {
+    swept: [],
+    skipped: [],
+    errors: [],
+  };
+
+  if (!fs.existsSync(processStateDir)) {
+    return report;
+  }
+
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(processStateDir);
+  } catch (err: unknown) {
+    report.errors.push({
+      processId: 'unknown',
+      error: `Failed to read process state dir: ${err instanceof Error ? err.message : String(err)}`,
+    });
+    return report;
+  }
+
+  const gracePeriodMs = options?.gracePeriodMs ?? 300;
+
+  for (const entry of entries) {
+    if (!entry.endsWith('.json')) continue;
+    const filePath = path.join(processStateDir, entry);
+    let state: ActiveProcessPersistedState;
+    try {
+      const raw = fs.readFileSync(filePath, 'utf8');
+      state = JSON.parse(raw);
+    } catch (err: unknown) {
+      report.errors.push({
+        processId: entry.replace(/\.json$/, ''),
+        error: `Failed to parse state file: ${err instanceof Error ? err.message : String(err)}`,
+      });
+      try {
+        fs.unlinkSync(filePath);
+      } catch {
+        /* ignore */
+      }
+      continue;
+    }
+
+    if (!state.pid || typeof state.pid !== 'number') {
+      try {
+        fs.unlinkSync(filePath);
+      } catch {
+        /* ignore */
+      }
+      continue;
+    }
+
+    // Check if process is still alive via kill(0)
+    let isAlive: boolean;
+    try {
+      process.kill(state.pid, 0);
+      isAlive = true;
+    } catch (e: unknown) {
+      if ((e as NodeJS.ErrnoException).code === 'EPERM') {
+        isAlive = true;
+      } else {
+        isAlive = false;
+      }
+    }
+
+    if (!isAlive) {
+      try {
+        fs.unlinkSync(filePath);
+      } catch {
+        /* ignore */
+      }
+      continue;
+    }
+
+    // Verify it belongs to the previous ARC execution (PID recycling protection)
+    if (state.statStartTime && process.platform === 'linux') {
+      const currentStart = getProcessStatStartTime(state.pid);
+      if (currentStart && currentStart !== state.statStartTime) {
+        report.skipped.push({
+          processId: state.processId,
+          pid: state.pid,
+          reason: `PID recycled: start time mismatch (expected ${state.statStartTime}, got ${currentStart})`,
+        });
+        try {
+          fs.unlinkSync(filePath);
+        } catch {
+          /* ignore */
+        }
+        continue;
+      }
+    }
+
+    // Check cmdline if available
+    if (state.executable && process.platform === 'linux') {
+      const currentCmd = getProcessCmdline(state.pid);
+      const exeBase = path.basename(state.executable);
+      if (
+        currentCmd &&
+        !currentCmd.includes(exeBase) &&
+        !currentCmd.includes('node') &&
+        !currentCmd.includes('bash')
+      ) {
+        report.skipped.push({
+          processId: state.processId,
+          pid: state.pid,
+          reason: `Command line mismatch: expected to contain '${exeBase}', got '${currentCmd}'`,
+        });
+        try {
+          fs.unlinkSync(filePath);
+        } catch {
+          /* ignore */
+        }
+        continue;
+      }
+    }
+
+    // Genuine orphan confirmed: terminate with SIGTERM then SIGKILL escalation
+    let terminatedSignal: 'SIGTERM' | 'SIGKILL' = 'SIGTERM';
+    try {
+      if (process.platform !== 'win32') {
+        try {
+          process.kill(-state.pid, 'SIGTERM');
+        } catch {
+          process.kill(state.pid, 'SIGTERM');
+        }
+      } else {
+        process.kill(state.pid, 'SIGTERM');
+      }
+    } catch {
+      // ignore
+    }
+
+    // Wait for grace period
+    await new Promise((r) => setTimeout(r, gracePeriodMs));
+
+    // Check if still alive
+    let stillAlive: boolean;
+    try {
+      process.kill(state.pid, 0);
+      stillAlive = true;
+    } catch {
+      stillAlive = false;
+    }
+
+    if (stillAlive) {
+      try {
+        if (process.platform !== 'win32') {
+          try {
+            process.kill(-state.pid, 'SIGKILL');
+          } catch {
+            process.kill(state.pid, 'SIGKILL');
+          }
+        } else {
+          process.kill(state.pid, 'SIGKILL');
+        }
+        terminatedSignal = 'SIGKILL';
+      } catch {
+        // ignore
+      }
+    }
+
+    try {
+      fs.unlinkSync(filePath);
+    } catch {
+      /* ignore */
+    }
+
+    report.swept.push({
+      processId: state.processId,
+      pid: state.pid,
+      terminationSignal: terminatedSignal,
+    });
+
+    if (options?.auditSink) {
+      try {
+        await options.auditSink({
+          eventType: 'PROCESS_ORPHAN_CLEANUP',
+          message: `Swept orphan process ${state.processId} (PID ${state.pid}) with ${terminatedSignal}.`,
+          details: {
+            processId: state.processId,
+            pid: state.pid,
+            terminationSignal: terminatedSignal,
+            startedAt: state.startedAt,
+            workspaceId: state.workspaceId,
+          },
+        });
+      } catch {
+        // sink errors caught
+      }
+    }
+  }
+
+  return report;
 }

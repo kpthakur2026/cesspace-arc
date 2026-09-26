@@ -1,6 +1,6 @@
 {
   "name": "@cesspace-arc/mcp-server",
-  "version": "0.6.0-rc06",
+  "version": "0.7.0-rc07",
   "description": "Model Context Protocol server daemon for CesSpace ARC",
   "license": "Apache-2.0",
   "private": true,
