@@ -818,11 +818,39 @@ describe('CesSpace ARC — RC-07 Task 8: Security Hardening & Acceptance Suite',
       'process-state',
     );
 
-    // Create a long running test script in workspace
-    const sleepTestFile = path.join(workspaceDir, 'crash-sleep.test.js');
+    // Create a stubborn descendant test script in workspace:
+    // The fixture spawns a stubborn descendant that ignores SIGTERM and records its PID,
+    // while the root test process does not ignore SIGTERM and exits promptly on SIGTERM.
+    const stubbornTestFile = path.join(workspaceDir, 'crash-stubborn.test.js');
+    const stubbornPidFile = path.join(workspaceDir, 'stubborn-descendant.pid');
+    if (fs.existsSync(stubbornPidFile)) {
+      try {
+        fs.unlinkSync(stubbornPidFile);
+      } catch {
+        /* ignore */
+      }
+    }
+
     fs.writeFileSync(
-      sleepTestFile,
-      "import test from 'node:test';\ntest('sleep', async () => { await new Promise(r => setTimeout(r, 60000)); });\n",
+      stubbornTestFile,
+      `import { spawn } from 'node:child_process';
+import * as fs from 'node:fs';
+import test from 'node:test';
+
+test('stubborn descendant test for grace-window crash', async () => {
+  const childScript = \`
+    const fs = require('node:fs');
+    process.on('SIGTERM', () => {});
+    fs.writeFileSync(${JSON.stringify(stubbornPidFile)}, String(process.pid));
+    setInterval(() => {}, 60000);
+  \`;
+  const stubborn = spawn(process.execPath, ['-e', childScript], {
+    stdio: 'ignore',
+  });
+  // Root test runner does NOT ignore SIGTERM; it will exit immediately upon SIGTERM delivery
+  await new Promise((r) => setTimeout(r, 60000));
+});
+`,
     );
 
     // 2. Write runner script that starts ARC server and runs approved arc_test in separate OS process
@@ -834,7 +862,7 @@ describe('CesSpace ARC — RC-07 Task 8: Security Hardening & Acceptance Suite',
       workerScriptPath,
       `import { createArcMcpServer } from ${JSON.stringify(mcpServerIndexPath)};
 import { createAuditConfig } from ${JSON.stringify(auditHelperPath)};
-import * as path from 'node:path';
+import * as readline from 'node:readline';
 
 const workspaceDir = process.argv[2];
 const auditRoot = process.argv[3];
@@ -857,30 +885,46 @@ const actor = {
 };
 
 const reqRes = await server.executeAuthenticatedToolCall(actor, 'arc_test', {
-  testPath: 'crash-sleep.test.js',
+  testPath: 'crash-stubborn.test.js',
   maxDurationMs: 60000,
 });
 const reqPayload = JSON.parse(reqRes.content[0].text);
 const reqId = reqPayload.details.approvalRequestId;
 const app = server.approvalStateManager.approve(reqId);
 
-server.executeAuthenticatedToolCall(actor, 'arc_test', {
-  testPath: 'crash-sleep.test.js',
-  maxDurationMs: 60000,
-  _arcApproval: { requestId: reqId, token: app.token },
-}).catch(() => {});
+const abortController = new AbortController();
+
+server.executeAuthenticatedToolCall(
+  actor,
+  'arc_test',
+  {
+    testPath: 'crash-stubborn.test.js',
+    maxDurationMs: 60000,
+    _arcApproval: { requestId: reqId, token: app.token },
+  },
+  { signal: abortController.signal },
+).catch(() => {});
 
 const interval = setInterval(() => {
   const procs = server.processRegistry.getActiveProcesses();
   if (procs.length > 0 && procs[0]._child?.pid) {
     clearInterval(interval);
-    process.stdout.write('CHILD_PID:' + procs[0]._child.pid + '\\n');
+    process.stdout.write('ROOT_PID:' + procs[0]._child.pid + '\\n');
   }
 }, 50);
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on('line', (line) => {
+  if (line.trim() === 'CANCEL') {
+    abortController.abort();
+    process.stdout.write('CANCELLED\\n');
+  }
+});
 `,
     );
 
-    let childPid;
+    let rootPid;
+    let stubbornPid;
     let workerProc;
     let sentinelProc;
 
@@ -890,14 +934,14 @@ const interval = setInterval(() => {
         stdio: ['pipe', 'pipe', 'inherit'],
       });
 
-      // Wait for child PID from worker
-      childPid = await new Promise((resolve, reject) => {
-        const timeout = setTimeout(() => reject(new Error('Timeout waiting for CHILD_PID')), 10000);
+      // Wait for root PID from worker
+      rootPid = await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error('Timeout waiting for ROOT_PID')), 10000);
         timeout.unref();
         let buf = '';
         workerProc.stdout.on('data', (d) => {
           buf += d.toString('utf8');
-          const m = /CHILD_PID:(\d+)/.exec(buf);
+          const m = /ROOT_PID:(\d+)/.exec(buf);
           if (m) {
             clearTimeout(timeout);
             resolve(parseInt(m[1], 10));
@@ -905,8 +949,43 @@ const interval = setInterval(() => {
         });
         workerProc.on('error', reject);
       });
+      assert.ok(rootPid > 0, `Captured controlled root PID: ${rootPid}`);
 
-      assert.ok(childPid > 0, `Captured child PID: ${childPid}`);
+      // Wait for stubborn descendant PID written by fixture
+      for (let i = 0; i < 80; i++) {
+        if (fs.existsSync(stubbornPidFile)) {
+          const content = fs.readFileSync(stubbornPidFile, 'utf8').trim();
+          if (content.length > 0) {
+            stubbornPid = Number(content);
+            break;
+          }
+        }
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      assert.ok(stubbornPid > 0, `Captured stubborn descendant PID: ${stubbornPid}`);
+
+      // Prove both root and stubborn descendant are alive before cancellation
+      let rootAliveBefore = false;
+      try {
+        process.kill(rootPid, 0);
+        rootAliveBefore = true;
+      } catch {
+        rootAliveBefore = false;
+      }
+      assert.equal(rootAliveBefore, true, 'Root process must be alive before cancellation');
+
+      let descendantAliveBefore = false;
+      try {
+        process.kill(stubbornPid, 0);
+        descendantAliveBefore = true;
+      } catch {
+        descendantAliveBefore = false;
+      }
+      assert.equal(
+        descendantAliveBefore,
+        true,
+        'Stubborn descendant must be alive before cancellation',
+      );
 
       // 3. Prove real ProcessRegistry ownership state file exists
       const stateFiles = fs.readdirSync(crashProcessStateDir).filter((f) => f.endsWith('.json'));
@@ -921,24 +1000,64 @@ const interval = setInterval(() => {
       const sentinelPid = sentinelProc.pid;
       assert.ok(sentinelPid, 'Sentinel process must have PID');
 
-      // 5. Abruptly SIGKILL the owning ARC worker process
-      workerProc.kill('SIGKILL');
+      // 5. Initiate cancellation so ARC sends SIGTERM
+      workerProc.stdin.write('CANCEL\n');
 
-      // 6. Verify controlled child remains alive as an orphan
-      let childAliveBefore = false;
+      // 6. Prove root process exits on SIGTERM
+      let rootDead = false;
+      for (let i = 0; i < 40; i++) {
+        try {
+          process.kill(rootPid, 0);
+          await new Promise((r) => setTimeout(r, 25));
+        } catch {
+          rootDead = true;
+          break;
+        }
+      }
+      assert.equal(rootDead, true, 'Root process must exit promptly upon SIGTERM delivery');
+
+      // 7. Prove stubborn descendant remains alive
+      let descendantAliveBeforeCrash = false;
       try {
-        process.kill(childPid, 0);
-        childAliveBefore = true;
+        process.kill(stubbornPid, 0);
+        descendantAliveBeforeCrash = true;
       } catch {
-        childAliveBefore = false;
+        descendantAliveBeforeCrash = false;
       }
       assert.equal(
-        childAliveBefore,
+        descendantAliveBeforeCrash,
         true,
-        'Controlled child must survive parent crash as an orphan',
+        'Stubborn descendant must remain alive after root exits',
       );
 
-      // 7. Start replacement ARC runtime with the same durable audit and process-state root
+      // Prove durable process ownership file is retained during kill grace window
+      const stateFilesGrace = fs
+        .readdirSync(crashProcessStateDir)
+        .filter((f) => f.endsWith('.json'));
+      assert.ok(
+        stateFilesGrace.length >= 1,
+        'State file must be retained during kill grace window while escalation is pending',
+      );
+
+      // 8. BEFORE normal SIGKILL escalation completes, abruptly SIGKILL/crash the ARC worker process
+      workerProc.kill('SIGKILL');
+
+      // 9. Prove stubborn descendant is still alive after ARC crash
+      await new Promise((r) => setTimeout(r, 100));
+      let descendantAliveAfterCrash = false;
+      try {
+        process.kill(stubbornPid, 0);
+        descendantAliveAfterCrash = true;
+      } catch {
+        descendantAliveAfterCrash = false;
+      }
+      assert.equal(
+        descendantAliveAfterCrash,
+        true,
+        'Stubborn descendant must survive ARC crash as an orphan in host OS',
+      );
+
+      // 10. Start replacement ARC runtime with the same durable audit and process-state root
       const lockPath = path.join(crashAuditConfig.directory, 'audit.lock');
       if (fs.existsSync(lockPath)) {
         fs.unlinkSync(lockPath);
@@ -951,24 +1070,38 @@ const interval = setInterval(() => {
         audit: crashAuditConfig,
       });
 
-      // Normal start() invokes sweepOrphanProcesses
+      // 11. Normal start() invokes sweepOrphanProcesses(stateDir)
       await replacementServer.start();
 
       try {
-        // 8. Prove original ARC-owned child is dead (within 2.5s)
-        let childDead = false;
+        // 12. Prove stubborn descendant is killed by replacement startup sweep (within 2.5s)
+        let descendantDead = false;
         for (let i = 0; i < 25; i++) {
           try {
-            process.kill(childPid, 0);
+            process.kill(stubbornPid, 0);
             await new Promise((r) => setTimeout(r, 100));
           } catch {
-            childDead = true;
+            descendantDead = true;
             break;
           }
         }
-        assert.equal(childDead, true, 'Original ARC-owned orphan process must be dead after sweep');
+        assert.equal(
+          descendantDead,
+          true,
+          'Original ARC-owned orphan descendant must be dead after replacement startup sweep',
+        );
 
-        // 9. Prove unrelated sentinel remains alive
+        // 13. Prove durable ownership record is cleaned only after recovery
+        const remainingStateFiles = fs
+          .readdirSync(crashProcessStateDir)
+          .filter((f) => f.endsWith('.json'));
+        assert.equal(
+          remainingStateFiles.length,
+          0,
+          'Stale state file must be removed after sweep recovery',
+        );
+
+        // 14. Prove unrelated sentinel remains alive
         let sentinelAlive = false;
         try {
           process.kill(sentinelPid, 0);
@@ -977,12 +1110,6 @@ const interval = setInterval(() => {
           sentinelAlive = false;
         }
         assert.equal(sentinelAlive, true, 'Unrelated sentinel process must remain alive');
-
-        // 10. Prove stale state record is gone
-        const remainingStateFiles = fs
-          .readdirSync(crashProcessStateDir)
-          .filter((f) => f.endsWith('.json'));
-        assert.equal(remainingStateFiles.length, 0, 'Stale state file must be removed after sweep');
       } finally {
         await replacementServer.stop();
       }
@@ -1001,15 +1128,27 @@ const interval = setInterval(() => {
           /* ignore */
         }
       }
-      if (childPid) {
+      if (rootPid) {
         try {
-          process.kill(childPid, 'SIGKILL');
+          process.kill(rootPid, 'SIGKILL');
+        } catch {
+          /* ignore */
+        }
+      }
+      if (stubbornPid) {
+        try {
+          process.kill(stubbornPid, 'SIGKILL');
         } catch {
           /* ignore */
         }
       }
       try {
-        fs.unlinkSync(sleepTestFile);
+        fs.unlinkSync(stubbornTestFile);
+      } catch {
+        /* ignore */
+      }
+      try {
+        fs.unlinkSync(stubbornPidFile);
       } catch {
         /* ignore */
       }
@@ -1756,22 +1895,55 @@ test('stubborn test requiring SIGKILL escalation', async () => {
       const rootPid = runningProc._child?.pid;
       assert.ok(rootPid, `Root child PID: ${rootPid}`);
 
-      // Allow a brief moment for descendant to spawn
-      await new Promise((r) => setTimeout(r, 500));
+      // Poll until descendant PID is output in stdout
+      let match;
+      for (let i = 0; i < 40; i++) {
+        const chunks = runningProc._stdoutChunks || [];
+        const combinedOutput = Buffer.concat(chunks).toString('utf8');
+        match = /STUBBORN_DESCENDANT:(\d+)/.exec(combinedOutput);
+        if (match) break;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      assert.ok(match, 'Must capture stubborn descendant PID');
+      const descendantPid = Number(match[1]);
+      assert.ok(descendantPid > 0, `Captured valid positive descendant PID: ${descendantPid}`);
 
-      // Check if descendant PID was output in stdout
-      const chunks = runningProc._stdoutChunks || [];
-      const combinedOutput = Buffer.concat(chunks).toString('utf8');
-      const match = /STUBBORN_DESCENDANT:(\d+)/.exec(combinedOutput);
-      const descendantPid = match ? parseInt(match[1], 10) : undefined;
+      // Prove descendant existed before cancellation
+      let descendantAliveBefore = false;
+      try {
+        process.kill(descendantPid, 0);
+        descendantAliveBefore = true;
+      } catch {
+        descendantAliveBefore = false;
+      }
+      assert.equal(
+        descendantAliveBefore,
+        true,
+        'Stubborn descendant must exist and be alive before cancellation',
+      );
 
       // 6. Trigger cancellation through real remote disconnect
       req.destroy();
 
-      // 7. Wait beyond the 1000ms SIGKILL escalation grace period
-      await new Promise((resolve) => setTimeout(resolve, 2000));
+      // 7. Prove descendant ignored SIGTERM / survived initial termination interval (300ms)
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      let descendantAliveMid = false;
+      try {
+        process.kill(descendantPid, 0);
+        descendantAliveMid = true;
+      } catch {
+        descendantAliveMid = false;
+      }
+      assert.equal(
+        descendantAliveMid,
+        true,
+        'Stubborn descendant must ignore SIGTERM and survive initial termination interval',
+      );
 
-      // 8. Prove root child is dead
+      // 8. Wait beyond the 1000ms SIGKILL escalation grace period (total > 1500ms)
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+
+      // 9. Prove root child is dead
       let rootAlive = true;
       try {
         process.kill(rootPid, 0);
@@ -1786,18 +1958,20 @@ test('stubborn test requiring SIGKILL escalation', async () => {
         `Root child PID ${rootPid} must be dead after SIGKILL escalation`,
       );
 
-      // 9. Prove stubborn descendant is dead
-      if (descendantPid) {
-        let descendantAlive = true;
-        try {
-          process.kill(descendantPid, 0);
-        } catch (err) {
-          if (err && err.code === 'ESRCH') {
-            descendantAlive = false;
-          }
+      // 10. Prove stubborn descendant is dead after SIGKILL escalation (mandatory assertion)
+      let descendantAlive = true;
+      try {
+        process.kill(descendantPid, 0);
+      } catch (err) {
+        if (err && err.code === 'ESRCH') {
+          descendantAlive = false;
         }
-        assert.equal(descendantAlive, false, `Descendant PID ${descendantPid} must be dead`);
       }
+      assert.equal(
+        descendantAlive,
+        false,
+        `Stubborn descendant PID ${descendantPid} must be dead after SIGKILL escalation`,
+      );
 
       // 10. Prove ordered lifecycle events: SIGTERM sent -> SIGKILL escalated
       const opEvents = lifecycleEvents.filter((e) => e.processId === runningProc.processId);

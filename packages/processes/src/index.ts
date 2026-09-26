@@ -70,6 +70,7 @@ export interface ProcessRecord {
 
   // Private internals
   _child?: ChildProcess;
+  _pid?: number;
   _timeoutTimer?: NodeJS.Timeout;
   _killTimer?: NodeJS.Timeout;
   _stdoutChunks: Buffer[];
@@ -237,17 +238,23 @@ export class ProcessRegistry implements IProcessRegistry {
   }
 
   public persistProcessState(record: ProcessRecord, pid: number): boolean {
+    record._pid = pid;
     if (!this.processStateDir) return true;
     try {
       if (!fs.existsSync(this.processStateDir)) {
         fs.mkdirSync(this.processStateDir, { recursive: true, mode: 0o700 });
       }
       const filePath = path.join(this.processStateDir, `${record.processId}.json`);
-      const statStartTime = getProcessStatStartTime(pid);
+      const statInfo = getProcessStatInfo(pid);
+      const statStartTime = statInfo?.starttime ?? getProcessStatStartTime(pid);
+      const pgid = statInfo?.pgrp ?? (process.platform !== 'win32' ? pid : undefined);
+      const sid = statInfo?.session ?? (process.platform !== 'win32' ? pid : undefined);
       const cmdline = getProcessCmdline(pid);
       const state: ActiveProcessPersistedState = {
         processId: record.processId,
         pid,
+        pgid,
+        sid,
         statStartTime,
         cmdline,
         executable: record.executable,
@@ -741,6 +748,22 @@ export class ProcessRegistry implements IProcessRegistry {
           // ignore
         } finally {
           record._killTimer = undefined;
+          if (record.completedAt) {
+            setTimeout(() => {
+              let clean = true;
+              if (pid && process.platform !== 'win32') {
+                try {
+                  process.kill(-pid, 0);
+                  clean = false;
+                } catch {
+                  clean = true;
+                }
+              }
+              if (clean) {
+                this.unpersistProcessState(record.processId);
+              }
+            }, 50).unref();
+          }
         }
       }, 1000);
       record._killTimer.unref();
@@ -754,9 +777,11 @@ export class ProcessRegistry implements IProcessRegistry {
   }
 
   public markCompleted(processId: string, exitCode: number | null, signal: string | null): void {
-    this.unpersistProcessState(processId);
     const record = this.processes.get(processId);
-    if (!record) return;
+    if (!record) {
+      this.unpersistProcessState(processId);
+      return;
+    }
 
     if (record._timeoutTimer) {
       clearTimeout(record._timeoutTimer);
@@ -787,6 +812,25 @@ export class ProcessRegistry implements IProcessRegistry {
       0,
       new Date(record.completedAt).getTime() - new Date(record.startedAt).getTime(),
     );
+
+    // Do NOT delete durable process ownership state while an escalation timer is active.
+    // Retain the state until process-group cleanup is authoritatively finished.
+    const hasEscalationObligation = Boolean(record._killTimer);
+    if (!hasEscalationObligation) {
+      const pid = record._pid ?? record._child?.pid;
+      let groupClean = true;
+      if (pid && process.platform !== 'win32' && (wasTimedOut || wasTerminating)) {
+        try {
+          process.kill(-pid, 0);
+          groupClean = false;
+        } catch {
+          groupClean = true;
+        }
+      }
+      if (groupClean) {
+        this.unpersistProcessState(processId);
+      }
+    }
 
     const eventType: ProcessLifecycleEventType = wasTimedOut
       ? 'PROCESS_EXITED'
@@ -855,6 +899,8 @@ export class ProcessRegistry implements IProcessRegistry {
 export interface ActiveProcessPersistedState {
   processId: string;
   pid: number;
+  pgid?: number;
+  sid?: number;
   statStartTime?: string;
   cmdline?: string;
   executable: string;
@@ -868,7 +914,14 @@ export interface OrphanSweepReport {
   errors: Array<{ processId: string; pid?: number; error: string }>;
 }
 
-export function getProcessStatStartTime(pid: number): string | undefined {
+export interface ProcessStatInfo {
+  pid: number;
+  pgrp: number;
+  session: number;
+  starttime: string;
+}
+
+export function getProcessStatInfo(pid: number): ProcessStatInfo | undefined {
   if (process.platform !== 'linux') return undefined;
   try {
     const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
@@ -878,10 +931,19 @@ export function getProcessStatStartTime(pid: number): string | undefined {
       .slice(lastParen + 2)
       .trim()
       .split(/\s+/);
-    return rest[19];
+    return {
+      pid,
+      pgrp: Number(rest[2]),
+      session: Number(rest[3]),
+      starttime: rest[19],
+    };
   } catch {
     return undefined;
   }
+}
+
+export function getProcessStatStartTime(pid: number): string | undefined {
+  return getProcessStatInfo(pid)?.starttime;
 }
 
 export function getProcessCmdline(pid: number): string | undefined {
@@ -892,6 +954,48 @@ export function getProcessCmdline(pid: number): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+export function findDetachedGroupMembers(state: ActiveProcessPersistedState): number[] {
+  if (process.platform !== 'linux') return [];
+  const targetPgid = state.pgid ?? state.pid;
+  const targetSid = state.sid ?? state.pid;
+  const rootStartTimeTicks = state.statStartTime ? Number(state.statStartTime) : 0;
+  const members: number[] = [];
+
+  let entries: string[];
+  try {
+    entries = fs.readdirSync('/proc');
+  } catch {
+    return [];
+  }
+
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    const pid = Number(entry);
+    if (pid <= 1 || pid === process.pid) continue;
+    try {
+      const statInfo = getProcessStatInfo(pid);
+      if (!statInfo) continue;
+      const matchesGroup = statInfo.pgrp === targetPgid || statInfo.session === targetSid;
+      if (!matchesGroup) continue;
+
+      // Ownership proof / PID-reuse safety:
+      // A member process must have started at or after the root process start-time ticks
+      if (rootStartTimeTicks > 0) {
+        const memberStartTimeTicks = Number(statInfo.starttime);
+        if (memberStartTimeTicks < rootStartTimeTicks) {
+          continue;
+        }
+      }
+
+      members.push(pid);
+    } catch {
+      // process may have exited during scan
+    }
+  }
+
+  return members;
 }
 
 export async function sweepOrphanProcesses(
@@ -957,20 +1061,210 @@ export async function sweepOrphanProcesses(
       continue;
     }
 
-    // Check if process is still alive via kill(0)
-    let isAlive: boolean;
+    const targetPgid = state.pgid ?? state.pid;
+
+    // Check if leader process is alive via kill(0)
+    let leaderAlive: boolean;
     try {
       process.kill(state.pid, 0);
-      isAlive = true;
+      leaderAlive = true;
     } catch (e: unknown) {
       if ((e as NodeJS.ErrnoException).code === 'EPERM') {
-        isAlive = true;
+        leaderAlive = true;
       } else {
-        isAlive = false;
+        leaderAlive = false;
       }
     }
 
-    if (!isAlive) {
+    if (leaderAlive) {
+      // Case A or Case D: Leader is alive
+      // Verify PID recycling protection
+      if (state.statStartTime && process.platform === 'linux') {
+        const currentStart = getProcessStatStartTime(state.pid);
+        if (currentStart && currentStart !== state.statStartTime) {
+          // Case D: Recycled PID
+          report.skipped.push({
+            processId: state.processId,
+            pid: state.pid,
+            reason: `PID recycled: start time mismatch (expected ${state.statStartTime}, got ${currentStart})`,
+          });
+          try {
+            fs.unlinkSync(filePath);
+          } catch {
+            /* ignore */
+          }
+          continue;
+        }
+      }
+
+      // Check cmdline if available
+      if (state.executable && process.platform === 'linux') {
+        const currentCmd = getProcessCmdline(state.pid);
+        const exeBase = path.basename(state.executable);
+        if (
+          currentCmd &&
+          !currentCmd.includes(exeBase) &&
+          !currentCmd.includes('node') &&
+          !currentCmd.includes('bash')
+        ) {
+          // Case D: Command line mismatch
+          report.skipped.push({
+            processId: state.processId,
+            pid: state.pid,
+            reason: `Command line mismatch: expected to contain '${exeBase}', got '${currentCmd}'`,
+          });
+          try {
+            fs.unlinkSync(filePath);
+          } catch {
+            /* ignore */
+          }
+          continue;
+        }
+      }
+
+      // Case A: Genuine orphan leader confirmed.
+      // Terminate process group (or leader) with SIGTERM, then SIGKILL escalation.
+      let terminationSignal: 'SIGTERM' | 'SIGKILL' = 'SIGTERM';
+      try {
+        if (process.platform !== 'win32') {
+          try {
+            process.kill(-targetPgid, 'SIGTERM');
+          } catch {
+            process.kill(state.pid, 'SIGTERM');
+          }
+        } else {
+          process.kill(state.pid, 'SIGTERM');
+        }
+      } catch {
+        /* ignore */
+      }
+
+      await new Promise((r) => setTimeout(r, gracePeriodMs));
+
+      let stillAlive = false;
+      try {
+        process.kill(state.pid, 0);
+        stillAlive = true;
+      } catch {
+        if (process.platform !== 'win32') {
+          try {
+            process.kill(-targetPgid, 0);
+            stillAlive = true;
+          } catch {
+            stillAlive = false;
+          }
+        }
+      }
+
+      if (process.platform === 'linux' && !stillAlive) {
+        const members = findDetachedGroupMembers(state);
+        if (members.length > 0) stillAlive = true;
+      }
+
+      if (stillAlive) {
+        try {
+          if (process.platform !== 'win32') {
+            try {
+              process.kill(-targetPgid, 'SIGKILL');
+            } catch {
+              process.kill(state.pid, 'SIGKILL');
+            }
+          } else {
+            process.kill(state.pid, 'SIGKILL');
+          }
+          terminationSignal = 'SIGKILL';
+        } catch {
+          /* ignore */
+        }
+
+        // On Linux, also directly SIGKILL any stubbornly surviving members
+        if (process.platform === 'linux') {
+          const survivingMembers = findDetachedGroupMembers(state);
+          for (const mPid of survivingMembers) {
+            try {
+              process.kill(mPid, 'SIGKILL');
+            } catch {
+              /* ignore */
+            }
+          }
+        }
+      }
+
+      await new Promise((r) => setTimeout(r, 50));
+
+      let confirmedClean = true;
+      try {
+        process.kill(state.pid, 0);
+        confirmedClean = false;
+      } catch {
+        if (process.platform === 'linux') {
+          const remaining = findDetachedGroupMembers(state);
+          if (remaining.length > 0) confirmedClean = false;
+        } else if (process.platform !== 'win32') {
+          try {
+            process.kill(-targetPgid, 0);
+            confirmedClean = false;
+          } catch {
+            confirmedClean = true;
+          }
+        }
+      }
+
+      if (confirmedClean) {
+        try {
+          fs.unlinkSync(filePath);
+        } catch {
+          /* ignore */
+        }
+        report.swept.push({
+          processId: state.processId,
+          pid: state.pid,
+          terminationSignal,
+        });
+      } else {
+        report.errors.push({
+          processId: state.processId,
+          pid: state.pid,
+          error: 'Process group members could not be authoritatively confirmed dead.',
+        });
+      }
+
+      if (options?.auditSink && confirmedClean) {
+        try {
+          await options.auditSink({
+            eventType: 'PROCESS_ORPHAN_CLEANUP',
+            message: `Swept orphan process ${state.processId} (PID ${state.pid}) with ${terminationSignal}.`,
+            details: {
+              processId: state.processId,
+              pid: state.pid,
+              terminationSignal,
+              startedAt: state.startedAt,
+              workspaceId: state.workspaceId,
+            },
+          });
+        } catch {
+          /* ignore */
+        }
+      }
+      continue;
+    }
+
+    // Leader is DEAD (!leaderAlive).
+    // Check Case B: ARC-owned detached process group/session still has surviving members
+    let survivingMembers: number[] = [];
+    if (process.platform === 'linux') {
+      survivingMembers = findDetachedGroupMembers(state);
+    } else if (process.platform !== 'win32') {
+      try {
+        process.kill(-targetPgid, 0);
+        survivingMembers = [targetPgid];
+      } catch {
+        survivingMembers = [];
+      }
+    }
+
+    if (survivingMembers.length === 0) {
+      // Case C: No owned process/group remains. Clean up state file.
       try {
         fs.unlinkSync(filePath);
       } catch {
@@ -979,121 +1273,115 @@ export async function sweepOrphanProcesses(
       continue;
     }
 
-    // Verify it belongs to the previous ARC execution (PID recycling protection)
-    if (state.statStartTime && process.platform === 'linux') {
-      const currentStart = getProcessStatStartTime(state.pid);
-      if (currentStart && currentStart !== state.statStartTime) {
-        report.skipped.push({
-          processId: state.processId,
-          pid: state.pid,
-          reason: `PID recycled: start time mismatch (expected ${state.statStartTime}, got ${currentStart})`,
-        });
-        try {
-          fs.unlinkSync(filePath);
-        } catch {
-          /* ignore */
-        }
-        continue;
-      }
-    }
-
-    // Check cmdline if available
-    if (state.executable && process.platform === 'linux') {
-      const currentCmd = getProcessCmdline(state.pid);
-      const exeBase = path.basename(state.executable);
-      if (
-        currentCmd &&
-        !currentCmd.includes(exeBase) &&
-        !currentCmd.includes('node') &&
-        !currentCmd.includes('bash')
-      ) {
-        report.skipped.push({
-          processId: state.processId,
-          pid: state.pid,
-          reason: `Command line mismatch: expected to contain '${exeBase}', got '${currentCmd}'`,
-        });
-        try {
-          fs.unlinkSync(filePath);
-        } catch {
-          /* ignore */
-        }
-        continue;
-      }
-    }
-
-    // Genuine orphan confirmed: terminate with SIGTERM then SIGKILL escalation
-    let terminatedSignal: 'SIGTERM' | 'SIGKILL' = 'SIGTERM';
+    // Case B: Leader dead, but ARC-owned detached process group/session still has members!
+    let terminationSignal: 'SIGTERM' | 'SIGKILL' = 'SIGTERM';
     try {
       if (process.platform !== 'win32') {
         try {
-          process.kill(-state.pid, 'SIGTERM');
+          process.kill(-targetPgid, 'SIGTERM');
         } catch {
-          process.kill(state.pid, 'SIGTERM');
+          /* ignore */
         }
-      } else {
-        process.kill(state.pid, 'SIGTERM');
       }
-    } catch {
-      // ignore
-    }
-
-    // Wait for grace period
-    await new Promise((r) => setTimeout(r, gracePeriodMs));
-
-    // Check if still alive
-    let stillAlive: boolean;
-    try {
-      process.kill(state.pid, 0);
-      stillAlive = true;
-    } catch {
-      stillAlive = false;
-    }
-
-    if (stillAlive) {
-      try {
-        if (process.platform !== 'win32') {
-          try {
-            process.kill(-state.pid, 'SIGKILL');
-          } catch {
-            process.kill(state.pid, 'SIGKILL');
-          }
-        } else {
-          process.kill(state.pid, 'SIGKILL');
+      for (const mPid of survivingMembers) {
+        try {
+          process.kill(mPid, 'SIGTERM');
+        } catch {
+          /* ignore */
         }
-        terminatedSignal = 'SIGKILL';
-      } catch {
-        // ignore
       }
-    }
-
-    try {
-      fs.unlinkSync(filePath);
     } catch {
       /* ignore */
     }
 
-    report.swept.push({
-      processId: state.processId,
-      pid: state.pid,
-      terminationSignal: terminatedSignal,
-    });
+    await new Promise((r) => setTimeout(r, gracePeriodMs));
 
-    if (options?.auditSink) {
+    let remainingMembers: number[] = [];
+    if (process.platform === 'linux') {
+      remainingMembers = findDetachedGroupMembers(state);
+    } else if (process.platform !== 'win32') {
       try {
-        await options.auditSink({
-          eventType: 'PROCESS_ORPHAN_CLEANUP',
-          message: `Swept orphan process ${state.processId} (PID ${state.pid}) with ${terminatedSignal}.`,
-          details: {
-            processId: state.processId,
-            pid: state.pid,
-            terminationSignal: terminatedSignal,
-            startedAt: state.startedAt,
-            workspaceId: state.workspaceId,
-          },
-        });
+        process.kill(-targetPgid, 0);
+        remainingMembers = [targetPgid];
       } catch {
-        // sink errors caught
+        remainingMembers = [];
       }
+    }
+
+    if (remainingMembers.length > 0) {
+      terminationSignal = 'SIGKILL';
+      try {
+        if (process.platform !== 'win32') {
+          try {
+            process.kill(-targetPgid, 'SIGKILL');
+          } catch {
+            /* ignore */
+          }
+        }
+        for (const mPid of remainingMembers) {
+          try {
+            process.kill(mPid, 'SIGKILL');
+          } catch {
+            /* ignore */
+          }
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+
+    await new Promise((r) => setTimeout(r, 50));
+
+    let confirmedDead = true;
+    if (process.platform === 'linux') {
+      const finalCheck = findDetachedGroupMembers(state);
+      if (finalCheck.length > 0) confirmedDead = false;
+    } else if (process.platform !== 'win32') {
+      try {
+        process.kill(-targetPgid, 0);
+        confirmedDead = false;
+      } catch {
+        confirmedDead = true;
+      }
+    }
+
+    if (confirmedDead) {
+      try {
+        fs.unlinkSync(filePath);
+      } catch {
+        /* ignore */
+      }
+      report.swept.push({
+        processId: state.processId,
+        pid: state.pid,
+        terminationSignal,
+      });
+
+      if (options?.auditSink) {
+        try {
+          await options.auditSink({
+            eventType: 'PROCESS_ORPHAN_CLEANUP',
+            message: `Swept orphan descendant group for process ${state.processId} (leader PID ${state.pid}, ${survivingMembers.length} member(s)) with ${terminationSignal}.`,
+            details: {
+              processId: state.processId,
+              pid: state.pid,
+              pgid: targetPgid,
+              members: survivingMembers,
+              terminationSignal,
+              startedAt: state.startedAt,
+              workspaceId: state.workspaceId,
+            },
+          });
+        } catch {
+          /* ignore */
+        }
+      }
+    } else {
+      report.errors.push({
+        processId: state.processId,
+        pid: state.pid,
+        error: 'Descendant group members could not be authoritatively confirmed dead.',
+      });
     }
   }
 
