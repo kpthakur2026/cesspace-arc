@@ -66,6 +66,9 @@ export async function handleArcCiStatus(
   const workflowsFound: ArcCiWorkflowInfo[] = [];
 
   for (const relPath of workflowFilePaths) {
+    // Validate each discovered path through validateWorkflowPath immediately before read
+    await filesystemSubsystem.validateWorkflowPath(targetWorkspace.rootPath, relPath);
+
     const fileRes = await filesystemSubsystem.readFile(targetWorkspace.rootPath, {
       path: relPath,
     });

@@ -1,5 +1,6 @@
 import {
   realpathSync,
+  readlinkSync,
   statSync,
   readdirSync,
   openSync,
@@ -550,37 +551,82 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
     }
 
     // 5. Must be strictly inside .github/workflows/
-    const expectedPrefix = resolve(canonicalRoot, '.github', 'workflows');
-    if (norm !== expectedPrefix && !norm.startsWith(expectedPrefix + sep)) {
+    const expectedWorkflowsDir = resolve(canonicalRoot, '.github', 'workflows');
+    if (norm !== expectedWorkflowsDir && !norm.startsWith(expectedWorkflowsDir + sep)) {
       throw ArcError.pathOutsideWorkspace(
         'Security violation: Workflow path must reside strictly within .github/workflows/.',
       );
     }
 
-    // 6. Symlink containment check
+    if (!existsSync(expectedWorkflowsDir)) {
+      throw ArcError.fileNotFound(`Workflow file not found: ${trimmed}`);
+    }
+
+    let canonicalWorkflowsDir: string;
+    try {
+      canonicalWorkflowsDir = realpathSync(expectedWorkflowsDir);
+    } catch {
+      throw ArcError.internalError('Filesystem path resolution failed.');
+    }
+
+    if (
+      canonicalWorkflowsDir !== canonicalRoot &&
+      !canonicalWorkflowsDir.startsWith(canonicalRoot + sep)
+    ) {
+      throw ArcError.pathOutsideWorkspace(
+        'Security violation: .github/workflows directory escapes authorized workspace boundary.',
+      );
+    }
+
+    // 6. Symlink containment check against canonicalWorkflowsDir
     let canonicalTarget: string;
     try {
       canonicalTarget = realpathSync(candidatePath);
     } catch (err: unknown) {
       const nodeErr = err as NodeJS.ErrnoException;
       if (nodeErr.code === 'ENOENT') {
+        // If broken symlink, check whether target points outside canonicalWorkflowsDir
+        try {
+          const rawTarget = readlinkSync(candidatePath);
+          const resolvedTarget = resolve(dirname(candidatePath), rawTarget);
+          const normTarget = normalize(resolvedTarget);
+          if (
+            normTarget !== canonicalWorkflowsDir &&
+            !normTarget.startsWith(canonicalWorkflowsDir + sep)
+          ) {
+            throw ArcError.pathOutsideWorkspace(
+              'Security violation: Workflow path resolves outside authorized .github/workflows directory.',
+            );
+          }
+        } catch (rlErr: unknown) {
+          if (rlErr instanceof ArcError) throw rlErr;
+        }
         throw ArcError.fileNotFound(`Workflow file not found: ${trimmed}`);
       }
       throw ArcError.internalError('Filesystem path resolution failed.');
     }
 
-    if (canonicalTarget !== canonicalRoot && !canonicalTarget.startsWith(canonicalRoot + sep)) {
-      throw ArcError.symlinkEscapeDetected(
-        'Symlink resolves outside authorized workspace boundary.',
+    if (
+      canonicalTarget !== canonicalWorkflowsDir &&
+      !canonicalTarget.startsWith(canonicalWorkflowsDir + sep)
+    ) {
+      throw ArcError.pathOutsideWorkspace(
+        'Security violation: Workflow path resolves outside authorized .github/workflows directory.',
       );
     }
 
-    // 7. Verify extension is .yml or .yaml
+    // 7. Verify target is a file
+    const targetStat = statSync(canonicalTarget);
+    if (!targetStat.isFile()) {
+      throw ArcError.invalidRequestSchema('Target workflow path is not a file.');
+    }
+
+    // 8. Verify extension is .yml or .yaml
     if (!/\.ya?ml$/i.test(trimmed)) {
       throw ArcError.invalidRequestSchema('Workflow file must have a .yml or .yaml extension.');
     }
 
-    // 8. Blacklist & Sensitive Path Enforcement
+    // 9. Blacklist & Sensitive Path Enforcement
     const relFromRoot = relative(canonicalRoot, canonicalTarget);
     if (isBlacklistedPath(canonicalTarget, relFromRoot) || isBlacklistedPath(trimmed)) {
       throw ArcError.accessDenied(
@@ -596,7 +642,7 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
    * Dedicated workflow directory scanner for arc_ci_status (RC-07 Task 6).
    * Confines scanning strictly to .github/workflows/ within authorized workspace.
    * If .github/workflows does not exist, returns empty array.
-   * If a symlink in the workflow hierarchy escapes the workspace boundary,
+   * If a symlink in the workflow hierarchy escapes the canonical .github/workflows boundary,
    * rejects with PATH_OUTSIDE_WORKSPACE.
    * Returns sorted array of relative paths (e.g. ['.github/workflows/ci.yml']).
    */
@@ -632,9 +678,13 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
     }
 
     // Verify .github/workflows does not escape workspace via symlink
+    let canonicalWorkflowsDir: string;
     try {
-      const realWorkflows = realpathSync(workflowsDir);
-      if (realWorkflows !== canonicalRoot && !realWorkflows.startsWith(canonicalRoot + sep)) {
+      canonicalWorkflowsDir = realpathSync(workflowsDir);
+      if (
+        canonicalWorkflowsDir !== canonicalRoot &&
+        !canonicalWorkflowsDir.startsWith(canonicalRoot + sep)
+      ) {
         throw ArcError.pathOutsideWorkspace(
           'Security violation: .github/workflows directory escapes authorized workspace boundary.',
         );
@@ -646,7 +696,7 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
 
     let st: Stats;
     try {
-      st = statSync(workflowsDir);
+      st = statSync(canonicalWorkflowsDir);
     } catch {
       return [];
     }
@@ -656,7 +706,7 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
 
     let dirents;
     try {
-      dirents = readdirSync(workflowsDir, { withFileTypes: true });
+      dirents = readdirSync(canonicalWorkflowsDir, { withFileTypes: true });
     } catch {
       return [];
     }
@@ -670,27 +720,65 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
         continue;
       }
 
-      const fullEntryPath = join(workflowsDir, name);
+      const fullEntryPath = join(canonicalWorkflowsDir, name);
 
       if (dirent.isSymbolicLink()) {
+        let canonicalTarget: string;
         try {
-          const realTarget = realpathSync(fullEntryPath);
-          if (realTarget !== canonicalRoot && !realTarget.startsWith(canonicalRoot + sep)) {
-            throw ArcError.pathOutsideWorkspace(
-              'Security violation: Workflow symlink resolves outside authorized workspace boundary.',
-            );
-          }
-          const targetStat = statSync(realTarget);
-          if (!targetStat.isFile()) {
-            continue;
-          }
+          canonicalTarget = realpathSync(fullEntryPath);
         } catch (err: unknown) {
           if (err instanceof ArcError) throw err;
-          // Broken symlink or inaccessible: skip
+          // Broken symlink: check where readlink points
+          try {
+            const rawTarget = readlinkSync(fullEntryPath);
+            const resolvedTarget = resolve(canonicalWorkflowsDir, rawTarget);
+            const normTarget = normalize(resolvedTarget);
+            if (
+              normTarget !== canonicalWorkflowsDir &&
+              !normTarget.startsWith(canonicalWorkflowsDir + sep)
+            ) {
+              throw ArcError.pathOutsideWorkspace(
+                'Security violation: Workflow symlink resolves outside authorized .github/workflows directory.',
+              );
+            }
+          } catch (readlinkErr: unknown) {
+            if (readlinkErr instanceof ArcError) throw readlinkErr;
+          }
+          continue;
+        }
+
+        // Canonical target must be strictly inside canonicalWorkflowsDir
+        if (
+          canonicalTarget !== canonicalWorkflowsDir &&
+          !canonicalTarget.startsWith(canonicalWorkflowsDir + sep)
+        ) {
+          throw ArcError.pathOutsideWorkspace(
+            'Security violation: Workflow symlink resolves outside authorized .github/workflows directory.',
+          );
+        }
+
+        const targetStat = statSync(canonicalTarget);
+        if (!targetStat.isFile()) {
           continue;
         }
       } else if (!dirent.isFile()) {
         continue;
+      } else {
+        // Regular file: verify canonical target stays within canonicalWorkflowsDir
+        let canonicalTarget: string;
+        try {
+          canonicalTarget = realpathSync(fullEntryPath);
+        } catch {
+          continue;
+        }
+        if (
+          canonicalTarget !== canonicalWorkflowsDir &&
+          !canonicalTarget.startsWith(canonicalWorkflowsDir + sep)
+        ) {
+          throw ArcError.pathOutsideWorkspace(
+            'Security violation: Workflow file resolves outside authorized .github/workflows directory.',
+          );
+        }
       }
 
       const relPath = relative(canonicalRoot, fullEntryPath).replace(/\\/g, '/');

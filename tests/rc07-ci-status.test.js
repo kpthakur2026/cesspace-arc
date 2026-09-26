@@ -13,7 +13,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, symlinkSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { execFileSync } from 'node:child_process';
+import child_process, { execFileSync } from 'node:child_process';
 import http from 'node:http';
 import https from 'node:https';
 import net from 'node:net';
@@ -230,46 +230,167 @@ describe('CesSpace ARC — RC-07 Task 6: arc_ci_status Test Suite', () => {
         },
       );
 
-      // 4. Symlink inside .github/workflows pointing outside workspace
+      // 4. Symlink inside .github/workflows pointing outside workspace (unconditional on POSIX)
       const workflowsDir = join(workspaceDir, '.github', 'workflows');
       mkdirSync(workflowsDir, { recursive: true });
       const outsideWorkflow = join(tempRoot, 'outside-secret.yml');
       writeFileSync(outsideWorkflow, 'name: Outside\non: push\njobs: {}\n');
 
       const escapingSymlink = join(workflowsDir, 'escaping.yml');
-      try {
-        symlinkSync(outsideWorkflow, escapingSymlink);
-      } catch {
-        // ignore if symlinks not supported
-      }
+      symlinkSync(outsideWorkflow, escapingSymlink);
 
-      if (existsSync(escapingSymlink)) {
+      try {
         await assert.rejects(
           async () => {
             await fsSubsystem.listWorkflowFiles(workspaceDir);
           },
           (err) => {
             assert.ok(err instanceof ArcError);
-            assert.ok(
-              err.code === 'PATH_OUTSIDE_WORKSPACE' || err.code === 'SYMLINK_ESCAPE_DETECTED',
-              `Expected PATH_OUTSIDE_WORKSPACE or SYMLINK_ESCAPE_DETECTED, got ${err.code}`,
-            );
+            assert.equal(err.code, 'PATH_OUTSIDE_WORKSPACE');
             return true;
           },
         );
 
-        // Also test through tool call
+        await assert.rejects(
+          async () => {
+            await fsSubsystem.validateWorkflowPath(workspaceDir, '.github/workflows/escaping.yml');
+          },
+          (err) => {
+            assert.ok(err instanceof ArcError);
+            assert.equal(err.code, 'PATH_OUTSIDE_WORKSPACE');
+            return true;
+          },
+        );
+
         const toolRes = await server.executeAuthenticatedToolCall(safeActor, 'arc_ci_status', {
           workspaceId: 'ws-task6',
         });
-        assert.ok(toolRes.isError);
-        assert.ok(
-          toolRes.content[0].text.includes('PATH_OUTSIDE_WORKSPACE') ||
-            toolRes.content[0].text.includes('SYMLINK_ESCAPE_DETECTED'),
+        assert.equal(toolRes.isError, true);
+        const parsed = JSON.parse(toolRes.content[0].text);
+        assert.equal(parsed.code, 'PATH_OUTSIDE_WORKSPACE');
+      } finally {
+        rmSync(escapingSymlink, { force: true });
+        rmSync(outsideWorkflow, { force: true });
+      }
+
+      // 5. MANDATORY REAL REGRESSION:
+      // Symlink whose target remains inside workspace but leaves .github/workflows/
+      // workspace/
+      //   .github/
+      //     workflows/
+      //       leak.yml -> ../../config/internal.yml
+      //   config/
+      //     internal.yml
+      const configDir = join(workspaceDir, 'config');
+      mkdirSync(configDir, { recursive: true });
+      const internalYmlPath = join(configDir, 'internal.yml');
+      const internalYmlContent =
+        'name: SHOULD_NOT_BE_VISIBLE\non: push\njobs:\n  secret_job:\n    runs-on: ubuntu-latest\n';
+      writeFileSync(internalYmlPath, internalYmlContent);
+
+      const leakSymlink = join(workflowsDir, 'leak.yml');
+      symlinkSync('../../config/internal.yml', leakSymlink);
+
+      // Directly prove corrected validateWorkflowPath fails with PATH_OUTSIDE_WORKSPACE
+      await assert.rejects(
+        async () => {
+          await fsSubsystem.validateWorkflowPath(workspaceDir, '.github/workflows/leak.yml');
+        },
+        (err) => {
+          assert.ok(err instanceof ArcError);
+          assert.equal(err.code, 'PATH_OUTSIDE_WORKSPACE');
+          return true;
+        },
+      );
+
+      // Track network calls and process spawns during arc_ci_status invocation
+      let networkCalls = 0;
+      const originalHttp = http.request;
+      const originalHttps = https.request;
+      const originalNet = net.connect;
+      const originalTls = tls.connect;
+      const originalFetch = globalThis.fetch;
+
+      http.request = (..._args) => {
+        networkCalls++;
+        throw new Error('Network call forbidden in zero-network arc_ci_status');
+      };
+      https.request = (..._args) => {
+        networkCalls++;
+        throw new Error('Network call forbidden in zero-network arc_ci_status');
+      };
+      net.connect = (..._args) => {
+        networkCalls++;
+        throw new Error('Network call forbidden in zero-network arc_ci_status');
+      };
+      tls.connect = (..._args) => {
+        networkCalls++;
+        throw new Error('Network call forbidden in zero-network arc_ci_status');
+      };
+      globalThis.fetch = (..._args) => {
+        networkCalls++;
+        throw new Error('Network call forbidden in zero-network arc_ci_status');
+      };
+
+      let spawnCalls = 0;
+      const originalSpawn = child_process.spawn;
+      const originalExecFile = child_process.execFile;
+      child_process.spawn = (...args) => {
+        spawnCalls++;
+        return originalSpawn.apply(child_process, args);
+      };
+      child_process.execFile = (...args) => {
+        spawnCalls++;
+        return originalExecFile.apply(child_process, args);
+      };
+
+      try {
+        const res = await server.executeAuthenticatedToolCall(safeActor, 'arc_ci_status', {
+          workspaceId: 'ws-task6',
+        });
+
+        // 1. Invocation fails closed
+        assert.equal(res.isError, true, 'Invocation must fail closed');
+
+        // 2. Error code is PATH_OUTSIDE_WORKSPACE
+        const parsed = JSON.parse(res.content[0].text);
+        assert.equal(parsed.code, 'PATH_OUTSIDE_WORKSPACE');
+
+        // 3. Complete raw MCP wire response checks
+        const rawWire = JSON.stringify(res);
+        assert.equal(
+          rawWire.includes('SHOULD_NOT_BE_VISIBLE'),
+          false,
+          '"SHOULD_NOT_BE_VISIBLE" must be absent from wire response',
+        );
+        assert.equal(
+          rawWire.includes('secret_job'),
+          false,
+          '"secret_job" must be absent from wire response',
+        );
+        assert.equal(
+          rawWire.includes('workflowsFound'),
+          false,
+          'outside target content must not be returned as workflowsFound',
         );
 
-        // Clean up symlink for subsequent tests
-        rmSync(escapingSymlink, { force: true });
+        // 4. Zero network calls occurred
+        assert.equal(networkCalls, 0, 'No network call occurred');
+
+        // 5. Zero processes spawned
+        assert.equal(spawnCalls, 0, 'No process was spawned');
+      } finally {
+        http.request = originalHttp;
+        https.request = originalHttps;
+        net.connect = originalNet;
+        tls.connect = originalTls;
+        globalThis.fetch = originalFetch;
+        child_process.spawn = originalSpawn;
+        child_process.execFile = originalExecFile;
+
+        rmSync(leakSymlink, { force: true });
+        rmSync(internalYmlPath, { force: true });
+        rmSync(configDir, { recursive: true, force: true });
       }
     });
 
