@@ -60,10 +60,21 @@ export type ArcErrorCode =
   | 'PAYLOAD_TOO_LARGE'
   | 'RATE_LIMIT_EXCEEDED'
   | 'RESOURCE_EXHAUSTED'
+  | 'CONCURRENCY_EXCEEDED'
+  | 'COMPOSITE_TIMEOUT'
 
   // Internal Errors
   | 'INTERNAL_ERROR'
-  | 'ROLLBACK_FAILED';
+  | 'ROLLBACK_FAILED'
+
+  // Repository & Worktree Errors (RC-07 Target)
+  | 'GIT_REPOSITORY_NOT_FOUND'
+  | 'PATH_OUTSIDE_WORKSPACE'
+  | 'SYMLINK_ESCAPE_DETECTED'
+  | 'WORKSPACE_UNREGISTERED'
+  | 'INVALID_GIT_ARGUMENT'
+  | 'EVIDENCE_NOT_MET'
+  | 'STAGE_NOT_FOUND';
 
 /**
  * Canonical structured error payload emitted across the control plane.
@@ -331,6 +342,35 @@ export class ArcError extends Error implements ArcErrorPayload {
     });
   }
 
+  public static concurrencyExceeded(
+    message = 'Concurrent execution limit exceeded for this workspace.',
+    details?: Record<string, string | number | boolean>,
+  ): ArcError {
+    return new ArcError({
+      code: 'CONCURRENCY_EXCEEDED',
+      category: 'RESOURCE',
+      message,
+      retryable: true,
+      remediationHint:
+        'Wait for active workspace test processes to finish before running additional tests.',
+      ...(details ? { details } : {}),
+    });
+  }
+
+  public static compositeTimeout(
+    message = 'Composite execution exceeded aggregate timeout.',
+    details?: Record<string, string | number | boolean>,
+  ): ArcError {
+    return new ArcError({
+      code: 'COMPOSITE_TIMEOUT',
+      category: 'RESOURCE',
+      message,
+      details,
+      retryable: false,
+      remediationHint: 'Reduce verification suite scope or investigate long-running step.',
+    });
+  }
+
   public static forbiddenCommand(
     message = 'Command or executable is forbidden by policy.',
   ): ArcError {
@@ -544,6 +584,92 @@ export class ArcError extends Error implements ArcErrorPayload {
       category: 'AUTHENTICATION',
       message,
       retryable: false,
+    });
+  }
+
+  public static gitRepositoryNotFound(
+    message = 'Directory is not a valid Git repository.',
+  ): ArcError {
+    return new ArcError({
+      code: 'GIT_REPOSITORY_NOT_FOUND',
+      category: 'FILESYSTEM',
+      message,
+      retryable: false,
+      remediationHint: 'Ensure the target directory is an initialized Git repository.',
+    });
+  }
+
+  public static pathOutsideWorkspace(
+    message = 'Target path resolves outside authorized workspace boundary.',
+  ): ArcError {
+    return new ArcError({
+      code: 'PATH_OUTSIDE_WORKSPACE',
+      category: 'FILESYSTEM',
+      message,
+      retryable: false,
+      remediationHint: 'Ensure target path is strictly contained within authorized workspace root.',
+    });
+  }
+
+  public static symlinkEscapeDetected(
+    message = 'Symlink resolves outside authorized workspace boundary.',
+  ): ArcError {
+    return new ArcError({
+      code: 'SYMLINK_ESCAPE_DETECTED',
+      category: 'FILESYSTEM',
+      message,
+      retryable: false,
+      remediationHint: 'Symlinks escaping the workspace boundary are strictly forbidden.',
+    });
+  }
+
+  public static workspaceUnregistered(
+    message = 'Specified workspace is not registered in authorized workspaces.',
+  ): ArcError {
+    return new ArcError({
+      code: 'WORKSPACE_UNREGISTERED',
+      category: 'AUTHORIZATION',
+      message,
+      retryable: false,
+      remediationHint: 'Provide an authorized registered workspaceId or workspaceRoot.',
+    });
+  }
+
+  public static invalidGitArgument(
+    message = 'Invalid Git argument provided.',
+    remediationHint?: string,
+  ): ArcError {
+    return new ArcError({
+      code: 'INVALID_GIT_ARGUMENT',
+      category: 'PROTOCOL',
+      message,
+      retryable: false,
+      remediationHint:
+        remediationHint ??
+        'Provide a valid Git revision or argument without leading dashes or shell metacharacters.',
+    });
+  }
+
+  public static evidenceNotMet(
+    message = 'Durable audit evidence is not met or unavailable.',
+  ): ArcError {
+    return new ArcError({
+      code: 'EVIDENCE_NOT_MET',
+      category: 'RESOURCE',
+      message,
+      retryable: false,
+      remediationHint:
+        'Ensure the persistent audit runtime is configured and has recorded durable evidence.',
+    });
+  }
+
+  public static stageNotFound(message = 'Target stage not found in closed catalog.'): ArcError {
+    return new ArcError({
+      code: 'STAGE_NOT_FOUND',
+      category: 'PROTOCOL',
+      message,
+      retryable: false,
+      remediationHint: 'Provide a valid stage name from the closed catalog (RC-00 through RC-07).',
     });
   }
 }

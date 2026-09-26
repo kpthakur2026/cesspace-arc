@@ -72,6 +72,94 @@ export const RC03_REGISTERED_TOOLS = [...RC02_ALLOWED_TOOLS, ...RC03_MUTATION_TO
 export const RC03_POLICY_TOOLS = RC03_REGISTERED_TOOLS;
 export type Rc03RegisteredTool = (typeof RC03_REGISTERED_TOOLS)[number];
 
+/**
+ * The 7 frozen engineering-aware composite tools introduced in RC-07.
+ * Policy vocabulary only: NOT exposed in production MCP tools/list until their owning tasks implement them.
+ */
+export const RC07_COMPOSITE_TOOLS = [
+  'arc_repo_status',
+  'arc_worktree_status',
+  'arc_review_diff',
+  'arc_verify',
+  'arc_test',
+  'arc_ci_status',
+  'arc_stage_evidence',
+] as const;
+
+export type Rc07CompositeTool = (typeof RC07_COMPOSITE_TOOLS)[number];
+
+/**
+ * The 2 RC-07 Task-2 read-only engineering-aware inspection tools.
+ */
+export const RC07_TASK2_READ_ONLY_TOOLS = ['arc_repo_status', 'arc_worktree_status'] as const;
+
+export type Rc07Task2ReadOnlyTool = (typeof RC07_TASK2_READ_ONLY_TOOLS)[number];
+
+/**
+ * The RC-07 Task-3 read-only engineering-aware review diff tool.
+ */
+export const RC07_TASK3_READ_ONLY_TOOLS = ['arc_review_diff'] as const;
+
+export type Rc07Task3ReadOnlyTool = (typeof RC07_TASK3_READ_ONLY_TOOLS)[number];
+
+/**
+ * The RC-07 Task-6 read-only engineering-aware CI status tool.
+ */
+export const RC07_TASK6_READ_ONLY_TOOLS = ['arc_ci_status'] as const;
+
+export type Rc07Task6ReadOnlyTool = (typeof RC07_TASK6_READ_ONLY_TOOLS)[number];
+
+/**
+ * The RC-07 Task-7 read-only engineering-aware stage evidence tool.
+ */
+export const RC07_TASK7_READ_ONLY_TOOLS = ['arc_stage_evidence'] as const;
+
+export type Rc07Task7ReadOnlyTool = (typeof RC07_TASK7_READ_ONLY_TOOLS)[number];
+
+/**
+ * The combined RC-07 read-only engineering-aware inspection tools (Tasks 2, 3, 6, & 7).
+ */
+export const RC07_READ_ONLY_TOOLS = [
+  ...RC07_TASK2_READ_ONLY_TOOLS,
+  ...RC07_TASK3_READ_ONLY_TOOLS,
+  ...RC07_TASK6_READ_ONLY_TOOLS,
+  ...RC07_TASK7_READ_ONLY_TOOLS,
+] as const;
+
+export type Rc07ReadOnlyTool = (typeof RC07_READ_ONLY_TOOLS)[number];
+
+/**
+ * The RC-07 Task-4 deterministic verification tool.
+ */
+export const RC07_TASK4_EXECUTION_TOOLS = ['arc_verify'] as const;
+
+export type Rc07Task4ExecutionTool = (typeof RC07_TASK4_EXECUTION_TOOLS)[number];
+
+/**
+ * The RC-07 Task-5 deterministic test execution tool.
+ */
+export const RC07_TASK5_EXECUTION_TOOLS = ['arc_test'] as const;
+
+export type Rc07Task5ExecutionTool = (typeof RC07_TASK5_EXECUTION_TOOLS)[number];
+
+/**
+ * Canonical complete policy vocabulary including registered tools and frozen composite tools.
+ */
+export const ALL_POLICY_TOOLS = [...RC03_REGISTERED_TOOLS, ...RC07_COMPOSITE_TOOLS] as const;
+export type PolicyTool = (typeof ALL_POLICY_TOOLS)[number];
+
+export interface CompositePlanSecurityFacts {
+  toolName: string;
+  workspaceRoot: string;
+  steps: ReadonlyArray<{
+    toolRegistryId: string;
+    executable: string;
+    cwd: string;
+    sideEffectClass: 'READ_ONLY' | 'EXECUTION';
+    projectCodeExecution: boolean;
+  }>;
+}
+
 export const ALLOWED_COMMANDS = RC02_PERMITTED_EXECUTABLES;
 
 export const DENIED_COMMANDS = RC02_FORBIDDEN_EXECUTABLES;
@@ -197,6 +285,179 @@ export class SecurityKernel implements IPolicyEngine {
   }
 
   /**
+   * Plan-aware Layer-1 evaluation for frozen RC-07 composite tools.
+   * Evaluates parent composite operation and plan security facts against permanent invariants.
+   */
+  public async evaluateComposite(
+    context: PolicyEvaluationContext,
+    planFacts?: CompositePlanSecurityFacts,
+  ): Promise<PolicyDecisionResult> {
+    const { actor, targetWorkspace, request } = context;
+    const toolName = request.toolName;
+
+    // 1. Mandatory Composite Tool Vocabulary Gate (Default-Deny)
+    const isCompositeTool = (RC07_COMPOSITE_TOOLS as readonly string[]).includes(toolName);
+    if (!isCompositeTool) {
+      return {
+        outcome: PolicyOutcome.DENY,
+        effect: 'DENY',
+        matchingRuleId: 'default-deny-unregistered-tool',
+        reason: `Tool '${toolName}' is not a recognized composite tool.`,
+      };
+    }
+
+    // 2. Caller Authentication Gate
+    if (!actor.authenticated) {
+      return {
+        outcome: PolicyOutcome.DENY,
+        effect: 'DENY',
+        matchingRuleId: 'deny-unauthenticated-caller',
+        reason: 'Caller is not authenticated.',
+      };
+    }
+
+    if (
+      !actor.clientId ||
+      !actor.sessionId ||
+      actor.clientId.trim().length === 0 ||
+      actor.sessionId.trim().length === 0
+    ) {
+      return {
+        outcome: PolicyOutcome.DENY,
+        effect: 'DENY',
+        matchingRuleId: 'deny-unauthenticated-caller',
+        reason: 'Caller identity is incomplete (clientId and sessionId are required).',
+      };
+    }
+
+    // 3. Workspace Binding Gate
+    if (targetWorkspace.workspaceId === 'deny-conflicting-workspace-selectors') {
+      return {
+        outcome: PolicyOutcome.DENY,
+        effect: 'DENY',
+        matchingRuleId: 'deny-conflicting-workspace-selectors',
+        reason: 'Conflicting workspace selectors provided in request parameters.',
+      };
+    }
+
+    if (targetWorkspace.workspaceId === 'deny-unregistered-workspace') {
+      return {
+        outcome: PolicyOutcome.DENY,
+        effect: 'DENY',
+        matchingRuleId: 'deny-unregistered-workspace',
+        reason: 'Workspace selector is not registered in authorized workspaces.',
+      };
+    }
+
+    const rootPath = targetWorkspace.rootPath;
+    if (!rootPath || rootPath.trim().length === 0) {
+      return {
+        outcome: PolicyOutcome.DENY,
+        effect: 'DENY',
+        matchingRuleId: 'deny-no-workspace-configured',
+        reason: 'Operation requires an authorized workspace, but none was configured.',
+      };
+    }
+
+    const registeredWs = this.workspaceRegistry.getWorkspace(targetWorkspace.workspaceId);
+    if (!registeredWs || registeredWs.rootPath !== rootPath) {
+      return {
+        outcome: PolicyOutcome.DENY,
+        effect: 'DENY',
+        matchingRuleId: 'deny-unregistered-workspace',
+        reason: 'Target workspace is not registered in authorized workspaces.',
+      };
+    }
+
+    // Explicit caller parameters check
+    if (request.parameters.workspaceRoot) {
+      const explicitWs =
+        this.workspaceRegistry.findWorkspaceForPath(String(request.parameters.workspaceRoot)) ||
+        this.workspaceRegistry.getWorkspace(String(request.parameters.workspaceRoot));
+      if (!explicitWs || explicitWs.id !== registeredWs.id) {
+        return {
+          outcome: PolicyOutcome.DENY,
+          effect: 'DENY',
+          matchingRuleId: 'deny-unregistered-workspace',
+          reason: 'Requested workspaceRoot is not authorized.',
+        };
+      }
+    }
+    if (request.parameters.workspaceId) {
+      const explicitWs = this.workspaceRegistry.getWorkspace(
+        String(request.parameters.workspaceId),
+      );
+      if (!explicitWs || explicitWs.id !== registeredWs.id) {
+        return {
+          outcome: PolicyOutcome.DENY,
+          effect: 'DENY',
+          matchingRuleId: 'deny-unregistered-workspace',
+          reason: 'Requested workspaceId is not authorized.',
+        };
+      }
+    }
+
+    // 4. Plan Security Facts Verification
+    if (planFacts) {
+      if (planFacts.toolName !== toolName) {
+        return {
+          outcome: PolicyOutcome.DENY,
+          effect: 'DENY',
+          matchingRuleId: 'deny-plan-tool-mismatch',
+          reason: `Plan tool '${planFacts.toolName}' does not match requested tool '${toolName}'.`,
+        };
+      }
+      if (planFacts.workspaceRoot !== registeredWs.rootPath) {
+        return {
+          outcome: PolicyOutcome.DENY,
+          effect: 'DENY',
+          matchingRuleId: 'deny-plan-workspace-mismatch',
+          reason: 'Plan workspaceRoot does not match target workspace root.',
+        };
+      }
+      for (const step of planFacts.steps) {
+        if (!step.toolRegistryId || step.toolRegistryId.trim().length === 0) {
+          return {
+            outcome: PolicyOutcome.DENY,
+            effect: 'DENY',
+            matchingRuleId: 'deny-invalid-registry-identity',
+            reason: 'Step missing closed registry identity.',
+          };
+        }
+        if (step.sideEffectClass !== 'READ_ONLY' && step.sideEffectClass !== 'EXECUTION') {
+          return {
+            outcome: PolicyOutcome.DENY,
+            effect: 'DENY',
+            matchingRuleId: 'deny-unpermitted-side-effect',
+            reason: `Side effect class '${step.sideEffectClass}' is not permitted in RC-07.`,
+          };
+        }
+        if (step.cwd && step.cwd.trim().length > 0) {
+          const resolvedCwd = resolve(registeredWs.rootPath, step.cwd);
+          if (
+            resolvedCwd !== registeredWs.rootPath &&
+            !resolvedCwd.startsWith(registeredWs.rootPath + sep)
+          ) {
+            return {
+              outcome: PolicyOutcome.DENY,
+              effect: 'DENY',
+              matchingRuleId: 'deny-step-cwd-escapes-workspace',
+              reason: 'Step cwd resolves outside authorized workspace.',
+            };
+          }
+        }
+      }
+    }
+
+    return {
+      outcome: PolicyOutcome.ALLOW,
+      effect: 'ALLOW',
+      matchingRuleId: 'allow-composite-operation',
+      reason: `Frozen composite tool '${toolName}' admitted for authenticated caller within workspace '${registeredWs.id}'.`,
+    };
+  }
+
+  /**
    * Evaluates an incoming tool request context.
    * Precedence Rule: DENY (0) > REQUIRE_APPROVAL (1) > ALLOW (2).
    */
@@ -206,13 +467,18 @@ export class SecurityKernel implements IPolicyEngine {
 
     // 1. Mandatory Tool Allowlist Gate (Default-Deny)
     const isRegisteredTool = (RC03_REGISTERED_TOOLS as readonly string[]).includes(toolName);
-    if (!isRegisteredTool) {
+    const isCompositeTool = (RC07_COMPOSITE_TOOLS as readonly string[]).includes(toolName);
+    if (!isRegisteredTool && !isCompositeTool) {
       return {
         outcome: PolicyOutcome.DENY,
         effect: 'DENY',
         matchingRuleId: 'default-deny-unregistered-tool',
         reason: `Tool '${toolName}' is not permitted in RC-03 stage.`,
       };
+    }
+
+    if (isCompositeTool) {
+      return this.evaluateComposite(context);
     }
 
     // 2. Caller Authentication Gate

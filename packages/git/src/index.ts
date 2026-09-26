@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { realpathSync, existsSync } from 'node:fs';
-import { resolve, sep } from 'node:path';
+import { realpathSync, existsSync, lstatSync, readFileSync } from 'node:fs';
+import { resolve, sep, dirname } from 'node:path';
 import {
   ArcError,
   type GitStatusRequest,
@@ -21,6 +21,20 @@ const execFileAsync = promisify(execFile);
 export const MAX_DIFF_BYTES = 512 * 1024;
 
 /**
+ * Safe bounded raw diff capture ceiling: 4 MiB.
+ * Large enough to handle multi-MiB diffs while bounding subprocess memory.
+ * If this ceiling is exceeded, a safe truncation marker is substituted.
+ */
+export const RAW_DIFF_CAPTURE_BYTES = 4 * 1024 * 1024;
+
+/**
+ * Placeholder emitted when the raw diff exceeds the capture ceiling.
+ * The overall response still succeeds with truncated === true.
+ */
+const RAW_DIFF_OVERFLOW_MARKER =
+  '[DIFF TOO LARGE TO CAPTURE — raw output exceeded safe intermediate buffer limit; showing file summaries only]';
+
+/**
  * Maximum git_log commit count: 100.
  */
 export const MAX_LOG_COUNT = 100;
@@ -29,6 +43,27 @@ export const MAX_LOG_COUNT = 100;
  * Protected branches that cannot be directly mutated.
  */
 export const PROTECTED_BRANCHES = ['main', 'master', 'release/*'];
+
+/**
+ * Checks whether a branch matches any protected branch pattern.
+ */
+export function isProtectedBranch(branch: string): boolean {
+  if (!branch) {
+    return false;
+  }
+  const normalized = branch.replace(/^refs\/heads\//, '').trim();
+  for (const protectedPattern of PROTECTED_BRANCHES) {
+    if (protectedPattern.endsWith('/*')) {
+      const prefix = protectedPattern.slice(0, -2);
+      if (normalized === prefix || normalized.startsWith(prefix + '/')) {
+        return true;
+      }
+    } else if (normalized === protectedPattern) {
+      return true;
+    }
+  }
+  return false;
+}
 
 /**
  * Validates that a git parameter (target, revision, or path) is not an option flag.
@@ -51,13 +86,37 @@ export function validateGitArgument(paramName: string, value: string | undefined
 }
 
 /**
- * Mask sensitive tokens in diff output.
+ * Mask sensitive tokens and private-key PEM blocks in diff output.
  */
 export function maskSensitiveDiff(diff: string): string {
-  return diff.replace(
-    /(AKIA[0-9A-Z]{16}|ghp_[a-zA-Z0-9]{36}|sk-[a-zA-Z0-9]{20,}|Bearer\s+[a-zA-Z0-9._-]+)/g,
-    '[REDACTED_SECRET]',
-  );
+  return maskSensitiveDiffWithCount(diff).diff;
+}
+
+/**
+ * Mask sensitive tokens and private-key PEM blocks in diff output,
+ * returning the sanitized diff and the count of masked blocks/tokens.
+ */
+export function maskSensitiveDiffWithCount(diff: string): { diff: string; maskedCount: number } {
+  let maskedCount = 0;
+
+  // 1. Mask private key blocks (RSA, EC, OPENSSH, PGP, PKCS, DSA, etc.)
+  // Matches both bare key blocks and git diff hunks with leading +/- markers
+  const privateKeyPattern =
+    /(?:^[+-]?\s*)?-----BEGIN\s+(?:[A-Z0-9_ -]+\s+)?PRIVATE\s+KEY(?:\s+BLOCK)?-----[\s\S]*?-----END\s+(?:[A-Z0-9_ -]+\s+)?PRIVATE\s+KEY(?:\s+BLOCK)?-----/gm;
+  let masked = diff.replace(privateKeyPattern, () => {
+    maskedCount++;
+    return '[REDACTED_SECRET]';
+  });
+
+  // 2. Mask sensitive API tokens, secret keys, and Bearer credentials
+  const tokenPattern =
+    /(AKIA[0-9A-Z]{16}|ghp_[a-zA-Z0-9]{36}|github_pat_[a-zA-Z0-9_]{22,}|sk-[a-zA-Z0-9_-]{20,}|Bearer\s+[a-zA-Z0-9._-]+)/g;
+  masked = masked.replace(tokenPattern, () => {
+    maskedCount++;
+    return '[REDACTED_SECRET]';
+  });
+
+  return { diff: masked, maskedCount };
 }
 
 /**
@@ -81,8 +140,29 @@ export function isSensitiveGitPath(filePath: string): boolean {
 
 /**
  * Purges file diff hunks belonging to sensitive files (even if tracked in git).
+ * @param diff - raw diff string
+ * @param extraSensitivePaths - optional additional paths to suppress (e.g. rename origins)
  */
-export function purgeSensitiveDiffBlocks(diff: string): string {
+export function purgeSensitiveDiffBlocks(diff: string, extraSensitivePaths?: Set<string>): string {
+  return purgeSensitiveDiffBlocksWithCount(diff, extraSensitivePaths).diff;
+}
+
+/**
+ * Purges file diff hunks belonging to sensitive files (even if tracked in git),
+ * returning the sanitized diff and the count of suppressed file hunks.
+ *
+ * Accepts an optional set of extra sensitive paths (e.g. rename/copy origins
+ * detected from a full --name-status pass without pathspec excludes) so that
+ * renames involving sensitive paths are suppressed even when Git pathspec excludes
+ * already hid the sensitive side, potentially presenting only the non-sensitive side.
+ */
+export function purgeSensitiveDiffBlocksWithCount(
+  diff: string,
+  extraSensitivePaths?: Set<string>,
+): {
+  diff: string;
+  suppressedCount: number;
+} {
   const sensitivePatterns = [
     /(^|[/\\])\.env($|\..*)/i,
     /(^|[/\\])\.ssh([/\\]|$)/i,
@@ -98,6 +178,7 @@ export function purgeSensitiveDiffBlocks(diff: string): string {
 
   const blocks = diff.split(/(?=diff --git )/);
   const sanitizedBlocks: string[] = [];
+  let suppressedCount = 0;
 
   for (const block of blocks) {
     if (!block.startsWith('diff --git ')) {
@@ -106,21 +187,75 @@ export function purgeSensitiveDiffBlocks(diff: string): string {
     }
 
     const firstLine = block.split('\n', 1)[0];
-    const isSensitive = sensitivePatterns.some((pattern) => pattern.test(firstLine));
+    let isSensitive = false;
+
+    // 1. Extract paths from diff --git a/<pathA> b/<pathB>
+    const rest = firstLine.slice('diff --git '.length);
+    const bIndex = rest.lastIndexOf(' b/');
+    if (bIndex > 2 && rest.startsWith('a/')) {
+      const pathA = rest.slice(2, bIndex);
+      const pathB = rest.slice(bIndex + 3);
+      if (isSensitiveGitPath(pathA) || isSensitiveGitPath(pathB)) {
+        isSensitive = true;
+      }
+      if (!isSensitive && extraSensitivePaths && extraSensitivePaths.size > 0) {
+        if (extraSensitivePaths.has(pathA) || extraSensitivePaths.has(pathB)) {
+          isSensitive = true;
+        }
+      }
+    }
+
+    // 2. Fallback pattern match against first line
+    if (!isSensitive) {
+      isSensitive = sensitivePatterns.some((pattern) => pattern.test(firstLine));
+    }
+
+    // 3. Check rename headers in block
+    if (!isSensitive) {
+      const headerLines = block.split('\n').slice(0, 10);
+      for (const hLine of headerLines) {
+        if (hLine.startsWith('---') || hLine.startsWith('+++') || hLine.startsWith('@@')) {
+          break;
+        }
+        if (hLine.startsWith('rename from ') || hLine.startsWith('copy from ')) {
+          const p = hLine.slice(hLine.startsWith('rename') ? 12 : 10).trim();
+          if (isSensitiveGitPath(p) || (extraSensitivePaths && extraSensitivePaths.has(p))) {
+            isSensitive = true;
+            break;
+          }
+        } else if (hLine.startsWith('rename to ') || hLine.startsWith('copy to ')) {
+          const p = hLine.slice(hLine.startsWith('rename') ? 10 : 8).trim();
+          if (isSensitiveGitPath(p) || (extraSensitivePaths && extraSensitivePaths.has(p))) {
+            isSensitive = true;
+            break;
+          }
+        }
+      }
+    }
+
+    // 4. Check extraSensitivePaths substring match in first line
+    if (!isSensitive && extraSensitivePaths && extraSensitivePaths.size > 0) {
+      for (const sensPath of extraSensitivePaths) {
+        if (firstLine.includes(sensPath)) {
+          isSensitive = true;
+          break;
+        }
+      }
+    }
 
     if (isSensitive) {
-      sanitizedBlocks.push(`${firstLine}\n[SENSITIVE FILE DIFF SUPPRESSED]\n`);
+      suppressedCount++;
+      // Completely drop the sensitive hunk so no sensitive filename or content is emitted
     } else {
       sanitizedBlocks.push(block);
     }
   }
 
-  return sanitizedBlocks.join('');
+  return {
+    diff: sanitizedBlocks.join(''),
+    suppressedCount,
+  };
 }
-
-/**
- * Truncates a UTF-8 string to a maximum byte limit without splitting multi-byte characters.
- */
 export function truncateUtf8ToByteLimit(
   str: string,
   maxBytes: number,
@@ -195,13 +330,83 @@ export function resolveTrustedGitBinary(): string {
 }
 
 /**
+ * Bounded worktree metadata for isolated agent environments.
+ */
+export interface WorktreeMetadata {
+  isWorktree: boolean;
+  worktreePath: string;
+  mainRepoPath: string;
+  branch: string;
+  locked: boolean;
+  lockReason?: string;
+  isDetached: boolean;
+  headSha: string;
+}
+
+/**
+ * Options for Sandboxed Git Subsystem execution, supporting cancellation and deadlines.
+ */
+export interface GitExecutionOptions {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}
+
+export interface GitReviewDiffOptions {
+  mode: 'staged' | 'unstaged' | 'target';
+  targetRevision?: string;
+  path?: string;
+  maxBytes?: number;
+}
+
+export interface GitReviewDiffFileSummary {
+  path: string;
+  status: 'modified' | 'added' | 'deleted' | 'renamed';
+  insertions: number;
+  deletions: number;
+}
+
+export interface GitReviewDiffResult {
+  diff: string;
+  truncated: boolean;
+  totalFilesChanged: number;
+  fileSummaries: GitReviewDiffFileSummary[];
+  sensitiveBlocksMasked: number;
+}
+
+/**
  * Interface definition for Sandboxed Git Subsystem.
  */
 export interface IGitSubsystem {
-  getStatus(workspaceRoot: string, request?: GitStatusRequest): Promise<GitStatusResponse>;
-  getDiff(workspaceRoot: string, request: GitDiffRequest): Promise<GitDiffResponse>;
-  getLog(workspaceRoot: string, request: GitLogRequest): Promise<GitLogResponse>;
+  getStatus(
+    workspaceRoot: string,
+    request?: GitStatusRequest,
+    options?: GitExecutionOptions,
+  ): Promise<GitStatusResponse>;
+  getDiff(
+    workspaceRoot: string,
+    request: GitDiffRequest,
+    options?: GitExecutionOptions,
+  ): Promise<GitDiffResponse>;
+  getLog(
+    workspaceRoot: string,
+    request: GitLogRequest,
+    options?: GitExecutionOptions,
+  ): Promise<GitLogResponse>;
   assertBranchWritable(workspaceRoot: string, targetBranch: string): Promise<void>;
+  getWorktreeMetadata(
+    workspaceRoot: string,
+    options?: GitExecutionOptions,
+  ): Promise<WorktreeMetadata>;
+  getReviewDiff(
+    workspaceRoot: string,
+    options: GitReviewDiffOptions,
+    execOptions?: GitExecutionOptions,
+  ): Promise<GitReviewDiffResult>;
+  isTrackedFileAtHead(
+    workspaceRoot: string,
+    repoRelativePath: string,
+    options?: GitExecutionOptions,
+  ): Promise<boolean>;
 }
 
 /**
@@ -220,7 +425,12 @@ export class GitSubsystem implements IGitSubsystem {
     cwd: string,
     args: string[],
     maxBuffer: number = 1024 * 1024,
+    options?: GitExecutionOptions,
   ): Promise<{ stdout: string; stderr: string }> {
+    if (options?.signal?.aborted) {
+      throw ArcError.executionTimeout('Command execution exceeded configured timeout.');
+    }
+
     const safeEnv: NodeJS.ProcessEnv = {
       PATH: TRUSTED_SYSTEM_PATH,
       HOME: '/dev/null',
@@ -253,13 +463,30 @@ export class GitSubsystem implements IGitSubsystem {
       const result = await execFileAsync(this.trustedGitBinary, [...safeGlobalArgs, ...args], {
         cwd,
         shell: false,
-        timeout: 10000,
+        timeout: options?.timeoutMs ?? 10000,
         maxBuffer,
         env: safeEnv,
+        signal: options?.signal,
       });
       return { stdout: result.stdout, stderr: result.stderr };
     } catch (err: unknown) {
-      const execErr = err as { code?: string | number; message?: string; stderr?: string };
+      if (options?.signal?.aborted) {
+        throw ArcError.executionTimeout('Command execution exceeded configured timeout.');
+      }
+      const execErr = err as {
+        code?: string | number;
+        name?: string;
+        message?: string;
+        stderr?: string;
+        killed?: boolean;
+        signal?: string;
+      };
+      if (execErr.name === 'AbortError' || execErr.code === 'ABORT_ERR') {
+        throw ArcError.executionTimeout('Command execution exceeded configured timeout.');
+      }
+      if (execErr.code === 'ETIMEDOUT' || (execErr.killed && execErr.signal === 'SIGTERM')) {
+        throw ArcError.executionTimeout('Command execution exceeded configured timeout.');
+      }
       if (execErr.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER') {
         throw ArcError.payloadTooLarge('Git command output exceeded maximum buffer limit.');
       }
@@ -267,21 +494,43 @@ export class GitSubsystem implements IGitSubsystem {
     }
   }
 
-  private async verifyRepositoryBoundary(canonicalRoot: string): Promise<void> {
-    const isGit =
-      existsSync(resolve(canonicalRoot, '.git')) || existsSync(resolve(canonicalRoot, 'HEAD'));
+  private async verifyRepositoryBoundary(
+    canonicalRoot: string,
+    options?: GitExecutionOptions,
+  ): Promise<void> {
+    const dotGit = resolve(canonicalRoot, '.git');
+    const isGit = existsSync(dotGit) || existsSync(resolve(canonicalRoot, 'HEAD'));
 
     if (!isGit) {
-      throw ArcError.fileNotFound('Directory is not a valid Git repository.');
+      throw ArcError.gitRepositoryNotFound('Directory is not a valid Git repository.');
+    }
+
+    if (existsSync(dotGit)) {
+      const dotGitStat = lstatSync(dotGit);
+      if (dotGitStat.isSymbolicLink()) {
+        let symlinkTarget: string;
+        try {
+          symlinkTarget = realpathSync(dotGit);
+        } catch {
+          throw ArcError.symlinkEscapeDetected(
+            'Symlinked .git metadata resolves outside authorized workspace boundary.',
+          );
+        }
+        if (symlinkTarget !== canonicalRoot && !symlinkTarget.startsWith(canonicalRoot + sep)) {
+          throw ArcError.symlinkEscapeDetected(
+            'Symlinked .git metadata resolves outside authorized workspace boundary.',
+          );
+        }
+      }
     }
 
     try {
-      const { stdout } = await this.runRawGit(canonicalRoot, [
-        'rev-parse',
-        '--show-toplevel',
-        '--git-dir',
-        '--git-common-dir',
-      ]);
+      const { stdout } = await this.runRawGit(
+        canonicalRoot,
+        ['rev-parse', '--show-toplevel', '--git-dir', '--git-common-dir'],
+        undefined,
+        options,
+      );
       const lines = stdout
         .split('\n')
         .map((l) => l.trim())
@@ -313,10 +562,6 @@ export class GitSubsystem implements IGitSubsystem {
         throw ArcError.accessDenied('Git directory path could not be resolved.');
       }
 
-      if (resolvedGitDir !== canonicalRoot && !resolvedGitDir.startsWith(canonicalRoot + sep)) {
-        throw ArcError.accessDenied('Git directory is outside authorized workspace boundary.');
-      }
-
       let resolvedGitCommonDir = '';
       try {
         resolvedGitCommonDir = realpathSync(resolve(canonicalRoot, gitCommonDirRaw));
@@ -324,19 +569,58 @@ export class GitSubsystem implements IGitSubsystem {
         throw ArcError.accessDenied('Git common directory path could not be resolved.');
       }
 
-      if (
-        resolvedGitCommonDir !== canonicalRoot &&
-        !resolvedGitCommonDir.startsWith(canonicalRoot + sep)
-      ) {
-        throw ArcError.accessDenied(
-          'Git common directory is outside authorized workspace boundary.',
-        );
+      // Check if this is a verified linked worktree
+      let isLinkedWorktree = false;
+      if (existsSync(dotGit)) {
+        const dotGitStat = lstatSync(dotGit);
+        if (dotGitStat.isFile()) {
+          const dotGitContent = readFileSync(dotGit, 'utf8').trim();
+          if (dotGitContent.startsWith('gitdir:')) {
+            const rawWorktreeGitDir = dotGitContent.slice(7).trim();
+            let resolvedWtGitDir = '';
+            try {
+              resolvedWtGitDir = realpathSync(resolve(canonicalRoot, rawWorktreeGitDir));
+            } catch {
+              // ignore
+            }
+            if (resolvedWtGitDir && resolvedWtGitDir === resolvedGitDir) {
+              const backlinkFile = resolve(resolvedGitDir, 'gitdir');
+              if (existsSync(backlinkFile)) {
+                const backlink = readFileSync(backlinkFile, 'utf8').trim();
+                let resolvedBacklink = '';
+                try {
+                  resolvedBacklink = realpathSync(resolve(resolvedGitDir, backlink));
+                } catch {
+                  // ignore
+                }
+                if (resolvedBacklink === realpathSync(dotGit)) {
+                  isLinkedWorktree = true;
+                }
+              }
+            }
+          }
+        }
+      }
+
+      if (!isLinkedWorktree) {
+        if (resolvedGitDir !== canonicalRoot && !resolvedGitDir.startsWith(canonicalRoot + sep)) {
+          throw ArcError.accessDenied('Git directory is outside authorized workspace boundary.');
+        }
+
+        if (
+          resolvedGitCommonDir !== canonicalRoot &&
+          !resolvedGitCommonDir.startsWith(canonicalRoot + sep)
+        ) {
+          throw ArcError.accessDenied(
+            'Git common directory is outside authorized workspace boundary.',
+          );
+        }
       }
     } catch (err: unknown) {
       if (err instanceof ArcError) {
         throw err;
       }
-      throw ArcError.fileNotFound('Directory is not a valid Git repository.');
+      throw ArcError.gitRepositoryNotFound('Directory is not a valid Git repository.');
     }
   }
 
@@ -344,6 +628,7 @@ export class GitSubsystem implements IGitSubsystem {
     workspaceRoot: string,
     args: string[],
     maxBuffer: number = 1024 * 1024,
+    options?: GitExecutionOptions,
   ): Promise<{ stdout: string; stderr: string }> {
     let canonicalRoot: string;
     try {
@@ -351,14 +636,48 @@ export class GitSubsystem implements IGitSubsystem {
     } catch {
       throw ArcError.fileNotFound('Workspace directory not found.');
     }
-    await this.verifyRepositoryBoundary(canonicalRoot);
-    return this.runRawGit(canonicalRoot, args, maxBuffer);
+    await this.verifyRepositoryBoundary(canonicalRoot, options);
+    return this.runRawGit(canonicalRoot, args, maxBuffer, options);
+  }
+
+  /**
+   * Dedicated read-only helper for arc_stage_evidence (RC-07 Task 7).
+   * Confirms whether an exact server-derived repository-relative path exists
+   * as a tracked regular file (blob) at current HEAD.
+   */
+  public async isTrackedFileAtHead(
+    workspaceRoot: string,
+    repoRelativePath: string,
+    options?: GitExecutionOptions,
+  ): Promise<boolean> {
+    if (!repoRelativePath || typeof repoRelativePath !== 'string') {
+      return false;
+    }
+    const cleanPath = repoRelativePath.trim().replace(/\\/g, '/');
+    if (cleanPath.startsWith('/') || /(^|\/)\.\.(\/|$)/.test(cleanPath)) {
+      return false;
+    }
+    try {
+      const { stdout } = await this.runGit(
+        workspaceRoot,
+        ['cat-file', '-t', `HEAD:${cleanPath}`],
+        undefined,
+        options,
+      );
+      return stdout.trim() === 'blob';
+    } catch {
+      return false;
+    }
   }
 
   public async getStatus(
     workspaceRoot: string,
     _request?: GitStatusRequest,
+    options?: GitExecutionOptions,
   ): Promise<GitStatusResponse> {
+    if (options?.signal?.aborted) {
+      throw ArcError.executionTimeout('Command execution exceeded configured timeout.');
+    }
     // Non-bypassable: execution subsystems MUST receive only the canonical workspace root
     // Caller parameters must never override the execution root after policy authorization.
     const targetRoot = workspaceRoot;
@@ -366,23 +685,45 @@ export class GitSubsystem implements IGitSubsystem {
     // Get current branch
     let branch = 'unknown';
     try {
-      const branchRes = await this.runGit(targetRoot, ['rev-parse', '--abbrev-ref', 'HEAD']);
+      const branchRes = await this.runGit(
+        targetRoot,
+        ['rev-parse', '--abbrev-ref', 'HEAD'],
+        undefined,
+        options,
+      );
       branch = branchRes.stdout.trim();
-    } catch {
+    } catch (err: unknown) {
+      if (
+        err instanceof ArcError &&
+        (err.code === 'EXECUTION_TIMEOUT' || err.code === 'PAYLOAD_TOO_LARGE')
+      ) {
+        throw err;
+      }
       // Empty repo or detached HEAD
     }
 
     // Get commit hash
     let commitHash = 'unknown';
     try {
-      const commitRes = await this.runGit(targetRoot, ['rev-parse', 'HEAD']);
+      const commitRes = await this.runGit(targetRoot, ['rev-parse', 'HEAD'], undefined, options);
       commitHash = commitRes.stdout.trim();
-    } catch {
+    } catch (err: unknown) {
+      if (
+        err instanceof ArcError &&
+        (err.code === 'EXECUTION_TIMEOUT' || err.code === 'PAYLOAD_TOO_LARGE')
+      ) {
+        throw err;
+      }
       // Empty repo
     }
 
     // Status porcelain
-    const statusRes = await this.runGit(targetRoot, ['status', '--porcelain=v1', '-uall']);
+    const statusRes = await this.runGit(
+      targetRoot,
+      ['status', '--porcelain=v1', '-uall'],
+      undefined,
+      options,
+    );
 
     const lines = statusRes.stdout.split('\n').filter((l) => l.length > 0);
 
@@ -425,7 +766,14 @@ export class GitSubsystem implements IGitSubsystem {
     };
   }
 
-  public async getDiff(workspaceRoot: string, request: GitDiffRequest): Promise<GitDiffResponse> {
+  public async getDiff(
+    workspaceRoot: string,
+    request: GitDiffRequest,
+    options?: GitExecutionOptions,
+  ): Promise<GitDiffResponse> {
+    if (options?.signal?.aborted) {
+      throw ArcError.executionTimeout('Command execution exceeded configured timeout.');
+    }
     validateGitArgument('target', request.target);
     validateGitArgument('path', request.path);
 
@@ -467,7 +815,7 @@ export class GitSubsystem implements IGitSubsystem {
       args.push('--', '.', ...secretExcludes);
     }
 
-    const { stdout } = await this.runGit(workspaceRoot, args, MAX_DIFF_BYTES * 2);
+    const { stdout } = await this.runGit(workspaceRoot, args, MAX_DIFF_BYTES * 2, options);
 
     // Defense-in-depth: purge any diff hunks mentioning sensitive files
     let diffText = purgeSensitiveDiffBlocks(stdout);
@@ -482,7 +830,14 @@ export class GitSubsystem implements IGitSubsystem {
     };
   }
 
-  public async getLog(workspaceRoot: string, request: GitLogRequest): Promise<GitLogResponse> {
+  public async getLog(
+    workspaceRoot: string,
+    request: GitLogRequest,
+    options?: GitExecutionOptions,
+  ): Promise<GitLogResponse> {
+    if (options?.signal?.aborted) {
+      throw ArcError.executionTimeout('Command execution exceeded configured timeout.');
+    }
     validateGitArgument('revision', request.revision);
     validateGitArgument('path', request.path);
 
@@ -504,7 +859,7 @@ export class GitSubsystem implements IGitSubsystem {
       args.push('--', request.path.trim());
     }
 
-    const { stdout } = await this.runGit(workspaceRoot, args);
+    const { stdout } = await this.runGit(workspaceRoot, args, undefined, options);
     const lines = stdout.split('\n').filter((l) => l.trim().length > 0);
 
     const commits: GitCommitItem[] = [];
@@ -552,5 +907,483 @@ export class GitSubsystem implements IGitSubsystem {
         });
       }
     }
+  }
+
+  public async getWorktreeMetadata(
+    workspaceRoot: string,
+    options?: GitExecutionOptions,
+  ): Promise<WorktreeMetadata> {
+    if (options?.signal?.aborted) {
+      throw ArcError.executionTimeout('Command execution exceeded configured timeout.');
+    }
+    let canonicalRoot: string;
+    try {
+      canonicalRoot = realpathSync(resolve(workspaceRoot));
+    } catch {
+      throw ArcError.fileNotFound('Workspace directory not found.');
+    }
+
+    const dotGitPath = resolve(canonicalRoot, '.git');
+    const hasDotGit = existsSync(dotGitPath);
+    const hasHead = existsSync(resolve(canonicalRoot, 'HEAD'));
+
+    if (!hasDotGit && !hasHead) {
+      throw ArcError.gitRepositoryNotFound('Directory is not a valid Git repository.');
+    }
+
+    let isWorktree = false;
+    let mainRepoPath = canonicalRoot;
+    let branch = 'unknown';
+    let isDetached = false;
+    let headSha = 'unknown';
+    let locked = false;
+    let lockReason: string | undefined = undefined;
+
+    if (hasDotGit) {
+      const dotGitStat = lstatSync(dotGitPath);
+      if (dotGitStat.isSymbolicLink()) {
+        let symlinkTarget: string;
+        try {
+          symlinkTarget = realpathSync(dotGitPath);
+        } catch {
+          throw ArcError.symlinkEscapeDetected(
+            'Symlinked .git metadata resolves outside authorized workspace boundary.',
+          );
+        }
+        if (symlinkTarget !== canonicalRoot && !symlinkTarget.startsWith(canonicalRoot + sep)) {
+          throw ArcError.symlinkEscapeDetected(
+            'Symlinked .git metadata resolves outside authorized workspace boundary.',
+          );
+        }
+      } else if (dotGitStat.isFile()) {
+        const dotGitContent = readFileSync(dotGitPath, 'utf8').trim();
+        if (!dotGitContent.startsWith('gitdir:')) {
+          throw ArcError.gitRepositoryNotFound('Invalid .git worktree pointer.');
+        }
+        const rawGitDir = dotGitContent.slice(7).trim();
+        let canonicalGitDir: string;
+        try {
+          canonicalGitDir = realpathSync(resolve(canonicalRoot, rawGitDir));
+        } catch {
+          throw ArcError.gitRepositoryNotFound('Git worktree directory could not be resolved.');
+        }
+
+        const backlinkFile = resolve(canonicalGitDir, 'gitdir');
+        if (!existsSync(backlinkFile)) {
+          throw ArcError.gitRepositoryNotFound('Git worktree backlink missing.');
+        }
+        const backlink = readFileSync(backlinkFile, 'utf8').trim();
+        let resolvedBacklink: string;
+        try {
+          resolvedBacklink = realpathSync(resolve(canonicalGitDir, backlink));
+        } catch {
+          throw ArcError.gitRepositoryNotFound('Git worktree backlink could not be resolved.');
+        }
+        if (resolvedBacklink !== realpathSync(dotGitPath)) {
+          throw ArcError.gitRepositoryNotFound(
+            'Git worktree bidirectional link verification failed.',
+          );
+        }
+
+        isWorktree = true;
+
+        // Resolve main repo path via commondir
+        const commondirFile = resolve(canonicalGitDir, 'commondir');
+        if (existsSync(commondirFile)) {
+          const commondirRel = readFileSync(commondirFile, 'utf8').trim();
+          let mainGitDir: string;
+          try {
+            mainGitDir = realpathSync(resolve(canonicalGitDir, commondirRel));
+          } catch {
+            mainGitDir = resolve(canonicalGitDir, commondirRel);
+          }
+          mainRepoPath = dirname(mainGitDir);
+        }
+
+        // Check lock status
+        const lockedFile = resolve(canonicalGitDir, 'locked');
+        if (existsSync(lockedFile)) {
+          locked = true;
+          const reason = readFileSync(lockedFile, 'utf8').trim();
+          if (reason.length > 0) {
+            lockReason = reason;
+          }
+        }
+
+        // Check HEAD
+        const headFile = resolve(canonicalGitDir, 'HEAD');
+        if (existsSync(headFile)) {
+          const headContent = readFileSync(headFile, 'utf8').trim();
+          if (headContent.startsWith('ref: refs/heads/')) {
+            branch = headContent.replace('ref: refs/heads/', '').trim();
+            isDetached = false;
+          } else {
+            branch = headContent;
+            isDetached = true;
+            headSha = headContent;
+          }
+        }
+      }
+    }
+
+    if (options?.signal?.aborted) {
+      throw ArcError.executionTimeout('Command execution exceeded configured timeout.');
+    }
+
+    // Resolve HEAD commit hash if not already known
+    if (headSha === 'unknown' || !isDetached) {
+      try {
+        const { stdout } = await this.runRawGit(
+          canonicalRoot,
+          ['rev-parse', 'HEAD'],
+          undefined,
+          options,
+        );
+        headSha = stdout.trim();
+      } catch (err: unknown) {
+        if (
+          err instanceof ArcError &&
+          (err.code === 'EXECUTION_TIMEOUT' || err.code === 'PAYLOAD_TOO_LARGE')
+        ) {
+          throw err;
+        }
+        // Empty repo
+      }
+    }
+
+    // If not a linked worktree, resolve branch and detached status from rev-parse
+    if (!isWorktree) {
+      try {
+        const { stdout: branchOut } = await this.runRawGit(
+          canonicalRoot,
+          ['rev-parse', '--abbrev-ref', 'HEAD'],
+          undefined,
+          options,
+        );
+        branch = branchOut.trim();
+        if (branch === 'HEAD') {
+          isDetached = true;
+        }
+      } catch (err: unknown) {
+        if (
+          err instanceof ArcError &&
+          (err.code === 'EXECUTION_TIMEOUT' || err.code === 'PAYLOAD_TOO_LARGE')
+        ) {
+          throw err;
+        }
+        // Empty repo
+      }
+    }
+
+    return {
+      isWorktree,
+      worktreePath: canonicalRoot,
+      mainRepoPath,
+      branch,
+      locked,
+      lockReason,
+      isDetached,
+      headSha,
+    };
+  }
+
+  private parseFileSummaries(
+    nameStatusRaw: string,
+    numstatRaw: string,
+  ): GitReviewDiffFileSummary[] {
+    const nameEntries: Array<{
+      status: 'modified' | 'added' | 'deleted' | 'renamed';
+      path: string;
+      oldPath?: string;
+    }> = [];
+
+    const nsTokens = nameStatusRaw.split('\0');
+    let i = 0;
+    while (i < nsTokens.length) {
+      const token = nsTokens[i];
+      if (!token) {
+        i++;
+        continue;
+      }
+      const code = token.trim();
+      if (code.startsWith('R') || code.startsWith('C')) {
+        const oldPath = nsTokens[i + 1] || '';
+        const newPath = nsTokens[i + 2] || '';
+        nameEntries.push({
+          status: code.startsWith('R') ? 'renamed' : 'added',
+          oldPath,
+          path: newPath,
+        });
+        i += 3;
+      } else {
+        const path = nsTokens[i + 1] || '';
+        let status: 'modified' | 'added' | 'deleted' | 'renamed';
+        if (code.startsWith('A')) {
+          status = 'added';
+        } else if (code.startsWith('D')) {
+          status = 'deleted';
+        } else {
+          status = 'modified';
+        }
+        nameEntries.push({ status, path });
+        i += 2;
+      }
+    }
+
+    const numMap = new Map<string, { ins: number; dels: number }>();
+    const numTokens = numstatRaw.split('\0');
+    let j = 0;
+    while (j < numTokens.length) {
+      const token = numTokens[j];
+      if (!token) {
+        j++;
+        continue;
+      }
+      const tabParts = token.split('\t');
+      if (tabParts.length >= 2) {
+        const ins = tabParts[0] === '-' ? 0 : parseInt(tabParts[0], 10) || 0;
+        const dels = tabParts[1] === '-' ? 0 : parseInt(tabParts[1], 10) || 0;
+        if (tabParts.length >= 3 && tabParts[2] !== '') {
+          const path = tabParts.slice(2).join('\t');
+          numMap.set(path, { ins, dels });
+          j++;
+        } else {
+          // Rename or copy: next two tokens are oldPath and newPath
+          const newPath = numTokens[j + 2] || '';
+          numMap.set(newPath, { ins, dels });
+          j += 3;
+        }
+      } else {
+        j++;
+      }
+    }
+
+    const summaries: GitReviewDiffFileSummary[] = [];
+    for (const entry of nameEntries) {
+      if (!entry.path) continue;
+      // Filter out sensitive files so they never leak in metadata
+      if (isSensitiveGitPath(entry.path) || (entry.oldPath && isSensitiveGitPath(entry.oldPath))) {
+        continue;
+      }
+      const counts = numMap.get(entry.path) ?? { ins: 0, dels: 0 };
+      summaries.push({
+        path: entry.path,
+        status: entry.status,
+        insertions: counts.ins,
+        deletions: counts.dels,
+      });
+    }
+
+    return summaries;
+  }
+
+  public async getReviewDiff(
+    workspaceRoot: string,
+    options: GitReviewDiffOptions,
+    execOptions?: GitExecutionOptions,
+  ): Promise<GitReviewDiffResult> {
+    if (execOptions?.signal?.aborted) {
+      throw ArcError.executionTimeout('Command execution exceeded configured timeout.');
+    }
+
+    validateGitArgument('targetRevision', options.targetRevision);
+    validateGitArgument('path', options.path);
+
+    if (options.path && isSensitiveGitPath(options.path)) {
+      throw ArcError.accessDenied(
+        'Target diff path matches sensitive credential or system blacklist pattern.',
+      );
+    }
+
+    const baseArgs = ['diff', '--no-ext-diff', '--no-textconv'];
+    const mode = options.mode;
+
+    if (mode === 'staged') {
+      baseArgs.push('--cached');
+      if (options.targetRevision) {
+        baseArgs.push(options.targetRevision.trim());
+      }
+    } else if (mode === 'target') {
+      if (!options.targetRevision) {
+        throw ArcError.invalidRequestSchema("targetRevision is required in 'target' mode.");
+      }
+      baseArgs.push(options.targetRevision.trim());
+    } else if (mode === 'unstaged') {
+      if (options.targetRevision) {
+        throw ArcError.invalidRequestSchema(
+          "targetRevision is not supported in 'unstaged' mode.",
+          "Omit targetRevision for unstaged mode, or specify mode as 'staged' or 'target'.",
+        );
+      }
+    } else {
+      throw ArcError.invalidRequestSchema(`Unsupported mode: ${String(mode)}`);
+    }
+
+    const secretExcludes = [
+      ':(exclude)*.env*',
+      ':(exclude)*.pem',
+      ':(exclude)*.key',
+      ':(exclude)*.p12',
+      ':(exclude)*.pfx',
+      ':(exclude)*id_rsa*',
+      ':(exclude)*id_ed25519*',
+      ':(exclude).ssh/**',
+      ':(exclude).aws/**',
+      ':(exclude).gnupg/**',
+      ':(exclude).kube/**',
+    ];
+
+    const pathFilter = options.path ? options.path.trim() : '.';
+
+    // 1. Discover all rename/copy pairs across the complete selected Git comparison
+    //    WITHOUT caller path restriction and WITHOUT pathspec excludes.
+    //    Security-sensitive rename/copy discovery MUST NOT be narrowed by the user-provided review path.
+    //    A discovery failure must fail closed immediately rather than silently disabling protection.
+    const fullNameStatusArgs = [
+      ...baseArgs,
+      '--name-status',
+      '-z',
+      '-M',
+      '-C',
+      '--find-copies-harder',
+      '--',
+      '.',
+    ];
+    const { stdout: fullNameStatusStdout } = await this.runGit(
+      workspaceRoot,
+      fullNameStatusArgs,
+      undefined,
+      execOptions,
+    );
+
+    // Parse rename/copy entries; collect any path where EITHER side is sensitive.
+    const renameSensitivePaths = new Set<string>();
+    const nsTokensFull = fullNameStatusStdout.split('\0');
+    let nsIdx = 0;
+    while (nsIdx < nsTokensFull.length) {
+      const tok = nsTokensFull[nsIdx];
+      if (!tok) {
+        nsIdx++;
+        continue;
+      }
+      const code = tok.trim();
+      if (code.startsWith('R') || code.startsWith('C')) {
+        const srcPath = nsTokensFull[nsIdx + 1] || '';
+        const dstPath = nsTokensFull[nsIdx + 2] || '';
+        if (isSensitiveGitPath(srcPath) || isSensitiveGitPath(dstPath)) {
+          // Suppress both sides: either may appear in pathspec-filtered diff output
+          if (srcPath) {
+            renameSensitivePaths.add(srcPath);
+            renameSensitivePaths.add(srcPath.replace(/^\.\//, '').replace(/\/$/, '').trim());
+          }
+          if (dstPath) {
+            renameSensitivePaths.add(dstPath);
+            renameSensitivePaths.add(dstPath.replace(/^\.\//, '').replace(/\/$/, '').trim());
+          }
+        }
+        nsIdx += 3;
+      } else {
+        nsIdx += 2;
+      }
+    }
+
+    if (execOptions?.signal?.aborted) {
+      throw ArcError.executionTimeout('Command execution exceeded configured timeout.');
+    }
+
+    // 2. Run git diff for full diff output using RAW_DIFF_CAPTURE_BYTES ceiling.
+    //    If the raw diff exceeds the ceiling, substitute a safe truncation marker
+    //    so the structured response remains successful with truncated === true.
+    const diffArgs = [...baseArgs, '--', pathFilter, ...secretExcludes];
+    let rawDiffStdout: string;
+    let rawDiffExceededCeiling = false;
+    try {
+      const { stdout } = await this.runGit(
+        workspaceRoot,
+        diffArgs,
+        RAW_DIFF_CAPTURE_BYTES,
+        execOptions,
+      );
+      rawDiffStdout = stdout;
+    } catch (err: unknown) {
+      if (err instanceof ArcError && err.code === 'PAYLOAD_TOO_LARGE') {
+        // Raw diff exceeds safe capture ceiling -- return a structured truncation marker.
+        rawDiffStdout = RAW_DIFF_OVERFLOW_MARKER;
+        rawDiffExceededCeiling = true;
+      } else {
+        throw err;
+      }
+    }
+
+    if (execOptions?.signal?.aborted) {
+      throw ArcError.executionTimeout('Command execution exceeded configured timeout.');
+    }
+
+    // 3. Run git diff --name-status -z -M and --numstat -z -M for structured file summaries
+    const nameStatusArgs = [
+      ...baseArgs,
+      '--name-status',
+      '-z',
+      '-M',
+      '--',
+      pathFilter,
+      ...secretExcludes,
+    ];
+    const { stdout: nameStatusStdout } = await this.runGit(
+      workspaceRoot,
+      nameStatusArgs,
+      undefined,
+      execOptions,
+    );
+
+    if (execOptions?.signal?.aborted) {
+      throw ArcError.executionTimeout('Command execution exceeded configured timeout.');
+    }
+
+    const numstatArgs = [...baseArgs, '--numstat', '-z', '-M', '--', pathFilter, ...secretExcludes];
+    const { stdout: numstatStdout } = await this.runGit(
+      workspaceRoot,
+      numstatArgs,
+      undefined,
+      execOptions,
+    );
+
+    // 4. Parse name-status -z and numstat -z
+    const rawFileSummaries = this.parseFileSummaries(nameStatusStdout, numstatStdout);
+
+    // Post-filter: also remove any entry whose path appears in renameSensitivePaths.
+    // This handles the case where the pathspec-excluded name-status emits the non-sensitive
+    // rename destination as an add (e.g. `.env -> renamed_notes.txt` appears as `A renamed_notes.txt`).
+    const fileSummaries =
+      renameSensitivePaths && renameSensitivePaths.size > 0
+        ? rawFileSummaries.filter((s) => {
+            const rawP = s.path;
+            const normP = rawP.replace(/^\.\//, '').replace(/\/$/, '').trim();
+            return !renameSensitivePaths.has(rawP) && !renameSensitivePaths.has(normP);
+          })
+        : rawFileSummaries;
+
+    // 5. Defense-in-depth: purge sensitive file diff hunks (including rename origin/destination
+    //    paths discovered in step 1) and mask sensitive tokens/keys
+    const { diff: purgedDiff, suppressedCount } = purgeSensitiveDiffBlocksWithCount(
+      rawDiffStdout,
+      renameSensitivePaths,
+    );
+    const { diff: maskedDiff, maskedCount } = maskSensitiveDiffWithCount(purgedDiff);
+    const sensitiveBlocksMasked = suppressedCount + maskedCount;
+
+    // 6. Enforce requested maxBytes (bounded by MAX_DIFF_BYTES)
+    const maxBudget =
+      options.maxBytes !== undefined ? Math.min(options.maxBytes, MAX_DIFF_BYTES) : MAX_DIFF_BYTES;
+
+    const { text: boundedDiff, truncated } = truncateUtf8ToByteLimit(maskedDiff, maxBudget);
+
+    return {
+      diff: boundedDiff,
+      truncated: truncated || rawDiffExceededCeiling,
+      totalFilesChanged: fileSummaries.length,
+      fileSummaries,
+      sensitiveBlocksMasked,
+    };
   }
 }

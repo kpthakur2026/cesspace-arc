@@ -825,18 +825,18 @@ describe('CesSpace ARC — RC-03 MCP Policy & Audit Integration', () => {
   // ==========================================================================
 
   describe('Section 8: Health Response', () => {
-    test('RC03-HEALTH-01: health response reports the current RC-06 version', async () => {
+    test('RC03-HEALTH-01: health response reports the current version', async () => {
       const res = await server.dispatchToolCall('health', {});
       assert.ok(!res.isError, 'health must succeed');
       const body = JSON.parse(res.content[0].text);
-      assert.equal(body.version, '0.6.0-rc06');
+      assert.equal(body.version, '0.7.0-rc07');
     });
 
-    test('RC03-HEALTH-02: health response reports stage RC-06', async () => {
+    test('RC03-HEALTH-02: health response reports stage RC-07', async () => {
       const res = await server.dispatchToolCall('health', {});
       assert.ok(!res.isError, 'health must succeed');
       const body = JSON.parse(res.content[0].text);
-      assert.equal(body.stage, 'RC-06');
+      assert.equal(body.stage, 'RC-07');
     });
   });
 
@@ -1547,19 +1547,19 @@ describe('CesSpace ARC — RC-03 MCP Policy & Audit Integration', () => {
   // ==========================================================================
 
   describe('Section 15: Actual Tool Discovery Source & Enumeration', () => {
-    test('RC03-DISC-01: ALL_TOOL_DEFINITIONS matches ListTools authoritative source with exactly 18 tools', () => {
-      assert.equal(ALL_TOOL_DEFINITIONS.length, 18, 'Total tool definitions must be exactly 18');
+    test('RC03-DISC-01: ALL_TOOL_DEFINITIONS matches ListTools authoritative source with exactly 25 tools', () => {
+      assert.equal(ALL_TOOL_DEFINITIONS.length, 25, 'Total tool definitions must be exactly 25');
       assert.equal(
         server.getRegisteredTools().length,
-        18,
-        'server.getRegisteredTools() must return 18 tools',
+        25,
+        'server.getRegisteredTools() must return 25 tools',
       );
     });
 
-    test('RC03-DISC-02: all 18 tool names are distinct with zero duplicates', () => {
+    test('RC03-DISC-02: all 25 tool names are distinct with zero duplicates', () => {
       const names = ALL_TOOL_DEFINITIONS.map((t) => t.name);
       const uniqueNames = new Set(names);
-      assert.equal(uniqueNames.size, 18, 'Must have exactly 18 unique tool names');
+      assert.equal(uniqueNames.size, 25, 'Must have exactly 25 unique tool names');
       assert.equal(
         names.length,
         uniqueNames.size,

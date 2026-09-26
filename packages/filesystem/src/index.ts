@@ -1,13 +1,15 @@
 import {
   realpathSync,
+  readlinkSync,
   statSync,
   readdirSync,
   openSync,
   readSync,
   closeSync,
+  existsSync,
   type Stats,
 } from 'node:fs';
-import { resolve, normalize, sep, relative, join } from 'node:path';
+import { resolve, normalize, sep, relative, join, dirname } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import {
   ArcError,
@@ -72,6 +74,11 @@ export interface IFilesystemSubsystem {
   deleteFile(workspaceRoot: string, request: DeleteFileRequest): Promise<DeleteFileResponse>;
   moveFile(workspaceRoot: string, request: MoveFileRequest): Promise<MoveFileResponse>;
   applyPatch(workspaceRoot: string, request: ApplyPatchRequest): Promise<ApplyPatchResponse>;
+  validateWorkspaceContainment(workspaceRoot: string, targetPath: string): Promise<string>;
+  validateReviewDiffPath(workspaceRoot: string, targetPath: string): Promise<string>;
+  validateTestPath(workspaceRoot: string, targetPath: string): Promise<string>;
+  validateWorkflowPath(workspaceRoot: string, targetPath: string): Promise<string>;
+  listWorkflowFiles(workspaceRoot: string): Promise<string[]>;
 }
 
 /**
@@ -263,6 +270,528 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
     }
 
     return canonicalPath;
+  }
+
+  /**
+   * Validates that targetPath resides strictly within workspaceRoot.
+   * Enforces RC07-NEG-016 (rejecting traversal tokens like .. before resolution)
+   * and RC07-NEG-014 (failing closed with PATH_OUTSIDE_WORKSPACE if resolving outside).
+   */
+  public async validateWorkspaceContainment(
+    workspaceRoot: string,
+    targetPath: string,
+  ): Promise<string> {
+    if (!targetPath || typeof targetPath !== 'string') {
+      throw ArcError.invalidRequestSchema('Path parameter is required and must be a string.');
+    }
+    // RC07-NEG-016: directory traversal (..) rejected before unsafe resolution
+    if (/(^|[/\\])\.\.([/\\]|$)/.test(targetPath)) {
+      throw ArcError.pathOutsideWorkspace(
+        'Directory traversal (..) is forbidden in workspace path.',
+      );
+    }
+    let canonicalRoot: string;
+    try {
+      canonicalRoot = realpathSync(resolve(workspaceRoot));
+    } catch {
+      throw ArcError.noWorkspaceConfigured('Workspace root directory does not exist.');
+    }
+    let canonicalTarget: string;
+    try {
+      canonicalTarget = realpathSync(resolve(targetPath));
+    } catch {
+      throw ArcError.pathOutsideWorkspace('Target path cannot be resolved.');
+    }
+    if (canonicalTarget !== canonicalRoot && !canonicalTarget.startsWith(canonicalRoot + sep)) {
+      throw ArcError.pathOutsideWorkspace(
+        'Security violation: Target path resides outside authorized workspace boundary.',
+      );
+    }
+    return canonicalTarget;
+  }
+
+  /**
+   * Validates a workspace-relative review diff path filter.
+   * Enforces RC07-NEG-021 (PATH_OUTSIDE_WORKSPACE on traversal escape like ../../etc/passwd),
+   * RC07-NEG-026 (blocking sensitive paths like .env and id_rsa with ACCESS_DENIED),
+   * and symlink escape detection.
+   * Correctly validates tracked files that may be deleted or missing from the working tree.
+   * Returns normalized workspace-relative filter path.
+   */
+  public async validateReviewDiffPath(
+    workspaceRoot: string,
+    requestedPath: string,
+  ): Promise<string> {
+    if (!requestedPath || typeof requestedPath !== 'string') {
+      throw ArcError.invalidRequestSchema('Path parameter is required and must be a string.');
+    }
+
+    const trimmed = requestedPath.trim();
+    if (trimmed.length === 0) {
+      throw ArcError.invalidRequestSchema('Path parameter must not be empty.');
+    }
+
+    // 1. Syntactic Null Byte & Traversal Pre-checks
+    if (trimmed.includes('\0')) {
+      throw ArcError.invalidPathChars('Path contains invalid null byte.');
+    }
+    if (/%2e%2e|%2f|%5c/i.test(trimmed)) {
+      throw ArcError.invalidPathChars('Path contains forbidden URL-encoded traversal characters.');
+    }
+    // RC07-NEG-021: directory traversal (..) rejected with PATH_OUTSIDE_WORKSPACE
+    if (/(^|[/\\])\.\.([/\\]|$)/.test(trimmed)) {
+      throw ArcError.pathOutsideWorkspace(
+        'Directory traversal (..) is forbidden in review diff path.',
+      );
+    }
+
+    // 2. Canonicalize Workspace Root
+    let canonicalRoot: string;
+    try {
+      canonicalRoot = realpathSync(resolve(workspaceRoot));
+    } catch {
+      throw ArcError.noWorkspaceConfigured('Workspace root directory does not exist.');
+    }
+
+    // 3. Workspace Root Join & Boundary Check
+    let candidatePath: string;
+    if (trimmed.startsWith('/') || /^[a-zA-Z]:\\/.test(trimmed)) {
+      const normRequested = normalize(resolve(trimmed));
+      if (normRequested !== canonicalRoot && !normRequested.startsWith(canonicalRoot + sep)) {
+        throw ArcError.pathOutsideWorkspace(
+          'Security violation: Path resides outside authorized workspace boundary.',
+        );
+      }
+      candidatePath = normRequested;
+    } else {
+      candidatePath = resolve(canonicalRoot, trimmed);
+    }
+
+    const norm = normalize(candidatePath);
+    if (norm !== canonicalRoot && !norm.startsWith(canonicalRoot + sep)) {
+      throw ArcError.pathOutsideWorkspace(
+        'Security violation: Path resides outside authorized workspace boundary.',
+      );
+    }
+
+    // 4. Symlink containment check for existing path components
+    let currentCheck = candidatePath;
+    while (currentCheck !== canonicalRoot && currentCheck.length >= canonicalRoot.length) {
+      try {
+        const resolvedCurrent = realpathSync(currentCheck);
+        if (resolvedCurrent !== canonicalRoot && !resolvedCurrent.startsWith(canonicalRoot + sep)) {
+          throw ArcError.symlinkEscapeDetected(
+            'Symlink resolves outside authorized workspace boundary.',
+          );
+        }
+        break; // Successfully verified nearest existing ancestor
+      } catch (err: unknown) {
+        const nodeErr = err as NodeJS.ErrnoException;
+        if (nodeErr.code === 'ENOENT') {
+          const parent = dirname(currentCheck);
+          if (parent === currentCheck) {
+            break;
+          }
+          currentCheck = parent;
+        } else {
+          throw ArcError.internalError('Filesystem path resolution failed.');
+        }
+      }
+    }
+
+    // 5. RC07-NEG-026: Blacklist & Sensitive Path Enforcement
+    const relFromRoot = relative(canonicalRoot, candidatePath);
+    if (isBlacklistedPath(candidatePath, relFromRoot) || isBlacklistedPath(trimmed)) {
+      throw ArcError.accessDenied(
+        'Access denied: Target path matches sensitive credential or system blacklist pattern.',
+      );
+    }
+
+    return relFromRoot.length > 0 ? relFromRoot : '.';
+  }
+
+  /**
+   * Dedicated read-only test path validator for arc_test (RC-07 Task 5).
+   * Validates workspace containment, symlink safety, sensitive path blacklist,
+   * and verifies that the target exists on disk.
+   * Returns normalized workspace-relative test path.
+   */
+  public async validateTestPath(workspaceRoot: string, requestedPath: string): Promise<string> {
+    if (!requestedPath || typeof requestedPath !== 'string') {
+      throw ArcError.invalidRequestSchema('Path parameter is required and must be a string.');
+    }
+
+    const trimmed = requestedPath.trim();
+    if (trimmed.length === 0) {
+      throw ArcError.invalidRequestSchema('Path parameter must not be empty.');
+    }
+
+    // 1. Syntactic Null Byte & Traversal Pre-checks
+    if (trimmed.includes('\0')) {
+      throw ArcError.invalidPathChars('Path contains invalid null byte.');
+    }
+    if (/%2e%2e|%2f|%5c/i.test(trimmed)) {
+      throw ArcError.invalidPathChars('Path contains forbidden URL-encoded traversal characters.');
+    }
+    // RC07-NEG-038: directory traversal (..) rejected with PATH_OUTSIDE_WORKSPACE
+    if (/(^|[/\\])\.\.([/\\]|$)/.test(trimmed)) {
+      throw ArcError.pathOutsideWorkspace('Directory traversal (..) is forbidden in test path.');
+    }
+
+    // 2. Canonicalize Workspace Root
+    let canonicalRoot: string;
+    try {
+      canonicalRoot = realpathSync(resolve(workspaceRoot));
+    } catch {
+      throw ArcError.noWorkspaceConfigured('Workspace root directory does not exist.');
+    }
+
+    // 3. Workspace Root Join & Absolute Escape Check
+    if (trimmed.startsWith('/') || /^[a-zA-Z]:\\/.test(trimmed)) {
+      throw ArcError.pathOutsideWorkspace(
+        'Security violation: Absolute path is forbidden in test path.',
+      );
+    }
+
+    const candidatePath = resolve(canonicalRoot, trimmed);
+    const norm = normalize(candidatePath);
+    if (norm !== canonicalRoot && !norm.startsWith(canonicalRoot + sep)) {
+      throw ArcError.pathOutsideWorkspace(
+        'Security violation: Path resides outside authorized workspace boundary.',
+      );
+    }
+
+    // 4. Verify existence
+    if (!existsSync(candidatePath)) {
+      throw ArcError.fileNotFound(`Target test path does not exist: '${trimmed}'.`);
+    }
+
+    // 5. Canonicalize target and verify symlink containment
+    let canonicalTarget: string;
+    try {
+      canonicalTarget = realpathSync(candidatePath);
+    } catch {
+      throw ArcError.fileNotFound(`Target test path does not exist: '${trimmed}'.`);
+    }
+
+    if (canonicalTarget !== canonicalRoot && !canonicalTarget.startsWith(canonicalRoot + sep)) {
+      throw ArcError.symlinkEscapeDetected(
+        'Symlink resolves outside authorized workspace boundary.',
+      );
+    }
+
+    // 6. Blacklist & Sensitive Path Enforcement
+    const relFromRoot = relative(canonicalRoot, canonicalTarget);
+    if (isBlacklistedPath(canonicalTarget, relFromRoot) || isBlacklistedPath(trimmed)) {
+      throw ArcError.accessDenied(
+        'Access denied: Target test path matches sensitive credential or system blacklist pattern.',
+      );
+    }
+
+    const normalizedRel = normalize(relFromRoot);
+    return normalizedRel.length > 0 ? normalizedRel : '.';
+  }
+
+  /**
+   * Dedicated read-only workflow path validator for arc_ci_status (RC-07 Task 6).
+   * Confines inspection strictly to .github/workflows/ within authorized workspace.
+   * Validates workspace containment, symlink safety, sensitive path blacklist,
+   * and verifies that the target exists and is a .yml/.yaml file.
+   * Returns normalized workspace-relative workflow path (e.g. .github/workflows/ci.yml).
+   */
+  public async validateWorkflowPath(workspaceRoot: string, requestedPath: string): Promise<string> {
+    if (!requestedPath || typeof requestedPath !== 'string') {
+      throw ArcError.invalidRequestSchema(
+        'Workflow path parameter is required and must be a string.',
+      );
+    }
+
+    const trimmed = requestedPath.trim();
+    if (trimmed.length === 0) {
+      throw ArcError.invalidRequestSchema('Workflow path parameter must not be empty.');
+    }
+
+    // 1. Syntactic Null Byte & Traversal Pre-checks
+    if (trimmed.includes('\0')) {
+      throw ArcError.invalidPathChars('Path contains invalid null byte.');
+    }
+    if (/%2e%2e|%2f|%5c/i.test(trimmed)) {
+      throw ArcError.invalidPathChars('Path contains forbidden URL-encoded traversal characters.');
+    }
+    // RC07-NEG-049: directory traversal (..) rejected with PATH_OUTSIDE_WORKSPACE
+    if (/(^|[/\\])\.\.([/\\]|$)/.test(trimmed)) {
+      throw ArcError.pathOutsideWorkspace(
+        'Directory traversal (..) is forbidden in workflow path.',
+      );
+    }
+
+    // 2. Canonicalize Workspace Root
+    let canonicalRoot: string;
+    try {
+      canonicalRoot = realpathSync(resolve(workspaceRoot));
+    } catch {
+      throw ArcError.noWorkspaceConfigured('Workspace root directory does not exist.');
+    }
+
+    // 3. Absolute path rejection
+    if (trimmed.startsWith('/') || /^[a-zA-Z]:\\/.test(trimmed)) {
+      throw ArcError.pathOutsideWorkspace(
+        'Security violation: Absolute path is forbidden in workflow path.',
+      );
+    }
+
+    const candidatePath = resolve(canonicalRoot, trimmed);
+    const norm = normalize(candidatePath);
+
+    // 4. Must be inside workspaceRoot
+    if (norm !== canonicalRoot && !norm.startsWith(canonicalRoot + sep)) {
+      throw ArcError.pathOutsideWorkspace(
+        'Security violation: Workflow path resides outside authorized workspace boundary.',
+      );
+    }
+
+    // 5. Must be strictly inside .github/workflows/
+    const expectedWorkflowsDir = resolve(canonicalRoot, '.github', 'workflows');
+    if (norm !== expectedWorkflowsDir && !norm.startsWith(expectedWorkflowsDir + sep)) {
+      throw ArcError.pathOutsideWorkspace(
+        'Security violation: Workflow path must reside strictly within .github/workflows/.',
+      );
+    }
+
+    if (!existsSync(expectedWorkflowsDir)) {
+      throw ArcError.fileNotFound(`Workflow file not found: ${trimmed}`);
+    }
+
+    let canonicalWorkflowsDir: string;
+    try {
+      canonicalWorkflowsDir = realpathSync(expectedWorkflowsDir);
+    } catch {
+      throw ArcError.internalError('Filesystem path resolution failed.');
+    }
+
+    if (
+      canonicalWorkflowsDir !== canonicalRoot &&
+      !canonicalWorkflowsDir.startsWith(canonicalRoot + sep)
+    ) {
+      throw ArcError.pathOutsideWorkspace(
+        'Security violation: .github/workflows directory escapes authorized workspace boundary.',
+      );
+    }
+
+    // 6. Symlink containment check against canonicalWorkflowsDir
+    let canonicalTarget: string;
+    try {
+      canonicalTarget = realpathSync(candidatePath);
+    } catch (err: unknown) {
+      const nodeErr = err as NodeJS.ErrnoException;
+      if (nodeErr.code === 'ENOENT') {
+        // If broken symlink, check whether target points outside canonicalWorkflowsDir
+        try {
+          const rawTarget = readlinkSync(candidatePath);
+          const resolvedTarget = resolve(dirname(candidatePath), rawTarget);
+          const normTarget = normalize(resolvedTarget);
+          if (
+            normTarget !== canonicalWorkflowsDir &&
+            !normTarget.startsWith(canonicalWorkflowsDir + sep)
+          ) {
+            throw ArcError.pathOutsideWorkspace(
+              'Security violation: Workflow path resolves outside authorized .github/workflows directory.',
+            );
+          }
+        } catch (rlErr: unknown) {
+          if (rlErr instanceof ArcError) throw rlErr;
+        }
+        throw ArcError.fileNotFound(`Workflow file not found: ${trimmed}`);
+      }
+      throw ArcError.internalError('Filesystem path resolution failed.');
+    }
+
+    if (
+      canonicalTarget !== canonicalWorkflowsDir &&
+      !canonicalTarget.startsWith(canonicalWorkflowsDir + sep)
+    ) {
+      throw ArcError.pathOutsideWorkspace(
+        'Security violation: Workflow path resolves outside authorized .github/workflows directory.',
+      );
+    }
+
+    // 7. Verify target is a file
+    const targetStat = statSync(canonicalTarget);
+    if (!targetStat.isFile()) {
+      throw ArcError.invalidRequestSchema('Target workflow path is not a file.');
+    }
+
+    // 8. Verify extension is .yml or .yaml
+    if (!/\.ya?ml$/i.test(trimmed)) {
+      throw ArcError.invalidRequestSchema('Workflow file must have a .yml or .yaml extension.');
+    }
+
+    // 9. Blacklist & Sensitive Path Enforcement
+    const relFromRoot = relative(canonicalRoot, canonicalTarget);
+    if (isBlacklistedPath(canonicalTarget, relFromRoot) || isBlacklistedPath(trimmed)) {
+      throw ArcError.accessDenied(
+        'Access denied: Target workflow path matches sensitive credential or system blacklist pattern.',
+      );
+    }
+
+    const normalizedRel = normalize(relative(canonicalRoot, candidatePath)).replace(/\\/g, '/');
+    return normalizedRel;
+  }
+
+  /**
+   * Dedicated workflow directory scanner for arc_ci_status (RC-07 Task 6).
+   * Confines scanning strictly to .github/workflows/ within authorized workspace.
+   * If .github/workflows does not exist, returns empty array.
+   * If a symlink in the workflow hierarchy escapes the canonical .github/workflows boundary,
+   * rejects with PATH_OUTSIDE_WORKSPACE.
+   * Returns sorted array of relative paths (e.g. ['.github/workflows/ci.yml']).
+   */
+  public async listWorkflowFiles(workspaceRoot: string): Promise<string[]> {
+    let canonicalRoot: string;
+    try {
+      canonicalRoot = realpathSync(resolve(workspaceRoot));
+    } catch {
+      throw ArcError.noWorkspaceConfigured('Workspace root directory does not exist.');
+    }
+
+    const githubDir = join(canonicalRoot, '.github');
+    if (!existsSync(githubDir)) {
+      return [];
+    }
+
+    // Verify .github does not escape workspace via symlink
+    try {
+      const realGithub = realpathSync(githubDir);
+      if (realGithub !== canonicalRoot && !realGithub.startsWith(canonicalRoot + sep)) {
+        throw ArcError.pathOutsideWorkspace(
+          'Security violation: .github directory escapes authorized workspace boundary.',
+        );
+      }
+    } catch (err: unknown) {
+      if (err instanceof ArcError) throw err;
+      return [];
+    }
+
+    const workflowsDir = join(githubDir, 'workflows');
+    if (!existsSync(workflowsDir)) {
+      return [];
+    }
+
+    // Verify .github/workflows does not escape workspace via symlink
+    let canonicalWorkflowsDir: string;
+    try {
+      canonicalWorkflowsDir = realpathSync(workflowsDir);
+      if (
+        canonicalWorkflowsDir !== canonicalRoot &&
+        !canonicalWorkflowsDir.startsWith(canonicalRoot + sep)
+      ) {
+        throw ArcError.pathOutsideWorkspace(
+          'Security violation: .github/workflows directory escapes authorized workspace boundary.',
+        );
+      }
+    } catch (err: unknown) {
+      if (err instanceof ArcError) throw err;
+      return [];
+    }
+
+    let st: Stats;
+    try {
+      st = statSync(canonicalWorkflowsDir);
+    } catch {
+      return [];
+    }
+    if (!st.isDirectory()) {
+      return [];
+    }
+
+    let dirents;
+    try {
+      dirents = readdirSync(canonicalWorkflowsDir, { withFileTypes: true });
+    } catch {
+      return [];
+    }
+
+    const workflowPaths: string[] = [];
+
+    for (const dirent of dirents) {
+      const name = dirent.name;
+      // Only process .yml and .yaml files
+      if (!/\.ya?ml$/i.test(name)) {
+        continue;
+      }
+
+      const fullEntryPath = join(canonicalWorkflowsDir, name);
+
+      if (dirent.isSymbolicLink()) {
+        let canonicalTarget: string;
+        try {
+          canonicalTarget = realpathSync(fullEntryPath);
+        } catch (err: unknown) {
+          if (err instanceof ArcError) throw err;
+          // Broken symlink: check where readlink points
+          try {
+            const rawTarget = readlinkSync(fullEntryPath);
+            const resolvedTarget = resolve(canonicalWorkflowsDir, rawTarget);
+            const normTarget = normalize(resolvedTarget);
+            if (
+              normTarget !== canonicalWorkflowsDir &&
+              !normTarget.startsWith(canonicalWorkflowsDir + sep)
+            ) {
+              throw ArcError.pathOutsideWorkspace(
+                'Security violation: Workflow symlink resolves outside authorized .github/workflows directory.',
+              );
+            }
+          } catch (readlinkErr: unknown) {
+            if (readlinkErr instanceof ArcError) throw readlinkErr;
+          }
+          continue;
+        }
+
+        // Canonical target must be strictly inside canonicalWorkflowsDir
+        if (
+          canonicalTarget !== canonicalWorkflowsDir &&
+          !canonicalTarget.startsWith(canonicalWorkflowsDir + sep)
+        ) {
+          throw ArcError.pathOutsideWorkspace(
+            'Security violation: Workflow symlink resolves outside authorized .github/workflows directory.',
+          );
+        }
+
+        const targetStat = statSync(canonicalTarget);
+        if (!targetStat.isFile()) {
+          continue;
+        }
+      } else if (!dirent.isFile()) {
+        continue;
+      } else {
+        // Regular file: verify canonical target stays within canonicalWorkflowsDir
+        let canonicalTarget: string;
+        try {
+          canonicalTarget = realpathSync(fullEntryPath);
+        } catch {
+          continue;
+        }
+        if (
+          canonicalTarget !== canonicalWorkflowsDir &&
+          !canonicalTarget.startsWith(canonicalWorkflowsDir + sep)
+        ) {
+          throw ArcError.pathOutsideWorkspace(
+            'Security violation: Workflow file resolves outside authorized .github/workflows directory.',
+          );
+        }
+      }
+
+      const relPath = relative(canonicalRoot, fullEntryPath).replace(/\\/g, '/');
+      if (isBlacklistedPath(fullEntryPath, relPath)) {
+        continue;
+      }
+
+      workflowPaths.push(relPath);
+    }
+
+    // Deterministic sorting (code unit comparison)
+    workflowPaths.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+    return workflowPaths;
   }
 
   public async listDirectory(

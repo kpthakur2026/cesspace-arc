@@ -432,7 +432,7 @@ describe('CesSpace ARC — RC-05 Task 6: Remote Actor Pipeline', () => {
       assert.equal(source.includes('public async dispatchToolCall('), true);
       assert.equal(source.includes('public async executeAuthenticatedToolCall('), true);
       assert.equal(
-        source.includes('return this.executeAuthenticatedToolCall(actor, toolName, parameters);'),
+        source.includes('return this.executeAuthenticatedToolCall('),
         true,
         'stdio delegates into the shared implementation',
       );

@@ -21,7 +21,14 @@ import {
   type PolicyEffect,
 } from '@cesspace-arc/protocol';
 
-import { RC01_ALLOWED_TOOLS, RC03_MUTATION_TOOLS, RC03_REGISTERED_TOOLS } from './index.js';
+import {
+  RC01_ALLOWED_TOOLS,
+  RC03_MUTATION_TOOLS,
+  ALL_POLICY_TOOLS,
+  RC07_READ_ONLY_TOOLS,
+  RC07_TASK4_EXECUTION_TOOLS,
+  RC07_TASK5_EXECUTION_TOOLS,
+} from './index.js';
 import {
   MAX_PATTERN_LENGTH,
   compilePathPattern,
@@ -108,7 +115,7 @@ let cachedMutationTools: ReadonlySet<string> | null = null;
 
 function registeredToolSet(): ReadonlySet<string> {
   if (cachedRegisteredTools === null) {
-    cachedRegisteredTools = new Set<string>(RC03_REGISTERED_TOOLS);
+    cachedRegisteredTools = new Set<string>(ALL_POLICY_TOOLS);
   }
   return cachedRegisteredTools;
 }
@@ -984,6 +991,21 @@ function buildBuiltInDocument(): ParsedDocument {
         id: 'builtin-require-approval-file-mutation',
         effect: 'REQUIRE_APPROVAL',
         tools: [...RC03_MUTATION_TOOLS],
+      },
+      {
+        id: 'builtin-require-approval-rc07-verify',
+        effect: 'REQUIRE_APPROVAL',
+        tools: [...RC07_TASK4_EXECUTION_TOOLS],
+      },
+      {
+        id: 'builtin-require-approval-rc07-test',
+        effect: 'REQUIRE_APPROVAL',
+        tools: [...RC07_TASK5_EXECUTION_TOOLS],
+      },
+      {
+        id: 'builtin-allow-rc07-read-only',
+        effect: 'ALLOW',
+        tools: [...RC07_READ_ONLY_TOOLS],
       },
     ],
   };

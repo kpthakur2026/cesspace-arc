@@ -100,6 +100,7 @@ export interface AuthenticatedToolSink {
     actor: CompleteActor,
     toolName: string,
     parameters: Record<string, unknown>,
+    options?: { signal?: AbortSignal },
   ): Promise<RemoteToolCallResult>;
 }
 
@@ -369,6 +370,7 @@ export interface RemoteToolCallInput {
   hasExistingSessionContext?: boolean;
   toolName: string;
   parameters: Record<string, unknown>;
+  signal?: AbortSignal;
 }
 
 /**
@@ -782,6 +784,7 @@ export class RemoteExecutionBridge {
       actor,
       input.toolName,
       input.parameters,
+      input.signal ? { signal: input.signal } : undefined,
     );
   }
 

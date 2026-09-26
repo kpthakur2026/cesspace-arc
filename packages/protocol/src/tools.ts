@@ -337,3 +337,194 @@ export interface ApplyPatchResponse {
   };
   dryRun: boolean;
 }
+
+// ============================================================================
+// Tier 3: Engineering-Aware Composite Tools (RC-07 Target)
+// ============================================================================
+
+export interface ArcRepoStatusRequest {
+  workspaceId?: string;
+  workspaceRoot?: string;
+}
+
+export interface ArcRepoStatusResponse {
+  branch: string;
+  headCommit: {
+    hash: string;
+    shortHash: string;
+    message: string;
+    author: string;
+    date: string;
+  };
+  isClean: boolean;
+  isProtectedBranch: boolean;
+  counts: {
+    staged: number;
+    unstaged: number;
+    untracked: number;
+  };
+  aheadCount?: number;
+  behindCount?: number;
+  upstreamBranch?: string;
+  truncated?: boolean;
+}
+
+export interface ArcWorktreeStatusRequest {
+  workspaceId?: string;
+  workspaceRoot?: string;
+}
+
+export interface ArcWorktreeStatusResponse {
+  workspaceId: string;
+  isWorktree: boolean;
+  worktreePath: string;
+  mainRepoPath: string;
+  branch: string;
+  locked: boolean;
+  lockReason?: string;
+  isDetached: boolean;
+  headSha: string;
+  truncated?: boolean;
+}
+
+export interface ArcReviewDiffRequest {
+  mode?: 'staged' | 'unstaged' | 'target';
+  targetRevision?: string;
+  path?: string;
+  maxBytes?: number;
+  workspaceId?: string;
+}
+
+export interface ArcReviewDiffFileSummary {
+  path: string;
+  status: 'modified' | 'added' | 'deleted' | 'renamed';
+  insertions: number;
+  deletions: number;
+}
+
+export interface ArcReviewDiffResponse {
+  mode: 'staged' | 'unstaged' | 'target';
+  targetRevision?: string;
+  pathFilter?: string;
+  diff: string;
+  bytes: number;
+  truncated: boolean;
+  totalFilesChanged: number;
+  fileSummaries: ArcReviewDiffFileSummary[];
+  sensitiveBlocksMasked: number;
+}
+
+export interface ArcVerifyRequest {
+  suite?: 'all' | 'format' | 'lint' | 'typecheck' | 'test';
+  workspaceId?: string;
+}
+
+export interface ArcVerifyStepResult {
+  stepName: string;
+  executable: string;
+  args: string[];
+  status: 'PASSED' | 'FAILED' | 'SKIPPED' | 'TIMED_OUT';
+  exitCode: number | null;
+  durationMs: number;
+  outputExcerpt: string;
+  truncated: boolean;
+}
+
+export interface ArcVerifyResponse {
+  suite: 'all' | 'format' | 'lint' | 'typecheck' | 'test';
+  status: 'PASSED' | 'FAILED' | 'TIMED_OUT' | 'CANCELLED';
+  totalDurationMs: number;
+  steps: ArcVerifyStepResult[];
+  failedStep?: string;
+}
+
+export interface ArcTestRequest {
+  testPath?: string;
+  filter?: string;
+  testRunner?: 'node';
+  maxDurationMs?: number;
+  workspaceId?: string;
+}
+
+export interface ArcTestResponse {
+  testRunner: 'node';
+  target: string;
+  status: 'PASSED' | 'FAILED' | 'TIMED_OUT' | 'CANCELLED';
+  exitCode: number | null;
+  durationMs: number;
+  passedCount?: number;
+  failedCount?: number;
+  skippedCount?: number;
+  outputExcerpt: string;
+  truncated: boolean;
+  processId: string;
+}
+
+export interface ArcCiWorkflowInfo {
+  name: string;
+  path: string;
+  jobCount: number;
+  triggers: string[];
+}
+
+export interface ArcCiStatusRequest {
+  workflowName?: string;
+  workspaceId?: string;
+}
+
+export interface ArcCiStatusResponse {
+  localSimulationMode: true;
+  workflowsFound: ArcCiWorkflowInfo[];
+  localBranch: string;
+  headSha: string;
+  workingTreeClean: boolean;
+  localVerificationMatch: boolean;
+  remoteQueryDeferred: true;
+  remoteNotice: string;
+}
+
+export const RC07_STAGE_CATALOG = [
+  'RC-00',
+  'RC-01',
+  'RC-02',
+  'RC-03',
+  'RC-04',
+  'RC-05',
+  'RC-06',
+  'RC-07',
+] as const;
+
+export type Rc07Stage = (typeof RC07_STAGE_CATALOG)[number];
+
+export interface ArcStageEvidenceRequest {
+  targetStage: string;
+  workspaceId?: string;
+}
+
+export interface ArcStageEvidenceResponse {
+  stage: string;
+  timestamp: string;
+  repository: {
+    branch: string;
+    headSha: string;
+    isClean: boolean;
+  };
+  auditLedger: {
+    sequence: number;
+    integrity: 'VERIFIED' | 'FAILED';
+    lastCheckpointSequence: number | null;
+    storeId: string;
+  };
+  verification: {
+    scriptPresent: boolean;
+    scriptPath?: string;
+    verifiedLocally: boolean;
+  };
+  acceptanceMet: boolean;
+  references: {
+    auditStoreId: string;
+    terminalRecordHash: string;
+    checkpointHash?: string;
+  };
+  disclaimer: string;
+}

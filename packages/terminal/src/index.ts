@@ -1,4 +1,3 @@
-import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync, realpathSync, statSync } from 'node:fs';
 import { resolve, basename, sep } from 'node:path';
 import {
@@ -16,6 +15,11 @@ import {
   FORBIDDEN_ENV_PATTERNS,
 } from '@cesspace-arc/protocol';
 import { ProcessRegistry, MAX_OUTPUT_READ_BYTES } from '@cesspace-arc/processes';
+import {
+  spawnAndControlProcess,
+  type InternalProcessExecutionSpec,
+  type InternalProcessExecutionResult,
+} from './internal/process-machinery.js';
 
 export {
   RC02_PERMITTED_EXECUTABLES as ALLOWED_EXECUTABLES,
@@ -309,6 +313,58 @@ export interface ITerminalSubsystem {
   ): Promise<TerminateProcessResponse>;
 }
 
+/**
+ * Type-level representation of the non-forgeable internal execution authority.
+ * Deliberately possesses no public factory (.create()) or constructible API.
+ */
+export class InternalExecutionCapability {
+  private constructor() {
+    throw new TypeError('InternalExecutionCapability cannot be instantiated directly');
+  }
+}
+
+/**
+ * A server-materialized deterministic execution step for higher-level composite tools.
+ */
+export interface DeterministicExecutionStep {
+  stepId: string;
+  executable: string;
+  args: string[];
+  cwd: string; // workspace-relative path or empty string for workspace root
+  timeoutMs: number;
+  outputLimitBytes: number;
+  projectCodeExecution: boolean;
+  sideEffectClass: 'READ_ONLY' | 'EXECUTION';
+  signal?: AbortSignal;
+}
+
+/**
+ * Outcome of executing a deterministic step.
+ */
+export interface DeterministicStepResult {
+  stepId: string;
+  processId: string;
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
+  stdout: string;
+  stderr: string;
+  durationMs: number;
+  timedOut: boolean;
+  truncated?: boolean;
+}
+
+/**
+ * Separate internal authority interface for deterministic composite execution.
+ * Held privately by trusted server composition; never exposed on public ITerminalSubsystem.
+ */
+export interface IInternalDeterministicExecutor {
+  executeDeterministicStep(
+    step: DeterministicExecutionStep,
+    actor: PolicyEvaluationContext['actor'],
+    targetWorkspace: PolicyEvaluationContext['targetWorkspace'],
+  ): Promise<DeterministicStepResult>;
+}
+
 export class ControlledProcessRunner implements ITerminalSubsystem {
   constructor(
     public readonly processRegistry: ProcessRegistry,
@@ -321,7 +377,6 @@ export class ControlledProcessRunner implements ITerminalSubsystem {
     actor: PolicyEvaluationContext['actor'],
     targetWorkspace: PolicyEvaluationContext['targetWorkspace'],
   ): Promise<RunCommandResponse> {
-    const startTime = Date.now();
     const workspaceRoot = targetWorkspace.rootPath;
 
     if (
@@ -402,7 +457,7 @@ export class ControlledProcessRunner implements ITerminalSubsystem {
     // 5. Concurrency Check & Registration
     const timeoutMs = Math.min(Math.max(100, request.timeoutMs ?? 30000), 300000);
 
-    const record = this.processRegistry.registerProcess({
+    const result = await this.#spawnAndControlProcess({
       workspaceId: targetWorkspace.workspaceId,
       actor: {
         clientId: actor.clientId,
@@ -410,203 +465,35 @@ export class ControlledProcessRunner implements ITerminalSubsystem {
         sessionId: actor.sessionId,
         deviceId: actor.deviceId,
       },
-      executable: request.executable,
-      sanitizedArgs: args,
-      cwd: executionCwd,
-      startedAt: new Date(startTime).toISOString(),
-      state: 'RUNNING',
-      timedOut: false,
+      resolvedExecutable,
+      rawExecutableName: request.executable,
+      args,
+      executionCwd,
+      env: sanitizedEnv,
+      timeoutMs,
+      outputLimitBytes: MAX_OUTPUT_READ_BYTES,
+      runInBackground: request.runInBackground,
     });
-
-    // 6. Spawn Child Process (shell: false, detached: true on POSIX for process group kill)
-    let child: ChildProcess;
-    let spawnSucceeded = false;
-    try {
-      child = spawn(resolvedExecutable, args, {
-        cwd: executionCwd,
-        env: sanitizedEnv,
-        shell: false,
-        detached: process.platform !== 'win32',
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-      record._child = child;
-
-      // Asynchronous spawn event handling (P2):
-      // Only emit PROCESS_SPAWN_SUCCEEDED after the child process actually emits the Node 'spawn' event.
-      // An asynchronous spawn failure must never produce a false success event.
-      child.once('spawn', () => {
-        spawnSucceeded = true;
-        this.processRegistry.notifySpawnSuccess(record.processId);
-      });
-    } catch (err: unknown) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      this.processRegistry.markSpawnFailed(record.processId, errMsg);
-      throw ArcError.internalError(`Failed to spawn process: ${errMsg}`);
-    }
-
-    // 7. Output Stream Plumbing
-    child.stdout?.on('data', (chunk: Buffer) => {
-      this.processRegistry.appendOutput(record.processId, 'stdout', chunk);
-    });
-
-    child.stderr?.on('data', (chunk: Buffer) => {
-      this.processRegistry.appendOutput(record.processId, 'stderr', chunk);
-    });
-
-    // 8. Timeout Setup
-    record._timeoutTimer = setTimeout(() => {
-      this.processRegistry.markTimedOut(record.processId);
-      try {
-        if (child.pid && process.platform !== 'win32') {
-          process.kill(-child.pid, 'SIGTERM');
-        } else {
-          child.kill('SIGTERM');
-        }
-      } catch {
-        // ignore
-      }
-      record._killTimer = setTimeout(() => {
-        try {
-          if (child.exitCode === null && child.signalCode === null) {
-            if (child.pid && process.platform !== 'win32') {
-              process.kill(-child.pid, 'SIGKILL');
-            } else {
-              child.kill('SIGKILL');
-            }
-          }
-        } catch {
-          // ignore
-        }
-      }, 1000);
-      record._killTimer.unref();
-    }, timeoutMs);
-    record._timeoutTimer.unref();
-
-    child.on('close', (code, signal) => {
-      this.processRegistry.markCompleted(record.processId, code, signal);
-    });
-
-    child.on('error', (err) => {
-      if (!spawnSucceeded) {
-        this.processRegistry.markSpawnFailed(record.processId, err.message);
-      } else {
-        this.processRegistry.markCompleted(record.processId, 1, null);
-      }
-    });
-
-    // 9. Synchronous vs Background Return
-    if (request.runInBackground) {
-      // Ensure the spawn event or spawn error has been emitted before returning
-      // so PROCESS_SPAWN_SUCCEEDED is reliably emitted and available in audit sinks.
-      if (
-        !spawnSucceeded &&
-        !child.killed &&
-        child.exitCode === null &&
-        record.state === 'RUNNING'
-      ) {
-        await new Promise<void>((resolvePromise) => {
-          const cleanup = () => {
-            clearTimeout(timer);
-            child.removeListener('spawn', onSpawn);
-            child.removeListener('error', onError);
-          };
-          const onSpawn = () => {
-            cleanup();
-            resolvePromise();
-          };
-          const onError = () => {
-            cleanup();
-            resolvePromise();
-          };
-          const onTimeout = () => {
-            cleanup();
-            resolvePromise();
-          };
-          const timer: NodeJS.Timeout = setTimeout(onTimeout, Math.min(timeoutMs, 5000));
-          timer.unref();
-          child.once('spawn', onSpawn);
-          child.once('error', onError);
-        });
-      }
-
-      // If spawn failed or child encountered an asynchronous error before spawn, fail closed / report truthful state
-      if (!spawnSucceeded || record.state === 'FAILED') {
-        if (
-          record.state !== 'FAILED' &&
-          record.state !== 'COMPLETED' &&
-          record.state !== 'TERMINATED'
-        ) {
-          this.processRegistry.markSpawnFailed(record.processId, 'Process failed to spawn');
-        }
-        const status = this.processRegistry.getProcessStatus(record.processId, {
-          clientId: actor.clientId,
-          sessionId: actor.sessionId,
-          workspaceId: targetWorkspace.workspaceId,
-        });
-        const output = this.processRegistry.getProcessOutput(
-          record.processId,
-          0,
-          MAX_OUTPUT_READ_BYTES,
-          {
-            clientId: actor.clientId,
-            sessionId: actor.sessionId,
-            workspaceId: targetWorkspace.workspaceId,
-          },
-        );
-        return {
-          processId: record.processId,
-          state: status.state,
-          exitCode: status.exitCode,
-          signal: status.signal,
-          stdout: output.stdoutChunk,
-          stderr: output.stderrChunk,
-          timedOut: status.timedOut,
-          durationMs: status.durationMs,
-        };
-      }
-
-      return {
-        processId: record.processId,
-        state: 'RUNNING',
-        stdout: '',
-        stderr: '',
-        timedOut: false,
-        durationMs: 0,
-      };
-    }
-
-    // Await completion or timeout
-    await new Promise<void>((resolvePromise) => {
-      child.on('close', () => resolvePromise());
-      child.on('error', () => resolvePromise());
-    });
-
-    const status = this.processRegistry.getProcessStatus(record.processId, {
-      clientId: actor.clientId,
-      sessionId: actor.sessionId || '',
-      workspaceId: targetWorkspace.workspaceId,
-    });
-    const output = this.processRegistry.getProcessOutput(
-      record.processId,
-      0,
-      MAX_OUTPUT_READ_BYTES,
-      {
-        clientId: actor.clientId,
-        sessionId: actor.sessionId || '',
-        workspaceId: targetWorkspace.workspaceId,
-      },
-    );
 
     return {
-      processId: record.processId,
-      state: status.state,
-      exitCode: status.exitCode,
-      signal: status.signal,
-      stdout: output.stdoutChunk,
-      stderr: output.stderrChunk,
-      timedOut: status.timedOut,
-      durationMs: status.durationMs,
+      processId: result.processId,
+      state: result.state,
+      exitCode: result.exitCode,
+      signal: result.signal,
+      stdout: result.stdout,
+      stderr: result.stderr,
+      timedOut: result.timedOut,
+      durationMs: result.durationMs,
     };
+  }
+
+  /**
+   * Delegates to the shared low-level controlled-process execution engine.
+   */
+  async #spawnAndControlProcess(
+    spec: InternalProcessExecutionSpec,
+  ): Promise<InternalProcessExecutionResult> {
+    return spawnAndControlProcess(this.processRegistry, spec);
   }
 
   public getProcessStatus(
