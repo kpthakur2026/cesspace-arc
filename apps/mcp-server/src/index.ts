@@ -9,8 +9,10 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
   CallToolRequestSchema,
   ErrorCode,
+  InitializeRequestSchema,
   ListToolsRequestSchema,
   McpError,
+  SUPPORTED_PROTOCOL_VERSIONS,
   type Tool,
 } from '@modelcontextprotocol/sdk/types.js';
 
@@ -1723,6 +1725,7 @@ export function sanitizePreValidationParameters(
 
 export class ArcMcpServer implements IArcMcpServer {
   private server: Server;
+  private isInitialized = false;
   private transport?: StdioServerTransport;
   /** Remote TLS admission gateway. Present only in remote mode. */
   private remoteGateway?: RemoteGateway;
@@ -2088,7 +2091,44 @@ export class ArcMcpServer implements IArcMcpServer {
   }
 
   private setupHandlers(): void {
-    this.server.setRequestHandler(ListToolsRequestSchema, async () => {
+    this.server.setRequestHandler(InitializeRequestSchema, async (request) => {
+      const requestedVersion = request.params.protocolVersion;
+      if (!SUPPORTED_PROTOCOL_VERSIONS.includes(requestedVersion)) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `Unsupported protocol version: ${requestedVersion}. Supported versions: ${SUPPORTED_PROTOCOL_VERSIONS.join(', ')}`,
+          {
+            code: 'UNSUPPORTED_PROTOCOL_VERSION',
+            requestedVersion,
+            supportedVersions: SUPPORTED_PROTOCOL_VERSIONS,
+          },
+        );
+      }
+      this.isInitialized = true;
+      return {
+        protocolVersion: requestedVersion,
+        capabilities: {
+          tools: {},
+        },
+        serverInfo: { name: 'cesspace-arc', version: '0.7.0-rc07' },
+      };
+    });
+
+    this.server.setRequestHandler(ListToolsRequestSchema, async (request) => {
+      if (this.transport !== undefined && !this.isInitialized) {
+        throw new McpError(
+          ErrorCode.InvalidRequest,
+          'Invalid initialization order: initialize must be called before tools/list',
+          { code: 'INVALID_INITIALIZATION_ORDER' },
+        );
+      }
+      if (request.params?.cursor) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `Invalid pagination token: '${request.params.cursor}'`,
+          { code: 'INVALID_PAGINATION_TOKEN' },
+        );
+      }
       return {
         tools: ALL_TOOL_DEFINITIONS,
       };
@@ -2103,6 +2143,13 @@ export class ArcMcpServer implements IArcMcpServer {
       // below, so both transports answer an unknown tool the same way.
       if (!isRegisteredToolName(toolName)) {
         throw unknownToolError();
+      }
+      if (this.transport !== undefined && !this.isInitialized) {
+        throw new McpError(
+          ErrorCode.InvalidRequest,
+          'Invalid initialization order: initialize must be called before tools/call',
+          { code: 'INVALID_INITIALIZATION_ORDER' },
+        );
       }
       const params = (request.params.arguments || {}) as Record<string, unknown>;
       return this.dispatchToolCall(toolName, params, extra?.signal);
@@ -4542,7 +4589,36 @@ export class ArcMcpServer implements IArcMcpServer {
       },
     );
 
-    server.setRequestHandler(ListToolsRequestSchema, async () => {
+    server.setRequestHandler(InitializeRequestSchema, async (request) => {
+      const requestedVersion = request.params.protocolVersion;
+      if (!SUPPORTED_PROTOCOL_VERSIONS.includes(requestedVersion)) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `Unsupported protocol version: ${requestedVersion}. Supported versions: ${SUPPORTED_PROTOCOL_VERSIONS.join(', ')}`,
+          {
+            code: 'UNSUPPORTED_PROTOCOL_VERSION',
+            requestedVersion,
+            supportedVersions: SUPPORTED_PROTOCOL_VERSIONS,
+          },
+        );
+      }
+      return {
+        protocolVersion: requestedVersion,
+        capabilities: {
+          tools: {},
+        },
+        serverInfo: { name: 'cesspace-arc', version: '0.7.0-rc07' },
+      };
+    });
+
+    server.setRequestHandler(ListToolsRequestSchema, async (request) => {
+      if (request.params?.cursor) {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          `Invalid pagination token: '${request.params.cursor}'`,
+          { code: 'INVALID_PAGINATION_TOKEN' },
+        );
+      }
       return {
         tools: ALL_TOOL_DEFINITIONS,
       };
@@ -4682,6 +4758,7 @@ export class ArcMcpServer implements IArcMcpServer {
     if (this.transport) {
       await this.transport.close();
     }
+    this.isInitialized = false;
     // The durable audit runtime is released LAST, once no transport can produce
     // another record: its writer lock and every descriptor it owns (active
     // segment, checkpoint artifact, anchor receipt ledger, anchor spool) must
