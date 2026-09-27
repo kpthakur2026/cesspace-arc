@@ -234,10 +234,10 @@ To ensure high reliability without compromising CI determinism, fuzzing in RC-08
 2. **Reproducibility Guarantee:** Any failing test case outputs the exact reproduction command, input payload, and seed to `tests/fixtures/fuzz-corpus/failures/`.
 3. **Bounded Iterations in CI:** CI runs execute a fixed corpus of 100 iterations per fuzz vector. An extended manual profile (`pnpm run test:fuzz:extended`) runs up to 5,000 iterations for deep fuzzing.
 4. **Bounded Input Dimensions:**
-   - Maximum payload size: 2 MiB (matching remote `MAX_REQUEST_BODY_BYTES`).
-   - Maximum recursion / object nesting depth: 10 levels.
-   - Maximum array length: 10,000 items.
-   - Maximum string length: 1 MiB.
+   - **Generic CI Fuzz Corpus Payload Cap:** Capped at 2 MiB for generic randomized/seeded fuzz testing to maintain bounded CI execution time and memory limits.
+   - **Authoritative Production Remote Ceiling:** Governed by `MAX_REMOTE_BODY_BYTES = 4_194_304` (4 MiB = 4,194,304 bytes), enforced on raw request bytes during stream ingestion per the frozen RC-05 contract. Targeted boundary tests (e.g. `RC08-NEG-037`) explicitly exercise the production 4 MiB boundary, including over-limit payloads (such as 4 MiB + 1 byte) and cumulative chunked overflows.
+   - **Nesting Depth:** Maximum recursion / object nesting depth: 10 levels.
+   - **Array & String Bounds:** Maximum array length: 10,000 items; maximum string length: 1 MiB.
 5. **No Host Harm:** Fuzz inputs target parsers and validators only. No fuzzed inputs are passed to unvalidated filesystem or OS commands.
 6. **No Network Access:** Fuzzing runs completely offline against in-memory or loopback fixtures.
 
@@ -272,7 +272,7 @@ Adversarial testing adheres to strict safety boundaries:
 
 ARC enforces bounded refusal across all resource vectors:
 
-1. **Request Body Caps:** Maximum 2 MiB per HTTP request body; exceeding bodies are rejected with HTTP 413 `PAYLOAD_TOO_LARGE` before JSON parsing.
+1. **Request Body Caps:** Governed by the frozen RC-05 contract constant `MAX_REMOTE_BODY_BYTES = 4_194_304` (4 MiB = 4,194,304 bytes). The limit is measured on raw request bytes and enforced during stream ingestion. Exceeding bodies (e.g., 4 MiB + 1 byte or chunked cumulative overflow) are rejected with HTTP 413 `PAYLOAD_TOO_LARGE` before JSON parsing. (Note: for bounded CI runtime, the generic randomized fuzzing corpus uses a separate 2 MiB cap, while targeted boundary tests verify the full 4 MiB production limit).
 2. **Gateway Admission Limiter:** Layer C token bucket bounds request bursts and sustainable rates per client certificate.
 3. **Process Concurrency Caps:** Maximum 4 running processes per workspace (`CONCURRENCY_LIMITS.maxPerWorkspaceRunning = 4`). Subsequent executions fail with `CONCURRENCY_EXCEEDED`.
 4. **Buffer & Output Caps:** Process stdout/stderr buffers capped at 512 KiB; output responses capped at 128 KiB or 512 KiB depending on tool tier. Truncation is marked truthfully with `truncated: true`.
@@ -289,7 +289,7 @@ The following 25 answers constitute binding architectural commitments for RC-08:
 2. **What externally reachable protocol surfaces are fuzzed?**
    The stdio JSON-RPC line parser, the Streamable HTTP gateway body decoder, the JSON-RPC envelope parser (version, id, method), and all 25 production tool input schemas.
 3. **What maximum fuzz input sizes are allowed?**
-   Maximum payload size is 2 MiB, maximum recursion depth is 10 levels, maximum array length is 10,000 items, and maximum string length is 1 MiB.
+   For generic randomized/seeded fuzz testing in CI, the maximum payload size is capped at 2 MiB to guarantee bounded execution time and memory limits; maximum recursion depth is 10 levels, maximum array length is 10,000 items, and maximum string length is 1 MiB. In contrast, the authoritative production remote HTTP request body ceiling is `MAX_REMOTE_BODY_BYTES = 4_194_304` (4 MiB = 4,194,304 bytes), which is specifically exercised by targeted boundary test `RC08-NEG-037`.
 4. **How is fuzzing made reproducible?**
    By using deterministic pseudo-random generators with explicit 32-bit seeds logged at test startup, and automatically persisting any failing input payload and seed to `tests/fixtures/fuzz-corpus/failures/`.
 5. **How are malformed requests prevented from reaching privileged subsystems?**
@@ -305,7 +305,7 @@ The following 25 answers constitute binding architectural commitments for RC-08:
 10. **How are session revocation/replay conditions tested?**
     By actively expiring or revoking active sessions in the session store and verifying that subsequent requests using the revoked token immediately fail with HTTP 401 / `INVALID_SESSION_TOKEN`.
 11. **How are resource exhaustion attacks bounded?**
-    Via strict limits: 2 MiB HTTP body limit, Layer C admission rate limiting, 4 concurrent processes per workspace, 512 KiB process buffer caps, and strict timeouts (15s to 120s).
+    Via strict code-enforced limits: `MAX_REMOTE_BODY_BYTES = 4_194_304` (4 MiB = 4,194,304 bytes) production remote HTTP body limit, Layer C admission rate limiting (token bucket), 4 concurrent processes per workspace, 512 KiB process buffer caps, and strict timeouts (15s to 120s).
 12. **How are filesystem race/path attacks tested safely?**
     Within isolated temporary directories (`os.tmpdir()`), verifying that symlink escapes, parent directory traversals (`../`), and TOCTOU file swaps are prevented by canonical `realpath` checks.
 13. **How are Git argument/revision attacks tested safely?**
@@ -317,7 +317,7 @@ The following 25 answers constitute binding architectural commitments for RC-08:
 16. **What behavior is Linux-specific?**
     POSIX process-group signaling (`process.kill(-pid)`), `/proc/[pid]/stat` field 22 verification against PID reuse, and Linux filesystem atomicity guarantees.
 17. **What cross-platform behaviors are actually claimed?**
-    Linux is the authoritative security and production target. macOS and Windows are supported for core MCP JSON-RPC protocol handling, schema validation, policy evaluation, and in-memory operations; Linux-specific process-group escalation and `/proc` inspection are acknowledged as degraded/deferred on non-Linux platforms. WSL is documented as Linux userspace with host integration.
+    Linux is the sole **VERIFIED / AUTHORITATIVE** security and CI target (POSIX process groups, `/proc` PID-reuse protection, and filesystem atomicity). WSL is **DEVELOPMENT-TESTED** for Linux userspace operation (host `/mnt/c` mounts are not equated with native Linux filesystem guarantees, though canonical workspace jailing applies; WSL is not equivalent to native Windows). macOS is an unverified **RC-08 VALIDATION TARGET** (intended for testing core MCP protocol, schemas, policy, and audit; no process-tree or process-group security equivalence is claimed). Native Windows is **DEFERRED / NOT CLAIMED** (POSIX process groups and `/proc` guarantees are unavailable; native Windows process-tree hardening remains deferred). In accordance with Task 0 discipline, RC-08 only makes final platform claims backed by actual recorded test evidence.
 18. **Which real MCP clients form the compatibility matrix?**
     The official MCP TypeScript SDK stdio client, the official MCP TypeScript SDK Streamable HTTP client, an independent raw JSON-RPC client harness, and manual compatibility profiles for Claude Code and ChatGPT.
 19. **What vendor-specific testing is automated vs manual?**
@@ -339,12 +339,21 @@ The following 25 answers constitute binding architectural commitments for RC-08:
 
 ## 13. Platform Support & Operating System Matrix
 
-| Platform                              | Tier                        | Support Level          | Security & Runtime Claims                                                                                                                           |
-| :------------------------------------ | :-------------------------- | :--------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Linux (POSIX)**                     | Tier 1 (Authoritative)      | Production & CI Target | Full security claims: POSIX process groups, `/proc/[pid]/stat` PID reuse protection, atomic filesystem semantics, canonical jailing.                |
-| **WSL (Windows Subsystem for Linux)** | Tier 1 (Compatible)         | Development & Testing  | Inherits Linux userspace security; host filesystem mounts (`/mnt/c`) must adhere to canonical jailing.                                              |
-| **macOS (Darwin)**                    | Tier 2 (Compatible)         | Developer Workstation  | Supported for core MCP protocol, schema validation, policy, and audit. Process group signaling supported; `/proc` checks fallback to POSIX signals. |
-| **Windows (Native)**                  | Tier 3 (Deferred Hardening) | Basic Compatibility    | Basic stdio MCP and tool execution supported. Process-tree termination and POSIX process-group guarantees are deferred to future stages.            |
+ARC establishes four platform support classifications:
+
+- **A. VERIFIED / AUTHORITATIVE:** Validated with continuous automated CI test coverage and code-enforced security invariants.
+- **B. DEVELOPMENT-TESTED:** Verified in local development workflows; host integration boundaries noted.
+- **C. RC-08 VALIDATION TARGET:** Target for compatibility verification during RC-08; claims unverified until test evidence is recorded.
+- **D. DEFERRED / NOT CLAIMED:** Explicitly out of scope for security/runtime equivalence; capabilities deferred.
+
+| Platform                              | Classification                               | Role & Verification Status                   | Security & Runtime Claims                                                                                                                                                                                                                                                                                                                                                     |
+| :------------------------------------ | :------------------------------------------- | :------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Linux (POSIX)**                     | **VERIFIED / AUTHORITATIVE** (Tier 1)        | Authoritative Security & CI Target           | Full security claims: POSIX process groups, `/proc/[pid]/stat` field 22 PID-reuse protection, orphan process group reaping, atomic filesystem semantics, canonical workspace jailing. Authoritative target for all automated CI security gates.                                                                                                                               |
+| **WSL (Windows Subsystem for Linux)** | **DEVELOPMENT-TESTED** (Tier 1 Compatible)   | Development Environment                      | Linux userspace and kernel behavior integrated with a Windows host. Verified for local development workflows. Host filesystem mounts (`/mnt/c`) are NOT equated with native Linux filesystem guarantees, though canonical workspace jailing strictly applies. WSL is NOT equivalent to native Windows.                                                                        |
+| **macOS (Darwin)**                    | **RC-08 VALIDATION TARGET** (Tier 2 Target)  | Compatibility Validation Target (Unverified) | Target for validating core MCP JSON-RPC protocol handling, 25 tool schemas, declarative policy evaluation, and audit logging. Not stated as "supported" as an established fact until an actual RC-08/macOS test matrix runs successfully. Process-tree and process-group security equivalence is NOT claimed. If test evidence is established, Task 8 may promote this claim. |
+| **Windows (Native)**                  | **DEFERRED / NOT CLAIMED** (Tier 3 Deferred) | Compatibility Validation Target (Deferred)   | Neither stdio MCP nor tool execution is claimed as supported or verified in RC-08. POSIX process groups, `/proc` PID verification, and process-tree supervision are unavailable. Native Windows process-tree hardening is deferred until separately implemented and tested.                                                                                                   |
+
+> **Binding Rule:** RC-08 may only make final platform claims backed by actual recorded test evidence.
 
 ---
 
@@ -437,7 +446,7 @@ All 90 negative controls are mandatory, immutable, and assigned to a specific fu
 - **`RC08-NEG-034`**: Remote: Replay of expired or revoked session token. Rejected with `SESSION_EXPIRED` / `SESSION_REVOKED` / 401 (integration).
 - **`RC08-NEG-035`**: Remote: Slow-trickle / slowloris HTTP request body. Timed out and closed by gateway admission ceiling (integration).
 - **`RC08-NEG-036`**: Remote: Layer C admission rate-limit exhaustion by single client. Enforced; bursts beyond token bucket rejected with 429 (integration).
-- **`RC08-NEG-037`**: Remote: Request body exceeding `MAX_REQUEST_BODY_BYTES` (2 MiB). Rejected with `PAYLOAD_TOO_LARGE` / 413 before parsing (integration).
+- **`RC08-NEG-037`**: Remote: Request body exceeding `MAX_REMOTE_BODY_BYTES` (4 MiB = 4,194,304 bytes, e.g. 4 MiB + 1 byte or chunked cumulative overflow). Rejected with `PAYLOAD_TOO_LARGE` / 413 before JSON parsing according to the frozen RC-05 contract (integration).
 
 ### Category 4: Filesystem, Git & Workspace Adversarial Testing (Task 4 Owner)
 
