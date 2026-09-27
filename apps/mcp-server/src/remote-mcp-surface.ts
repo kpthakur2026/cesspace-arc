@@ -64,6 +64,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
+import { JSONRPCMessageSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { ArcError } from '@cesspace-arc/protocol';
 import {
   ARC_SESSION_TOKEN_HEADER,
@@ -765,6 +766,25 @@ export class RemoteMcpSurface {
 
     this.holdAdmission(res, admission);
 
+    if (method === 'POST' && parsedBody !== undefined) {
+      const envelope = JSONRPCMessageSchema.safeParse(parsedBody);
+      if (!envelope.success) {
+        this.send(
+          res,
+          400,
+          JSON.stringify({
+            jsonrpc: '2.0',
+            error: {
+              code: -32600,
+              message: 'Invalid Request: Not a valid JSON-RPC 2.0 message',
+            },
+            id: jsonRpcRequestId(parsedBody),
+          }),
+        );
+        return;
+      }
+    }
+
     // Request-scoped, server-owned AbortController for this admitted HTTP exchange.
     // Triggered ONLY on premature client disconnect (req aborted / premature socket close),
     // and never on a normal completed response.
@@ -881,6 +901,25 @@ export class RemoteMcpSurface {
       // how many sessions exist.
       this.sendMcpRefusal(res, 'POST', remoteAuthenticationFailure(), requestId);
       return;
+    }
+
+    if (parsedBody !== undefined) {
+      const envelope = JSONRPCMessageSchema.safeParse(parsedBody);
+      if (!envelope.success) {
+        this.send(
+          res,
+          400,
+          JSON.stringify({
+            jsonrpc: '2.0',
+            error: {
+              code: -32600,
+              message: 'Invalid Request: Not a valid JSON-RPC 2.0 message',
+            },
+            id: requestId,
+          }),
+        );
+        return;
+      }
     }
 
     // The ID the generator reserved for THIS bootstrap, captured so a failure

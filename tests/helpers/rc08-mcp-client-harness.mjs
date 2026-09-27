@@ -65,13 +65,59 @@ export function spawnArcStdioServerProcess({ tempDir, workspaceDir, label = 'std
     cwd: process.cwd(),
   });
 
+  let exited = false;
+  proc.once('exit', () => {
+    exited = true;
+  });
+  proc.once('close', () => {
+    exited = true;
+  });
+
   const cleanup = async () => {
-    if (!proc.killed) {
+    if (exited || proc.exitCode !== null || proc.signalCode !== null) {
+      return;
+    }
+
+    const waitForExit = (timeoutMs) => {
+      return new Promise((resolve) => {
+        if (exited || proc.exitCode !== null || proc.signalCode !== null) {
+          resolve(true);
+          return;
+        }
+        const onExit = () => {
+          clearTimeout(timer);
+          resolve(true);
+        };
+        const timer = setTimeout(() => {
+          proc.off('exit', onExit);
+          proc.off('close', onExit);
+          resolve(false);
+        }, timeoutMs);
+        proc.once('exit', onExit);
+        proc.once('close', onExit);
+      });
+    };
+
+    try {
       proc.kill('SIGTERM');
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      if (!proc.killed) {
-        proc.kill('SIGKILL');
-      }
+    } catch {
+      // process might have exited in the interim
+    }
+
+    const termExited = await waitForExit(2000);
+    if (termExited) return;
+
+    try {
+      proc.kill('SIGKILL');
+    } catch {
+      // process might have exited in the interim
+    }
+
+    const killExited = await waitForExit(3000);
+    if (!killExited) {
+      throw new Error(
+        `Failed to confirm child process exit (pid: ${proc.pid}) within bounded deadline`,
+      );
     }
   };
 
@@ -87,6 +133,7 @@ export class RawJsonRpcStdioClient {
    */
   constructor(proc) {
     this.proc = proc;
+    this.nextRequestId = 1;
     this.pendingRequests = new Map();
     this.incomingQueue = [];
     this.readWaiters = [];
@@ -163,22 +210,25 @@ export class RawJsonRpcStdioClient {
    * @param {number} [timeoutMs]
    * @returns {Promise<any>}
    */
-  async request(method, params, id = Math.floor(Math.random() * 1000000) + 1, timeoutMs = 5000) {
+  async request(method, params, id = undefined, timeoutMs = 5000) {
     if (this.closed) throw new Error('Client is closed');
+    const reqId = id !== undefined ? id : this.nextRequestId++;
     const req = {
       jsonrpc: '2.0',
-      id,
+      id: reqId,
       method,
       ...(params !== undefined ? { params } : {}),
     };
 
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.pendingRequests.delete(id);
-        reject(new Error(`Request timed out after ${timeoutMs}ms (method: ${method}, id: ${id})`));
+        this.pendingRequests.delete(reqId);
+        reject(
+          new Error(`Request timed out after ${timeoutMs}ms (method: ${method}, id: ${reqId})`),
+        );
       }, timeoutMs);
 
-      this.pendingRequests.set(id, {
+      this.pendingRequests.set(reqId, {
         resolve: (val) => {
           clearTimeout(timer);
           resolve(val);
@@ -398,4 +448,71 @@ export async function startTestRemoteServer({
       await server.stop();
     },
   };
+}
+
+/**
+ * Creates a raw HTTPS request with the underlying ClientRequest exposed
+ * so that tests can destroy the socket mid-stream to simulate client disconnect.
+ */
+export function makeRawHttpsRequest({
+  port,
+  caPath,
+  certPath,
+  keyPath,
+  method = 'POST',
+  reqPath = '/mcp',
+  headers = {},
+  body = undefined,
+}) {
+  let req;
+  const promise = new Promise((resolve, reject) => {
+    req = https.request(
+      {
+        host: '127.0.0.1',
+        port,
+        method,
+        path: reqPath,
+        servername: 'localhost',
+        ca: [fs.readFileSync(caPath)],
+        cert: fs.readFileSync(certPath),
+        key: fs.readFileSync(keyPath),
+        rejectUnauthorized: true,
+        headers: {
+          Host: 'localhost:' + port,
+          Accept: 'application/json, text/event-stream',
+          'Content-Type': 'application/json',
+          ...headers,
+        },
+      },
+      (res) => {
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => {
+          resolve({
+            statusCode: res.statusCode,
+            headers: res.headers,
+            body: Buffer.concat(chunks).toString('utf8'),
+          });
+        });
+      },
+    );
+    req.on('error', reject);
+    if (body) req.write(body);
+    req.end();
+  });
+  return { req, promise };
+}
+
+/**
+ * Parses an MCP response body, handling both application/json and text/event-stream (SSE).
+ * @param {Response} response
+ * @returns {Promise<any>}
+ */
+export async function parseMcpResponse(response) {
+  const text = await response.text();
+  const dataLine = text.split('\n').find((l) => l.startsWith('data:'));
+  if (dataLine) {
+    return JSON.parse(dataLine.slice(5).trim());
+  }
+  return JSON.parse(text.trim());
 }

@@ -30,6 +30,8 @@ import {
   RawJsonRpcStdioClient,
   createMtlsFetch,
   startTestRemoteServer,
+  makeRawHttpsRequest,
+  parseMcpResponse,
 } from './helpers/rc08-mcp-client-harness.mjs';
 
 const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'rc08-task1-conformance-'));
@@ -122,24 +124,26 @@ describe('RC-08 Task 1: Negative Controls (RC08-NEG-001..RC08-NEG-010)', () => {
   });
 
   test('RC08-NEG-003: Client sends JSON-RPC notification for call-only method (tools/call without id) - discarded without execution', async () => {
-    const { proc, cleanup } = spawnArcStdioServerProcess({
+    const { proc, workspaceDir, cleanup } = spawnArcStdioServerProcess({
       tempDir: tempRoot,
       label: 'neg-003',
     });
     const client = new RawJsonRpcStdioClient(proc);
 
     try {
-      // Send notification for tools/call (no id property)
+      const targetFileName = 'mutation-should-not-exist.txt';
+      const targetFilePath = path.join(workspaceDir, targetFileName);
+
+      // Send notification for tools/call targeting mutation tool create_file
       client.notify('tools/call', {
-        name: 'health',
-        arguments: {},
+        name: 'create_file',
+        arguments: {
+          path: targetFileName,
+          content: 'unauthorized mutation content via notification',
+        },
       });
 
-      // Give server time to process; no message should be emitted
-      await new Promise((resolve) => setTimeout(resolve, 150));
-      assert.equal(client.incomingQueue.length, 0, 'No reply should be emitted for notification');
-
-      // Server must remain healthy and accept legitimate subsequent initialize + tools/call
+      // Use a subsequent successful protocol round-trip as the processing barrier (zero blind sleep)
       const initRes = await client.request('initialize', {
         protocolVersion: '2025-11-25',
         capabilities: {},
@@ -150,13 +154,30 @@ describe('RC-08 Task 1: Negative Controls (RC08-NEG-001..RC08-NEG-010)', () => {
         'Server must accept legitimate initialize after discarded notification',
       );
 
+      // Prove target file does NOT exist and no mutation occurred
+      assert.strictEqual(
+        fs.existsSync(targetFilePath),
+        false,
+        'Target file must NOT exist: notification must not execute mutation tool',
+      );
+
+      // Prove no response was emitted for the notification
+      assert.strictEqual(
+        client.incomingQueue.length,
+        0,
+        'No reply should be emitted for notification',
+      );
+
+      // Confirm protocol lifecycle
       client.notify('notifications/initialized', {});
 
+      // Subsequent legitimate safe tool call succeeds
       const callRes = await client.request('tools/call', {
         name: 'health',
         arguments: {},
       });
       assert.ok(callRes.result, 'Server must respond to legitimate tools/call');
+      assert.strictEqual(callRes.error, undefined);
     } finally {
       client.close();
       await cleanup();
@@ -165,23 +186,37 @@ describe('RC-08 Task 1: Negative Controls (RC08-NEG-001..RC08-NEG-010)', () => {
 
   test('RC08-NEG-004: Client sends batch JSON-RPC request - rejected atomically per-request without session corruption', async () => {
     // 1. Over stdio transport
-    const { proc, cleanup: stdioCleanup } = spawnArcStdioServerProcess({
+    const {
+      proc,
+      workspaceDir: stdioWs,
+      cleanup: stdioCleanup,
+    } = spawnArcStdioServerProcess({
       tempDir: tempRoot,
       label: 'neg-004-stdio',
     });
     const client = new RawJsonRpcStdioClient(proc);
 
     try {
-      // Send batch JSON-RPC array
+      const stdioBatchFile = path.join(stdioWs, 'stdio-batch-file.txt');
+
+      // Send mixed wire-level batch: one valid request calling create_file + one structurally invalid member
       const batchPayload = JSON.stringify([
-        { jsonrpc: '2.0', id: 1, method: 'ping' },
-        { jsonrpc: '2.0', id: 2, method: 'ping' },
+        {
+          jsonrpc: '2.0',
+          id: 101,
+          method: 'tools/call',
+          params: {
+            name: 'create_file',
+            arguments: { path: 'stdio-batch-file.txt', content: 'batch' },
+          },
+        },
+        { id: 102, method: 'ping' }, // structurally invalid: missing jsonrpc: "2.0"
       ]);
       client.sendRaw(batchPayload);
 
-      await new Promise((resolve) => setTimeout(resolve, 100));
-
-      // Server process must survive and cleanly process subsequent requests
+      // Observe SDK 1.30.0 stdio behavior: SDK stdio parser rejects batch array as invalid JSON-RPC message,
+      // discarding it without executing any member.
+      // Use subsequent valid initialize round-trip as the deterministic barrier (no blind sleep).
       const initRes = await client.request('initialize', {
         protocolVersion: '2025-11-25',
         capabilities: {},
@@ -191,6 +226,19 @@ describe('RC-08 Task 1: Negative Controls (RC08-NEG-001..RC08-NEG-010)', () => {
         initRes.result,
         'Stdio server must process subsequent requests cleanly after batch attempt',
       );
+
+      // Prove no unauthorized member execution occurred
+      assert.strictEqual(
+        fs.existsSync(stdioBatchFile),
+        false,
+        'Batch member must NOT have executed mutation',
+      );
+
+      client.notify('notifications/initialized', {});
+
+      // Prove no protocol/session corruption: subsequent valid request succeeds
+      const pingRes = await client.request('ping', {}, 104);
+      assert.deepEqual(pingRes.result, {}, 'Subsequent valid ping request must succeed');
     } finally {
       client.close();
       await stdioCleanup();
@@ -211,9 +259,40 @@ describe('RC-08 Task 1: Negative Controls (RC08-NEG-001..RC08-NEG-010)', () => {
         keyPath: pki.clientKeyPath,
       });
 
-      const batchBody = JSON.stringify([
-        { jsonrpc: '2.0', id: 1, method: 'ping' },
-        { jsonrpc: '2.0', id: 2, method: 'ping' },
+      // Establish session first
+      const initRes = await customFetch(`https://localhost:${remote.port}/mcp`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/event-stream',
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'initialize',
+          params: {
+            protocolVersion: '2025-11-25',
+            capabilities: {},
+            clientInfo: { name: 'test-batch', version: '1.0' },
+          },
+        }),
+      });
+      assert.equal(initRes.status, 200);
+
+      const httpBatchFile = path.join(remote.workspaceDir, 'http-batch-file.txt');
+
+      // Send mixed wire-level batch: 1 valid tool call + 1 structurally invalid member
+      const mixedBatchBody = JSON.stringify([
+        {
+          jsonrpc: '2.0',
+          id: 201,
+          method: 'tools/call',
+          params: {
+            name: 'create_file',
+            arguments: { path: 'http-batch-file.txt', content: 'batch' },
+          },
+        },
+        { id: 202, method: 'ping' }, // missing jsonrpc
       ]);
 
       const res = await customFetch(`https://localhost:${remote.port}/mcp`, {
@@ -222,15 +301,41 @@ describe('RC-08 Task 1: Negative Controls (RC08-NEG-001..RC08-NEG-010)', () => {
           'Content-Type': 'application/json',
           Accept: 'application/json, text/event-stream',
         },
-        body: batchBody,
+        body: mixedBatchBody,
       });
 
+      // Prove one fail-closed batch refusal: HTTP 200 (MCP_POST_REPLY_STATUS), -32600, INVALID_REQUEST_SCHEMA
       assert.equal(res.status, 200, 'Batch refusal is framed as MCP JSON-RPC reply');
       const data = await res.json();
       assert.ok(data.error, 'Batch request must return JSON-RPC error');
       assert.equal(data.error.code, -32600, 'Batch refusal code is -32600 (Invalid Request)');
       assert.equal(data.error.data?.code, 'INVALID_REQUEST_SCHEMA');
       assert.match(data.error.message, /batch/i);
+
+      // Prove no batch member executes
+      assert.strictEqual(
+        fs.existsSync(httpBatchFile),
+        false,
+        'Batch member must NOT have created file',
+      );
+
+      // Prove session remains intact: subsequent valid request succeeds
+      const pingRes = await customFetch(`https://localhost:${remote.port}/mcp`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/event-stream',
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 203,
+          method: 'ping',
+          params: {},
+        }),
+      });
+      assert.equal(pingRes.status, 200, 'Subsequent request must succeed');
+      const pingData = await parseMcpResponse(pingRes);
+      assert.deepEqual(pingData.result, {}, 'Ping result must be empty object');
     } finally {
       await remote.cleanup();
     }
@@ -292,32 +397,57 @@ describe('RC-08 Task 1: Negative Controls (RC08-NEG-001..RC08-NEG-010)', () => {
       });
       client.notify('notifications/initialized', {});
 
-      // Send two requests concurrently with the IDENTICAL ID
-      const duplicateId = 999988;
-      const req1 = JSON.stringify({
+      // Use two requests with IDENTICAL IDs but clearly different result shapes:
+      // A: tools/call health
+      // B: tools/list
+      const duplicateId = 42;
+      const reqA = {
         jsonrpc: '2.0',
         id: duplicateId,
         method: 'tools/call',
         params: { name: 'health', arguments: {} },
-      });
-      const req2 = JSON.stringify({
+      };
+      const reqB = {
         jsonrpc: '2.0',
         id: duplicateId,
         method: 'tools/list',
         params: {},
-      });
+      };
 
-      client.sendRaw(req1);
-      client.sendRaw(req2);
+      // Send both concurrently
+      client.sendRaw(JSON.stringify(reqA));
+      client.sendRaw(JSON.stringify(reqB));
 
-      // Read both responses
-      const res1 = await client.readNext(5000);
-      const res2 = await client.readNext(5000);
+      // Receive both responses without assuming arrival order
+      const resp1 = await client.readNext(5000);
+      const resp2 = await client.readNext(5000);
 
-      assert.equal(res1.id, duplicateId, 'First response must carry duplicate ID');
-      assert.equal(res2.id, duplicateId, 'Second response must carry duplicate ID');
-      assert.ok(res1.result, 'First response must contain result');
-      assert.ok(res2.result, 'Second response must contain result');
+      // Prove both have the duplicate ID
+      assert.equal(resp1.id, duplicateId, 'First response must carry duplicate ID');
+      assert.equal(resp2.id, duplicateId, 'Second response must carry duplicate ID');
+
+      // Disambiguate responses by result shape
+      const responses = [resp1, resp2];
+      const healthResp = responses.find((r) => r.result && r.result.content !== undefined);
+      const listResp = responses.find((r) => r.result && Array.isArray(r.result.tools));
+
+      assert.ok(healthResp, 'Exactly one response must be a health result');
+      assert.ok(listResp, 'Exactly one response must be a tools/list result');
+
+      // Health result inspection
+      assert.equal(healthResp.error, undefined, 'Health response must not contain error');
+      const healthParsed = JSON.parse(healthResp.result.content[0].text);
+      assert.equal(healthParsed.status, 'HEALTHY', 'Health status must be HEALTHY');
+
+      // Tools/list result inspection
+      assert.equal(listResp.error, undefined, 'Tools/list response must not contain error');
+      assert.equal(listResp.result.tools.length, 25, 'tools/list must contain exactly 25 tools');
+
+      // A later request using a NEW ID succeeds
+      const newId = 1001;
+      const pingRes = await client.request('ping', {}, newId);
+      assert.equal(pingRes.id, newId, 'Ping response must carry new ID');
+      assert.deepEqual(pingRes.result, {}, 'Ping result must be empty object');
     } finally {
       client.close();
       await cleanup();
@@ -325,52 +455,222 @@ describe('RC-08 Task 1: Negative Controls (RC08-NEG-001..RC08-NEG-010)', () => {
   });
 
   test('RC08-NEG-007: Client disconnects during tools/call processing - server handles clean disconnect without hung promises', async () => {
-    const { proc, cleanup } = spawnArcStdioServerProcess({
+    const remote = await startTestRemoteServer({
       tempDir: tempRoot,
-      label: 'neg-007',
+      pki,
+      tag: 'neg-007-disconnect',
+      enrolledClientCertPaths: [pki.clientCertPath],
     });
 
-    try {
-      const client = new RawJsonRpcStdioClient(proc);
-      await client.request('initialize', {
-        protocolVersion: '2025-11-25',
-        capabilities: {},
-        clientInfo: { name: 'test-client', version: '1.0' },
-      });
-      client.notify('notifications/initialized', {});
+    const customFetch = createMtlsFetch({
+      caPath: pki.trustedCaCertPath,
+      certPath: pki.clientCertPath,
+      keyPath: pki.clientKeyPath,
+    });
 
-      // Send tools/call and immediately terminate client connection
-      client.sendRaw(
-        JSON.stringify({
+    const abortTestFile = path.join(remote.workspaceDir, 'remote-abort.test.js');
+
+    try {
+      // 1. Establish session over Streamable HTTP
+      const initRes = await customFetch(`https://localhost:${remote.port}/mcp`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/event-stream',
+        },
+        body: JSON.stringify({
           jsonrpc: '2.0',
-          id: 555,
+          id: 1,
+          method: 'initialize',
+          params: {
+            protocolVersion: '2025-11-25',
+            capabilities: {},
+            clientInfo: { name: 'disconnect-test', version: '1.0' },
+          },
+        }),
+      });
+      assert.equal(initRes.status, 200);
+      const sessionId = customFetch.getSessionId();
+      const sessionToken = customFetch.getSessionToken();
+      assert.ok(sessionId && sessionToken);
+
+      // 2. Create long-running node:test fixture
+      fs.writeFileSync(
+        abortTestFile,
+        "import test from 'node:test';\ntest('sleep', async () => { await new Promise((r) => setTimeout(r, 60000)); });\n",
+      );
+
+      // Track lifecycle events from process registry
+      const lifecycleEvents = [];
+      remote.server.processRegistry?.registerLifecycleSink({
+        onProcessEvent(evt) {
+          lifecycleEvents.push(evt);
+        },
+      });
+
+      // 3. Request approval for arc_test via real HTTPS
+      const reqRes = await customFetch(`https://localhost:${remote.port}/mcp`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/event-stream',
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 701,
+          method: 'tools/call',
+          params: {
+            name: 'arc_test',
+            arguments: { testPath: 'remote-abort.test.js', maxDurationMs: 60000 },
+          },
+        }),
+      });
+      assert.equal(reqRes.status, 200);
+      const reqPayload = await parseMcpResponse(reqRes);
+      const toolText = JSON.parse(reqPayload.result.content[0].text);
+      assert.equal(toolText.code, 'APPROVAL_REQUIRED');
+      const requestId = toolText.details.approvalRequestId;
+
+      // 4. Operator approves request
+      const approval = remote.server.approvalStateManager.approve(requestId);
+
+      // 5. Redeem approval via real raw HTTPS request with exposed ClientRequest
+      const { req, promise } = makeRawHttpsRequest({
+        port: remote.port,
+        caPath: pki.trustedCaCertPath,
+        certPath: pki.clientCertPath,
+        keyPath: pki.clientKeyPath,
+        method: 'POST',
+        reqPath: '/mcp',
+        headers: {
+          'Mcp-Session-Id': sessionId,
+          Authorization: `Bearer ${sessionToken}`,
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 702,
+          method: 'tools/call',
+          params: {
+            name: 'arc_test',
+            arguments: {
+              testPath: 'remote-abort.test.js',
+              maxDurationMs: 60000,
+              _arcApproval: { requestId, token: approval.token },
+            },
+          },
+        }),
+      });
+
+      // Swallow expected socket error on abort
+      promise.catch(() => {});
+
+      // 6. Synchronize until ProcessRegistry proves child state RUNNING
+      let runningProc;
+      for (let i = 0; i < 60; i++) {
+        const procs = remote.server.processRegistry?.getActiveProcesses() ?? [];
+        runningProc = procs.find((p) => p.state === 'RUNNING' && p._child?.pid);
+        if (runningProc) break;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      assert.ok(runningProc, 'Process must reach RUNNING state in ProcessRegistry');
+      const childPid = runningProc._child?.pid;
+      assert.ok(childPid && childPid > 0, `Child PID must be valid: ${childPid}`);
+
+      // 7. Destroy the actual client HTTP/socket connection while execution is active
+      req.destroy();
+
+      // 8. Prove within bounded deadline that child process terminates
+      let childDead = false;
+      for (let i = 0; i < 60; i++) {
+        try {
+          process.kill(childPid, 0);
+          await new Promise((r) => setTimeout(r, 50));
+        } catch {
+          childDead = true;
+          break;
+        }
+      }
+      assert.strictEqual(
+        childDead,
+        true,
+        `Child process ${childPid} must be terminated upon client disconnect`,
+      );
+
+      // Prove ProcessRegistry no longer reports RUNNING or TERMINATING
+      const procRecord = remote.server.processRegistry?.getProcess(runningProc.processId);
+      assert.ok(procRecord, 'Process record must exist in ProcessRegistry');
+      assert.ok(
+        procRecord.state !== 'RUNNING' && procRecord.state !== 'TERMINATING',
+        `Process state must not be RUNNING or TERMINATING (got: ${procRecord.state})`,
+      );
+      const procStatus = remote.server.processRegistry?.getProcessStatus(runningProc.processId, {
+        clientId: procRecord.actor.clientId,
+        sessionId: procRecord.actor.sessionId,
+        workspaceId: procRecord.workspaceId,
+      });
+      assert.ok(
+        procStatus.state !== 'TERMINATING',
+        `Process status must not be TERMINATING (got: ${procStatus.state})`,
+      );
+
+      // Prove lifecycle/audit reaches truthful terminal state
+      let foundCompleted = false;
+      for (let i = 0; i < 60; i++) {
+        const auditFiles = fs
+          .readdirSync(remote.audit.directory)
+          .filter((f) => f.endsWith('.jsonl'));
+        for (const af of auditFiles) {
+          const lines = fs
+            .readFileSync(path.join(remote.audit.directory, af), 'utf8')
+            .trim()
+            .split('\n');
+          for (const line of lines) {
+            if (!line) continue;
+            try {
+              const rec = JSON.parse(line);
+              if (rec.lifecycle?.phase === 'COMPLETED' && rec.invocation?.toolName === 'arc_test') {
+                foundCompleted = true;
+                break;
+              }
+            } catch {
+              // ignore parse errors
+            }
+          }
+          if (foundCompleted) break;
+        }
+        if (foundCompleted) break;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      assert.ok(foundCompleted, 'Audit log must truthfully record COMPLETED lifecycle phase');
+
+      // Prove Layer-C admission slot is released and ARC server remains operational
+      const healthRes = await customFetch(`https://localhost:${remote.port}/mcp`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/event-stream',
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 703,
           method: 'tools/call',
           params: { name: 'health', arguments: {} },
         }),
+      });
+      assert.equal(
+        healthRes.status,
+        200,
+        'ARC server must remain operational after client disconnect',
       );
-
-      // Close client immediately before response is consumed
-      client.close();
-
-      // Ensure process cleans up without uncaught exceptions or hung exit
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      if (proc.exitCode === null && proc.signalCode === null) {
-        proc.kill('SIGTERM');
-        await new Promise((resolve) => {
-          if (proc.exitCode !== null || proc.signalCode !== null) return resolve();
-          const timer = setTimeout(resolve, 1000);
-          proc.once('exit', () => {
-            clearTimeout(timer);
-            resolve();
-          });
-        });
-      }
-      assert.ok(
-        proc.killed || proc.exitCode !== null || proc.signalCode !== null,
-        'Server process must exit cleanly after client disconnect',
-      );
+      const healthData = await parseMcpResponse(healthRes);
+      assert.ok(healthData.result, 'Health result must be returned');
     } finally {
-      await cleanup();
+      try {
+        fs.unlinkSync(abortTestFile);
+      } catch {
+        // ignore unlink error
+      }
+      await remote.cleanup();
     }
   });
 
@@ -401,6 +701,16 @@ describe('RC-08 Task 1: Negative Controls (RC08-NEG-001..RC08-NEG-010)', () => {
         'data.code must be INVALID_PAGINATION_TOKEN',
       );
       assert.match(response.error.message, /corrupted-page-token-0xdeadbeef/);
+
+      // Verify recovery after bad cursor: send valid tools/list with no cursor
+      const validListRes = await client.request('tools/list', {});
+      assert.equal(validListRes.error, undefined, 'Must not return error for valid tools/list');
+      assert.ok(Array.isArray(validListRes.result?.tools), 'Must return tools array');
+      assert.equal(
+        validListRes.result.tools.length,
+        25,
+        'Must return exactly 25 tools after recovering from bad cursor',
+      );
     } finally {
       client.close();
       await cleanup();
@@ -408,7 +718,7 @@ describe('RC-08 Task 1: Negative Controls (RC08-NEG-001..RC08-NEG-010)', () => {
   });
 
   test('RC08-NEG-009: Independent raw JSON-RPC client omits required protocol envelopes - server rejects with INVALID_REQUEST / -32600', async () => {
-    // 1. Over Streamable HTTP: omits jsonrpc: "2.0" envelope
+    // 1. Over Streamable HTTP:
     const remote = await startTestRemoteServer({
       tempDir: tempRoot,
       pki,
@@ -424,7 +734,7 @@ describe('RC-08 Task 1: Negative Controls (RC08-NEG-001..RC08-NEG-010)', () => {
       });
 
       // Initialize session first
-      await customFetch(`https://localhost:${remote.port}/mcp`, {
+      const initRes = await customFetch(`https://localhost:${remote.port}/mcp`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -441,8 +751,10 @@ describe('RC-08 Task 1: Negative Controls (RC08-NEG-001..RC08-NEG-010)', () => {
           },
         }),
       });
+      assert.equal(initRes.status, 200);
 
-      // Send raw payload missing jsonrpc: "2.0" envelope
+      // Case A: Syntactically valid JSON with invalid JSON-RPC envelope (missing jsonrpc: "2.0")
+      // MUST produce -32600 Invalid Request
       const missingEnvelopeRes = await customFetch(`https://localhost:${remote.port}/mcp`, {
         method: 'POST',
         headers: {
@@ -457,8 +769,51 @@ describe('RC-08 Task 1: Negative Controls (RC08-NEG-001..RC08-NEG-010)', () => {
 
       assert.equal(missingEnvelopeRes.status, 400);
       const envelopeError = await missingEnvelopeRes.json();
-      assert.ok(envelopeError.error);
-      assert.equal(envelopeError.error.code, -32700);
+      assert.ok(envelopeError.error, 'Must return JSON-RPC error');
+      assert.equal(
+        envelopeError.error.code,
+        -32600,
+        'Syntactically valid JSON with invalid envelope must return -32600 (Invalid Request)',
+      );
+      assert.equal(envelopeError.id, 2, 'Error response must echo request id');
+
+      // Case B: Truly malformed JSON syntax
+      // MUST produce -32700 Parse Error
+      const malformedJsonRes = await customFetch(`https://localhost:${remote.port}/mcp`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/event-stream',
+        },
+        body: '{"id": 3, "method": "ping", invalid-json...',
+      });
+
+      assert.equal(malformedJsonRes.status, 400);
+      const malformedError = await malformedJsonRes.json();
+      assert.ok(malformedError.error, 'Must return JSON-RPC error');
+      assert.equal(
+        malformedError.error.code,
+        -32700,
+        'Malformed JSON syntax must return -32700 (Parse Error)',
+      );
+
+      // Prove that after rejection, a subsequent valid request succeeds
+      const recoveryRes = await customFetch(`https://localhost:${remote.port}/mcp`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/event-stream',
+        },
+        body: JSON.stringify({
+          jsonrpc: '2.0',
+          id: 4,
+          method: 'ping',
+          params: {},
+        }),
+      });
+      assert.equal(recoveryRes.status, 200, 'Subsequent valid request must succeed');
+      const recoveryData = await parseMcpResponse(recoveryRes);
+      assert.deepEqual(recoveryData.result, {});
     } finally {
       await remote.cleanup();
     }
@@ -504,8 +859,9 @@ describe('RC-08 Task 1: Negative Controls (RC08-NEG-001..RC08-NEG-010)', () => {
     });
 
     try {
-      // Launch 15 rapid unauthenticated raw TCP connections (within Layer A burst cap)
+      // Launch 15 rapid unauthenticated raw TCP connections (within Layer A burst cap of 20)
       const stormSize = 15;
+      const stormSockets = [];
       const stormPromises = [];
 
       for (let i = 0; i < stormSize; i++) {
@@ -515,23 +871,57 @@ describe('RC-08 Task 1: Negative Controls (RC08-NEG-001..RC08-NEG-010)', () => {
               // Send random unauthenticated non-TLS junk bytes
               socket.write(`GARBAGE_PAYLOAD_${i}\r\n\r\n`);
             });
+            stormSockets.push(socket);
             socket.on('error', () => resolve());
             socket.on('close', () => resolve());
-            // Guard timeout
-            setTimeout(() => {
-              socket.destroy();
-              resolve();
-            }, 1000);
           }),
         );
       }
 
       await Promise.all(stormPromises);
 
-      // Allow 1.5s for token bucket refill
-      await new Promise((resolve) => setTimeout(resolve, 1500));
+      // Explicitly destroy all storm sockets
+      for (const sock of stormSockets) {
+        try {
+          sock.destroy();
+        } catch {
+          // ignore destroy errors
+        }
+      }
 
-      // Verify that immediately following the storm, an authenticated client succeeds
+      // Prove using bounded condition polling that gateway resources return to baseline
+      let status;
+      for (let i = 0; i < 60; i++) {
+        status = remote.server.getRemoteGatewayStatus();
+        if (
+          status &&
+          status.liveConnections === 0 &&
+          status.inFlightHandshakes === 0 &&
+          status.activeAndServing === true
+        ) {
+          break;
+        }
+        await new Promise((r) => setTimeout(r, 50));
+      }
+
+      assert.ok(status, 'Must obtain remote gateway status');
+      assert.strictEqual(
+        status.liveConnections,
+        0,
+        `liveConnections must return to zero (got: ${status.liveConnections})`,
+      );
+      assert.strictEqual(
+        status.inFlightHandshakes,
+        0,
+        `inFlightHandshakes must return to zero (got: ${status.inFlightHandshakes})`,
+      );
+      assert.strictEqual(
+        status.activeAndServing,
+        true,
+        'Remote gateway must remain active and serving',
+      );
+
+      // Verify that following the storm, an authenticated client succeeds
       const customFetch = createMtlsFetch({
         caPath: pki.trustedCaCertPath,
         certPath: pki.clientCertPath,
