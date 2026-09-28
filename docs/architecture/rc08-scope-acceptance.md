@@ -180,8 +180,8 @@ RC-08 strictly preserves all architectural and security invariants established a
 10. **Single Durable Audit Ledger (INV-10):** All events are recorded in a monotonic SHA-256 hash-chained JSONL ledger. Segment files are anchored and signed.
 11. **Audit Fail-Closed Latch (INV-11):** Failure to persist durable audit records halts execution immediately or latches the server into `DEGRADED_AUDIT_FAILURE`.
 12. **TLS 1.3-Only Remote Transport (INV-12):** Remote transport enforces TLS 1.3 exclusively with secure cipher suites (`TLS_AES_256_GCM_SHA384`, `TLS_CHACHA20_POLY1305_SHA256`, `TLS_AES_128_GCM_SHA256`). TLS 1.2 or below is rejected.
-13. **Mandatory Mutual TLS (INV-13):** Remote HTTP endpoints mandate valid client certificates enrolled in the device trust store.
-14. **Layer-C Admission Control (INV-14):** Token bucket rate and burst limiting protects the gateway against connection and request exhaustion.
+13. **Mandatory Mutual TLS (INV-13):** Remote HTTP endpoints require a client certificate that chains to the configured trusted client CA and whose SPKI SHA-256 pin resolves to an enrolled device. Device identity is server-derived from enrollment; certificate CN and SAN values do not define `deviceId`.
+14. **Layer-C Admission Control (INV-14):** Token bucket rate and burst limiting protects the gateway against authenticated request exhaustion. Layer C is keyed by server-derived authenticated session/device context and reports exhaustion through MCP JSON-RPC `RATE_LIMIT_EXCEEDED`.
 15. **Composite Composition Invariant (INV-15):** Tier-3 composite tools compose lower-level primitives; direct `child_process` or `fs` bypasses in composite modules are forbidden.
 16. **Anti-Fabrication Invariant (INV-16):** Passing tests or clean Git state never fabricates release approval; stage evidence reports strictly verifiable ledger records.
 
@@ -273,7 +273,7 @@ Adversarial testing adheres to strict safety boundaries:
 ARC enforces bounded refusal across all resource vectors:
 
 1. **Request Body Caps:** Governed by the frozen RC-05 contract constant `MAX_REMOTE_BODY_BYTES = 4_194_304` (4 MiB = 4,194,304 bytes). The limit is measured on raw request bytes and enforced during stream ingestion. Exceeding bodies (e.g., 4 MiB + 1 byte or chunked cumulative overflow) are rejected with HTTP 413 `PAYLOAD_TOO_LARGE` before JSON parsing. (Note: for bounded CI runtime, the generic randomized fuzzing corpus uses a separate 2 MiB cap, while targeted boundary tests verify the full 4 MiB production limit).
-2. **Gateway Admission Limiter:** Layer C token bucket bounds request bursts and sustainable rates per client certificate.
+2. **Gateway Admission Limiter:** Layer A may drop/reset connections, Layer B bounds pre-session requests and returns HTTP 429, and Layer C bounds authenticated request bursts and sustainable rates by server-derived session/device context and returns MCP JSON-RPC `RATE_LIMIT_EXCEEDED`.
 3. **Process Concurrency Caps:** Maximum 4 running processes per workspace (`CONCURRENCY_LIMITS.maxPerWorkspaceRunning = 4`). Subsequent executions fail with `CONCURRENCY_EXCEEDED`.
 4. **Buffer & Output Caps:** Process stdout/stderr buffers capped at 512 KiB; output responses capped at 128 KiB or 512 KiB depending on tool tier. Truncation is marked truthfully with `truncated: true`.
 5. **Execution Timeouts:** Read-only tools hard-capped at 15s; verification steps at 30s; test runs at 60s; composite operations at 120s.
@@ -301,9 +301,9 @@ The following 25 answers constitute binding architectural commitments for RC-08:
 8. **How are approval tokens bound and replay-protected under fuzz/adversarial use?**
    Tokens are 32-byte cryptographically secure random values bound to `toolName`, validated business parameters, `workspaceId`, `actorId`, `policyHash`, and `planHash`. Comparison uses `crypto.timingSafeEqual`, and `ApprovalStateManager` atomically marks tokens as consumed on first use to prevent replay attacks.
 9. **How are TLS/mTLS failures tested?**
-   Using local loopback TLS 1.3 servers and testing expired certificates, untrusted CA signatures, mismatched subject names, cleartext HTTP requests, and attempted TLS 1.2 downgrades.
+   Using local loopback TLS 1.3 servers and testing expired certificates, untrusted CA signatures, trusted-CA certificates whose SPKI pins are not enrolled, cleartext HTTP requests, and attempted TLS 1.2 downgrades. Untrusted or expired certificates fail during the TLS handshake with no HTTP or MCP application response. Certificate CN and SAN values are not treated as device identity.
 10. **How are session revocation/replay conditions tested?**
-    By actively expiring or revoking active sessions in the session store and verifying that subsequent requests using the revoked token immediately fail with HTTP 401 / `INVALID_SESSION_TOKEN`.
+    By actively expiring or revoking active sessions in the session store and verifying that subsequent requests immediately fail through the MCP JSON-RPC application channel with the uniform `INVALID_SESSION_TOKEN` semantic. Ordinary remote clients are not told whether the token was malformed, mismatched, expired, or revoked.
 11. **How are resource exhaustion attacks bounded?**
     Via strict code-enforced limits: `MAX_REMOTE_BODY_BYTES = 4_194_304` (4 MiB = 4,194,304 bytes) production remote HTTP body limit, Layer C admission rate limiting (token bucket), 4 concurrent processes per workspace, 512 KiB process buffer caps, and strict timeouts (15s to 120s).
 12. **How are filesystem race/path attacks tested safely?**
@@ -435,18 +435,18 @@ All 90 negative controls are mandatory, immutable, and assigned to a specific fu
 
 ### Category 3: Remote Gateway Adversarial Testing (Task 3 Owner)
 
-- **`RC08-NEG-026`**: Remote: Client presents TLS certificate signed by untrusted CA. Terminated at TLS layer with `CERT_UNTRUSTED` (integration).
-- **`RC08-NEG-027`**: Remote: Client certificate CN/SAN does not match enrolled device ID. Admission rejected with `UNAUTHENTICATED` (integration).
-- **`RC08-NEG-028`**: Remote: Client presents expired client certificate. Terminated at TLS layer (integration).
-- **`RC08-NEG-029`**: Remote: Client attempts TLS 1.2 or below connection (downgrade attack). Connection terminated by TLS 1.3-only cipher configuration (integration).
-- **`RC08-NEG-030`**: Remote: Cleartext HTTP request sent to remote TLS 1.3 listener port. Socket closed with zero response (integration).
-- **`RC08-NEG-031`**: Remote: Host header mismatch (DNS rebinding attack). Request rejected with `INVALID_HOST_HEADER` / 400 (integration).
-- **`RC08-NEG-032`**: Remote: Origin header validation failure for browser-originated requests. Rejected with `ORIGIN_MISMATCH` / 403 (integration).
-- **`RC08-NEG-033`**: Remote: Malformed or forged session bearer token. Rejected with `INVALID_SESSION_TOKEN` / 401 (integration).
-- **`RC08-NEG-034`**: Remote: Replay of expired or revoked session token. Rejected with `SESSION_EXPIRED` / `SESSION_REVOKED` / 401 (integration).
-- **`RC08-NEG-035`**: Remote: Slow-trickle / slowloris HTTP request body. Timed out and closed by gateway admission ceiling (integration).
-- **`RC08-NEG-036`**: Remote: Layer C admission rate-limit exhaustion by single client. Enforced; bursts beyond token bucket rejected with 429 (integration).
-- **`RC08-NEG-037`**: Remote: Request body exceeding `MAX_REMOTE_BODY_BYTES` (4 MiB = 4,194,304 bytes, e.g. 4 MiB + 1 byte or chunked cumulative overflow). Rejected with `PAYLOAD_TOO_LARGE` / 413 before JSON parsing according to the frozen RC-05 contract (integration).
+- **`RC08-NEG-026`**: Remote: Client presents a certificate signed by an untrusted CA. The TLS handshake fails with a TLS alert or connection termination; no HTTP request reaches ARC, no MCP body exists, and no session, device, policy, or subsystem activity occurs (integration).
+- **`RC08-NEG-027`**: Remote: Client presents a trusted-CA certificate whose SPKI SHA-256 pin is not enrolled, or whose server-derived enrolled-device binding cannot be resolved. Admission fails generically with `UNAUTHENTICATED`, without disclosing whether a device exists, the expected pin, a near-match, or client/device identifiers. Certificate CN and SAN values are not `deviceId` (integration).
+- **`RC08-NEG-028`**: Remote: Client presents an expired client certificate. The TLS handshake fails with a TLS alert before HTTP or MCP processing; no application body is required (integration).
+- **`RC08-NEG-029`**: Remote: Client attempts TLS 1.2 or below connection (downgrade attack). TLS negotiation fails because the server requires TLS 1.3; no HTTP or MCP application body exists (integration).
+- **`RC08-NEG-030`**: Remote: Cleartext HTTP request is sent to the TLS listener. The TLS parser rejects it and the connection closes with zero valid HTTP or MCP response (integration).
+- **`RC08-NEG-031`**: Remote: Host header mismatch (DNS rebinding attack). Rejected before MCP processing with HTTP 403 and the fixed bounded body `{"error":"Forbidden"}`; the Host value is not reflected (integration).
+- **`RC08-NEG-032`**: Remote: An Origin header is present and refused. Rejected before MCP processing with HTTP 403 and the same fixed bounded body `{"error":"Forbidden"}` as a Host refusal, with no CORS allow response (integration).
+- **`RC08-NEG-033`**: Remote: Malformed or forged session bearer token. Rejected through the MCP JSON-RPC application channel with uniform `INVALID_SESSION_TOKEN`, without credential details or token digest and before policy or subsystem execution (integration).
+- **`RC08-NEG-034`**: Remote: Replay of an expired or revoked session token. Rejected through the same uniform MCP JSON-RPC `INVALID_SESSION_TOKEN` semantic; ordinary remote clients are not told whether a session expired or was revoked, while internal audit lifecycle distinctions remain limited to those already permitted by RC-05 (integration).
+- **`RC08-NEG-035`**: Remote: Slow-trickle / slowloris HTTP request body. The frozen RC-05 request/body deadline causes a bounded timeout or connection termination, with no partial execution and no indefinitely retained body-read deadline or socket; no new public error code is required (integration).
+- **`RC08-NEG-036`**: Remote: Authenticated Layer-C rate/concurrency exhaustion. Requests beyond the frozen token bucket are rejected through MCP JSON-RPC `RATE_LIMIT_EXCEEDED`, keyed by server-derived authenticated session/device context. HTTP 429 remains exclusive to Layer B pre-session rate limiting; frozen limiter rates and bursts are unchanged (integration).
+- **`RC08-NEG-037`**: Remote: Raw request body exceeds `MAX_REMOTE_BODY_BYTES = 4_194_304` (4 MiB), including a 4 MiB + 1 byte body or cumulative chunked overflow. Rejected with HTTP 413 / `PAYLOAD_TOO_LARGE` during body reading and before JSON parsing (integration).
 
 ### Category 4: Filesystem, Git & Workspace Adversarial Testing (Task 4 Owner)
 
@@ -522,28 +522,28 @@ All 90 negative controls are mandatory, immutable, and assigned to a specific fu
 
 All 20 positive acceptance flows are mandatory and assigned to future task owners:
 
-| Flow ID        | Title                                                | Description                                                                                                                 | Owner  |
-| :------------- | :--------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------- | :----- |
-| `RC08-FLOW-01` | Official MCP SDK Stdio Session                       | Client performs initialize handshake, capability exchange, `tools/list`, and tool execution via stdio.                      | Task 1 |
-| `RC08-FLOW-02` | Official MCP SDK Streamable HTTP Session             | Client performs mTLS handshake, device enrollment, session establishment, and tool execution over TLS 1.3.                  | Task 1 |
-| `RC08-FLOW-03` | Independent Raw JSON-RPC Client Flow                 | Custom non-SDK client communicates with ARC stdio, verifying pure specification conformance.                                | Task 1 |
-| `RC08-FLOW-04` | Multi-Session Client Concurrency                     | Multiple client sessions concurrently initialize, negotiate capabilities, and query tool listings.                          | Task 1 |
-| `RC08-FLOW-05` | Deterministic Corpus Fuzz Execution                  | Seeded fuzzer executes full corpus against JSON-RPC transport and 25 tool schemas; all cases properly handled.              | Task 2 |
-| `RC08-FLOW-06` | Property-Based Schema Validation Flow                | Fast-check property engine verifies schema boundary invariants with deterministic seed reproduction.                        | Task 2 |
-| `RC08-FLOW-07` | Authenticated Remote Gateway Tool Call               | Valid mTLS client executes read-only tool (`read_file`) over TLS 1.3 with chunked SSE response.                             | Task 3 |
-| `RC08-FLOW-08` | Remote Layer-C Token Refill Flow                     | Client consumes rate-limit tokens, waits for bucket refill, and verifies subsequent requests succeed.                       | Task 3 |
-| `RC08-FLOW-09` | Canonical Filesystem & Symlink Traversal             | Jailed read/list operations traverse legitimate internal symlinks while strictly blocking escapes.                          | Task 4 |
-| `RC08-FLOW-10` | Protected Git Inspection Workflow                    | Execute `git_status`, `git_log`, `git_diff` on complex branch history; receive structured, redacted diff.                   | Task 4 |
-| `RC08-FLOW-11` | Controlled Process Supervision Flow                  | Launch legitimate command (`node --version`), track status, collect output, process terminates cleanly.                     | Task 5 |
-| `RC08-FLOW-12` | Interactive Approval Lifecycle Redemption            | Privileged tool (`arc_verify`) requests approval; token granted by authorized actor, redeemed with matching `planHash`.     | Task 5 |
-| `RC08-FLOW-13` | Durable Audit Ledger Anchoring & Verification        | Sequence of operations produces append-only records; checkpoint is signed and verified cleanly.                             | Task 5 |
-| `RC08-FLOW-14` | Bounded High-Concurrency Execution                   | Run 10 concurrent read operations across multiple workspaces without latency degradation or crosstalk.                      | Task 6 |
-| `RC08-FLOW-15` | Cross-Workspace State Isolation                      | Concurrently operate on Workspace 1 and Workspace 2; verify zero data leakage between actors.                               | Task 7 |
-| `RC08-FLOW-16` | Controlled Process Interruption & Clean Exit         | Terminate long-running process; verify orderly SIGTERM followed by confirmation in `ProcessRegistry`.                       | Task 7 |
-| `RC08-FLOW-17` | Read-Only Engineering Workflow                       | Agent performs `arc_repo_status`, `arc_worktree_status`, `arc_review_diff`, `arc_ci_status` without mutations or approvals. | Task 7 |
-| `RC08-FLOW-18` | Approved Full Verification Suite Flow (`arc_verify`) | Full check-only verification suite passes with valid approval, reporting structured step outcomes.                          | Task 8 |
-| `RC08-FLOW-19` | Approved Targeted Test Execution Flow (`arc_test`)   | Targeted test file executes under approval, returning structured test counts and sanitized excerpt.                         | Task 8 |
-| `RC08-FLOW-20` | End-to-End Release Candidate 08 Verification         | Execution of `scripts/verify-rc08.sh` validating all quality gates, all 90 negative controls, and all 20 positive flows.    | Task 8 |
+| Flow ID        | Title                                                | Description                                                                                                                                                                                          | Owner  |
+| :------------- | :--------------------------------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :----- |
+| `RC08-FLOW-01` | Official MCP SDK Stdio Session                       | Client performs initialize handshake, capability exchange, `tools/list`, and tool execution via stdio.                                                                                               | Task 1 |
+| `RC08-FLOW-02` | Official MCP SDK Streamable HTTP Session             | Client performs mTLS handshake, device enrollment, session establishment, and tool execution over TLS 1.3.                                                                                           | Task 1 |
+| `RC08-FLOW-03` | Independent Raw JSON-RPC Client Flow                 | Custom non-SDK client communicates with ARC stdio, verifying pure specification conformance.                                                                                                         | Task 1 |
+| `RC08-FLOW-04` | Multi-Session Client Concurrency                     | Multiple client sessions concurrently initialize, negotiate capabilities, and query tool listings.                                                                                                   | Task 1 |
+| `RC08-FLOW-05` | Deterministic Corpus Fuzz Execution                  | Seeded fuzzer executes full corpus against JSON-RPC transport and 25 tool schemas; all cases properly handled.                                                                                       | Task 2 |
+| `RC08-FLOW-06` | Property-Based Schema Validation Flow                | Fast-check property engine verifies schema boundary invariants with deterministic seed reproduction.                                                                                                 | Task 2 |
+| `RC08-FLOW-07` | Authenticated Remote Gateway Tool Call               | An authenticated, enrolled mTLS client executes read-only tool (`read_file`) over real TLS 1.3 with a chunked SSE response.                                                                          | Task 3 |
+| `RC08-FLOW-08` | Remote Layer-C Token Refill Flow                     | An authenticated client consumes Layer-C tokens, receives MCP JSON-RPC `RATE_LIMIT_EXCEEDED` at exhaustion, advances/refills the bucket deterministically, and verifies subsequent requests succeed. | Task 3 |
+| `RC08-FLOW-09` | Canonical Filesystem & Symlink Traversal             | Jailed read/list operations traverse legitimate internal symlinks while strictly blocking escapes.                                                                                                   | Task 4 |
+| `RC08-FLOW-10` | Protected Git Inspection Workflow                    | Execute `git_status`, `git_log`, `git_diff` on complex branch history; receive structured, redacted diff.                                                                                            | Task 4 |
+| `RC08-FLOW-11` | Controlled Process Supervision Flow                  | Launch legitimate command (`node --version`), track status, collect output, process terminates cleanly.                                                                                              | Task 5 |
+| `RC08-FLOW-12` | Interactive Approval Lifecycle Redemption            | Privileged tool (`arc_verify`) requests approval; token granted by authorized actor, redeemed with matching `planHash`.                                                                              | Task 5 |
+| `RC08-FLOW-13` | Durable Audit Ledger Anchoring & Verification        | Sequence of operations produces append-only records; checkpoint is signed and verified cleanly.                                                                                                      | Task 5 |
+| `RC08-FLOW-14` | Bounded High-Concurrency Execution                   | Run 10 concurrent read operations across multiple workspaces without latency degradation or crosstalk.                                                                                               | Task 6 |
+| `RC08-FLOW-15` | Cross-Workspace State Isolation                      | Concurrently operate on Workspace 1 and Workspace 2; verify zero data leakage between actors.                                                                                                        | Task 7 |
+| `RC08-FLOW-16` | Controlled Process Interruption & Clean Exit         | Terminate long-running process; verify orderly SIGTERM followed by confirmation in `ProcessRegistry`.                                                                                                | Task 7 |
+| `RC08-FLOW-17` | Read-Only Engineering Workflow                       | Agent performs `arc_repo_status`, `arc_worktree_status`, `arc_review_diff`, `arc_ci_status` without mutations or approvals.                                                                          | Task 7 |
+| `RC08-FLOW-18` | Approved Full Verification Suite Flow (`arc_verify`) | Full check-only verification suite passes with valid approval, reporting structured step outcomes.                                                                                                   | Task 8 |
+| `RC08-FLOW-19` | Approved Targeted Test Execution Flow (`arc_test`)   | Targeted test file executes under approval, returning structured test counts and sanitized excerpt.                                                                                                  | Task 8 |
+| `RC08-FLOW-20` | End-to-End Release Candidate 08 Verification         | Execution of `scripts/verify-rc08.sh` validating all quality gates, all 90 negative controls, and all 20 positive flows.                                                                             | Task 8 |
 
 ---
 
