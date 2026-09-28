@@ -74,14 +74,14 @@ export function validateGitArgument(paramName: string, value: string | undefined
   }
   const trimmed = value.trim();
   if (trimmed.startsWith('-')) {
-    throw ArcError.invalidRequestSchema(
+    throw ArcError.invalidGitArgument(
       `Parameter '${paramName}' must not begin with '-' (option flag injection prevention).`,
       'Provide a valid revision name or path without leading dashes.',
     );
   }
   // Disallow shell metacharacters
-  if (/[;&|`$><]/.test(trimmed)) {
-    throw ArcError.invalidRequestSchema(`Parameter '${paramName}' contains forbidden characters.`);
+  if (/[;&|`$><\r\n]/.test(trimmed)) {
+    throw ArcError.invalidGitArgument(`Parameter '${paramName}' contains forbidden characters.`);
   }
 }
 

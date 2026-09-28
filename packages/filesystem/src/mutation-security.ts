@@ -89,7 +89,9 @@ export function validateMutationPath(
 
   // URL-encoded traversal check
   if (/%2e%2e|%2f|%5c/i.test(requestedPath)) {
-    throw ArcError.invalidPathChars('Path contains forbidden URL-encoded traversal characters.');
+    throw ArcError.pathOutsideWorkspace(
+      'Path contains forbidden URL-encoded traversal characters.',
+    );
   }
 
   const trimmed = requestedPath.trim();

@@ -197,7 +197,7 @@ export async function handleArcReviewDiff(
       }
       // RC07-NEG-019: Shell metacharacters in target revision
       if (/[;&|`$><\r\n]/.test(rawRev)) {
-        throw ArcError.invalidRequestSchema(
+        throw ArcError.invalidGitArgument(
           "Parameter 'targetRevision' contains forbidden shell metacharacters.",
           'Provide a valid revision name without shell metacharacters.',
         );

@@ -197,88 +197,119 @@ export interface PolicyInitializationFailure {
   reason: 'POLICY_PARSE_ERROR' | 'POLICY_LOAD_ERROR';
 }
 
+function containsControlCharacter(value: string, allowTextFormatting = false): boolean {
+  return Array.from(value).some((character) => {
+    const codePoint = character.codePointAt(0) ?? 0;
+    if (allowTextFormatting && (codePoint === 9 || codePoint === 10 || codePoint === 13)) {
+      return false;
+    }
+    return codePoint <= 31 || codePoint === 127;
+  });
+}
+
 const WorkspaceIdSchema = z
   .string()
+  .refine((value) => !containsControlCharacter(value), 'workspaceId contains control characters')
   .max(128, 'workspaceId exceeds maximum allowed length of 128 characters')
   .trim()
   .min(1, 'workspaceId must not be empty or whitespace-only');
 
 const WorkspaceRootSchema = z
   .string()
+  .refine((value) => !containsControlCharacter(value), 'workspaceRoot contains control characters')
   .max(1024, 'workspaceRoot exceeds maximum allowed length of 1024 characters')
   .trim()
   .min(1, 'workspaceRoot must not be empty or whitespace-only');
 
 const RelativePathSchema = z
   .string()
+  .refine((value) => !containsControlCharacter(value), 'path contains control characters')
   .max(1024, 'path exceeds maximum allowed length of 1024 characters')
   .trim()
   .min(1, 'path must not be empty or whitespace-only');
 
 const OptionalPathSchema = z
   .string()
+  .refine((value) => !containsControlCharacter(value), 'path contains control characters')
   .max(1024, 'path exceeds maximum allowed length of 1024 characters')
   .trim()
   .min(1, 'path must not be empty or whitespace-only');
 
 const SubPathSchema = z
   .string()
+  .refine((value) => !containsControlCharacter(value), 'subPath contains control characters')
   .max(1024, 'subPath exceeds maximum allowed length of 1024 characters')
   .trim()
   .min(1, 'subPath must not be empty or whitespace-only');
 
 const QuerySchema = z
   .string()
+  .refine((value) => !containsControlCharacter(value), 'query contains control characters')
   .max(500, 'query exceeds maximum allowed length of 500 characters')
   .trim()
   .min(1, 'query must not be empty or whitespace-only');
 
 const PatternSchema = z
   .string()
+  .refine((value) => !containsControlCharacter(value), 'pattern contains control characters')
   .max(256, 'pattern exceeds maximum allowed length of 256 characters')
   .trim()
   .min(1, 'pattern must not be empty or whitespace-only');
 
 const FilePatternSchema = z
   .string()
+  .refine((value) => !containsControlCharacter(value), 'filePattern contains control characters')
   .max(256, 'filePattern exceeds maximum allowed length of 256 characters')
   .trim()
   .min(1, 'filePattern must not be empty or whitespace-only');
 
 const RevisionTargetSchema = z
   .string()
+  .refine(
+    (value) => !containsControlCharacter(value),
+    'revision or target contains control characters',
+  )
   .max(128, 'revision or target exceeds maximum allowed length of 128 characters')
   .trim()
   .min(1, 'revision or target must not be empty or whitespace-only');
 
 const ExecutableSchema = z
   .string()
+  .refine((value) => !containsControlCharacter(value), 'executable contains control characters')
   .max(128, 'executable exceeds maximum allowed length of 128 characters')
   .trim()
   .min(1, 'executable must not be empty or whitespace-only');
 
 const ProcessIdSchema = z
   .string()
+  .refine((value) => !containsControlCharacter(value), 'processId contains control characters')
   .max(128, 'processId exceeds maximum allowed length of 128 characters')
   .trim()
   .min(1, 'processId must not be empty or whitespace-only');
 
 const CommandArgSchema = z
   .string()
+  .refine(
+    (value) => !containsControlCharacter(value),
+    'command argument contains control characters',
+  )
   .max(1024, 'command argument exceeds maximum allowed length of 1024 characters');
 
 const EnvKeySchema = z
   .string()
+  .refine((value) => !containsControlCharacter(value), 'env key contains control characters')
   .max(128, 'env key exceeds maximum allowed length of 128 characters')
   .trim()
   .min(1, 'env key must not be empty');
 
 const EnvValueSchema = z
   .string()
+  .refine((value) => !containsControlCharacter(value), 'env value contains control characters')
   .max(512, 'env value exceeds maximum allowed length of 512 characters');
 
 const FileContentSchema = z
   .string()
+  .refine((value) => !containsControlCharacter(value, true), 'content contains control characters')
   .refine(
     (val) => Buffer.byteLength(val, 'utf8') <= 1024 * 1024,
     'content exceeds maximum allowed size of 1 MiB (1,048,576 bytes)',
@@ -286,6 +317,7 @@ const FileContentSchema = z
 
 const PatchContentSchema = z
   .string()
+  .refine((value) => !containsControlCharacter(value, true), 'patch contains control characters')
   .refine((val) => val.trim().length > 0, 'patch must not be empty or whitespace-only')
   .refine(
     (val) => Buffer.byteLength(val, 'utf8') <= 512 * 1024,
@@ -295,6 +327,15 @@ const PatchContentSchema = z
 const Sha256HashSchema = z
   .string()
   .regex(/^[0-9a-fA-F]{64}$/, 'expectedHash must be a 64-character hexadecimal SHA-256 hash');
+
+const CompositeStringSchema = z
+  .string()
+  .refine((value) => !containsControlCharacter(value), 'value contains control characters');
+
+const CompositeFilterSchema = CompositeStringSchema.refine(
+  (value) => !/[;&|`$><]/.test(value) && !value.includes('$('),
+  'value contains forbidden shell control tokens or metacharacters',
+);
 
 /**
  * Advertises the reserved `_arcApproval` control object on every registered MCP
@@ -323,7 +364,7 @@ export const TOOL_SCHEMAS = {
     .object({
       path: OptionalPathSchema.optional(),
       recursive: z.boolean().optional(),
-      maxDepth: z.number().int().min(1).max(5).optional(),
+      maxDepth: z.number().int().safe().min(1).max(5).optional(),
       includeHidden: z.boolean().optional(),
       workspaceId: WorkspaceIdSchema.optional(),
     })
@@ -331,8 +372,8 @@ export const TOOL_SCHEMAS = {
   read_file: z
     .object({
       path: RelativePathSchema,
-      offset: z.number().int().min(0).optional(),
-      length: z.number().int().min(0).max(1048576).optional(),
+      offset: z.number().int().safe().min(0).optional(),
+      length: z.number().int().safe().min(0).max(1048576).optional(),
       workspaceId: WorkspaceIdSchema.optional(),
     })
     .strict(),
@@ -340,7 +381,7 @@ export const TOOL_SCHEMAS = {
     .object({
       pattern: PatternSchema,
       subPath: SubPathSchema.optional(),
-      maxResults: z.number().int().min(1).max(200).optional(),
+      maxResults: z.number().int().safe().min(1).max(200).optional(),
       workspaceId: WorkspaceIdSchema.optional(),
     })
     .strict(),
@@ -349,7 +390,7 @@ export const TOOL_SCHEMAS = {
       query: QuerySchema,
       isRegex: z.boolean().optional(),
       filePattern: FilePatternSchema.optional(),
-      maxMatches: z.number().int().min(1).max(200).optional(),
+      maxMatches: z.number().int().safe().min(1).max(200).optional(),
       workspaceId: WorkspaceIdSchema.optional(),
     })
     .strict(),
@@ -369,7 +410,7 @@ export const TOOL_SCHEMAS = {
     .strict(),
   git_log: z
     .object({
-      maxCount: z.number().int().min(1).max(100).optional(),
+      maxCount: z.number().int().safe().min(1).max(100).optional(),
       revision: RevisionTargetSchema.optional(),
       path: OptionalPathSchema.optional(),
       workspaceId: WorkspaceIdSchema.optional(),
@@ -380,7 +421,7 @@ export const TOOL_SCHEMAS = {
       executable: ExecutableSchema,
       args: z.array(CommandArgSchema).max(100).optional(),
       cwd: OptionalPathSchema.optional(),
-      timeoutMs: z.number().int().min(100).max(300000).optional(),
+      timeoutMs: z.number().int().safe().min(100).max(300000).optional(),
       env: z.record(EnvKeySchema, EnvValueSchema).optional(),
       workspaceId: WorkspaceIdSchema.optional(),
       runInBackground: z.boolean().optional(),
@@ -395,10 +436,10 @@ export const TOOL_SCHEMAS = {
   process_output: z
     .object({
       processId: ProcessIdSchema,
-      offset: z.number().int().min(0).optional(),
-      stdoutCursor: z.number().int().min(0).optional(),
-      stderrCursor: z.number().int().min(0).optional(),
-      maxBytes: z.number().int().min(1).max(131072).optional(),
+      offset: z.number().int().safe().min(0).optional(),
+      stdoutCursor: z.number().int().safe().min(0).optional(),
+      stderrCursor: z.number().int().safe().min(0).optional(),
+      maxBytes: z.number().int().safe().min(1).max(131072).optional(),
       workspaceId: WorkspaceIdSchema.optional(),
     })
     .strict(),
@@ -463,9 +504,9 @@ export const TOOL_SCHEMAS = {
   arc_review_diff: z
     .object({
       mode: z.enum(['staged', 'unstaged', 'target']).optional(),
-      targetRevision: z.string().min(1).max(256).optional(),
-      path: z.string().min(1).optional(),
-      maxBytes: z.number().int().positive().max(MAX_DIFF_BYTES).optional(),
+      targetRevision: CompositeFilterSchema.min(1).max(256).optional(),
+      path: CompositeFilterSchema.min(1).max(1024).optional(),
+      maxBytes: z.number().int().safe().positive().max(MAX_DIFF_BYTES).optional(),
       workspaceId: WorkspaceIdSchema.optional(),
     })
     .strict(),
@@ -477,22 +518,22 @@ export const TOOL_SCHEMAS = {
     .strict(),
   arc_test: z
     .object({
-      testPath: z.string().min(1).max(1024).optional(),
-      filter: z.string().min(1).max(512).optional(),
+      testPath: CompositeFilterSchema.min(1).max(1024).optional(),
+      filter: CompositeFilterSchema.min(1).max(512).optional(),
       testRunner: z.literal('node').optional(),
-      maxDurationMs: z.number().int().min(100).max(60000).optional(),
+      maxDurationMs: z.number().int().safe().min(100).max(60000).optional(),
       workspaceId: WorkspaceIdSchema.optional(),
     })
     .strict(),
   arc_ci_status: z
     .object({
-      workflowName: z.string().min(1).max(256).optional(),
+      workflowName: CompositeStringSchema.min(1).max(256).optional(),
       workspaceId: WorkspaceIdSchema.optional(),
     })
     .strict(),
   arc_stage_evidence: z
     .object({
-      targetStage: z.string().min(1).max(64),
+      targetStage: CompositeStringSchema.min(1).max(64),
       workspaceId: WorkspaceIdSchema.optional(),
     })
     .strict(),
@@ -2499,6 +2540,18 @@ export class ArcMcpServer implements IArcMcpServer {
         `Invalid parameters for tool '${toolName}': reserved control object failed schema validation.`,
       );
       return denyWith(arcErr, 'schema-arc-approval-control', 'DENY', approvalAuditMetadata);
+    }
+
+    // RC08-NEG-024: issued approval tokens are exactly 32 random bytes encoded
+    // as 64 hexadecimal characters. Preserve the RC-04 extraction contract for
+    // test-only callers while refusing malformed wire tokens before policy or
+    // privileged execution. Uppercase remains structurally valid so the
+    // existing constant-time TOKEN_MISMATCH path handles case modification.
+    if (extracted.control !== null && !/^[0-9a-fA-F]{64}$/.test(extracted.control.token)) {
+      const arcErr = ArcError.invalidRequestSchema(
+        `Invalid parameters for tool '${toolName}': reserved approval token has invalid encoding or length.`,
+      );
+      return denyWith(arcErr, 'schema-arc-approval-token', 'DENY', approvalAuditMetadata);
     }
 
     // 2. Pre-Admission Tool Name & Runtime Schema Validation Gate (P1-02)

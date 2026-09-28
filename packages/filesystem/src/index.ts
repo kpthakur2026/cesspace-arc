@@ -205,7 +205,12 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
 
     // Check for raw URL encoded directory traversal
     if (/%2e%2e|%2f|%5c/i.test(requestedPath)) {
-      throw ArcError.invalidPathChars('Path contains forbidden URL-encoded traversal characters.');
+      throw ArcError.pathOutsideWorkspace(
+        'Path contains forbidden URL-encoded traversal characters.',
+      );
+    }
+    if (/(^|[/\\])\.{2,}([/\\]|$)/.test(requestedPath)) {
+      throw ArcError.pathOutsideWorkspace('Directory traversal is forbidden in workspace path.');
     }
 
     // 2. Canonicalize Workspace Root
@@ -285,7 +290,7 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
       throw ArcError.invalidRequestSchema('Path parameter is required and must be a string.');
     }
     // RC07-NEG-016: directory traversal (..) rejected before unsafe resolution
-    if (/(^|[/\\])\.\.([/\\]|$)/.test(targetPath)) {
+    if (/(^|[/\\])\.{2,}([/\\]|$)/.test(targetPath)) {
       throw ArcError.pathOutsideWorkspace(
         'Directory traversal (..) is forbidden in workspace path.',
       );
@@ -336,10 +341,12 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
       throw ArcError.invalidPathChars('Path contains invalid null byte.');
     }
     if (/%2e%2e|%2f|%5c/i.test(trimmed)) {
-      throw ArcError.invalidPathChars('Path contains forbidden URL-encoded traversal characters.');
+      throw ArcError.pathOutsideWorkspace(
+        'Path contains forbidden URL-encoded traversal characters.',
+      );
     }
     // RC07-NEG-021: directory traversal (..) rejected with PATH_OUTSIDE_WORKSPACE
-    if (/(^|[/\\])\.\.([/\\]|$)/.test(trimmed)) {
+    if (/(^|[/\\])\.{2,}([/\\]|$)/.test(trimmed)) {
       throw ArcError.pathOutsideWorkspace(
         'Directory traversal (..) is forbidden in review diff path.',
       );
@@ -431,10 +438,12 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
       throw ArcError.invalidPathChars('Path contains invalid null byte.');
     }
     if (/%2e%2e|%2f|%5c/i.test(trimmed)) {
-      throw ArcError.invalidPathChars('Path contains forbidden URL-encoded traversal characters.');
+      throw ArcError.pathOutsideWorkspace(
+        'Path contains forbidden URL-encoded traversal characters.',
+      );
     }
     // RC07-NEG-038: directory traversal (..) rejected with PATH_OUTSIDE_WORKSPACE
-    if (/(^|[/\\])\.\.([/\\]|$)/.test(trimmed)) {
+    if (/(^|[/\\])\.{2,}([/\\]|$)/.test(trimmed)) {
       throw ArcError.pathOutsideWorkspace('Directory traversal (..) is forbidden in test path.');
     }
 
@@ -516,10 +525,12 @@ export class FilesystemSubsystem implements IFilesystemSubsystem {
       throw ArcError.invalidPathChars('Path contains invalid null byte.');
     }
     if (/%2e%2e|%2f|%5c/i.test(trimmed)) {
-      throw ArcError.invalidPathChars('Path contains forbidden URL-encoded traversal characters.');
+      throw ArcError.pathOutsideWorkspace(
+        'Path contains forbidden URL-encoded traversal characters.',
+      );
     }
     // RC07-NEG-049: directory traversal (..) rejected with PATH_OUTSIDE_WORKSPACE
-    if (/(^|[/\\])\.\.([/\\]|$)/.test(trimmed)) {
+    if (/(^|[/\\])\.{2,}([/\\]|$)/.test(trimmed)) {
       throw ArcError.pathOutsideWorkspace(
         'Directory traversal (..) is forbidden in workflow path.',
       );

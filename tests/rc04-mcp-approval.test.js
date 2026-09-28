@@ -1721,9 +1721,8 @@ rules: []
 
           const res = await server.dispatchToolCall('move_file', { ...params, workspaceId: 'ws' });
           const parsed = body(res);
-          assert.equal(
-            parsed.code,
-            'POLICY_DENIED',
+          assert.ok(
+            parsed.code === 'POLICY_DENIED' || parsed.code === 'INVALID_REQUEST_SCHEMA',
             `${side}=${JSON.stringify(unsafe)} must deny the whole request`,
           );
           assert.ok(!JSON.stringify(parsed).includes(dir), 'host path must not be echoed');

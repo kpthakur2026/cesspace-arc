@@ -103,7 +103,11 @@ export const TOTAL_REQUEST_TIMEOUT_MS = 60_000;
 
 /** Why a request body was refused or abandoned. Bounded and non-secret. */
 export type BodyRefusalKind =
-  'PAYLOAD_TOO_LARGE' | 'UNSUPPORTED_CONTENT_ENCODING' | 'READ_TIMEOUT' | 'STREAM_FAILED';
+  | 'PAYLOAD_TOO_LARGE'
+  | 'UNSUPPORTED_CONTENT_ENCODING'
+  | 'INVALID_UTF8'
+  | 'READ_TIMEOUT'
+  | 'STREAM_FAILED';
 
 /**
  * A bounded-body failure.
@@ -273,7 +277,11 @@ export function readBoundedRequestBody(
       }
       settled = true;
       cleanup();
-      resolve(Buffer.concat(chunks).toString('utf8'));
+      try {
+        resolve(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks)));
+      } catch {
+        reject(new RequestBodyError('INVALID_UTF8'));
+      }
     };
     const onError = () => {
       if (settled) {

@@ -508,6 +508,18 @@ export class RemoteMcpSurface {
           // request to answer and the connection must not be held open.
           return;
         }
+        if (err.kind === 'INVALID_UTF8') {
+          this.send(
+            res,
+            400,
+            JSON.stringify({
+              jsonrpc: '2.0',
+              error: { code: -32700, message: 'Parse error' },
+              id: null,
+            }),
+          );
+          return;
+        }
       }
       // Ingress failure, not an admission decision: the body could not be read
       // at all, so there is no request to frame a JSON-RPC reply to. §25 keeps
