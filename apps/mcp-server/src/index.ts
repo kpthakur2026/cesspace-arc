@@ -4571,6 +4571,25 @@ export class ArcMcpServer implements IArcMcpServer {
     this.transport = new StdioServerTransport();
     await this.server.connect(this.transport);
 
+    // RC08-NEG-013 / RC08-NEG-022: the SDK's stdio transport reports a
+    // malformed JSON line through `onerror` but otherwise emits no JSON-RPC
+    // refusal. Keep the SDK's protocol error observer and add the missing wire
+    // response for parser/schema failures so the connection can recover on the
+    // next newline-delimited request.
+    const protocolErrorHandler = this.transport.onerror;
+    this.transport.onerror = (error: Error) => {
+      protocolErrorHandler?.(error);
+      if (error instanceof SyntaxError || error.name === 'ZodError') {
+        void this.transport
+          ?.send({
+            jsonrpc: '2.0',
+            error: { code: -32700, message: 'Parse error' },
+            id: null,
+          } as unknown as Parameters<StdioServerTransport['send']>[0])
+          .catch((sendError: Error) => protocolErrorHandler?.(sendError));
+      }
+    };
+
     // The admin channel exists only when explicitly composed in. There is no
     // implicit endpoint and no default socket path.
     if (this.adminIpcServer) {

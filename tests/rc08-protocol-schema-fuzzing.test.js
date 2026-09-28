@@ -5,6 +5,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
 import fc from 'fast-check';
+import { Client } from '../apps/mcp-server/node_modules/@modelcontextprotocol/sdk/dist/esm/client/index.js';
+import { StreamableHTTPClientTransport } from '../apps/mcp-server/node_modules/@modelcontextprotocol/sdk/dist/esm/client/streamableHttp.js';
 
 import {
   ALL_TOOL_DEFINITIONS,
@@ -19,9 +21,13 @@ import {
 import { FilesystemSubsystem } from '../packages/filesystem/dist/index.js';
 import { validateGitArgument } from '../packages/git/dist/index.js';
 import {
+  createMtlsFetch,
+  parseMcpResponse,
   RawJsonRpcStdioClient,
   spawnArcStdioServerProcess,
+  startTestRemoteServer,
 } from './helpers/rc08-mcp-client-harness.mjs';
+import { createTestPki, hasOpenssl } from './helpers/rc05-test-pki.mjs';
 import {
   DEFAULT_FUZZ_SEED,
   EXTENDED_FUZZ_RUNS,
@@ -271,6 +277,7 @@ const TOOL_MANIFEST = [
 let tempRoot;
 let workspace;
 let server;
+let pki;
 
 function parsedToolError(result) {
   assert.equal(result.isError, true);
@@ -307,7 +314,9 @@ function rawResponse(client, raw) {
 
 before(() => {
   reportFuzzConfiguration();
+  assert.ok(hasOpenssl(), 'OpenSSL is required for the real RC-08 mTLS transport proof');
   tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'arc-rc08-fuzz-'));
+  pki = createTestPki(path.join(tempRoot, 'pki'));
   workspace = path.join(tempRoot, 'workspace');
   fs.mkdirSync(workspace);
   fs.writeFileSync(path.join(workspace, 'README.md'), 'fixture\n');
@@ -373,7 +382,7 @@ test('RC08-NEG-012: 10,001-item arrays and unsafe IEEE-754 integers are rejected
   assert.ok((await server.dispatchToolCall('health', {})).content);
 });
 
-test('RC08-NEG-013: invalid UTF-8 bytes and malformed Unicode escape syntax fail at parser boundaries', async () => {
+test('RC08-NEG-013: invalid UTF-8 bytes and malformed Unicode escape syntax produce real -32700 wire responses', async () => {
   const stream = new PassThrough();
   stream.headers = {};
   const bodyPromise = readBoundedRequestBody(stream, { maxBytes: 1024 });
@@ -383,23 +392,62 @@ test('RC08-NEG-013: invalid UTF-8 bytes and malformed Unicode escape syntax fail
     (error) => error instanceof RequestBodyError && error.kind === 'INVALID_UTF8',
   );
 
-  const { client, cleanup } = await initializedStdio('neg-013');
+  const remote = await startTestRemoteServer({
+    tempDir: tempRoot,
+    pki,
+    tag: 'neg-013',
+    enrolledClientCertPaths: [pki.clientCertPath],
+  });
+  const customFetch = createMtlsFetch({
+    caPath: pki.trustedCaCertPath,
+    certPath: pki.clientCertPath,
+    keyPath: pki.clientKeyPath,
+  });
+  const transport = new StreamableHTTPClientTransport(
+    new URL(`https://localhost:${remote.port}/mcp`),
+    { fetch: customFetch },
+  );
+  const client = new Client({ name: 'rc08-neg-013', version: '1.0.0' }, { capabilities: {} });
+  const forbiddenTarget = path.join(remote.workspaceDir, 'must-not-exist.txt');
   try {
-    client.sendRaw('{"jsonrpc":"2.0","id":1301,"method":"ping\\x"}');
-    client.sendRaw(
-      JSON.stringify({
-        jsonrpc: '2.0',
-        id: 1302,
-        method: 'tools/call',
-        params: { name: 'health', arguments: {} },
-      }),
-    );
-    const recovered = await client.readNext(5_000);
-    assert.equal(recovered.id, 1302);
-    assert.ok(recovered.result);
+    await client.connect(transport);
+
+    const invalidUtf8 = Buffer.from([0x7b, 0x22, 0x78, 0x22, 0x3a, 0x22, 0xc3, 0x28, 0x22, 0x7d]);
+    const utf8Response = await customFetch(`https://localhost:${remote.port}/mcp`, {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json, text/event-stream',
+        'Content-Type': 'application/json',
+      },
+      body: invalidUtf8,
+    });
+    const utf8Text = await utf8Response.text();
+    assert.ok(Buffer.byteLength(utf8Text, 'utf8') < 4096);
+    assert.deepEqual(JSON.parse(utf8Text), {
+      jsonrpc: '2.0',
+      error: { code: -32700, message: 'Parse error' },
+      id: null,
+    });
+    assert.equal(fs.existsSync(forbiddenTarget), false);
+
+    const malformedResponse = await customFetch(`https://localhost:${remote.port}/mcp`, {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json, text/event-stream',
+        'Content-Type': 'application/json',
+      },
+      body: '{"jsonrpc":"2.0","id":1301,"method":"tools/call","params":{"name":"create_file","arguments":{"path":"must-not-exist.txt","content":"\\uZZZZ"}}}',
+    });
+    const malformed = await parseMcpResponse(malformedResponse);
+    assert.equal(malformed.jsonrpc, '2.0');
+    assert.equal(malformed.error?.code, -32700);
+    assert.equal(fs.existsSync(forbiddenTarget), false);
+
+    const recovered = await client.callTool({ name: 'health', arguments: {} });
+    assert.ok(recovered.content[0].text);
   } finally {
-    client.close();
-    await cleanup();
+    await client.close();
+    await remote.cleanup();
   }
 });
 
@@ -548,6 +596,10 @@ test('RC08-NEG-022: fragmented requests parse once while truncated frames fail a
     }
     assert.ok((await client.readNext(5_000)).result);
     client.sendRaw('{"jsonrpc":"2.0","id":2202,"method":');
+    const refusal = await client.readNext(5_000);
+    assert.equal(refusal.jsonrpc, '2.0');
+    assert.equal(refusal.id, null);
+    assert.equal(refusal.error?.code, -32700);
     client.sendRaw(
       JSON.stringify({
         jsonrpc: '2.0',
@@ -616,7 +668,7 @@ test('RC08-NEG-025: a fast-check seed plus path reproduces the same controlled c
   assert.match(reproductionCommand(first.seed, first.counterexamplePath), /FUZZ_SEED=424242/);
 });
 
-test('RC08-FLOW-05: deterministic corpus executes 100 normal cases against JSON parsing and every production schema', () => {
+test('RC08-FLOW-05: deterministic corpus fuzzes the real JSON-RPC boundary and every production schema', async () => {
   assert.equal(DEFAULT_FUZZ_SEED, 1_592_639_710);
   assert.ok(FUZZ_RUNS === NORMAL_FUZZ_RUNS || FUZZ_RUNS === EXTENDED_FUZZ_RUNS);
   assert.equal(MAX_GENERATED_DEPTH, 10);
@@ -626,52 +678,119 @@ test('RC08-FLOW-05: deterministic corpus executes 100 normal cases against JSON 
   const catalog = ALL_TOOL_DEFINITIONS.map((tool) => tool.name).sort();
   assert.equal(TOOL_MANIFEST.length, 25);
   assert.deepEqual(TOOL_MANIFEST.map((entry) => entry.name).sort(), catalog);
-  assertFuzzProperty(
-    fc,
-    'RC08-FLOW-05-json',
-    fc.property(fc.jsonValue({ maxDepth: 10 }), (value) => {
-      const encoded = JSON.stringify(value);
-      assert.equal(JSON.stringify(JSON.parse(encoded)), encoded);
-      return true;
-    }),
-  );
-  for (const entry of TOOL_MANIFEST)
-    assert.equal(TOOL_SCHEMAS[entry.name].safeParse(entry.args).success, true, entry.name);
+  const suffixes = fc.sample(fc.stringMatching(/^[a-z0-9]{0,16}$/), {
+    seed: FUZZ_SEED,
+    numRuns: FUZZ_RUNS,
+  });
+  const { client, cleanup } = await initializedStdio('flow-05');
+  const transportCoverage = new Set();
+  try {
+    for (let index = 0; index < FUZZ_RUNS; index += 1) {
+      const id = 50_000 + index;
+      const kind = index % 6;
+      let raw;
+      if (kind === 0) raw = JSON.stringify({ jsonrpc: '2.0', id, method: 'ping' });
+      if (kind === 1) raw = JSON.stringify({ jsonrpc: '2.0', id, method: 'tools/list' });
+      if (kind === 2)
+        raw = JSON.stringify({
+          jsonrpc: '2.0',
+          id,
+          method: 'tools/call',
+          params: { name: 'health', arguments: {} },
+        });
+      if (kind === 3)
+        raw = JSON.stringify({ jsonrpc: '2.0', id, method: `unknown/${suffixes[index]}` });
+      if (kind === 4) raw = JSON.stringify({ jsonrpc: '1.0', id, method: 'ping' });
+      if (kind === 5) raw = `{"jsonrpc":"2.0","id":${id},"method":"ping","params":"\\uZZZZ"}`;
+
+      const response = await rawResponse(client, raw);
+      assert.ok(Buffer.byteLength(JSON.stringify(response), 'utf8') < 64 * 1024);
+      if (kind <= 2) assert.ok(response.result !== undefined, `transport case ${index}`);
+      else assert.ok(response.error, `transport case ${index}`);
+      transportCoverage.add(kind);
+    }
+    assert.deepEqual([...transportCoverage].sort(), [0, 1, 2, 3, 4, 5]);
+    const recovered = await client.request('tools/call', {
+      name: 'health',
+      arguments: {},
+    });
+    assert.ok(recovered.result);
+  } finally {
+    client.close();
+    await cleanup();
+  }
+
+  const schemaCoverage = new Set();
+  for (const entry of TOOL_MANIFEST) {
+    const fields = Object.entries(entry.types);
+    assertFuzzProperty(
+      fc,
+      `RC08-FLOW-05-schema-${entry.name}`,
+      fc.property(
+        fc.constantFrom('valid', 'unknown', 'type'),
+        fc.stringMatching(/^[a-z0-9]{0,16}$/),
+        fc.nat(),
+        (kind, suffix, selector) => {
+          schemaCoverage.add(entry.name);
+          if (kind === 'valid')
+            return TOOL_SCHEMAS[entry.name].safeParse({ ...entry.args }).success;
+          if (kind === 'unknown') {
+            return !TOOL_SCHEMAS[entry.name].safeParse({
+              ...entry.args,
+              [`_rc08_${suffix}`]: true,
+            }).success;
+          }
+          if (fields.length === 0) return !TOOL_SCHEMAS[entry.name].safeParse('scalar').success;
+          const [field, type] = fields[selector % fields.length];
+          return !TOOL_SCHEMAS[entry.name].safeParse({
+            ...entry.args,
+            [field]: wrongValue(type),
+          }).success;
+        },
+      ),
+    );
+  }
+  assert.equal(schemaCoverage.size, 25);
+  assert.deepEqual([...schemaCoverage].sort(), catalog);
 });
 
 test('RC08-FLOW-06: fast-check verifies strict, typed, bounded schema invariants for all 25 tools', () => {
-  const indexArbitrary = fc.integer({ min: 0, max: TOOL_MANIFEST.length - 1 });
-  assertFuzzProperty(
-    fc,
-    'RC08-FLOW-06-unknown',
-    fc.property(indexArbitrary, fc.string({ maxLength: 32 }), (index, suffix) => {
-      const entry = TOOL_MANIFEST[index];
-      return !TOOL_SCHEMAS[entry.name].safeParse({ ...entry.args, [`_rc08_${suffix}`]: true })
-        .success;
-    }),
-  );
-  assertFuzzProperty(
-    fc,
-    'RC08-FLOW-06-valid',
-    fc.property(indexArbitrary, (index) => {
-      const entry = TOOL_MANIFEST[index];
-      return TOOL_SCHEMAS[entry.name].safeParse(entry.args).success;
-    }),
-  );
-  assertFuzzProperty(
-    fc,
-    'RC08-FLOW-06-types',
-    fc.property(indexArbitrary, (index) => {
-      const entry = TOOL_MANIFEST[index];
-      const fields = Object.entries(entry.types);
-      return fields.length === 0
-        ? !TOOL_SCHEMAS[entry.name].safeParse('scalar').success
-        : !TOOL_SCHEMAS[entry.name].safeParse({
-            ...entry.args,
-            [fields[0][0]]: wrongValue(fields[0][1]),
-          }).success;
-    }),
-  );
+  const propertyCoverage = new Set();
+  for (const entry of TOOL_MANIFEST) {
+    assertFuzzProperty(
+      fc,
+      `RC08-FLOW-06-unknown-${entry.name}`,
+      fc.property(fc.stringMatching(/^[a-z0-9]{0,24}$/), (suffix) => {
+        propertyCoverage.add(entry.name);
+        return !TOOL_SCHEMAS[entry.name].safeParse({
+          ...entry.args,
+          [`_rc08_${suffix}`]: true,
+        }).success;
+      }),
+    );
+    assertFuzzProperty(
+      fc,
+      `RC08-FLOW-06-valid-${entry.name}`,
+      fc.property(fc.constant({ ...entry.args }), (args) => {
+        propertyCoverage.add(entry.name);
+        return TOOL_SCHEMAS[entry.name].safeParse(args).success;
+      }),
+    );
+    const fields = Object.entries(entry.types);
+    assertFuzzProperty(
+      fc,
+      `RC08-FLOW-06-types-${entry.name}`,
+      fc.property(fc.nat(), (selector) => {
+        propertyCoverage.add(entry.name);
+        if (fields.length === 0) return !TOOL_SCHEMAS[entry.name].safeParse('scalar').success;
+        const [field, type] = fields[selector % fields.length];
+        return !TOOL_SCHEMAS[entry.name].safeParse({
+          ...entry.args,
+          [field]: wrongValue(type),
+        }).success;
+      }),
+    );
+  }
   const sequenceA = fc.sample(fc.string({ maxLength: 24 }), {
     seed: FUZZ_SEED,
     numRuns: FUZZ_RUNS,
@@ -681,7 +800,11 @@ test('RC08-FLOW-06: fast-check verifies strict, typed, bounded schema invariants
     numRuns: FUZZ_RUNS,
   });
   assert.deepEqual(sequenceA, sequenceB);
-  assert.equal(TOOL_MANIFEST.length, 25);
+  assert.equal(propertyCoverage.size, 25);
+  assert.deepEqual(
+    [...propertyCoverage].sort(),
+    ALL_TOOL_DEFINITIONS.map((tool) => tool.name).sort(),
+  );
   assert.equal(fastCheckParameters().seed, FUZZ_SEED);
   assert.equal(fastCheckParameters().numRuns, FUZZ_RUNS);
   assert.equal(fastCheckParameters().path, FUZZ_PATH);
