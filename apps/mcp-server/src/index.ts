@@ -84,6 +84,7 @@ import {
 } from './composite-framework.js';
 import { SERVER_INTERNAL_ACCESS } from './internal/server-seam.js';
 import { createServerDeterministicExecutor } from './internal/execution-authority.js';
+import { exceedsMaxJsonNestingDepth } from './json-nesting.js';
 import type { TestCompositeHarness } from './internal/composite-testing.js';
 import {
   handleArcRepoStatus,
@@ -4570,6 +4571,25 @@ export class ArcMcpServer implements IArcMcpServer {
 
     this.transport = new StdioServerTransport();
     await this.server.connect(this.transport);
+
+    // RC08-NEG-011: retain the official SDK transport and intercept only its
+    // already-parsed inbound message callback. A message beyond the shared
+    // JSON depth ceiling is refused before the SDK protocol/server handlers,
+    // so it cannot resolve a method or reach any registered tool.
+    const protocolMessageHandler = this.transport.onmessage;
+    this.transport.onmessage = (message) => {
+      if (exceedsMaxJsonNestingDepth(message)) {
+        void this.transport
+          ?.send({
+            jsonrpc: '2.0',
+            error: { code: -32600, message: 'Invalid Request: JSON nesting exceeds limit' },
+            id: 'id' in message && message.id !== undefined ? message.id : null,
+          } as unknown as Parameters<StdioServerTransport['send']>[0])
+          .catch((sendError: Error) => this.transport?.onerror?.(sendError));
+        return;
+      }
+      protocolMessageHandler?.(message);
+    };
 
     // RC08-NEG-013 / RC08-NEG-022: the SDK's stdio transport reports a
     // malformed JSON line through `onerror` but otherwise emits no JSON-RPC

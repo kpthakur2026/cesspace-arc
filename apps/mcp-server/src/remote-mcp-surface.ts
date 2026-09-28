@@ -93,6 +93,7 @@ import {
   readBoundedRequestBody,
 } from './remote-request-bounds.js';
 import type { GatewayAuditSink } from './gateway-audit.js';
+import { exceedsMaxJsonNestingDepth } from './json-nesting.js';
 
 // The Host (§10) and Origin (§11) refusals and their normalization are owned by
 // the ONE shared authority module, so `/mcp` and `/enroll/complete` cannot
@@ -538,6 +539,25 @@ export class RemoteMcpSurface {
       // malformed body still reaches the transport, which returns the JSON-RPC
       // parse error itself.
       parsedBody = undefined;
+    }
+
+    // RC08-NEG-011: malformed JSON remains a parse error in the transport;
+    // only a successfully parsed JSON value is subject to this shared depth
+    // admission. Refuse before session SDK dispatch or any registered handler.
+    if (parsedBody !== undefined && exceedsMaxJsonNestingDepth(parsedBody)) {
+      this.send(
+        res,
+        400,
+        JSON.stringify({
+          jsonrpc: '2.0',
+          error: {
+            code: -32600,
+            message: 'Invalid Request: JSON nesting exceeds limit',
+          },
+          id: jsonRpcRequestId(parsedBody),
+        }),
+      );
+      return;
     }
 
     // §21.1 Layer C / §26 C-3 / MCP `2025-06-18`: a JSON-RPC BATCH is refused.

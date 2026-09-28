@@ -329,25 +329,104 @@ before(() => {
 
 after(() => fs.rmSync(tempRoot, { recursive: true, force: true }));
 
-test('RC08-NEG-011: deeply nested JSON is rejected at the real stdio protocol boundary and recovery succeeds', async () => {
-  const { client, cleanup } = await initializedStdio('neg-011');
+test('RC08-NEG-011: depth 10 resolves normally while depth 11 is rejected on real stdio and remote wires', async () => {
+  const forbiddenTarget = path.join(workspace, 'neg-011-must-not-exist.txt');
+  const allowedParams = makeNested(9);
+  const excessiveParams = makeNested(10);
+
+  const { client, cleanup } = await initializedStdio('neg-011-stdio');
   try {
-    const response = await rawResponse(
+    const allowed = await rawResponse(
       client,
       JSON.stringify({
         jsonrpc: '2.0',
         id: 1101,
-        method: 'tools/call',
-        params: { name: makeNested(11), arguments: {} },
+        method: 'unknown/depth-probe',
+        params: allowedParams,
       }),
     );
-    assert.ok(response.error);
-    assert.ok([-32600, -32602, -32603].includes(response.error.code));
-    const healthy = await client.request('tools/call', { name: 'health', arguments: {} }, 1102);
+    assert.equal(allowed.error?.code, -32601);
+
+    const excessive = await rawResponse(
+      client,
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1102,
+        method: 'unknown/depth-probe',
+        params: excessiveParams,
+      }),
+    );
+    assert.equal(excessive.error?.code, -32600);
+    assert.match(excessive.error?.message, /nesting exceeds limit/i);
+    assert.equal(fs.existsSync(forbiddenTarget), false);
+
+    const healthy = await client.request('tools/call', { name: 'health', arguments: {} }, 1103);
     assert.ok(healthy.result);
   } finally {
     client.close();
     await cleanup();
+  }
+
+  const remote = await startTestRemoteServer({
+    tempDir: tempRoot,
+    pki,
+    tag: 'neg-011-remote',
+    enrolledClientCertPaths: [pki.clientCertPath],
+  });
+  const customFetch = createMtlsFetch({
+    caPath: pki.trustedCaCertPath,
+    certPath: pki.clientCertPath,
+    keyPath: pki.clientKeyPath,
+  });
+  const transport = new StreamableHTTPClientTransport(
+    new URL(`https://localhost:${remote.port}/mcp`),
+    { fetch: customFetch },
+  );
+  const remoteClient = new Client({ name: 'rc08-neg-011', version: '1.0.0' }, { capabilities: {} });
+  try {
+    await remoteClient.connect(transport);
+    const post = (body) =>
+      customFetch(`https://localhost:${remote.port}/mcp`, {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json, text/event-stream',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify(body),
+      });
+
+    const allowedResponse = await post({
+      jsonrpc: '2.0',
+      id: 1111,
+      method: 'unknown/depth-probe',
+      params: allowedParams,
+    });
+    const allowedEnvelope = await parseMcpResponse(allowedResponse);
+    assert.equal(allowedEnvelope.error?.code, -32601);
+
+    const excessiveResponse = await post({
+      jsonrpc: '2.0',
+      id: 1112,
+      method: 'unknown/depth-probe',
+      params: excessiveParams,
+    });
+    const excessiveText = await excessiveResponse.text();
+    assert.ok(Buffer.byteLength(excessiveText, 'utf8') < 4096);
+    const excessiveEnvelope = JSON.parse(excessiveText);
+    assert.equal(excessiveEnvelope.jsonrpc, '2.0');
+    assert.equal(excessiveEnvelope.id, 1112);
+    assert.equal(excessiveEnvelope.error?.code, -32600);
+    assert.match(excessiveEnvelope.error?.message, /nesting exceeds limit/i);
+    assert.equal(
+      fs.existsSync(path.join(remote.workspaceDir, 'neg-011-must-not-exist.txt')),
+      false,
+    );
+
+    const recovered = await remoteClient.callTool({ name: 'health', arguments: {} });
+    assert.ok(recovered.content[0].text);
+  } finally {
+    await remoteClient.close();
+    await remote.cleanup();
   }
 });
 
