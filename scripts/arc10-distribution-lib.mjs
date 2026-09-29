@@ -97,32 +97,6 @@ function assertNoSecrets(name, bytes) {
   }
 }
 
-async function walkFiles(root, relative = '') {
-  const directory = path.join(root, relative);
-  const names = await fs.promises.readdir(directory);
-  names.sort();
-  const files = [];
-  for (const name of names) {
-    const childRelative = relative ? `${relative}/${name}` : name;
-    if (childRelative === '.git' || childRelative.startsWith('.git/')) continue;
-    if (childRelative === 'node_modules' || childRelative.includes('/node_modules/')) continue;
-    if (childRelative === 'dist' || childRelative.includes('/dist/')) continue;
-    const fullPath = path.join(root, ...childRelative.split('/'));
-    const stat = await fs.promises.lstat(fullPath);
-    if (stat.isSymbolicLink()) {
-      throw new DistributionError(
-        'UNSAFE_SOURCE_ENTRY',
-        'Source distribution cannot contain symlinks',
-      );
-    }
-    if (stat.isDirectory()) files.push(...(await walkFiles(root, childRelative)));
-    else if (stat.isFile() && SOURCE_PATTERNS.some((pattern) => pattern.test(childRelative))) {
-      files.push(childRelative);
-    }
-  }
-  return files;
-}
-
 async function command(commandRunner, file, args, options = {}) {
   const runner = commandRunner ?? execFile;
   return runner(file, args, { ...options, maxBuffer: 32 * 1024 * 1024 });
@@ -217,17 +191,40 @@ export async function createDependencyEvidence(sourceRoot, lockfileSha256, optio
   return { inventory, sbom };
 }
 
-export async function createSourceArchive(sourceRoot) {
-  const files = await walkFiles(sourceRoot);
+export async function createSourceArchive(sourceRoot, options = {}) {
+  const treeResult = await command(
+    options.commandRunner,
+    'git',
+    ['-C', sourceRoot, 'ls-tree', '-rz', '--full-tree', 'HEAD'],
+    { encoding: 'buffer' },
+  );
+  const records = treeResult.stdout.toString('utf8').split('\0').filter(Boolean);
   const entries = [];
-  for (const relativePath of files) {
+  for (const record of records) {
+    const match = /^(\d{6}) (\S+) ([0-9a-f]+)\t(.+)$/u.exec(record);
+    if (!match) {
+      throw new DistributionError('INVALID_SOURCE_TREE', 'Git returned malformed tree metadata');
+    }
+    const [, gitMode, gitType, objectId, relativePath] = match;
+    if (!SOURCE_PATTERNS.some((pattern) => pattern.test(relativePath))) continue;
     const normalized = normalizeRelativePath(relativePath);
-    const bytes = await fs.promises.readFile(path.join(sourceRoot, ...normalized.split('/')));
+    if (gitType !== 'blob' || !['100644', '100755'].includes(gitMode)) {
+      throw new DistributionError(
+        'UNSAFE_SOURCE_ENTRY',
+        `Selected source entry is not a regular file: ${path.posix.basename(normalized)}`,
+      );
+    }
+    const blobResult = await command(
+      options.commandRunner,
+      'git',
+      ['-C', sourceRoot, 'cat-file', 'blob', objectId],
+      { encoding: 'buffer' },
+    );
+    const bytes = blobResult.stdout;
     assertNoSecrets(normalized, bytes);
-    const stat = await fs.promises.stat(path.join(sourceRoot, ...normalized.split('/')));
     entries.push({
       data: bytes.toString('base64'),
-      mode: stat.mode & 0o111 ? '0755' : '0644',
+      mode: gitMode === '100755' ? '0755' : '0644',
       path: normalized,
       sha256: sha256(bytes),
       size: bytes.length,
@@ -263,26 +260,30 @@ export function verifyManifestSignature(manifestBytes, signature, trustedPublicK
 
 export async function buildDistribution({ sourceRoot, outputDir, privateKey, commandRunner }) {
   if (!privateKey) throw new DistributionError('SIGNING_KEY_REQUIRED', 'A signing key is required');
-  const packageJson = JSON.parse(
-    await fs.promises.readFile(path.join(sourceRoot, 'package.json'), 'utf8'),
+  const sourceCommit = await gitValue(sourceRoot, ['rev-parse', 'HEAD'], commandRunner);
+  const sourceTree = await gitValue(sourceRoot, ['rev-parse', 'HEAD^{tree}'], commandRunner);
+  const dirty = await gitValue(
+    sourceRoot,
+    ['status', '--porcelain=v1', '--untracked-files=no', '--ignore-submodules=none'],
+    commandRunner,
   );
+  if (dirty)
+    throw new DistributionError('DIRTY_SOURCE', 'Distribution source must be committed and clean');
+
+  const { archive, bytes: archiveBytes } = await createSourceArchive(sourceRoot, { commandRunner });
+  const packageEntry = archive.entries.find((entry) => entry.path === 'package.json');
+  if (!packageEntry)
+    throw new DistributionError(
+      'PACKAGE_MANIFEST_REQUIRED',
+      'The tracked package manifest is required',
+    );
+  const packageJson = JSON.parse(Buffer.from(packageEntry.data, 'base64').toString('utf8'));
   if (packageJson.version !== ARC_VERSION) {
     throw new DistributionError(
       'VERSION_MISMATCH',
       'Source version does not match the distribution contract',
     );
   }
-  const sourceCommit = await gitValue(sourceRoot, ['rev-parse', 'HEAD'], commandRunner);
-  const sourceTree = await gitValue(sourceRoot, ['rev-parse', 'HEAD^{tree}'], commandRunner);
-  const dirty = await gitValue(
-    sourceRoot,
-    ['status', '--porcelain', '--untracked-files=no'],
-    commandRunner,
-  );
-  if (dirty)
-    throw new DistributionError('DIRTY_SOURCE', 'Distribution source must be committed and clean');
-
-  const { archive, bytes: archiveBytes } = await createSourceArchive(sourceRoot);
   const lockEntry = archive.entries.find((entry) => entry.path === 'pnpm-lock.yaml');
   if (!lockEntry)
     throw new DistributionError('LOCKFILE_REQUIRED', 'The exact pnpm lockfile is required');

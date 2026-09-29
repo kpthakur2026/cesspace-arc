@@ -58,6 +58,15 @@ async function copyBundle() {
   return value;
 }
 
+async function cloneSourceFixture(prefix) {
+  const destination = await temporaryDirectory(prefix);
+  await execFile('git', ['clone', '--quiet', '--no-hardlinks', fixtureRoot, destination], {
+    maxBuffer: 32 * 1024 * 1024,
+  });
+  await attachInstalledDependencies(repositoryRoot, destination);
+  return destination;
+}
+
 async function rewriteArtifact(bundleDir, artifactName, value, mutateManifest = () => {}) {
   const bytes = Buffer.from(`${canonicalJson(value)}\n`);
   await fs.promises.writeFile(path.join(bundleDir, artifactName), bytes);
@@ -281,6 +290,116 @@ test('ARC10-NEG-007 detects a reproducibility-relevant source perturbation in th
   assert.notEqual(perturbed.normalizedDigest, baseline.normalizedDigest);
 });
 
+test('source provenance excludes untracked and ignored eligible files from the declared HEAD archive', async () => {
+  const untrackedSource = await cloneSourceFixture('arc10-untracked-source-');
+  const untrackedPath = 'apps/mcp-server/src/untracked-provenance-injection.ts';
+  await fs.promises.writeFile(path.join(untrackedSource, untrackedPath), 'untracked injection\n');
+  const untrackedParent = await temporaryDirectory('arc10-untracked-output-');
+  const untrackedBundle = path.join(untrackedParent, 'bundle');
+  const untrackedResult = await buildDistribution({
+    sourceRoot: untrackedSource,
+    outputDir: untrackedBundle,
+    privateKey: keys.privateKey,
+  });
+  const untrackedArchive = JSON.parse(
+    await fs.promises.readFile(path.join(untrackedBundle, ARCHIVE_FILE), 'utf8'),
+  );
+  assert.equal(
+    untrackedArchive.entries.some((entry) => entry.path === untrackedPath),
+    false,
+  );
+  assert.equal(
+    untrackedResult.manifest.source.commit,
+    (await execFile('git', ['rev-parse', 'HEAD'], { cwd: untrackedSource })).stdout.trim(),
+  );
+  assert.equal(
+    untrackedResult.manifest.source.tree,
+    (await execFile('git', ['rev-parse', 'HEAD^{tree}'], { cwd: untrackedSource })).stdout.trim(),
+  );
+
+  const ignoredSource = await cloneSourceFixture('arc10-ignored-source-');
+  const ignoredPath = 'docs/distribution/ignored-provenance-injection.md';
+  await fs.promises.appendFile(path.join(ignoredSource, '.gitignore'), `\n${ignoredPath}\n`);
+  await execFile('git', ['add', '.gitignore'], { cwd: ignoredSource });
+  await execFile(
+    'git',
+    [
+      '-c',
+      'user.name=ARC Test',
+      '-c',
+      'user.email=arc@example.invalid',
+      'commit',
+      '--quiet',
+      '-m',
+      'ignore provenance fixture',
+    ],
+    { cwd: ignoredSource },
+  );
+  await fs.promises.writeFile(path.join(ignoredSource, ignoredPath), 'ignored injection\n');
+  const ignoredParent = await temporaryDirectory('arc10-ignored-output-');
+  const ignoredBundle = path.join(ignoredParent, 'bundle');
+  await buildDistribution({
+    sourceRoot: ignoredSource,
+    outputDir: ignoredBundle,
+    privateKey: keys.privateKey,
+  });
+  const ignoredArchive = JSON.parse(
+    await fs.promises.readFile(path.join(ignoredBundle, ARCHIVE_FILE), 'utf8'),
+  );
+  assert.equal(
+    ignoredArchive.entries.some((entry) => entry.path === ignoredPath),
+    false,
+  );
+});
+
+test('source provenance refuses tracked unstaged and staged-but-uncommitted changes', async () => {
+  for (const staged of [false, true]) {
+    const source = await cloneSourceFixture(
+      staged ? 'arc10-staged-source-' : 'arc10-unstaged-source-',
+    );
+    await fs.promises.appendFile(
+      path.join(source, 'README.md'),
+      '\nuncommitted provenance change\n',
+    );
+    if (staged) await execFile('git', ['add', 'README.md'], { cwd: source });
+    const outputParent = await temporaryDirectory(
+      staged ? 'arc10-staged-output-' : 'arc10-unstaged-output-',
+    );
+    await assert.rejects(
+      buildDistribution({
+        sourceRoot: source,
+        outputDir: path.join(outputParent, 'bundle'),
+        privateKey: keys.privateKey,
+      }),
+      (error) => error.code === 'DIRTY_SOURCE',
+    );
+  }
+});
+
+test('source archive bytes and executable modes equal representative exact HEAD objects', async () => {
+  const archive = JSON.parse(await fs.promises.readFile(path.join(bundle, ARCHIVE_FILE), 'utf8'));
+  for (const relativePath of [
+    'package.json',
+    'apps/mcp-server/src/index.ts',
+    'scripts/arc10-build-distribution.mjs',
+  ]) {
+    const entry = archive.entries.find((candidate) => candidate.path === relativePath);
+    assert.ok(entry, `${relativePath} must be selected from HEAD`);
+    const headBlob = (
+      await execFile('git', ['show', `HEAD:${relativePath}`], {
+        cwd: fixtureRoot,
+        encoding: 'buffer',
+        maxBuffer: 32 * 1024 * 1024,
+      })
+    ).stdout;
+    assert.deepEqual(Buffer.from(entry.data, 'base64'), headBlob);
+    const treeMetadata = (
+      await execFile('git', ['ls-tree', 'HEAD', '--', relativePath], { cwd: fixtureRoot })
+    ).stdout;
+    assert.equal(entry.mode, treeMetadata.startsWith('100755 ') ? '0755' : '0644');
+  }
+});
+
 test('ARC10-NEG-008 enforces authoritative Linux x86-64 platform support without partial install', async () => {
   assert.deepEqual(classifyPlatform({ platform: 'linux', arch: 'x64' }), {
     accepted: true,
@@ -465,6 +584,19 @@ test('ARC10-FLOW-02 produces equivalent normalized release evidence in independe
   }
   await verifyDistribution({ bundleDir: bundle, trustedPublicKey: keys.publicKey });
   await verifyDistribution({ bundleDir: secondBundle, trustedPublicKey: keys.publicKey });
+  const firstManifest = JSON.parse(await fs.promises.readFile(path.join(bundle, MANIFEST_FILE)));
+  const secondManifest = JSON.parse(
+    await fs.promises.readFile(path.join(secondBundle, MANIFEST_FILE)),
+  );
+  assert.deepEqual(firstManifest.source, secondManifest.source);
+  assert.equal(
+    firstManifest.source.commit,
+    (await execFile('git', ['rev-parse', 'HEAD'], { cwd: fixtureRoot })).stdout.trim(),
+  );
+  assert.equal(
+    firstManifest.source.tree,
+    (await execFile('git', ['rev-parse', 'HEAD^{tree}'], { cwd: fixtureRoot })).stdout.trim(),
+  );
   process.stdout.write(`ARC10 reproducible digests ${JSON.stringify(digests)}\n`);
 });
 

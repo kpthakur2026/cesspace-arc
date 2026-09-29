@@ -18,6 +18,8 @@ pnpm run dist:build -- <bundle-directory> <private-key-file> [source-root]
 
 The bundle contains a normalized source archive, canonical manifest, detached manifest signature, SPDX 2.3 JSON SBOM, dependency/license inventory, and source provenance. Verify in this order before installation:
 
+The source archive is a deterministic projection of eligible regular-file blobs in the declared Git `HEAD` tree. Bytes and executable modes come from Git objects, never from untracked, ignored, generated, staged-but-uncommitted, or modified working-tree files. Tracked staged or unstaged changes cause the release builder to fail closed.
+
 1. supply a trusted Ed25519 public key independently of the bundle;
 2. verify the detached signature over the canonical manifest digest;
 3. verify every artifact and archive-entry SHA-256 digest;
