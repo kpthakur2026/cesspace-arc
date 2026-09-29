@@ -118,6 +118,7 @@ The complete architecture and security foundation of CesSpace ARC is documented 
 | [**RC-07 Scope & Acceptance**](docs/architecture/rc07-scope-acceptance.md)               | Detailed scope, engineering-aware tools, composition framework, and 75 frozen negative controls.           |
 | [**RC-07 Final Integration Report**](docs/architecture/rc07-final-integration-report.md) | RC-07 acceptance evidence: architecture summary, control coverage table, and final quality gates.          |
 | [**RC-08 Scope & Acceptance**](docs/architecture/rc08-scope-acceptance.md)               | Detailed scope, threat model, cross-client compatibility, fuzzing policy, and 90 negative controls.        |
+| [**ARC 1.0 Scope & Acceptance**](docs/architecture/arc10-scope-acceptance.md)            | Normative distribution, hosted-profile, stable-release architecture, and acceptance freeze.                |
 | [**Engineering Governance**](docs/governance/engineering-governance.md)                  | Mandatory project engineering, stage-gate, and security governance rules.                                  |
 | [**Security Policy**](SECURITY.md)                                                       | Vulnerability disclosure, responsible reporting, and safety invariants.                                    |
 | [**Contributing Guide**](CONTRIBUTING.md)                                                | Guidelines for contributing code, tests, and security negative controls.                                   |
@@ -137,17 +138,18 @@ CesSpace ARC is standardized on:
 
 ## 6. Development Roadmap & Stages
 
-| Stage     | Name                                   | Target Capabilities                                                                                       | Status      |
-| :-------- | :------------------------------------- | :-------------------------------------------------------------------------------------------------------- | :---------- |
-| **RC-00** | **Architecture & Security Foundation** | Trust boundaries, threat models, invariants, tool taxonomy, ADRs.                                         | Implemented |
-| **RC-01** | **Read-Only MCP Core**                 | Minimal Security Kernel, 9 read-only tools, canonical jailing, negative controls.                         | Implemented |
-| **RC-02** | **Controlled Terminal & Processes**    | Bounded process execution, output limits, timeout enforcement.                                            | Implemented |
-| **RC-03** | **Safe File Modification**             | Jailed file writing, atomic patches, size limits, approval gating.                                        | Implemented |
-| **RC-04** | **Policy Engine & Approvals**          | Declarative YAML policy engine, authenticated admin channel, approval tokens, approval audit lifecycle.   | Implemented |
-| **RC-05** | **Secure Remote Gateway**              | Streamable HTTP over TLS 1.3 with SSE response framing, mutual TLS, device enrollment, volatile sessions. | Implemented |
-| **RC-06** | **Audit & Evidence**                   | Append-only JSONL logging, tiered anchoring, automated redaction.                                         | Implemented |
-| **RC-07** | **Engineering-Aware Tools**            | Composite verification commands (`arc_verify`, `arc_stage_evidence`).                                     | Implemented |
-| **RC-08** | **Integrations & Security Review**     | Cross-client validation, penetration testing, fuzzing.                                                    | Implemented |
+| Stage       | Name                                   | Target Capabilities                                                                                       | Status      |
+| :---------- | :------------------------------------- | :-------------------------------------------------------------------------------------------------------- | :---------- |
+| **RC-00**   | **Architecture & Security Foundation** | Trust boundaries, threat models, invariants, tool taxonomy, ADRs.                                         | Implemented |
+| **RC-01**   | **Read-Only MCP Core**                 | Minimal Security Kernel, 9 read-only tools, canonical jailing, negative controls.                         | Implemented |
+| **RC-02**   | **Controlled Terminal & Processes**    | Bounded process execution, output limits, timeout enforcement.                                            | Implemented |
+| **RC-03**   | **Safe File Modification**             | Jailed file writing, atomic patches, size limits, approval gating.                                        | Implemented |
+| **RC-04**   | **Policy Engine & Approvals**          | Declarative YAML policy engine, authenticated admin channel, approval tokens, approval audit lifecycle.   | Implemented |
+| **RC-05**   | **Secure Remote Gateway**              | Streamable HTTP over TLS 1.3 with SSE response framing, mutual TLS, device enrollment, volatile sessions. | Implemented |
+| **RC-06**   | **Audit & Evidence**                   | Append-only JSONL logging, tiered anchoring, automated redaction.                                         | Implemented |
+| **RC-07**   | **Engineering-Aware Tools**            | Composite verification commands (`arc_verify`, `arc_stage_evidence`).                                     | Implemented |
+| **RC-08**   | **Integrations & Security Review**     | Cross-client validation, penetration testing, fuzzing.                                                    | Implemented |
+| **ARC 1.0** | **Distribution & Stable Release**      | Installable distribution, upgrade safety, release provenance, and optional gated hosted connectivity.     | Planning    |
 
 ---
 
