@@ -23,8 +23,8 @@ export const INVENTORY_FILE = 'dependencies.json';
 export const PROVENANCE_FILE = 'provenance.json';
 export const RELEASE_PROFILE_FILE = 'arc10-release-profile.json';
 export const OWNERSHIP_FILE = '.cesspace-arc-install.json';
-export const ARC_VERSION = '0.8.0-rc08';
-export const ARC_STAGE = 'RC-08';
+export const ARC_VERSION = '1.0.0';
+export const ARC_STAGE = 'ARC-1.0';
 export const EXPECTED_TOOL_COUNT = 25;
 export const EXPECTED_REGISTRY_COUNT = 5;
 

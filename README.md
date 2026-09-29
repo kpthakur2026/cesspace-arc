@@ -1,7 +1,7 @@
 # CesSpace ARC — Secure Agent-to-Machine Control Plane
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Stage](https://img.shields.io/badge/Stage-RC--08%20Integrations%20%26%20Security%20Review-blue.svg)](#roadmap)
+[![Stage](https://img.shields.io/badge/Stage-ARC--1.0%20Core-blue.svg)](#roadmap)
 [![Security Policy](https://img.shields.io/badge/Security-Default%20Deny-red.svg)](SECURITY.md)
 [![Engineering Governance](https://img.shields.io/badge/Governance-Engineering%20Rules-brightgreen.svg)](docs/governance/engineering-governance.md)
 [![Node](https://img.shields.io/badge/Node-24-green.svg)](#toolchain)
@@ -122,6 +122,7 @@ The complete architecture and security foundation of CesSpace ARC is documented 
 | [**ARC Core Distribution**](docs/distribution/installation.md)                           | Signed source-bundle verification, locked installation, prefix ownership, and safe uninstall.              |
 | [**ARC Core Configuration & Upgrade**](docs/distribution/configuration-upgrade.md)       | Strict versioned configuration, secret-file authority, transactional migration, recovery, and rollback.    |
 | [**ARC Core Release Candidate**](docs/distribution/release-candidate.md)                 | Core-only supply-chain gates, offline verification, dependency policy, and truthful platform evidence.     |
+| [**ARC 1.0 Stable Core Release**](docs/distribution/stable-release.md)                   | Final acceptance ownership, stable verification, installation, platform, and publication boundaries.       |
 | [**Engineering Governance**](docs/governance/engineering-governance.md)                  | Mandatory project engineering, stage-gate, and security governance rules.                                  |
 | [**Security Policy**](SECURITY.md)                                                       | Vulnerability disclosure, responsible reporting, and safety invariants.                                    |
 | [**Contributing Guide**](CONTRIBUTING.md)                                                | Guidelines for contributing code, tests, and security negative controls.                                   |
@@ -152,7 +153,7 @@ CesSpace ARC is standardized on:
 | **RC-06**   | **Audit & Evidence**                   | Append-only JSONL logging, tiered anchoring, automated redaction.                                         | Implemented |
 | **RC-07**   | **Engineering-Aware Tools**            | Composite verification commands (`arc_verify`, `arc_stage_evidence`).                                     | Implemented |
 | **RC-08**   | **Integrations & Security Review**     | Cross-client validation, penetration testing, fuzzing.                                                    | Implemented |
-| **ARC 1.0** | **Distribution & Stable Release**      | Installable distribution, upgrade safety, release provenance, and optional gated hosted connectivity.     | Planning    |
+| **ARC 1.0** | **Distribution & Stable Release**      | Reproducible Core distribution, upgrade safety, exact provenance, and final stable verification.          | Implemented |
 
 ---
 

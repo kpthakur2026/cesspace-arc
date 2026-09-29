@@ -528,9 +528,9 @@ test('ARC10-NEG-012 preserves package, CLI, health, distribution, tool, and regi
     path.join(repositoryRoot, 'apps/mcp-server/src/index.ts'),
     'utf8',
   );
-  assert.match(cli, /CLI_VERSION = '0\.8\.0-rc08'/u);
-  assert.match(server, /version: '0\.8\.0-rc08'/u);
-  assert.match(server, /stage: 'RC-08'/u);
+  assert.match(cli, /CLI_VERSION = '1\.0\.0'/u);
+  assert.match(server, /version: '1\.0\.0'/u);
+  assert.match(server, /stage: 'ARC-1\.0'/u);
   assert.equal(verified.manifest.version, ARC_VERSION);
   assert.equal(verified.manifest.stage, ARC_STAGE);
   assert.equal(verified.provenance.source.commit, verified.manifest.source.commit);

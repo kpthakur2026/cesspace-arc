@@ -667,6 +667,6 @@ test('RC08-FLOW-10: protected public Git inspection is structured, redacted, bou
   assert.equal(ALL_TOOL_DEFINITIONS.length, 25);
   assert.equal(createProductionDeterministicRegistry().listEntryIds().length, 5);
   const health = parseToolResult(await server.executeAuthenticatedToolCall(actor, 'health', {}));
-  assert.equal(health.version, '0.8.0-rc08');
-  assert.equal(health.stage, 'RC-08');
+  assert.equal(health.version, '1.0.0');
+  assert.equal(health.stage, 'ARC-1.0');
 });

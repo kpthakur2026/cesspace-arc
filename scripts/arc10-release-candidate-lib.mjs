@@ -262,10 +262,9 @@ export async function verifyCoreReleaseCandidate({
   if (
     packageJson.version !== ARC_VERSION ||
     verified.manifest.version !== ARC_VERSION ||
-    verified.manifest.stage !== ARC_STAGE ||
-    ARC_VERSION === '1.0.0'
+    verified.manifest.stage !== ARC_STAGE
   )
-    fail('PROMOTION_FORBIDDEN', 'Task 7 cannot promote the stable product identity');
+    fail('RELEASE_IDENTITY_INVALID', 'Release identity is inconsistent');
   gates.push('VERSION_STAGE_VERIFIED');
   const compatibility = stateMetadata
     ? assertArtifactStateCompatibility(verified.manifest, stateMetadata)

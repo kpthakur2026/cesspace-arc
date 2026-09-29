@@ -616,12 +616,12 @@ test('RC08-NEG-090: promotion provenance and every authoritative current version
     'apps/mcp-server/package.json',
     'apps/cli/package.json',
   ]) {
-    assert.equal(JSON.parse(fs.readFileSync(manifest, 'utf8')).version, '0.8.0-rc08');
+    assert.equal(JSON.parse(fs.readFileSync(manifest, 'utf8')).version, '1.0.0');
   }
   const serverSource = fs.readFileSync('apps/mcp-server/src/index.ts', 'utf8');
-  assert.equal((serverSource.match(/0\.8\.0-rc08/g) ?? []).length, 5);
-  assert.match(serverSource, /stage: 'RC-08'/);
-  assert.match(fs.readFileSync('apps/cli/src/index.ts', 'utf8'), /CLI_VERSION = '0\.8\.0-rc08'/);
+  assert.equal((serverSource.match(/1\.0\.0/g) ?? []).length, 5);
+  assert.match(serverSource, /stage: 'ARC-1\.0'/);
+  assert.match(fs.readFileSync('apps/cli/src/index.ts', 'utf8'), /CLI_VERSION = '1\.0\.0'/);
   const verifier = fs.readFileSync('scripts/verify-rc08.sh', 'utf8');
   assert.match(verifier, /EXPECTED_VERSION="0\.8\.0-rc08"/);
   assert.match(verifier, /EXPECTED_STAGE="RC-08"/);

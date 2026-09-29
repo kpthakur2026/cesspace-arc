@@ -6,7 +6,8 @@ import path from 'node:path';
 import { openAuditRuntime, verifyOfflineStore } from '../../packages/audit/dist/index.js';
 import { atomicPersistTrustStore } from '../../packages/auth/dist/index.js';
 
-export const PRODUCT_VERSION = '0.8.0-rc08';
+export const LEGACY_PRODUCT_VERSION = '0.8.0-rc08';
+export const PRODUCT_VERSION = '1.0.0';
 
 function writeJson(filePath, value, mode = 0o600) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true, mode: 0o700 });
@@ -109,7 +110,7 @@ export async function createMigrationFixture({ schemaVersion = 1, auditRecords =
 
   const commonConfig = {
     schemaVersion,
-    productVersion: PRODUCT_VERSION,
+    productVersion: schemaVersion === 1 ? LEGACY_PRODUCT_VERSION : PRODUCT_VERSION,
     ...(schemaVersion === 2 ? { profile: 'core' } : {}),
     transport: { kind: 'stdio' },
     workspaces: [{ id: 'workspace', root: workspace }],
@@ -132,7 +133,7 @@ export async function createMigrationFixture({ schemaVersion = 1, auditRecords =
     format: 'cesspace-arc-core-state',
     stateSchemaVersion: schemaVersion,
     configSchemaVersion: schemaVersion,
-    productVersion: PRODUCT_VERSION,
+    productVersion: schemaVersion === 1 ? LEGACY_PRODUCT_VERSION : PRODUCT_VERSION,
     sourceCommit: '3'.repeat(40),
     sourceTree: '4'.repeat(40),
     profile: 'core',

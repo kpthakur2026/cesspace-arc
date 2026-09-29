@@ -42,7 +42,7 @@ import {
 import { AdminClientError, AdminIpcClient, readPrivateKeyFromFd } from './admin-client.js';
 
 export const CLI_NAME = 'arc';
-export const CLI_VERSION = '0.8.0-rc08';
+export const CLI_VERSION = '1.0.0';
 
 export const EXIT_OK = 0;
 export const EXIT_FAILURE = 1;

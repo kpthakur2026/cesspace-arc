@@ -114,3 +114,43 @@ jobs:
 
       - name: Dependency Security Audit
         run: pnpm audit
+
+  arc10-final-verification:
+    name: ARC 1.0 Final Verification
+    if: >-
+      github.ref == 'refs/heads/feat/arc-1.0-scope' ||
+      github.ref == 'refs/heads/main' ||
+      github.head_ref == 'feat/arc-1.0-scope'
+    runs-on: ubuntu-latest
+    needs: [secret-scan]
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Setup pnpm 12.4.2
+        uses: pnpm/action-setup@v4
+        with:
+          version: 12.4.2
+          run_install: false
+
+      - name: Install Dependencies (Frozen Lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Pinned Gitleaks
+        run: |
+          set -euo pipefail
+          version="8.24.3"
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz" |
+            tar -xz -C /tmp gitleaks
+
+      - name: Run ARC 1.0 Final Verification
+        env:
+          GITLEAKS_BIN: /tmp/gitleaks
+        run: bash scripts/verify-arc10.sh

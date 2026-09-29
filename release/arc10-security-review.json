@@ -1,0 +1,35 @@
+{
+  "format": "cesspace-arc-security-review-v1",
+  "reviewedSource": {
+    "commit": "f094b1bbad325e102792b3c568e21a3bd83e2bcf",
+    "tree": "3fbbc499a3dd4b2d3fabd2cecbccf980f1eabfc5"
+  },
+  "scope": "ARC Core distribution, configuration, migration, supply-chain, acceptance ownership, and stable-promotion surfaces",
+  "automatedSecurityGates": [
+    "frozen-lockfile dependency integrity",
+    "Ed25519 manifest signature and SHA-256 artifact binding",
+    "SPDX and dependency-license reconciliation",
+    "exact source commit and tree provenance",
+    "full ARC control ownership and hosted-absence accounting",
+    "Gitleaks exact-commit, ARC-1.0-range, and repository-history scans",
+    "static shell, extraction, symlink, environment, migration, and verifier review"
+  ],
+  "findingsDisposition": {
+    "task1": "No unresolved release blocker; source archive is Git-object-derived and installation is prefix-scoped.",
+    "task2": "No unresolved release blocker; migration remains transactional with audit continuity and compatible rollback.",
+    "task7": "No unresolved release blocker; Core-only supply-chain and platform claims are fail-closed.",
+    "task8": "Project final review found no Critical or High blocker; exact-head independent approval remains pending."
+  },
+  "unresolvedCritical": 0,
+  "unresolvedHigh": 0,
+  "lowerSeverityFindings": [
+    {
+      "id": "ARC10-REVIEW-LOW-001",
+      "severity": "LOW",
+      "disposition": "ACCEPTED_FOR_REVIEW",
+      "summary": "The authoritative release remains source-based and requires the documented Node and pnpm toolchain rather than a native standalone binary."
+    }
+  ],
+  "reviewerStatus": "PROJECT_FINAL_SECURITY_REVIEW_COMPLETE",
+  "releaseAuthorityStatus": "PENDING_INDEPENDENT_APPROVAL"
+}

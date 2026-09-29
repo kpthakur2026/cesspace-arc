@@ -70,8 +70,8 @@ export function validateReleaseProfile(profile, { requireArtifactSource = false 
     profile.format !== 'cesspace-arc-release-profile-v1' ||
     profile.profile !== 'core' ||
     profile.reason !== 'hosted profile not shipped' ||
-    profile.productVersion !== '0.8.0-rc08' ||
-    profile.healthStage !== 'RC-08' ||
+    profile.productVersion !== '1.0.0' ||
+    profile.healthStage !== 'ARC-1.0' ||
     profile.expectedProductionTools !== 25 ||
     profile.expectedDeterministicRegistryEntries !== 5 ||
     profile.distributionFormat !== 'cesspace-arc-source-distribution-v1'
@@ -136,9 +136,9 @@ export function validateReleaseProfile(profile, { requireArtifactSource = false 
   const accounting = profile.controlAccounting;
   if (
     JSON.stringify(accounting.implementedNegative) !==
-      JSON.stringify(['ARC10-NEG-001..022', 'ARC10-NEG-068..075']) ||
+      JSON.stringify(['ARC10-NEG-001..022', 'ARC10-NEG-068..080']) ||
     JSON.stringify(accounting.implementedFlows) !==
-      JSON.stringify(['ARC10-FLOW-01..05', 'ARC10-FLOW-15..16']) ||
+      JSON.stringify(['ARC10-FLOW-01..05', 'ARC10-FLOW-15..18']) ||
     accounting.profileNotShippedNegative?.[0]?.range !== 'ARC10-NEG-023..067' ||
     accounting.profileNotShippedNegative?.[0]?.classification !== 'PROFILE_NOT_SHIPPED' ||
     accounting.profileNotShippedFlows?.[0]?.range !== 'ARC10-FLOW-06..14' ||

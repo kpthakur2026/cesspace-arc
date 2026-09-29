@@ -2393,16 +2393,16 @@ describe('CesSpace ARC — RC-06 Task 6: Universal Lifecycle & Full-History Star
       const auditPackageJson = JSON.parse(
         fs.readFileSync(path.join(REPO_ROOT, 'packages/audit/package.json'), 'utf8'),
       );
-      assert.equal(rootPackage.version, '0.8.0-rc08');
-      assert.equal(serverPackage.version, '0.8.0-rc08');
+      assert.equal(rootPackage.version, '1.0.0');
+      assert.equal(serverPackage.version, '1.0.0');
       assert.equal(auditPackageJson.version, '0.0.0-rc00');
 
       const fixture = makeAuditConfig('reg23');
       const parts = buildServer(fixture);
       await startServer(parts);
       const health = body(await parts.server.dispatchToolCall('health', {}));
-      assert.equal(health.version, '0.8.0-rc08');
-      assert.equal(health.stage, 'RC-08');
+      assert.equal(health.version, '1.0.0');
+      assert.equal(health.stage, 'ARC-1.0');
 
       // No `enabled` flag exists on the frozen audit configuration: auditing is
       // mandatory in production.

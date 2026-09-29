@@ -368,7 +368,7 @@ test('ARC10-FLOW-04: RC-08 state upgrades transactionally with config, device, a
   const preflight = await preflightCoreState(value.live);
   assert.equal(preflight.state.stateSchemaVersion, 2);
   assert.equal(preflight.resolved.config.schemaVersion, 2);
-  assert.equal(preflight.resolved.config.productVersion, '0.8.0-rc08');
+  assert.equal(preflight.resolved.config.productVersion, '1.0.0');
   assert.equal(preflight.resolved.config.profile, 'core');
   assert.deepEqual(preflight.resolved.config.workspaces, sourceConfig.workspaces);
   assert.deepEqual(preflight.resolved.config.policy, sourceConfig.policy);
@@ -396,7 +396,7 @@ test('ARC10-FLOW-04: RC-08 state upgrades transactionally with config, device, a
     audit: 'VERIFIED',
     configSchemaVersion: 2,
     devices: 1,
-    productVersion: '0.8.0-rc08',
+    productVersion: '1.0.0',
     stateSchemaVersion: 2,
   });
 });

@@ -1743,7 +1743,7 @@ test('env check', () => {
         clientInfo: { name: 'flow17-tester', version: '1.0' },
       });
       assert.equal(initRes.result.serverInfo.name, 'cesspace-arc');
-      assert.equal(initRes.result.serverInfo.version, '0.8.0-rc08');
+      assert.equal(initRes.result.serverInfo.version, '1.0.0');
 
       // 2. notifications/initialized
       stdio.notify('notifications/initialized');

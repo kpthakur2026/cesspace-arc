@@ -1,6 +1,6 @@
 # ARC Core source distribution and installation
 
-CesSpace ARC Task 1 provides a local, signed source-distribution workflow. It does not publish artifacts or enable hosted services. The current runtime identity remains `0.8.0-rc08` / `RC-08`.
+CesSpace ARC provides a local, signed source-distribution workflow. Task 8 promotes the current Core runtime identity to `1.0.0` / `ARC-1.0`; no hosted profile or publication is implied.
 
 ## Supported target
 
@@ -48,4 +48,4 @@ Verification completes before extraction, dependency installation, build, or pre
 
 Default uninstall removes only paths recorded by the ownership manifest and empty ARC-created directories. Workspace data, configuration, durable audit data, and unrelated files are preserved. Explicit user-data deletion is outside Task 1. Reinstallation uses the same verification and locked-build path.
 
-This tooling does not provide ARC 1.0 stable promotion, OAuth/OIDC, hosted relay, public MCP hosting, ChatGPT or Claude connectors, directory publishing, tenancy, metering, billing, or subscriptions.
+This tooling does not provide OAuth/OIDC, hosted relay, public MCP hosting, ChatGPT or Claude connectors, directory publishing, tenancy, metering, billing, or subscriptions. Building or verifying a stable artifact does not publish it.

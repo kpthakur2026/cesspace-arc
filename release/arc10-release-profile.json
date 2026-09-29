@@ -3,11 +3,11 @@
   "profile": "core",
   "reason": "hosted profile not shipped",
   "reviewedSource": {
-    "commit": "34e62bfb8ea1b7f0c35c50cd1afe3c6874780703",
-    "tree": "b3c838d1dad7c820c335f2d7e5f4b81c8bf72179"
+    "commit": "f094b1bbad325e102792b3c568e21a3bd83e2bcf",
+    "tree": "3fbbc499a3dd4b2d3fabd2cecbccf980f1eabfc5"
   },
-  "productVersion": "0.8.0-rc08",
-  "healthStage": "RC-08",
+  "productVersion": "1.0.0",
+  "healthStage": "ARC-1.0",
   "expectedProductionTools": 25,
   "expectedDeterministicRegistryEntries": 5,
   "distributionFormat": "cesspace-arc-source-distribution-v1",
@@ -72,8 +72,8 @@
     }
   ],
   "controlAccounting": {
-    "implementedNegative": ["ARC10-NEG-001..022", "ARC10-NEG-068..075"],
-    "implementedFlows": ["ARC10-FLOW-01..05", "ARC10-FLOW-15..16"],
+    "implementedNegative": ["ARC10-NEG-001..022", "ARC10-NEG-068..080"],
+    "implementedFlows": ["ARC10-FLOW-01..05", "ARC10-FLOW-15..18"],
     "profileNotShippedNegative": [
       {
         "range": "ARC10-NEG-023..067",

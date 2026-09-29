@@ -1,0 +1,18 @@
+{
+  "format": "cesspace-arc-final-verification-v1",
+  "profile": "core",
+  "productVersion": "1.0.0",
+  "healthStage": "ARC-1.0",
+  "reviewedSource": {
+    "commit": "f094b1bbad325e102792b3c568e21a3bd83e2bcf",
+    "tree": "3fbbc499a3dd4b2d3fabd2cecbccf980f1eabfc5"
+  },
+  "artifactSourcePolicy": "EXACT_VERIFIER_HEAD_COMMIT_AND_TREE",
+  "gateInventory": "scripts/verify-arc10.sh",
+  "gateCount": 30,
+  "negativeControls": 80,
+  "positiveFlows": 18,
+  "hostedProfile": "NOT_SHIPPED",
+  "releaseAuthorityStatus": "PENDING_INDEPENDENT_APPROVAL",
+  "publicationAuthorized": false
+}

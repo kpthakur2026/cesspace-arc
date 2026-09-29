@@ -2,7 +2,7 @@
  * ARC 1.0 Task 2 — strict Core configuration and transactional state lifecycle.
  *
  * Product identity and persistent schema identity are deliberately independent.
- * This package migrates schema 1 to schema 2 while ARC remains 0.8.0-rc08 / RC-08.
+ * Schema-1 RC-08 state migrates explicitly into stable schema-2 Core state.
  */
 
 import crypto from 'node:crypto';
@@ -17,8 +17,9 @@ import {
 import { parseDocument } from 'yaml';
 import { isPreCommitFaultEnabled } from './internal-test-seam.js';
 
-export const CORE_PRODUCT_VERSION = '0.8.0-rc08';
-export const CORE_HEALTH_STAGE = 'RC-08';
+export const CORE_PRODUCT_VERSION = '1.0.0';
+export const CORE_HEALTH_STAGE = 'ARC-1.0';
+export const LEGACY_CORE_PRODUCT_VERSION = '0.8.0-rc08';
 export const CORE_CONFIG_SCHEMA_VERSION = 2;
 export const CORE_STATE_SCHEMA_VERSION = 2;
 export const CORE_MIGRATION_VERSION = 1;
@@ -64,7 +65,7 @@ export type CoreTransportConfig =
 
 export interface CoreConfigV2 {
   readonly schemaVersion: 2;
-  readonly productVersion: '0.8.0-rc08';
+  readonly productVersion: '1.0.0';
   readonly profile: 'core';
   readonly transport: CoreTransportConfig;
   readonly workspaces: readonly CoreWorkspaceConfig[];
@@ -86,15 +87,16 @@ export interface CoreConfigV2 {
   readonly observability: { readonly logLevel: CoreLogLevel };
 }
 
-interface CoreConfigV1 extends Omit<CoreConfigV2, 'schemaVersion' | 'profile'> {
+interface CoreConfigV1 extends Omit<CoreConfigV2, 'schemaVersion' | 'productVersion' | 'profile'> {
   readonly schemaVersion: 1;
+  readonly productVersion: '0.8.0-rc08';
 }
 
 export interface CoreStateMetadata {
   readonly format: 'cesspace-arc-core-state';
   readonly stateSchemaVersion: 1 | 2;
   readonly configSchemaVersion: 1 | 2;
-  readonly productVersion: '0.8.0-rc08';
+  readonly productVersion: '0.8.0-rc08' | '1.0.0';
   readonly sourceCommit: string;
   readonly sourceTree: string;
   readonly profile: 'core';
@@ -308,7 +310,9 @@ function parseCoreConfig(raw: unknown, expectedVersion: 1 | 2): CoreConfigV1 | C
   );
   if (record.schemaVersion !== expectedVersion)
     fail('CONFIG_SCHEMA_UNSUPPORTED', 'Configuration schema version is unsupported.');
-  if (record.productVersion !== CORE_PRODUCT_VERSION)
+  const expectedProductVersion =
+    expectedVersion === 1 ? LEGACY_CORE_PRODUCT_VERSION : CORE_PRODUCT_VERSION;
+  if (record.productVersion !== expectedProductVersion)
     fail('CONFIG_PRODUCT_MISMATCH', 'Configuration product version is unsupported.');
   if (expectedVersion === 2 && record.profile !== 'core')
     fail('CONFIG_INVALID', 'Configuration profile must be core.');
@@ -363,7 +367,7 @@ function parseCoreConfig(raw: unknown, expectedVersion: 1 | 2): CoreConfigV1 | C
   }
 
   const common = {
-    productVersion: CORE_PRODUCT_VERSION,
+    productVersion: expectedProductVersion,
     transport: parseTransport(record.transport),
     workspaces,
     defaultWorkspaceId,
@@ -487,17 +491,17 @@ export function readCoreStateMetadata(stateDirectory: string): CoreStateMetadata
     ],
     'state metadata',
   );
-  if (
-    record.format !== 'cesspace-arc-core-state' ||
-    record.productVersion !== CORE_PRODUCT_VERSION ||
-    record.profile !== 'core'
-  )
+  if (record.format !== 'cesspace-arc-core-state' || record.profile !== 'core')
     fail('STATE_METADATA_INVALID', 'Core state metadata identity is invalid.');
   if (
     ![1, 2].includes(record.stateSchemaVersion as number) ||
     ![1, 2].includes(record.configSchemaVersion as number)
   )
     fail('UNSUPPORTED_STATE_VERSION', 'Core state schema is newer or unsupported.');
+  const expectedProductVersion =
+    record.stateSchemaVersion === 1 ? LEGACY_CORE_PRODUCT_VERSION : CORE_PRODUCT_VERSION;
+  if (record.productVersion !== expectedProductVersion)
+    fail('STATE_METADATA_INVALID', 'Core state product identity is invalid.');
   if (!HASH_REGEX.test(String(record.sourceCommit)) || !HASH_REGEX.test(String(record.sourceTree)))
     fail('STATE_METADATA_INVALID', 'Core state source identity is invalid.');
   if (record.stateSchemaVersion === 2 && record.migrationVersion !== CORE_MIGRATION_VERSION)
@@ -859,12 +863,18 @@ function loadConfigAtVersion(stateDirectory: string, version: 1 | 2): CoreConfig
 
 function transformStagedState(staged: string, source: CoreStateMetadata): void {
   const legacy = loadConfigAtVersion(staged, 1) as CoreConfigV1;
-  const current: CoreConfigV2 = { ...legacy, schemaVersion: 2, profile: 'core' };
+  const current: CoreConfigV2 = {
+    ...legacy,
+    schemaVersion: 2,
+    productVersion: CORE_PRODUCT_VERSION,
+    profile: 'core',
+  };
   writeJsonAtomic(path.join(staged, CORE_CONFIG_FILENAME), current);
   const metadata: CoreStateMetadata = {
     ...source,
     stateSchemaVersion: 2,
     configSchemaVersion: 2,
+    productVersion: CORE_PRODUCT_VERSION,
     migrationVersion: 1,
   };
   writeJsonAtomic(path.join(staged, CORE_STATE_METADATA_FILENAME), metadata);

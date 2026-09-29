@@ -1,8 +1,8 @@
 # ARC Core Release-Candidate Verification
 
-ARC's Task-7 release profile is **Core-only**. It produces supply-chain
-evidence for the existing `0.8.0-rc08` / `RC-08` runtime; it does not promote
-the product to `1.0.0` and it does not publish an artifact.
+ARC's release profile is **Core-only**. The accepted Task-7 parent records the
+pre-promotion `0.8.0-rc08` / `RC-08` evidence. Task 8 promotes the current
+runtime to `1.0.0` / `ARC-1.0`; it still does not publish an artifact.
 
 The authoritative machine-readable profile is
 [`release/arc10-release-profile.json`](../../release/arc10-release-profile.json).
@@ -68,6 +68,6 @@ fail-closed gates and emits bounded JSON containing no signing material.
 Documentation, the signed Task-1 manifest, and the release-profile matrix must
 agree. A validation-only target cannot be promoted by editing one surface.
 
-Stable `1.0.0` promotion remains exclusively owned by Task 8. Task 7 creates no
-tag, GitHub release, package publication, hosted service, or vendor-directory
-submission.
+Stable `1.0.0` promotion is exclusively owned by Task 8 and is proven against
+the exact Task-7 parent. The promotion commit creates no tag, GitHub release,
+package publication, hosted service, or vendor-directory submission.

@@ -1,0 +1,739 @@
+{
+  "format": "cesspace-arc-acceptance-ownership-v1",
+  "releaseProfile": "core",
+  "negativeControls": [
+    {
+      "id": "ARC10-NEG-001",
+      "ownerTask": 1,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-distribution-installation.test.js"
+    },
+    {
+      "id": "ARC10-NEG-002",
+      "ownerTask": 1,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-distribution-installation.test.js"
+    },
+    {
+      "id": "ARC10-NEG-003",
+      "ownerTask": 1,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-distribution-installation.test.js"
+    },
+    {
+      "id": "ARC10-NEG-004",
+      "ownerTask": 1,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-distribution-installation.test.js"
+    },
+    {
+      "id": "ARC10-NEG-005",
+      "ownerTask": 1,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-distribution-installation.test.js"
+    },
+    {
+      "id": "ARC10-NEG-006",
+      "ownerTask": 1,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-distribution-installation.test.js"
+    },
+    {
+      "id": "ARC10-NEG-007",
+      "ownerTask": 1,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-distribution-installation.test.js"
+    },
+    {
+      "id": "ARC10-NEG-008",
+      "ownerTask": 1,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-distribution-installation.test.js"
+    },
+    {
+      "id": "ARC10-NEG-009",
+      "ownerTask": 1,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-distribution-installation.test.js"
+    },
+    {
+      "id": "ARC10-NEG-010",
+      "ownerTask": 1,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-distribution-installation.test.js"
+    },
+    {
+      "id": "ARC10-NEG-011",
+      "ownerTask": 1,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-distribution-installation.test.js"
+    },
+    {
+      "id": "ARC10-NEG-012",
+      "ownerTask": 1,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-distribution-installation.test.js"
+    },
+    {
+      "id": "ARC10-NEG-013",
+      "ownerTask": 2,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-config-upgrade-migration.test.js"
+    },
+    {
+      "id": "ARC10-NEG-014",
+      "ownerTask": 2,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-config-upgrade-migration.test.js"
+    },
+    {
+      "id": "ARC10-NEG-015",
+      "ownerTask": 2,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-config-upgrade-migration.test.js"
+    },
+    {
+      "id": "ARC10-NEG-016",
+      "ownerTask": 2,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-config-upgrade-migration.test.js"
+    },
+    {
+      "id": "ARC10-NEG-017",
+      "ownerTask": 2,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-config-upgrade-migration.test.js"
+    },
+    {
+      "id": "ARC10-NEG-018",
+      "ownerTask": 2,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-config-upgrade-migration.test.js"
+    },
+    {
+      "id": "ARC10-NEG-019",
+      "ownerTask": 2,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-config-upgrade-migration.test.js"
+    },
+    {
+      "id": "ARC10-NEG-020",
+      "ownerTask": 2,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-config-upgrade-migration.test.js"
+    },
+    {
+      "id": "ARC10-NEG-021",
+      "ownerTask": 2,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-config-upgrade-migration.test.js"
+    },
+    {
+      "id": "ARC10-NEG-022",
+      "ownerTask": 2,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-config-upgrade-migration.test.js"
+    },
+    {
+      "id": "ARC10-NEG-023",
+      "ownerTask": 3,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_OAUTH_OIDC_AUTHORIZATION_SERVER"
+    },
+    {
+      "id": "ARC10-NEG-024",
+      "ownerTask": 3,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_OAUTH_OIDC_AUTHORIZATION_SERVER"
+    },
+    {
+      "id": "ARC10-NEG-025",
+      "ownerTask": 3,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_OAUTH_OIDC_AUTHORIZATION_SERVER"
+    },
+    {
+      "id": "ARC10-NEG-026",
+      "ownerTask": 3,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_OAUTH_OIDC_AUTHORIZATION_SERVER"
+    },
+    {
+      "id": "ARC10-NEG-027",
+      "ownerTask": 3,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_OAUTH_OIDC_AUTHORIZATION_SERVER"
+    },
+    {
+      "id": "ARC10-NEG-028",
+      "ownerTask": 3,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_OAUTH_OIDC_AUTHORIZATION_SERVER"
+    },
+    {
+      "id": "ARC10-NEG-029",
+      "ownerTask": 3,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_OAUTH_OIDC_AUTHORIZATION_SERVER"
+    },
+    {
+      "id": "ARC10-NEG-030",
+      "ownerTask": 3,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_CONFIDENTIAL_OAUTH_CLIENT_SECRET"
+    },
+    {
+      "id": "ARC10-NEG-031",
+      "ownerTask": 3,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_ACCOUNT_OR_TENANT_AUTHORITY"
+    },
+    {
+      "id": "ARC10-NEG-032",
+      "ownerTask": 3,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_ACCOUNT_OR_TENANT_AUTHORITY"
+    },
+    {
+      "id": "ARC10-NEG-033",
+      "ownerTask": 3,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_HOSTED_IDENTITY_MTLS_BYPASS"
+    },
+    {
+      "id": "ARC10-NEG-034",
+      "ownerTask": 3,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_ACCOUNT_OR_TENANT_AUTHORITY"
+    },
+    {
+      "id": "ARC10-NEG-035",
+      "ownerTask": 4,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_RELAY_TRANSPORT"
+    },
+    {
+      "id": "ARC10-NEG-036",
+      "ownerTask": 4,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_RELAY_TRANSPORT"
+    },
+    {
+      "id": "ARC10-NEG-037",
+      "ownerTask": 4,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_RELAY_TRANSPORT"
+    },
+    {
+      "id": "ARC10-NEG-038",
+      "ownerTask": 4,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_PAIRING_OR_ROUTE_BROKER"
+    },
+    {
+      "id": "ARC10-NEG-039",
+      "ownerTask": 4,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_PAIRING_OR_ROUTE_BROKER"
+    },
+    {
+      "id": "ARC10-NEG-040",
+      "ownerTask": 4,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_PAIRING_OR_ROUTE_BROKER"
+    },
+    {
+      "id": "ARC10-NEG-041",
+      "ownerTask": 4,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_PAIRING_OR_ROUTE_BROKER"
+    },
+    {
+      "id": "ARC10-NEG-042",
+      "ownerTask": 4,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_PAIRING_OR_ROUTE_BROKER"
+    },
+    {
+      "id": "ARC10-NEG-043",
+      "ownerTask": 4,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_PAIRING_OR_ROUTE_BROKER"
+    },
+    {
+      "id": "ARC10-NEG-044",
+      "ownerTask": 4,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_HOSTED_ROUTING_OR_RELAY_LISTENER"
+    },
+    {
+      "id": "ARC10-NEG-045",
+      "ownerTask": 4,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_HOSTED_ROUTING_OR_RELAY_LISTENER"
+    },
+    {
+      "id": "ARC10-NEG-046",
+      "ownerTask": 4,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_HOSTED_ROUTING_OR_RELAY_LISTENER"
+    },
+    {
+      "id": "ARC10-NEG-047",
+      "ownerTask": 5,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_TENANT_DATASTORE_OR_CACHE"
+    },
+    {
+      "id": "ARC10-NEG-048",
+      "ownerTask": 5,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_TENANT_DATASTORE_OR_CACHE"
+    },
+    {
+      "id": "ARC10-NEG-049",
+      "ownerTask": 5,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_TENANT_DATASTORE_OR_CACHE"
+    },
+    {
+      "id": "ARC10-NEG-050",
+      "ownerTask": 5,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_TENANT_DATASTORE_OR_CACHE"
+    },
+    {
+      "id": "ARC10-NEG-051",
+      "ownerTask": 5,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_TENANT_DATASTORE_OR_CACHE"
+    },
+    {
+      "id": "ARC10-NEG-052",
+      "ownerTask": 5,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_TENANT_DATASTORE_OR_CACHE"
+    },
+    {
+      "id": "ARC10-NEG-053",
+      "ownerTask": 5,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_TENANT_DATASTORE_OR_CACHE"
+    },
+    {
+      "id": "ARC10-NEG-054",
+      "ownerTask": 5,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_HOSTED_PAYLOAD_OR_TELEMETRY_STORE"
+    },
+    {
+      "id": "ARC10-NEG-055",
+      "ownerTask": 5,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_HOSTED_PAYLOAD_OR_TELEMETRY_STORE"
+    },
+    {
+      "id": "ARC10-NEG-056",
+      "ownerTask": 5,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_HOSTED_DEPROVISION_OR_SERVICE_AUDIT"
+    },
+    {
+      "id": "ARC10-NEG-057",
+      "ownerTask": 5,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_HOSTED_DEPROVISION_OR_SERVICE_AUDIT"
+    },
+    {
+      "id": "ARC10-NEG-058",
+      "ownerTask": 5,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_HOSTED_DEPROVISION_OR_SERVICE_AUDIT"
+    },
+    {
+      "id": "ARC10-NEG-059",
+      "ownerTask": 6,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_HOSTED_CONTROL_PLANE"
+    },
+    {
+      "id": "ARC10-NEG-060",
+      "ownerTask": 6,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_HOSTED_CONTROL_PLANE"
+    },
+    {
+      "id": "ARC10-NEG-061",
+      "ownerTask": 6,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_HOSTED_CONTROL_PLANE"
+    },
+    {
+      "id": "ARC10-NEG-062",
+      "ownerTask": 6,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_HOSTED_RESOURCE_OR_METRICS_BACKEND"
+    },
+    {
+      "id": "ARC10-NEG-063",
+      "ownerTask": 6,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_HOSTED_RESOURCE_OR_METRICS_BACKEND"
+    },
+    {
+      "id": "ARC10-NEG-064",
+      "ownerTask": 6,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_HOSTED_RESOURCE_OR_METRICS_BACKEND"
+    },
+    {
+      "id": "ARC10-NEG-065",
+      "ownerTask": 6,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_HOSTED_RESOURCE_OR_METRICS_BACKEND"
+    },
+    {
+      "id": "ARC10-NEG-066",
+      "ownerTask": 6,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_HOSTED_RESOURCE_OR_METRICS_BACKEND"
+    },
+    {
+      "id": "ARC10-NEG-067",
+      "ownerTask": 6,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "PROFILE_NOT_SHIPPED",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence",
+      "absencePredicate": "NO_HOSTED_RETRY_SERVICE"
+    },
+    {
+      "id": "ARC10-NEG-068",
+      "ownerTask": 7,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-supply-chain-release-candidate.test.js"
+    },
+    {
+      "id": "ARC10-NEG-069",
+      "ownerTask": 7,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-supply-chain-release-candidate.test.js"
+    },
+    {
+      "id": "ARC10-NEG-070",
+      "ownerTask": 7,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-supply-chain-release-candidate.test.js"
+    },
+    {
+      "id": "ARC10-NEG-071",
+      "ownerTask": 7,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-supply-chain-release-candidate.test.js"
+    },
+    {
+      "id": "ARC10-NEG-072",
+      "ownerTask": 7,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-supply-chain-release-candidate.test.js"
+    },
+    {
+      "id": "ARC10-NEG-073",
+      "ownerTask": 7,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-supply-chain-release-candidate.test.js"
+    },
+    {
+      "id": "ARC10-NEG-074",
+      "ownerTask": 7,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-supply-chain-release-candidate.test.js"
+    },
+    {
+      "id": "ARC10-NEG-075",
+      "ownerTask": 7,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-supply-chain-release-candidate.test.js"
+    },
+    {
+      "id": "ARC10-NEG-076",
+      "ownerTask": 8,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-final-verification.test.js"
+    },
+    {
+      "id": "ARC10-NEG-077",
+      "ownerTask": 8,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-final-verification.test.js"
+    },
+    {
+      "id": "ARC10-NEG-078",
+      "ownerTask": 8,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-final-verification.test.js"
+    },
+    {
+      "id": "ARC10-NEG-079",
+      "ownerTask": 8,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-final-verification.test.js"
+    },
+    {
+      "id": "ARC10-NEG-080",
+      "ownerTask": 8,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-final-verification.test.js"
+    }
+  ],
+  "positiveFlows": [
+    {
+      "id": "ARC10-FLOW-01",
+      "ownerTask": 1,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-distribution-installation.test.js"
+    },
+    {
+      "id": "ARC10-FLOW-02",
+      "ownerTask": 1,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-distribution-installation.test.js"
+    },
+    {
+      "id": "ARC10-FLOW-03",
+      "ownerTask": 1,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-distribution-installation.test.js"
+    },
+    {
+      "id": "ARC10-FLOW-04",
+      "ownerTask": 2,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-config-upgrade-migration.test.js"
+    },
+    {
+      "id": "ARC10-FLOW-05",
+      "ownerTask": 2,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-config-upgrade-migration.test.js"
+    },
+    {
+      "id": "ARC10-FLOW-06",
+      "ownerTask": 3,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "NOT_APPLICABLE_TO_CORE_RELEASE",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence"
+    },
+    {
+      "id": "ARC10-FLOW-07",
+      "ownerTask": 3,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "NOT_APPLICABLE_TO_CORE_RELEASE",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence"
+    },
+    {
+      "id": "ARC10-FLOW-08",
+      "ownerTask": 3,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "NOT_APPLICABLE_TO_CORE_RELEASE",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence"
+    },
+    {
+      "id": "ARC10-FLOW-09",
+      "ownerTask": 4,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "NOT_APPLICABLE_TO_CORE_RELEASE",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence"
+    },
+    {
+      "id": "ARC10-FLOW-10",
+      "ownerTask": 4,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "NOT_APPLICABLE_TO_CORE_RELEASE",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence"
+    },
+    {
+      "id": "ARC10-FLOW-11",
+      "ownerTask": 5,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "NOT_APPLICABLE_TO_CORE_RELEASE",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence"
+    },
+    {
+      "id": "ARC10-FLOW-12",
+      "ownerTask": 5,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "NOT_APPLICABLE_TO_CORE_RELEASE",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence"
+    },
+    {
+      "id": "ARC10-FLOW-13",
+      "ownerTask": 6,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "NOT_APPLICABLE_TO_CORE_RELEASE",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence"
+    },
+    {
+      "id": "ARC10-FLOW-14",
+      "ownerTask": 6,
+      "releaseApplicability": "HOSTED_PROFILE_NOT_SHIPPED",
+      "status": "NOT_APPLICABLE_TO_CORE_RELEASE",
+      "executableEvidence": "scripts/arc10-final-verification-lib.mjs#verifyHostedAbsence"
+    },
+    {
+      "id": "ARC10-FLOW-15",
+      "ownerTask": 7,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-supply-chain-release-candidate.test.js"
+    },
+    {
+      "id": "ARC10-FLOW-16",
+      "ownerTask": 7,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-supply-chain-release-candidate.test.js"
+    },
+    {
+      "id": "ARC10-FLOW-17",
+      "ownerTask": 8,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-final-verification.test.js"
+    },
+    {
+      "id": "ARC10-FLOW-18",
+      "ownerTask": 8,
+      "releaseApplicability": "CORE",
+      "status": "EXECUTED",
+      "executableEvidence": "tests/arc10-final-verification.test.js"
+    }
+  ]
+}

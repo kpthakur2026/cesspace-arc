@@ -1,10 +1,10 @@
 # ARC Core configuration, upgrade, and migration
 
-ARC 1.0 Task 2 introduces the local Core configuration and state-lifecycle boundary. It does not enable hosted services and does not promote the product: software and health identity remain `0.8.0-rc08` / `RC-08`.
+ARC 1.0 Task 2 introduced the local Core configuration and state-lifecycle boundary. Task 8 promotes the current schema-2 product and health identity to `1.0.0` / `ARC-1.0`; hosted services remain disabled.
 
 ## Configuration authority
 
-`core-config.json` is strict JSON using `schemaVersion: 2`, `productVersion: "0.8.0-rc08"`, and `profile: "core"`. Unknown fields, duplicate JSON keys, type confusion, duplicate workspace selectors, unsupported combinations, control characters, and unbounded values fail closed. State-owned selectors are normalized relative paths beneath the live state directory; workspace roots are explicit absolute operator-authorized paths.
+`core-config.json` is strict JSON using `schemaVersion: 2`, `productVersion: "1.0.0"`, and `profile: "core"`. Unknown fields, duplicate JSON keys, type confusion, duplicate workspace selectors, unsupported combinations, control characters, and unbounded values fail closed. State-owned selectors are normalized relative paths beneath the live state directory; workspace roots are explicit absolute operator-authorized paths.
 
 The top-level fields are:
 
@@ -38,7 +38,8 @@ Product version, configuration schema, state schema, and migration version are s
 
 | Identity                 | Value                    |
 | :----------------------- | :----------------------- |
-| Product / health         | `0.8.0-rc08` / `RC-08`   |
+| Current product / health | `1.0.0` / `ARC-1.0`      |
+| Legacy migration source  | `0.8.0-rc08` / `RC-08`   |
 | Legacy source config     | `configSchemaVersion: 1` |
 | Current Core config      | `configSchemaVersion: 2` |
 | Legacy source state      | `stateSchemaVersion: 1`  |
