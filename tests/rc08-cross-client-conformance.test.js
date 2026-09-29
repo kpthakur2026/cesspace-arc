@@ -1002,8 +1002,8 @@ describe('RC-08 Task 1: Positive Acceptance Flows (RC08-FLOW-01..RC08-FLOW-04)',
     assert.ok(healthResult.content && healthResult.content.length > 0);
     const parsedHealth = JSON.parse(healthResult.content[0].text);
     assert.equal(parsedHealth.status, 'HEALTHY');
-    assert.equal(parsedHealth.version, '0.7.0-rc07');
-    assert.equal(parsedHealth.stage, 'RC-07');
+    assert.equal(parsedHealth.version, '0.8.0-rc08');
+    assert.equal(parsedHealth.stage, 'RC-08');
     assert.equal(parsedHealth.transportMode, 'stdio');
     assert.equal(parsedHealth.remoteGatewayActive, false);
     assert.equal(parsedHealth.policyEngineActive, true);
@@ -1058,8 +1058,8 @@ describe('RC-08 Task 1: Positive Acceptance Flows (RC08-FLOW-01..RC08-FLOW-04)',
       const healthResult = await client.callTool({ name: 'health', arguments: {} });
       const parsedHealth = JSON.parse(healthResult.content[0].text);
       assert.equal(parsedHealth.status, 'HEALTHY');
-      assert.equal(parsedHealth.version, '0.7.0-rc07');
-      assert.equal(parsedHealth.stage, 'RC-07');
+      assert.equal(parsedHealth.version, '0.8.0-rc08');
+      assert.equal(parsedHealth.stage, 'RC-08');
       assert.equal(parsedHealth.transportMode, 'remote');
       assert.equal(parsedHealth.remoteGatewayActive, true);
       assert.equal(parsedHealth.authenticationActive, true);
@@ -1092,7 +1092,7 @@ describe('RC-08 Task 1: Positive Acceptance Flows (RC08-FLOW-01..RC08-FLOW-04)',
       assert.ok(initRes.result, 'Handshake must yield result');
       assert.equal(initRes.result.protocolVersion, '2025-11-25');
       assert.equal(initRes.result.serverInfo?.name, 'cesspace-arc');
-      assert.equal(initRes.result.serverInfo?.version, '0.7.0-rc07');
+      assert.equal(initRes.result.serverInfo?.version, '0.8.0-rc08');
       assert.ok(initRes.result.capabilities?.tools, 'Server must advertise tools capability');
 
       // Send initialized notification per MCP specification
@@ -1126,8 +1126,8 @@ describe('RC-08 Task 1: Positive Acceptance Flows (RC08-FLOW-01..RC08-FLOW-04)',
       assert.ok(healthRes.result?.content, 'Tool call must return content array');
       const payload = JSON.parse(healthRes.result.content[0].text);
       assert.equal(payload.status, 'HEALTHY');
-      assert.equal(payload.version, '0.7.0-rc07');
-      assert.equal(payload.stage, 'RC-07');
+      assert.equal(payload.version, '0.8.0-rc08');
+      assert.equal(payload.stage, 'RC-08');
       assert.equal(payload.transportMode, 'stdio');
     } finally {
       rawClient.close();

@@ -327,12 +327,12 @@ describe('CesSpace ARC — RC-01 Mandatory Security Negative & Positive Controls
   // POSITIVE CONTROLS (All 9 Tools)
   // ==========================================================================
 
-  test('Positive 1: health returns HEALTHY and RC-07 stage metadata', async () => {
+  test('Positive 1: health returns HEALTHY and current stage metadata', async () => {
     const res = await server.dispatchToolCall('health', {});
     assert.equal(res.isError, undefined);
     const parsed = JSON.parse(res.content[0].text);
     assert.equal(parsed.status, 'HEALTHY');
-    assert.equal(parsed.stage, 'RC-07');
+    assert.equal(parsed.stage, 'RC-08');
     assert.equal(parsed.policyEngineActive, true);
     assert.equal(parsed.auditActive, true);
     assert.ok(parsed.authorizedWorkspacesCount >= 1);

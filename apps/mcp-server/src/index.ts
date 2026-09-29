@@ -109,6 +109,7 @@ import {
   AuditLogger,
   computeSha256,
   canonicalJson,
+  redactString,
   openAuditRuntime,
   type AuditConfig,
   type AuditHealthMetadata,
@@ -1248,7 +1249,7 @@ export const RC07_TASK7_TOOL_DEFINITIONS: Tool[] = withArcApprovalSchemaOnTools(
       properties: {
         targetStage: {
           type: 'string',
-          description: 'Target development or release stage name (e.g., RC-00 through RC-07).',
+          description: 'Target development or release stage name (e.g., RC-00 through RC-08).',
         },
         workspaceId: {
           type: 'string',
@@ -2101,7 +2102,7 @@ export class ArcMcpServer implements IArcMcpServer {
     this.server = new Server(
       {
         name: 'cesspace-arc',
-        version: '0.7.0-rc07',
+        version: '0.8.0-rc08',
       },
       {
         capabilities: {
@@ -2152,7 +2153,7 @@ export class ArcMcpServer implements IArcMcpServer {
         capabilities: {
           tools: {},
         },
-        serverInfo: { name: 'cesspace-arc', version: '0.7.0-rc07' },
+        serverInfo: { name: 'cesspace-arc', version: '0.8.0-rc08' },
       };
     });
 
@@ -3915,8 +3916,8 @@ export class ArcMcpServer implements IArcMcpServer {
                 : gatewayDegradedForHealth || this.auditRuntime?.isDegraded() === true
                   ? 'DEGRADED'
                   : 'HEALTHY',
-              version: '0.7.0-rc07',
-              stage: 'RC-07',
+              version: '0.8.0-rc08',
+              stage: 'RC-08',
               policyEngineActive,
               // A chain is always active: the durable RC-06 chain on a started
               // server, the in-memory chain otherwise. The durable chain's own
@@ -4672,7 +4673,7 @@ export class ArcMcpServer implements IArcMcpServer {
     const server = new Server(
       {
         name: 'cesspace-arc',
-        version: '0.7.0-rc07',
+        version: '0.8.0-rc08',
       },
       {
         capabilities: {
@@ -4699,7 +4700,7 @@ export class ArcMcpServer implements IArcMcpServer {
         capabilities: {
           tools: {},
         },
-        serverInfo: { name: 'cesspace-arc', version: '0.7.0-rc07' },
+        serverInfo: { name: 'cesspace-arc', version: '0.8.0-rc08' },
       };
     });
 
@@ -4966,7 +4967,7 @@ export function deriveTerminalExecutionStatus(
  */
 export function sanitizeClientErrorMessage(msg: string): string {
   if (!msg) return msg;
-  let sanitized = msg;
+  let sanitized = redactString(msg);
   // Redact absolute host paths
   sanitized = sanitized.replace(
     /(?:\/(?:home|tmp|root|Users|var|private|opt|etc|usr|bin|lib)[^\s'",;:]*)/gi,

@@ -492,6 +492,7 @@ export const RC07_STAGE_CATALOG = [
   'RC-05',
   'RC-06',
   'RC-07',
+  'RC-08',
 ] as const;
 
 export type Rc07Stage = (typeof RC07_STAGE_CATALOG)[number];

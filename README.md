@@ -147,7 +147,7 @@ CesSpace ARC is standardized on:
 | **RC-05** | **Secure Remote Gateway**              | Streamable HTTP over TLS 1.3 with SSE response framing, mutual TLS, device enrollment, volatile sessions. | Implemented |
 | **RC-06** | **Audit & Evidence**                   | Append-only JSONL logging, tiered anchoring, automated redaction.                                         | Implemented |
 | **RC-07** | **Engineering-Aware Tools**            | Composite verification commands (`arc_verify`, `arc_stage_evidence`).                                     | Implemented |
-| **RC-08** | **Integrations & Security Review**     | Cross-client validation, penetration testing, fuzzing.                                                    | Active      |
+| **RC-08** | **Integrations & Security Review**     | Cross-client validation, penetration testing, fuzzing.                                                    | Implemented |
 
 ---
 

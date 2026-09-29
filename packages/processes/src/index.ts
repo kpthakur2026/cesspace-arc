@@ -165,7 +165,9 @@ const HIGH_CONFIDENCE_SECRET_PATTERNS = [
   /ghp_[a-zA-Z0-9]{36}/g,
   /gho_[a-zA-Z0-9]{36}/g,
   /sk-[a-zA-Z0-9]{20,}/g,
-  /-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+PRIVATE KEY-----/g,
+  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g,
+  /-----BEGIN [A-Z0-9 ]*CERTIFICATE-----[\s\S]*?-----END [A-Z0-9 ]*CERTIFICATE-----/g,
+  /(?:Arc-Session-Token|session[_-]?token|approval[_-]?token)[:\s=]+[a-zA-Z0-9._~+/-]+=*/gi,
   /Bearer\s+[a-zA-Z0-9._-]+/gi,
 ];
 
