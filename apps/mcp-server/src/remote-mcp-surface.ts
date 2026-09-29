@@ -64,6 +64,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
+import { JSONRPCMessageSchema } from '@modelcontextprotocol/sdk/types.js';
 import type { ArcError } from '@cesspace-arc/protocol';
 import {
   ARC_SESSION_TOKEN_HEADER,
@@ -92,6 +93,7 @@ import {
   readBoundedRequestBody,
 } from './remote-request-bounds.js';
 import type { GatewayAuditSink } from './gateway-audit.js';
+import { exceedsMaxJsonNestingDepth } from './json-nesting.js';
 
 // The Host (§10) and Origin (§11) refusals and their normalization are owned by
 // the ONE shared authority module, so `/mcp` and `/enroll/complete` cannot
@@ -507,6 +509,18 @@ export class RemoteMcpSurface {
           // request to answer and the connection must not be held open.
           return;
         }
+        if (err.kind === 'INVALID_UTF8') {
+          this.send(
+            res,
+            400,
+            JSON.stringify({
+              jsonrpc: '2.0',
+              error: { code: -32700, message: 'Parse error' },
+              id: null,
+            }),
+          );
+          return;
+        }
       }
       // Ingress failure, not an admission decision: the body could not be read
       // at all, so there is no request to frame a JSON-RPC reply to. §25 keeps
@@ -525,6 +539,25 @@ export class RemoteMcpSurface {
       // malformed body still reaches the transport, which returns the JSON-RPC
       // parse error itself.
       parsedBody = undefined;
+    }
+
+    // RC08-NEG-011: malformed JSON remains a parse error in the transport;
+    // only a successfully parsed JSON value is subject to this shared depth
+    // admission. Refuse before session SDK dispatch or any registered handler.
+    if (parsedBody !== undefined && exceedsMaxJsonNestingDepth(parsedBody)) {
+      this.send(
+        res,
+        400,
+        JSON.stringify({
+          jsonrpc: '2.0',
+          error: {
+            code: -32600,
+            message: 'Invalid Request: JSON nesting exceeds limit',
+          },
+          id: jsonRpcRequestId(parsedBody),
+        }),
+      );
+      return;
     }
 
     // §21.1 Layer C / §26 C-3 / MCP `2025-06-18`: a JSON-RPC BATCH is refused.
@@ -765,6 +798,25 @@ export class RemoteMcpSurface {
 
     this.holdAdmission(res, admission);
 
+    if (method === 'POST' && parsedBody !== undefined) {
+      const envelope = JSONRPCMessageSchema.safeParse(parsedBody);
+      if (!envelope.success) {
+        this.send(
+          res,
+          400,
+          JSON.stringify({
+            jsonrpc: '2.0',
+            error: {
+              code: -32600,
+              message: 'Invalid Request: Not a valid JSON-RPC 2.0 message',
+            },
+            id: jsonRpcRequestId(parsedBody),
+          }),
+        );
+        return;
+      }
+    }
+
     // Request-scoped, server-owned AbortController for this admitted HTTP exchange.
     // Triggered ONLY on premature client disconnect (req aborted / premature socket close),
     // and never on a normal completed response.
@@ -881,6 +933,25 @@ export class RemoteMcpSurface {
       // how many sessions exist.
       this.sendMcpRefusal(res, 'POST', remoteAuthenticationFailure(), requestId);
       return;
+    }
+
+    if (parsedBody !== undefined) {
+      const envelope = JSONRPCMessageSchema.safeParse(parsedBody);
+      if (!envelope.success) {
+        this.send(
+          res,
+          400,
+          JSON.stringify({
+            jsonrpc: '2.0',
+            error: {
+              code: -32600,
+              message: 'Invalid Request: Not a valid JSON-RPC 2.0 message',
+            },
+            id: requestId,
+          }),
+        );
+        return;
+      }
     }
 
     // The ID the generator reserved for THIS bootstrap, captured so a failure

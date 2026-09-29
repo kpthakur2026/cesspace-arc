@@ -165,7 +165,9 @@ const HIGH_CONFIDENCE_SECRET_PATTERNS = [
   /ghp_[a-zA-Z0-9]{36}/g,
   /gho_[a-zA-Z0-9]{36}/g,
   /sk-[a-zA-Z0-9]{20,}/g,
-  /-----BEGIN [A-Z ]+PRIVATE KEY-----[\s\S]*?-----END [A-Z ]+PRIVATE KEY-----/g,
+  /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g,
+  /-----BEGIN [A-Z0-9 ]*CERTIFICATE-----[\s\S]*?-----END [A-Z0-9 ]*CERTIFICATE-----/g,
+  /(?:Arc-Session-Token|session[_-]?token|approval[_-]?token)[:\s=]+[a-zA-Z0-9._~+/-]+=*/gi,
   /Bearer\s+[a-zA-Z0-9._-]+/gi,
 ];
 
@@ -475,7 +477,22 @@ export class ProcessRegistry implements IProcessRegistry {
     }
 
     const available = MAX_PROCESS_BUFFER_BYTES - currentTotal;
-    const slice = chunk.length > available ? chunk.subarray(0, available) : chunk;
+    // When the frozen byte ceiling cuts through a multibyte character, retain
+    // only the complete UTF-8 prefix. Process output is surfaced as text, so a
+    // raw byte slice here would otherwise manufacture U+FFFD in the bounded
+    // response even though the child emitted valid UTF-8.
+    let slice = chunk;
+    if (chunk.length > available) {
+      // A stream event may itself start with continuation bytes for a code
+      // point begun by the preceding event. Find the safe cap against the
+      // bounded concatenated stream, not against this event in isolation.
+      const streamChunks = stream === 'stdout' ? record._stdoutChunks : record._stderrChunks;
+      const retainedStreamBytes =
+        stream === 'stdout' ? record.totalStdoutBytes : record.totalStderrBytes;
+      const combined = Buffer.concat([...streamChunks, chunk], retainedStreamBytes + chunk.length);
+      const safeCombined = sliceUtf8Safe(combined, 0, retainedStreamBytes + available).slice;
+      slice = safeCombined.subarray(retainedStreamBytes);
+    }
 
     if (stream === 'stdout') {
       record._stdoutChunks.push(slice);
@@ -698,18 +715,20 @@ export class ProcessRegistry implements IProcessRegistry {
     record.state = 'TERMINATING';
 
     // Terminate process tree using process group if available (-pid), else child.kill
-    const killTarget = (sig: 'SIGTERM' | 'SIGKILL') => {
+    const killTarget = (sig: 'SIGTERM' | 'SIGKILL'): boolean => {
       try {
         if (pid && process.platform !== 'win32') {
           process.kill(-pid, sig);
+          return true;
         } else {
-          child.kill(sig);
+          return child.kill(sig);
         }
       } catch {
         try {
-          child.kill(sig);
+          return child.kill(sig);
         } catch {
           // Child may have already exited
+          return false;
         }
       }
     };
@@ -729,10 +748,7 @@ export class ProcessRegistry implements IProcessRegistry {
     if (signal === 'SIGTERM') {
       record._killTimer = setTimeout(() => {
         try {
-          if (
-            (pid && process.platform !== 'win32') ||
-            (child.exitCode === null && child.signalCode === null)
-          ) {
+          if (killTarget('SIGKILL')) {
             this.emitLifecycleEvent({
               eventType: 'PROCESS_SIGKILL_ESCALATED',
               timestamp: new Date().toISOString(),
@@ -742,7 +758,6 @@ export class ProcessRegistry implements IProcessRegistry {
               executable: record.executable,
               signal: 'SIGKILL',
             });
-            killTarget('SIGKILL');
           }
         } catch {
           // ignore

@@ -1405,8 +1405,8 @@ describe('CesSpace ARC — RC-06 Task 7: Local Operator CLI & Standalone Offline
       const cliPackage = JSON.parse(
         fs.readFileSync(path.join(REPO_ROOT, 'apps/cli/package.json'), 'utf8'),
       );
-      assert.equal(rootPackage.version, '0.7.0-rc07');
-      assert.equal(cliPackage.version, '0.7.0-rc07');
+      assert.equal(rootPackage.version, '0.8.0-rc08');
+      assert.equal(cliPackage.version, '0.8.0-rc08');
     });
   });
 

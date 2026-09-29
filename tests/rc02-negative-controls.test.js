@@ -206,7 +206,8 @@ describe('CesSpace ARC — RC-02 Mandatory Security Negative & Positive Controls
     });
     assert.equal(res.isError, true);
     const parsed = JSON.parse(res.content[0].text);
-    assert.equal(parsed.code, 'POLICY_DENIED');
+    // RC-08 rejects C0 controls at strict schema admission, before policy or spawn.
+    assert.equal(parsed.code, 'INVALID_REQUEST_SCHEMA');
   });
 
   test('RC02-N-14: git write subcommands are denied by policy (git commit)', async () => {

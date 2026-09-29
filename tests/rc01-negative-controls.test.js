@@ -313,27 +313,26 @@ describe('CesSpace ARC — RC-01 Mandatory Security Negative & Positive Controls
     const parsedNoPath = JSON.parse(resNoPath.content[0].text);
     assert.equal(parsedNoPath.code, 'INVALID_REQUEST_SCHEMA');
 
-    // Null byte in path. Denied fail-closed by RC-04 Layer-2 target admission
-    // before the subsystem is reached; the filesystem INVALID_PATH_CHARS control
-    // remains directly covered in the RC-03 filesystem suites.
+    // RC-08 tightens this boundary to strict Zod admission before either policy
+    // target extraction or the filesystem subsystem can observe the value.
     const resNullByte = await server.dispatchToolCall('read_file', {
       path: 'README.md\0.secret',
     });
     assert.equal(resNullByte.isError, true);
     const parsedNullByte = JSON.parse(resNullByte.content[0].text);
-    assert.equal(parsedNullByte.code, 'POLICY_DENIED');
+    assert.equal(parsedNullByte.code, 'INVALID_REQUEST_SCHEMA');
   });
 
   // ==========================================================================
   // POSITIVE CONTROLS (All 9 Tools)
   // ==========================================================================
 
-  test('Positive 1: health returns HEALTHY and RC-07 stage metadata', async () => {
+  test('Positive 1: health returns HEALTHY and current stage metadata', async () => {
     const res = await server.dispatchToolCall('health', {});
     assert.equal(res.isError, undefined);
     const parsed = JSON.parse(res.content[0].text);
     assert.equal(parsed.status, 'HEALTHY');
-    assert.equal(parsed.stage, 'RC-07');
+    assert.equal(parsed.stage, 'RC-08');
     assert.equal(parsed.policyEngineActive, true);
     assert.equal(parsed.auditActive, true);
     assert.ok(parsed.authorizedWorkspacesCount >= 1);

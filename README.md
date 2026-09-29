@@ -1,7 +1,7 @@
 # CesSpace ARC — Secure Agent-to-Machine Control Plane
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Stage](https://img.shields.io/badge/Stage-RC--07%20Engineering--Aware%20Tools-blue.svg)](#roadmap)
+[![Stage](https://img.shields.io/badge/Stage-RC--08%20Integrations%20%26%20Security%20Review-blue.svg)](#roadmap)
 [![Security Policy](https://img.shields.io/badge/Security-Default%20Deny-red.svg)](SECURITY.md)
 [![Engineering Governance](https://img.shields.io/badge/Governance-Engineering%20Rules-brightgreen.svg)](docs/governance/engineering-governance.md)
 [![Node](https://img.shields.io/badge/Node-24-green.svg)](#toolchain)
@@ -116,6 +116,8 @@ The complete architecture and security foundation of CesSpace ARC is documented 
 | [**RC-06 Scope & Acceptance**](docs/architecture/rc06-scope-acceptance.md)               | Detailed scope, persistent append-only logging, tiered anchoring, and automated redaction.                 |
 | [**RC-06 Final Integration Report**](docs/architecture/rc06-final-integration-report.md) | RC-06 acceptance evidence: architecture summary, control coverage table, and final quality gates.          |
 | [**RC-07 Scope & Acceptance**](docs/architecture/rc07-scope-acceptance.md)               | Detailed scope, engineering-aware tools, composition framework, and 75 frozen negative controls.           |
+| [**RC-07 Final Integration Report**](docs/architecture/rc07-final-integration-report.md) | RC-07 acceptance evidence: architecture summary, control coverage table, and final quality gates.          |
+| [**RC-08 Scope & Acceptance**](docs/architecture/rc08-scope-acceptance.md)               | Detailed scope, threat model, cross-client compatibility, fuzzing policy, and 90 negative controls.        |
 | [**Engineering Governance**](docs/governance/engineering-governance.md)                  | Mandatory project engineering, stage-gate, and security governance rules.                                  |
 | [**Security Policy**](SECURITY.md)                                                       | Vulnerability disclosure, responsible reporting, and safety invariants.                                    |
 | [**Contributing Guide**](CONTRIBUTING.md)                                                | Guidelines for contributing code, tests, and security negative controls.                                   |
@@ -144,8 +146,8 @@ CesSpace ARC is standardized on:
 | **RC-04** | **Policy Engine & Approvals**          | Declarative YAML policy engine, authenticated admin channel, approval tokens, approval audit lifecycle.   | Implemented |
 | **RC-05** | **Secure Remote Gateway**              | Streamable HTTP over TLS 1.3 with SSE response framing, mutual TLS, device enrollment, volatile sessions. | Implemented |
 | **RC-06** | **Audit & Evidence**                   | Append-only JSONL logging, tiered anchoring, automated redaction.                                         | Implemented |
-| **RC-07** | **Engineering-Aware Tools**            | Composite verification commands (`arc_verify`, `arc_stage_evidence`).                                     | Active      |
-| **RC-08** | **Integrations & Security Review**     | Cross-client validation, penetration testing, fuzzing.                                                    | Planned     |
+| **RC-07** | **Engineering-Aware Tools**            | Composite verification commands (`arc_verify`, `arc_stage_evidence`).                                     | Implemented |
+| **RC-08** | **Integrations & Security Review**     | Cross-client validation, penetration testing, fuzzing.                                                    | Implemented |
 
 ---
 

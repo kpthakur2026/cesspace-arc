@@ -474,7 +474,7 @@ describe('CesSpace ARC — RC-07 Task 7: arc_stage_evidence Test Suite', () => {
     });
 
     test('RC07-NEG-060: arc_stage_evidence requested for nonexistent stage name. Rejected with STAGE_NOT_FOUND', async () => {
-      for (const invalidStage of ['RC-99', 'RC-08', 'RC-UNKNOWN', 'rc-06', 'stage-1']) {
+      for (const invalidStage of ['RC-99', 'RC-09', 'RC-UNKNOWN', 'rc-06', 'stage-1']) {
         const res = await server.executeAuthenticatedToolCall(safeActor, 'arc_stage_evidence', {
           targetStage: invalidStage,
         });

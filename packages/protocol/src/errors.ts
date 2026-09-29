@@ -669,7 +669,7 @@ export class ArcError extends Error implements ArcErrorPayload {
       category: 'PROTOCOL',
       message,
       retryable: false,
-      remediationHint: 'Provide a valid stage name from the closed catalog (RC-00 through RC-07).',
+      remediationHint: 'Provide a valid stage name from the closed catalog (RC-00 through RC-08).',
     });
   }
 }

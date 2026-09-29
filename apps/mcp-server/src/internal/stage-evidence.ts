@@ -6,7 +6,7 @@
  * - Read-only aggregation of already-existing, machine-verifiable local evidence from:
  *   - GitSubsystem (branch, commit hash, isClean, tracked verify script presence at HEAD)
  *   - Persistent audit runtime state & packages/audit verification
- * - Closed stage catalog: RC-00 through RC-07; unknown stages reject with STAGE_NOT_FOUND
+ * - Closed stage catalog: RC-00 through RC-08; unknown stages reject with STAGE_NOT_FOUND
  * - Zero subprocess spawning in arc_stage_evidence
  * - Zero filesystem direct imports (fully respects security kernel / subsystem boundaries)
  * - Missing audit runtime or zero records rejects with EVIDENCE_NOT_MET
@@ -63,7 +63,7 @@ export async function handleArcStageEvidence(
     throw ArcError.gitRepositoryNotFound('Directory is not a valid Git repository.');
   }
 
-  // 2. Validate targetStage against closed catalog (RC-00 .. RC-07)
+  // 2. Validate targetStage against closed catalog (RC-00 .. RC-08)
   const targetStage = validatedParams.targetStage;
   if (!targetStage || !RC07_STAGE_CATALOG.includes(targetStage as Rc07Stage)) {
     throw ArcError.stageNotFound(
@@ -94,7 +94,7 @@ export async function handleArcStageEvidence(
   }
 
   // 5. Check stage verification script presence at HEAD
-  // Naming convention: scripts/verify-rc00.sh .. scripts/verify-rc07.sh
+  // Naming convention: scripts/verify-rc00.sh .. scripts/verify-rc08.sh
   const stageSlug = targetStage.toLowerCase().replace(/[^a-z0-9]/g, '');
   const candidateScriptPath = `scripts/verify-${stageSlug}.sh`;
   const scriptPresent = await gitSubsystem.isTrackedFileAtHead(

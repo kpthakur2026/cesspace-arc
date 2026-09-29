@@ -59,6 +59,10 @@ export const ArcApprovalControlSchema = z
       .string()
       .min(1, 'token must be a non-empty string')
       .refine(
+        (value) => /^[\x20-\x7e]+$/.test(value),
+        'token must contain printable ASCII characters',
+      )
+      .refine(
         (value) => Buffer.byteLength(value, 'utf8') <= MAX_ARC_APPROVAL_TOKEN_BYTES,
         `token must not exceed ${MAX_ARC_APPROVAL_TOKEN_BYTES} UTF-8 bytes`,
       ),
