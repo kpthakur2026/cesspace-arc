@@ -2,7 +2,6 @@
 # CesSpace ARC — authoritative RC-08 final verification suite.
 set -euo pipefail
 
-FEATURE_BRANCH="feat/rc-08-integrations-security-review"
 EXPECTED_VERSION="0.8.0-rc08"
 EXPECTED_STAGE="RC-08"
 RC08_SUITES=(
@@ -18,9 +17,9 @@ RC08_SUITES=(
 
 echo "CesSpace ARC — RC-08 final verification"
 
-# Gate 1: Required feature branch
-echo "--> Gate 1: required feature branch"
-[[ "$(git rev-parse --abbrev-ref HEAD)" == "$FEATURE_BRANCH" ]]
+# Gate 1: Required RC-08 branch
+echo "--> Gate 1: required RC-08 branch"
+bash scripts/verify-rc08-branch.sh
 
 # Gate 2: Version, stage, and verification wiring
 echo "--> Gate 2: promotion consistency"

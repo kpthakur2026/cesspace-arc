@@ -739,7 +739,9 @@ test('RC08-FLOW-19: approved production arc_test runs only its targeted passing 
 
 test('RC08-FLOW-20: authoritative verifier owns all final gates and implementation coverage', () => {
   const scriptPath = 'scripts/verify-rc08.sh';
+  const branchGatePath = path.resolve('scripts/verify-rc08-branch.sh');
   fs.accessSync(scriptPath, fs.constants.X_OK);
+  fs.accessSync(branchGatePath, fs.constants.X_OK);
   const source = fs.readFileSync(scriptPath, 'utf8');
   assert.match(source, /^#!\/usr\/bin\/env bash/m);
   assert.match(source, /set -euo pipefail/);
@@ -766,4 +768,20 @@ test('RC08-FLOW-20: authoritative verifier owns all final gates and implementati
   const coverage = assertRc08ControlCoverage();
   assert.equal(coverage.negativeFound, 90);
   assert.equal(coverage.flowsFound, 20);
+
+  const verifyBranch = (branch) => {
+    const root = workspace(`flow20-branch-${branch.replaceAll('/', '-')}`);
+    initializeGit(root);
+    git(root, ['add', 'README.md']);
+    git(root, ['commit', '-m', 'fixture']);
+    if (branch !== 'main') git(root, ['branch', '-m', branch]);
+    return () => execFileSync('bash', [branchGatePath], { cwd: root, encoding: 'utf8' });
+  };
+
+  assert.doesNotThrow(verifyBranch('feat/rc-08-integrations-security-review'));
+  assert.doesNotThrow(verifyBranch('main'));
+  assert.throws(
+    verifyBranch('rc08-invalid-branch'),
+    /RC-08 verification must run on .* or main; got rc08-invalid-branch/,
+  );
 });
