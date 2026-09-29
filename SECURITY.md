@@ -88,10 +88,30 @@ We welcome vulnerability reports from the security community, researchers, and u
 
 Only the current active release candidate or stable branch receives security updates.
 
-| Version                | Supported          | Notes                              |
-| :--------------------- | :----------------- | :--------------------------------- |
-| `0.0.0-rc00` (Current) | :white_check_mark: | Architecture & Security Foundation |
-| Future Releases        | :white_check_mark: | Active development stream          |
+| Version                                     | Supported          | Notes                                    |
+| :------------------------------------------ | :----------------- | :--------------------------------------- |
+| `1.0.0`                                     | :white_check_mark: | Current stable CesSpace ARC Core release |
+| `0.8.0-rc08` and earlier release candidates | :x:                | Superseded by the stable release         |
+
+Security fixes are targeted at the current stable release unless the project
+explicitly announces support for an additional version.
+
+---
+
+## Official Distribution and Impersonation
+
+Security-sensitive users should verify that CesSpace ARC artifacts originate
+from the official publisher and canonical repository documented in
+[PUBLISHER.md](PUBLISHER.md).
+
+Forks and derivative works are permitted under the Apache-2.0 license, but a
+fork or third-party package must not be assumed to be an official CesSpace ARC
+release solely because it uses similar naming or branding. See
+[TRADEMARKS.md](TRADEMARKS.md).
+
+Do not report ordinary trademark or branding disputes through private
+vulnerability-reporting channels unless the issue also creates a concrete
+security risk, such as malicious package impersonation or credential theft.
 
 ---
 
