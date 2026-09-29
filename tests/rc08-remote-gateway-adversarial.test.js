@@ -25,8 +25,12 @@ import {
   sessionRateLimitKey,
 } from '../apps/mcp-server/dist/remote-execution.js';
 import {
+  BoundedRequestLimiter,
+  LAYER_B_BURST,
+  LAYER_B_REQUESTS_PER_MINUTE,
   LAYER_C_BURST,
   LAYER_C_REQUESTS_PER_MINUTE,
+  MAX_LAYER_B_KEYS,
   MAX_LAYER_C_KEYS,
   MAX_OUTSTANDING_REQUESTS_PER_SESSION,
 } from '../apps/mcp-server/dist/remote-resource-limits.js';
@@ -135,7 +139,7 @@ function writeTrustStore(tag, enrolledCertPath = pki.clientCertPath) {
   return { storePath, store, device };
 }
 
-async function startRemote({ tag, sessionClock, layerClock } = {}) {
+async function startRemote({ tag, sessionClock, layerClock, layerBClock } = {}) {
   counter += 1;
   const label = tag ?? `remote-${counter}`;
   const port = await freePort();
@@ -190,6 +194,18 @@ async function startRemote({ tag, sessionClock, layerClock } = {}) {
   }
 
   await server.start();
+  if (layerBClock !== undefined) {
+    // Keep the real Layer-B gate and all its frozen production dimensions, but
+    // inject a clock independent from Layer C. Advancing Layer B by its exact
+    // refill interval prevents this Layer-C-focused proof from first becoming
+    // a Layer-B HTTP-429 test; no token is inserted or consumed directly.
+    server.remoteGateway.layerB = new BoundedRequestLimiter({
+      requestsPerMinute: LAYER_B_REQUESTS_PER_MINUTE,
+      burst: LAYER_B_BURST,
+      maxKeys: MAX_LAYER_B_KEYS,
+      getMonotonicTimeMs: layerBClock.now,
+    });
+  }
   return { server, port, workspaceDir, audit, device, storePath };
 }
 
@@ -232,6 +248,7 @@ function request(
     certPath = pki.clientCertPath,
     keyPath = pki.clientKeyPath,
     rejectUnauthorized = true,
+    agent,
   } = {},
 ) {
   return new Promise((resolve, reject) => {
@@ -247,6 +264,7 @@ function request(
         rejectUnauthorized,
         minVersion: 'TLSv1.3',
         headers: { Host: PUBLIC_HOSTNAME, ...headers },
+        ...(agent === undefined ? {} : { agent }),
       },
       (res) => {
         const chunks = [];
@@ -258,6 +276,7 @@ function request(
             headers: res.headers,
             body: Buffer.concat(chunks).toString('utf8'),
             protocol,
+            reusedSocket: req.reusedSocket,
           }),
         );
         res.on('error', reject);
@@ -267,6 +286,29 @@ function request(
     if (body !== undefined) req.write(body);
     req.end();
   });
+}
+
+async function sendSuccessfulRemoteRequests({
+  port,
+  headers,
+  agent,
+  count,
+  firstId,
+  beforeRequest,
+}) {
+  let reusedSockets = 0;
+  for (let offset = 0; offset < count; offset += 1) {
+    beforeRequest?.();
+    const response = await request(port, {
+      headers,
+      body: rpcBody(firstId + offset),
+      agent,
+    });
+    assert.equal(response.status, 200, response.body);
+    assert.equal(payloadOf(response.body).error, undefined, response.body);
+    if (response.reusedSocket) reusedSockets += 1;
+  }
+  return reusedSockets;
 }
 
 function payloadOf(body) {
@@ -693,8 +735,14 @@ test('RC08-NEG-035: slow-trickle authenticated TLS body times out, executes noth
 });
 
 test('RC08-NEG-036: real Layer-C exhaustion is MCP RATE_LIMIT_EXCEEDED and identity is server-derived', async () => {
-  const clock = makeClock();
-  const harness = await startRemote({ tag: 'neg036-layer-c', layerClock: clock });
+  const layerCClock = makeClock();
+  const layerBClock = makeClock();
+  const harness = await startRemote({
+    tag: 'neg036-layer-c',
+    layerClock: layerCClock,
+    layerBClock,
+  });
+  const agent = new https.Agent({ keepAlive: true, maxSockets: 1 });
   try {
     assert.equal(LAYER_C_REQUESTS_PER_MINUTE, 300);
     assert.equal(LAYER_C_BURST, 60);
@@ -729,6 +777,7 @@ test('RC08-NEG-036: real Layer-C exhaustion is MCP RATE_LIMIT_EXCEEDED and ident
         'X-Forwarded-Host': 'forged.example.invalid',
       },
       body: rpcBody(362),
+      agent,
     });
     assert.equal(payloadOf(admitted.body).error, undefined, admitted.body);
 
@@ -740,20 +789,36 @@ test('RC08-NEG-036: real Layer-C exhaustion is MCP RATE_LIMIT_EXCEEDED and ident
         host: 'client-controlled',
         origin: 'client-controlled',
       }),
+      agent,
     });
     assert.equal(payloadOf(shaped.body).error.code, -32601);
     assert.deepEqual(limiter.getRetainedKeysForTests(), [expectedKey]);
+    assert.equal(limiter.getBucket(expectedKey).tokens, LAYER_C_BURST - 2);
 
-    while (limiter.consume(expectedKey).consumed) {
-      // Exhaust the exact production table without opening enough connections
-      // to trip the intentionally tighter Layer-A connection budget.
-    }
+    const remainingAdmissions = LAYER_C_BURST - 2;
+    const reusedSockets = await sendSuccessfulRemoteRequests({
+      port: harness.port,
+      headers: { ...MCP_HEADERS, ...sessionHeaders(init.sessionId, init.token) },
+      agent,
+      count: remainingAdmissions,
+      firstId: 364,
+      beforeRequest: () => layerBClock.advance(60_000 / LAYER_B_REQUESTS_PER_MINUTE),
+    });
+    assert.equal(
+      2 + remainingAdmissions,
+      LAYER_C_BURST,
+      'exactly the frozen remote admission budget succeeded',
+    );
+    assert.equal(limiter.getBucket(expectedKey).tokens, 0);
+    assert.ok(reusedSockets > 0, 'remote admissions reused one keep-alive connection');
+
     const before = workRecords(harness.audit).length;
     const refused = await request(harness.port, {
       headers: { ...MCP_HEADERS, ...sessionHeaders(init.sessionId, init.token) },
-      body: toolBody(364, 'health', {}),
+      body: toolBody(422, 'health', {}),
+      agent,
     });
-    assertMcpArcError(refused, 'RATE_LIMIT_EXCEEDED', 364);
+    assertMcpArcError(refused, 'RATE_LIMIT_EXCEEDED', 422);
     assert.notEqual(refused.status, 429);
     assert.equal(limiter.getBucket(expectedKey).tokens < 1, true, 'rate, not concurrency');
     assert.equal(limiter.getHolderCount(expectedKey), 0);
@@ -764,6 +829,7 @@ test('RC08-NEG-036: real Layer-C exhaustion is MCP RATE_LIMIT_EXCEEDED and ident
     );
     assert.deepEqual(limiter.getRetainedKeysForTests(), [expectedKey]);
   } finally {
+    agent.destroy();
     await harness.server.stop();
   }
 });
@@ -911,8 +977,14 @@ test('RC08-FLOW-07: real TLS 1.3 mTLS session executes production read_file over
 });
 
 test('RC08-FLOW-08: real authenticated Layer-C tokens exhaust, refill on injected monotonic time, and succeed', async () => {
-  const clock = makeClock();
-  const harness = await startRemote({ tag: 'flow08-refill', layerClock: clock });
+  const layerCClock = makeClock();
+  const layerBClock = makeClock();
+  const harness = await startRemote({
+    tag: 'flow08-refill',
+    layerClock: layerCClock,
+    layerBClock,
+  });
+  const agent = new https.Agent({ keepAlive: true, maxSockets: 1 });
   try {
     const init = await initialize(harness.port);
     const limiter = harness.server.authenticatedRequestLimiter;
@@ -924,37 +996,56 @@ test('RC08-FLOW-08: real authenticated Layer-C tokens exhaust, refill on injecte
     const first = await request(harness.port, {
       headers: { ...MCP_HEADERS, ...sessionHeaders(init.sessionId, init.token) },
       body: rpcBody(808),
+      agent,
     });
     assert.equal(payloadOf(first.body).error, undefined);
     assert.equal(limiter.getBucket(key).tokens, LAYER_C_BURST - 1);
 
-    while (limiter.consume(key).consumed) {
-      // Same frozen table; only the monotonic clock is injected.
-    }
+    const remainingAdmissions = LAYER_C_BURST - 1;
+    const reusedSockets = await sendSuccessfulRemoteRequests({
+      port: harness.port,
+      headers: { ...MCP_HEADERS, ...sessionHeaders(init.sessionId, init.token) },
+      agent,
+      count: remainingAdmissions,
+      firstId: 809,
+      beforeRequest: () => layerBClock.advance(60_000 / LAYER_B_REQUESTS_PER_MINUTE),
+    });
+    assert.equal(
+      1 + remainingAdmissions,
+      LAYER_C_BURST,
+      'authenticated remote requests consumed the complete frozen budget',
+    );
+    assert.equal(limiter.getBucket(key).tokens, 0);
+    assert.ok(reusedSockets > 0, 'exhaustion reused the authenticated keep-alive path');
+
     const refused = await request(harness.port, {
       headers: { ...MCP_HEADERS, ...sessionHeaders(init.sessionId, init.token) },
-      body: rpcBody(809),
+      body: rpcBody(868),
+      agent,
     });
-    assertMcpArcError(refused, 'RATE_LIMIT_EXCEEDED', 809);
+    assertMcpArcError(refused, 'RATE_LIMIT_EXCEEDED', 868);
     assert.notEqual(refused.status, 429);
 
     const refillMs = 60_000 / LAYER_C_REQUESTS_PER_MINUTE;
-    clock.advance(refillMs);
+    layerCClock.advance(refillMs);
     const recovered = await request(harness.port, {
       headers: { ...MCP_HEADERS, ...sessionHeaders(init.sessionId, init.token) },
-      body: rpcBody(810),
+      body: rpcBody(869),
+      agent,
     });
     assert.equal(payloadOf(recovered.body).error, undefined, recovered.body);
     assert.equal(limiter.getBucket(key).tokens, 0, 'exactly one refilled token was consumed');
 
-    clock.advance(60_000 * 10);
+    layerCClock.advance(60_000 * 10);
     const capped = await request(harness.port, {
       headers: { ...MCP_HEADERS, ...sessionHeaders(init.sessionId, init.token) },
-      body: rpcBody(811),
+      body: rpcBody(870),
+      agent,
     });
     assert.equal(payloadOf(capped.body).error, undefined, capped.body);
     assert.equal(limiter.getBucket(key).tokens, LAYER_C_BURST - 1, 'refill capped at burst');
   } finally {
+    agent.destroy();
     await harness.server.stop();
   }
 });
