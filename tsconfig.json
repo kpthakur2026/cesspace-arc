@@ -5,6 +5,7 @@
     { "path": "packages/policy" },
     { "path": "packages/audit" },
     { "path": "packages/auth" },
+    { "path": "packages/config" },
     { "path": "packages/filesystem" },
     { "path": "packages/git" },
     { "path": "packages/terminal" },
