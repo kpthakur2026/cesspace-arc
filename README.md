@@ -121,6 +121,7 @@ The complete architecture and security foundation of CesSpace ARC is documented 
 | [**ARC 1.0 Scope & Acceptance**](docs/architecture/arc10-scope-acceptance.md)            | Normative distribution, hosted-profile, stable-release architecture, and acceptance freeze.                |
 | [**ARC Core Distribution**](docs/distribution/installation.md)                           | Signed source-bundle verification, locked installation, prefix ownership, and safe uninstall.              |
 | [**ARC Core Configuration & Upgrade**](docs/distribution/configuration-upgrade.md)       | Strict versioned configuration, secret-file authority, transactional migration, recovery, and rollback.    |
+| [**ARC Core Release Candidate**](docs/distribution/release-candidate.md)                 | Core-only supply-chain gates, offline verification, dependency policy, and truthful platform evidence.     |
 | [**Engineering Governance**](docs/governance/engineering-governance.md)                  | Mandatory project engineering, stage-gate, and security governance rules.                                  |
 | [**Security Policy**](SECURITY.md)                                                       | Vulnerability disclosure, responsible reporting, and safety invariants.                                    |
 | [**Contributing Guide**](CONTRIBUTING.md)                                                | Guidelines for contributing code, tests, and security negative controls.                                   |

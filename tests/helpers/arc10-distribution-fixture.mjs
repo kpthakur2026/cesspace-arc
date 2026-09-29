@@ -70,7 +70,7 @@ export async function resignBundle(bundleDir, privateKey, mutate) {
 }
 
 export class InstalledStdioClient {
-  constructor(serverFile, workspace) {
+  constructor(serverFile, workspace, environment = {}) {
     const auditRoot = fs.mkdtempSync(path.join(path.dirname(workspace), 'installed-audit-'));
     const keyRoot = path.join(auditRoot, 'keys');
     fs.mkdirSync(keyRoot, { recursive: true, mode: 0o700 });
@@ -105,7 +105,7 @@ export class InstalledStdioClient {
     `;
     this.proc = spawn(process.execPath, ['--input-type=module', '-e', runner], {
       cwd: workspace,
-      env: { ...process.env, CESSPACE_WORKSPACE: workspace },
+      env: { ...process.env, ...environment, CESSPACE_WORKSPACE: workspace },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     this.id = 0;

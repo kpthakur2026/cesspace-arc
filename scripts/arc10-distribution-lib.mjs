@@ -9,6 +9,7 @@ import { execFile as execFileCallback } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import { promisify } from 'node:util';
+import { resolveReleaseProfile, validateReleaseProfile } from './arc10-release-profile-lib.mjs';
 
 const execFile = promisify(execFileCallback);
 
@@ -20,6 +21,7 @@ export const ARCHIVE_FILE = 'source.arcsrc';
 export const SBOM_FILE = 'sbom.spdx.json';
 export const INVENTORY_FILE = 'dependencies.json';
 export const PROVENANCE_FILE = 'provenance.json';
+export const RELEASE_PROFILE_FILE = 'arc10-release-profile.json';
 export const OWNERSHIP_FILE = '.cesspace-arc-install.json';
 export const ARC_VERSION = '0.8.0-rc08';
 export const ARC_STAGE = 'RC-08';
@@ -31,6 +33,7 @@ const SOURCE_PATTERNS = [
   /^(?:apps|packages)\/[^/]+\/(?:package\.json|tsconfig\.json|src\/.*)$/,
   /^scripts\/arc10-[^/]+\.mjs$/,
   /^docs\/distribution\/.*$/,
+  /^release\/arc10-release-profile\.json$/,
 ];
 
 const SECRET_PATTERNS = [
@@ -130,9 +133,16 @@ function flattenDependencyTree(roots) {
 function licenseLookup(report) {
   const lookup = new Map();
   const add = (license, item) => {
-    if (!item?.name || !item?.version) return;
-    const key = `${item.name}@${item.version}`;
-    if (!lookup.has(key)) lookup.set(key, license || 'UNKNOWN');
+    if (!item?.name) return;
+    const versions = Array.isArray(item.versions)
+      ? item.versions
+      : item.version === undefined
+        ? []
+        : [item.version];
+    for (const version of versions) {
+      const key = `${item.name}@${version}`;
+      if (!lookup.has(key)) lookup.set(key, license || item.license || 'UNKNOWN');
+    }
   };
   if (Array.isArray(report)) {
     for (const item of report) add(item.license, item);
@@ -161,6 +171,11 @@ export async function createDependencyEvidence(sourceRoot, lockfileSha256, optio
   const licenses = licenseLookup(JSON.parse(licensed.stdout));
   for (const dependency of dependencies) {
     dependency.license = licenses.get(`${dependency.name}@${dependency.version}`) ?? 'UNKNOWN';
+    dependency.source = {
+      locator: `${dependency.name}@${dependency.version}`,
+      lockfileSha256,
+      type: 'pnpm-lock',
+    };
   }
   const inventory = {
     format: 'cesspace-arc-dependency-inventory-v1',
@@ -292,12 +307,31 @@ export async function buildDistribution({ sourceRoot, outputDir, privateKey, com
   });
   const inventoryBytes = Buffer.from(`${canonicalJson(inventory)}\n`);
   const sbomBytes = Buffer.from(`${canonicalJson(sbom)}\n`);
+  const profileEntry = archive.entries.find(
+    (entry) => entry.path === 'release/arc10-release-profile.json',
+  );
+  if (!profileEntry)
+    throw new DistributionError(
+      'RELEASE_PROFILE_REQUIRED',
+      'The reviewed Core release profile is required',
+    );
+  let profileTemplate;
+  try {
+    profileTemplate = JSON.parse(Buffer.from(profileEntry.data, 'base64').toString('utf8'));
+  } catch {
+    throw new DistributionError('RELEASE_PROFILE_INVALID', 'Release profile is not valid JSON');
+  }
+  const releaseProfile = resolveReleaseProfile(profileTemplate, {
+    source: { commit: sourceCommit, tree: sourceTree },
+  });
+  const releaseProfileBytes = Buffer.from(`${canonicalJson(releaseProfile)}\n`);
   const provenance = {
     buildType: DISTRIBUTION_FORMAT,
     builder: { node: packageJson.engines.node, pnpm: packageJson.packageManager },
     materials: {
       dependencyInventorySha256: sha256(inventoryBytes),
       lockfileSha256: lockEntry.sha256,
+      releaseProfileSha256: sha256(releaseProfileBytes),
       sbomSha256: sha256(sbomBytes),
     },
     profile: 'core',
@@ -320,6 +354,8 @@ export async function buildDistribution({ sourceRoot, outputDir, privateKey, com
     },
     expectedProductionTools: EXPECTED_TOOL_COUNT,
     expectedDeterministicRegistryEntries: EXPECTED_REGISTRY_COUNT,
+    configSchemaVersion: releaseProfile.schemas.config,
+    stateSchemaVersion: releaseProfile.schemas.state,
     files: archive.entries.map(({ path: entryPath, mode, sha256: digest, size }) => ({
       mode,
       path: entryPath,
@@ -330,6 +366,7 @@ export async function buildDistribution({ sourceRoot, outputDir, privateKey, com
       [ARCHIVE_FILE]: sha256(archiveBytes),
       [INVENTORY_FILE]: sha256(inventoryBytes),
       [PROVENANCE_FILE]: sha256(provenanceBytes),
+      [RELEASE_PROFILE_FILE]: sha256(releaseProfileBytes),
       [SBOM_FILE]: sha256(sbomBytes),
     },
     lockfileSha256: lockEntry.sha256,
@@ -352,6 +389,9 @@ export async function buildDistribution({ sourceRoot, outputDir, privateKey, com
       fs.promises.writeFile(path.join(staging, INVENTORY_FILE), inventoryBytes, { mode: 0o644 }),
       fs.promises.writeFile(path.join(staging, SBOM_FILE), sbomBytes, { mode: 0o644 }),
       fs.promises.writeFile(path.join(staging, PROVENANCE_FILE), provenanceBytes, { mode: 0o644 }),
+      fs.promises.writeFile(path.join(staging, RELEASE_PROFILE_FILE), releaseProfileBytes, {
+        mode: 0o644,
+      }),
       fs.promises.writeFile(path.join(staging, MANIFEST_FILE), manifestBytes, { mode: 0o644 }),
       fs.promises.writeFile(path.join(staging, SIGNATURE_FILE), `${signature}\n`, { mode: 0o644 }),
     ]);
@@ -397,7 +437,13 @@ export async function verifyDistribution({ bundleDir, trustedPublicKey }) {
     );
   }
   const artifactBytes = {};
-  for (const artifact of [ARCHIVE_FILE, INVENTORY_FILE, PROVENANCE_FILE, SBOM_FILE]) {
+  for (const artifact of [
+    ARCHIVE_FILE,
+    INVENTORY_FILE,
+    PROVENANCE_FILE,
+    RELEASE_PROFILE_FILE,
+    SBOM_FILE,
+  ]) {
     let bytes;
     try {
       bytes = await fs.promises.readFile(path.join(bundleDir, artifact));
@@ -412,6 +458,10 @@ export async function verifyDistribution({ bundleDir, trustedPublicKey }) {
   const archive = parseCanonicalFile(artifactBytes[ARCHIVE_FILE], ARCHIVE_FILE);
   const inventory = parseCanonicalFile(artifactBytes[INVENTORY_FILE], INVENTORY_FILE);
   const provenance = parseCanonicalFile(artifactBytes[PROVENANCE_FILE], PROVENANCE_FILE);
+  const releaseProfile = parseCanonicalFile(
+    artifactBytes[RELEASE_PROFILE_FILE],
+    RELEASE_PROFILE_FILE,
+  );
   const sbom = parseCanonicalFile(artifactBytes[SBOM_FILE], SBOM_FILE);
   if (archive.format !== ARCHIVE_FORMAT || !Array.isArray(archive.entries)) {
     throw new DistributionError('INVALID_ARCHIVE', 'Source archive format is invalid');
@@ -420,7 +470,8 @@ export async function verifyDistribution({ bundleDir, trustedPublicKey }) {
     provenance.subject?.name !== ARCHIVE_FILE ||
     provenance.subject?.sha256 !== sha256(artifactBytes[ARCHIVE_FILE]) ||
     provenance.source?.commit !== manifest.source?.commit ||
-    provenance.source?.tree !== manifest.source?.tree
+    provenance.source?.tree !== manifest.source?.tree ||
+    provenance.materials?.releaseProfileSha256 !== sha256(artifactBytes[RELEASE_PROFILE_FILE])
   ) {
     throw new DistributionError(
       'PROVENANCE_SUBJECT_MISMATCH',
@@ -481,6 +532,27 @@ export async function verifyDistribution({ bundleDir, trustedPublicKey }) {
       'SBOM does not match the locked dependency inventory',
     );
   }
+  try {
+    validateReleaseProfile(releaseProfile, { requireArtifactSource: true });
+  } catch (error) {
+    throw new DistributionError(error.code ?? 'RELEASE_PROFILE_INVALID', error.message);
+  }
+  if (
+    releaseProfile.artifactSource.commit !== manifest.source?.commit ||
+    releaseProfile.artifactSource.tree !== manifest.source?.tree ||
+    releaseProfile.productVersion !== manifest.version ||
+    releaseProfile.healthStage !== manifest.stage ||
+    releaseProfile.schemas.config !== manifest.configSchemaVersion ||
+    releaseProfile.schemas.state !== manifest.stateSchemaVersion ||
+    releaseProfile.expectedProductionTools !== manifest.expectedProductionTools ||
+    releaseProfile.expectedDeterministicRegistryEntries !==
+      manifest.expectedDeterministicRegistryEntries
+  ) {
+    throw new DistributionError(
+      'RELEASE_PROFILE_MISMATCH',
+      'Release profile does not bind the signed distribution identity',
+    );
+  }
   if (
     manifest.version !== ARC_VERSION ||
     manifest.stage !== ARC_STAGE ||
@@ -492,7 +564,7 @@ export async function verifyDistribution({ bundleDir, trustedPublicKey }) {
       'Distribution identity does not match ARC Core',
     );
   }
-  return { archive, inventory, manifest, provenance, sbom };
+  return { archive, inventory, manifest, provenance, releaseProfile, sbom };
 }
 
 export async function extractVerifiedArchive(archive, destination) {
