@@ -121,10 +121,12 @@ export function normalizeHostHeader(raw: unknown): string | null {
  */
 export function checkRequestAuthority(
   headers: IncomingHttpHeaders,
-  publicHostname: string,
+  publicHostname?: string,
 ): RequestAuthorityRefusal | null {
-  if (normalizeHostHeader(headers.host) !== publicHostname.toLowerCase()) {
-    return 'HOST_REFUSED';
+  if (publicHostname !== undefined) {
+    if (normalizeHostHeader(headers.host) !== publicHostname.toLowerCase()) {
+      return 'HOST_REFUSED';
+    }
   }
   if (headers.origin !== undefined) {
     return 'ORIGIN_REFUSED';

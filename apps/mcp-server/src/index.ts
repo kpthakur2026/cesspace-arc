@@ -57,6 +57,9 @@ import { RemoteGateway, type RemoteGatewayStatus } from './remote-gateway.js';
 import { readRemoteRequestContext, RemoteMcpSurface } from './remote-mcp-surface.js';
 import { GatewayDeviceAdministration } from './device-administration.js';
 import type { RemoteConfig } from './remote-config.js';
+import { type ChatGptRemoteConfig, resolveChatGptRemoteConfig } from './chatgpt-profile.js';
+import { ChatGptAuthBridge } from './chatgpt-auth-bridge.js';
+import { ChatGptRemoteAdapter, type ChatGptAdapterStatus } from './chatgpt-remote-adapter.js';
 import {
   ARC_APPROVAL_KEY,
   computeExecutionPayloadHash,
@@ -191,6 +194,13 @@ export interface ArcServerConfig {
    * Defaults to `${auditConfig.directory}/process-state` when auditConfig is present.
    */
   processStateDir?: string;
+  /**
+   * Optional ChatGPT-compatible remote MCP integration profile.
+   *
+   * Opt-in only and disabled by default. When absent or disabled, no ChatGPT
+   * remote listener is started.
+   */
+  chatgpt?: ChatGptRemoteConfig;
 }
 
 /** Safe, non-sensitive reason the Layer-2 engine is unavailable. */
@@ -1299,7 +1309,7 @@ const REGISTERED_TOOL_NAMES: ReadonlySet<string> = new Set(
  * registered catalog, so a name that is not a tool is not callable regardless
  * of what it is called or who calls it.
  */
-function isRegisteredToolName(name: string): boolean {
+export function isRegisteredToolName(name: string): boolean {
   return REGISTERED_TOOL_NAMES.has(name);
 }
 
@@ -1776,6 +1786,12 @@ export class ArcMcpServer implements IArcMcpServer {
   private readonly transportMode: 'stdio' | 'remote';
   /** Remote configuration, retained only in remote mode. */
   private readonly remoteConfig?: RemoteConfig;
+  /** ChatGPT remote profile configuration (opt-in only). */
+  private readonly chatgptConfig?: ChatGptRemoteConfig;
+  /** ChatGPT server-owned authentication bridge. */
+  private chatgptAuthBridge?: ChatGptAuthBridge;
+  /** ChatGPT remote adapter instance. Present only when enabled and running. */
+  private chatgptAdapter?: ChatGptRemoteAdapter;
   private defaultWorkspaceId?: string;
   public processRegistry?: ProcessRegistry;
   /** Approval state manager. Always present; a fresh one is created if not injected. */
@@ -1992,6 +2008,7 @@ export class ArcMcpServer implements IArcMcpServer {
     // remote configuration supplied alongside stdio is NOT activated.
     this.transportMode = config?.transport ?? 'stdio';
     this.remoteConfig = this.transportMode === 'remote' ? config?.remote : undefined;
+    this.chatgptConfig = config?.chatgpt;
     // Retained verbatim and never defaulted: an absent audit configuration is a
     // startup failure, not a reason to run un-audited.
     this.auditConfig = config?.audit;
@@ -2116,6 +2133,10 @@ export class ArcMcpServer implements IArcMcpServer {
 
   public getRegisteredTools(): Tool[] {
     return ALL_TOOL_DEFINITIONS;
+  }
+
+  public isRegisteredTool(name: string): boolean {
+    return isRegisteredToolName(name);
   }
 
   /**
@@ -4455,6 +4476,22 @@ export class ArcMcpServer implements IArcMcpServer {
       await sweepOrphanProcesses(stateDir);
     }
 
+    // ChatGPT remote MCP integration profile: starts if explicitly enabled.
+    if (this.chatgptConfig?.enabled) {
+      const resolved = resolveChatGptRemoteConfig(this.chatgptConfig);
+      this.chatgptAuthBridge = new ChatGptAuthBridge({
+        expectedToken: resolved.expectedToken,
+        sink: this,
+        auditLogger: this.auditLogger,
+      });
+      this.chatgptAdapter = new ChatGptRemoteAdapter({
+        config: this.chatgptConfig,
+        bridge: this.chatgptAuthBridge,
+        auditLogger: this.auditLogger,
+      });
+      await this.chatgptAdapter.start();
+    }
+
     // Exactly one transport mode runs per process (§4 L-4). In remote mode the
     // stdio transport is never connected, so there is no second listener and no
     // way for a remote failure to fall back to stdio.
@@ -4631,6 +4668,20 @@ export class ArcMcpServer implements IArcMcpServer {
   /** The single active transport mode for this process. */
   public getTransportMode(): 'stdio' | 'remote' {
     return this.transportMode;
+  }
+
+  /**
+   * Runtime status of the ChatGPT remote adapter, if active.
+   */
+  public getChatGptAdapterStatus(): ChatGptAdapterStatus | undefined {
+    return this.chatgptAdapter?.getStatus();
+  }
+
+  /**
+   * The server-owned ChatGPT authentication bridge, if active.
+   */
+  public getChatGptAuthBridge(): ChatGptAuthBridge | undefined {
+    return this.chatgptAuthBridge;
   }
 
   /** Bounded, non-secret remote gateway status. Undefined in stdio mode. */
@@ -4819,6 +4870,14 @@ export class ArcMcpServer implements IArcMcpServer {
   }
 
   public async stop(): Promise<void> {
+    if (this.chatgptAdapter !== undefined) {
+      await this.chatgptAdapter.stop();
+      this.chatgptAdapter = undefined;
+    }
+    if (this.chatgptAuthBridge !== undefined) {
+      this.chatgptAuthBridge.revokeAllSessions();
+      this.chatgptAuthBridge = undefined;
+    }
     if (this.remoteGateway !== undefined) {
       await this.remoteGateway.stop();
       this.remoteGateway = undefined;
@@ -5100,3 +5159,21 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     process.exit(1);
   });
 }
+
+export {
+  type ChatGptRemoteConfig,
+  type ResolvedChatGptRemoteConfig,
+  resolveChatGptRemoteConfig,
+  verifyBearerToken,
+} from './chatgpt-profile.js';
+export {
+  ChatGptAuthBridge,
+  type ChatGptAuthBridgeDeps,
+  type ChatGptExecutionSink,
+  type ChatGptSessionRecord,
+} from './chatgpt-auth-bridge.js';
+export {
+  ChatGptRemoteAdapter,
+  type ChatGptAdapterStatus,
+  type ChatGptRemoteAdapterDeps,
+} from './chatgpt-remote-adapter.js';
