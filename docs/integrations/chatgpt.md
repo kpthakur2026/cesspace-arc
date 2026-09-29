@@ -34,7 +34,12 @@ Secure MCP Tunnel / Private Reverse Connection (Operator-Managed)
   │ Loopback / Private Interface (127.0.0.1) + Bearer Token
   ▼
 ARC Remote MCP Adapter (`ChatGptRemoteAdapter`)
-  │
+  │ (Transport admission only: Host header, rate limiting, request bounds)
+  ▼
+ARC ChatGPT Authentication Bridge (`ChatGptAuthBridge`)
+  │ (Validates transport credential, mints server-authoritative sessions,
+  │  rejects arbitrary/unminted Mcp-Session-Id, binds session to credential,
+  │  and derives authoritative CompleteActor — adapter never sets authenticated:true)
   ▼
 Existing ARC Authenticated Execution Pipeline (`executeAuthenticatedToolCall`)
   │
@@ -50,7 +55,7 @@ Subsystems (Filesystem / Git / Terminal / Processes)
 Authorized Workspace Jails Only
 ```
 
-The new ChatGPT-facing transport does **not** call filesystem, git, terminal, process, or approval subsystems directly. All execution flows exclusively through the shared authenticated ARC tool execution pipeline.
+The new ChatGPT-facing transport does **not** call filesystem, git, terminal, process, or approval subsystems directly. Furthermore, the transport adapter does **not** synthesize `CompleteActor` objects or assert `authenticated: true`. All session lifecycle management, credential binding, and actor derivation are owned by `ChatGptAuthBridge`. Client-supplied session identifiers do not create trust and are rejected unless previously minted by the server. All tool executions flow exclusively through the shared authenticated ARC tool execution pipeline.
 
 ## 4. Setup Instructions
 

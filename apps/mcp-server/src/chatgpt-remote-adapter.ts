@@ -7,9 +7,9 @@
  * Invariants:
  * 1. The adapter itself DOES NOT call filesystem, git, terminal, process, or
  *    approval subsystems directly.
- * 2. All tool execution flows exclusively through the shared authenticated ARC
- *    tool execution path (`sink.executeAuthenticatedToolCall`).
- * 3. Does not invent a second tool catalog; returns ARC's authoritative 25 tools.
+ * 2. The adapter NEVER synthesizes a CompleteActor and NEVER sets authenticated: true.
+ * 3. All tool execution and actor creation flows strictly through the server-owned
+ *    ChatGptAuthBridge.
  * 4. Opt-in only; no listener starts unless explicitly configured.
  * 5. Fails closed on any missing authentication, oversized payload, unknown tool,
  *    or policy denial.
@@ -17,16 +17,9 @@
 
 import http from 'node:http';
 import net from 'node:net';
-import { randomUUID } from 'node:crypto';
-import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 import { ArcError } from '@cesspace-arc/protocol';
 import type { AuditLogger } from '@cesspace-arc/audit';
 import { exceedsMaxJsonNestingDepth } from './json-nesting.js';
-import {
-  findActorFieldInjection,
-  type CompleteActor,
-  type RemoteToolCallResult,
-} from './remote-execution.js';
 import {
   BoundedRequestLimiter,
   LAYER_C_BURST,
@@ -36,31 +29,16 @@ import {
 } from './remote-resource-limits.js';
 import {
   resolveChatGptRemoteConfig,
-  verifyBearerToken,
   type ChatGptRemoteConfig,
   type ResolvedChatGptRemoteConfig,
 } from './chatgpt-profile.js';
+import type { ChatGptAuthBridge } from './chatgpt-auth-bridge.js';
 
 export const MAX_HEADER_BYTES = 16 * 1024; // 16 KiB
 
-/**
- * Sink interface required by ChatGptRemoteAdapter.
- * Matches ArcMcpServer's shared authenticated tool dispatch pipeline.
- */
-export interface ChatGptExecutionSink {
-  executeAuthenticatedToolCall(
-    actor: CompleteActor,
-    toolName: string,
-    parameters: Record<string, unknown>,
-    options?: { signal?: AbortSignal },
-  ): Promise<RemoteToolCallResult>;
-  getRegisteredTools?: () => Tool[];
-  isRegisteredTool?: (name: string) => boolean;
-}
-
 export interface ChatGptRemoteAdapterDeps {
   config: ChatGptRemoteConfig;
-  sink: ChatGptExecutionSink;
+  bridge: ChatGptAuthBridge;
   auditLogger?: AuditLogger;
 }
 
@@ -73,26 +51,19 @@ export interface ChatGptAdapterStatus {
   activeSessions: number;
 }
 
-interface ActiveSessionRecord {
-  sessionId: string;
-  createdAt: number;
-  lastActive: number;
-}
-
 export class ChatGptRemoteAdapter {
   private readonly rawConfig: ChatGptRemoteConfig;
-  private readonly sink: ChatGptExecutionSink;
+  private readonly bridge: ChatGptAuthBridge;
   private readonly auditLogger?: AuditLogger;
   private resolvedConfig?: ResolvedChatGptRemoteConfig;
   private server?: http.Server;
   private actualPort = 0;
-  private readonly sessions = new Map<string, ActiveSessionRecord>();
   private readonly openSockets = new Set<net.Socket>();
   private readonly limiter: BoundedRequestLimiter;
 
   constructor(deps: ChatGptRemoteAdapterDeps) {
     this.rawConfig = deps.config;
-    this.sink = deps.sink;
+    this.bridge = deps.bridge;
     this.auditLogger = deps.auditLogger;
     this.limiter = new BoundedRequestLimiter({
       requestsPerMinute: LAYER_C_REQUESTS_PER_MINUTE,
@@ -157,45 +128,42 @@ export class ChatGptRemoteAdapter {
   }
 
   /**
-   * Stops the HTTP listener and terminates active connections.
+   * Stops the HTTP listener and terminates existing connections.
    */
   public async stop(): Promise<void> {
-    if (!this.server) {
-      return;
-    }
-
-    const server = this.server;
-    this.server = undefined;
-
     for (const socket of this.openSockets) {
       socket.destroy();
     }
     this.openSockets.clear();
-    this.sessions.clear();
 
-    return new Promise((resolve) => {
-      server.close(() => {
-        resolve();
+    if (this.server) {
+      await new Promise<void>((resolve) => {
+        this.server?.close(() => {
+          resolve();
+        });
       });
-    });
+      this.server = undefined;
+    }
+    this.actualPort = 0;
   }
 
   /**
-   * Returns runtime status of the adapter.
+   * Returns adapter operational status.
    */
   public getStatus(): ChatGptAdapterStatus {
+    const config = this.resolvedConfig;
     return {
-      active: this.server !== undefined && this.server.listening,
-      bindHost: this.resolvedConfig?.bindHost ?? this.rawConfig.bindHost ?? '127.0.0.1',
+      active: this.server !== undefined && this.actualPort > 0,
+      bindHost: config?.bindHost ?? this.rawConfig.bindHost ?? '127.0.0.1',
       port: this.actualPort,
-      path: this.resolvedConfig?.path ?? this.rawConfig.path ?? '/mcp',
-      tunnelHostname: this.resolvedConfig?.tunnelHostname,
-      activeSessions: this.sessions.size,
+      path: config?.path ?? this.rawConfig.path ?? '/mcp',
+      tunnelHostname: config?.tunnelHostname ?? this.rawConfig.tunnelHostname,
+      activeSessions: this.bridge.getActiveSessionCount(),
     };
   }
 
   /**
-   * Primary ingress handler for incoming HTTP requests from the tunnel.
+   * Dispatches incoming HTTP requests according to MCP specification.
    */
   private async handleRequest(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const config = this.resolvedConfig;
@@ -228,7 +196,7 @@ export class ChatGptRemoteAdapter {
     // Handle health probe
     if (pathname === '/health') {
       const authHeader = req.headers.authorization;
-      if (!verifyBearerToken(authHeader, config.expectedToken)) {
+      if (!this.bridge.verifyTransportAuth(authHeader)) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Unauthorized', message: 'Authentication required' }));
         return;
@@ -264,18 +232,18 @@ export class ChatGptRemoteAdapter {
       return;
     }
 
-    if (!['GET', 'POST', 'DELETE'].includes(method)) {
+    if (method !== 'POST' && method !== 'GET' && method !== 'DELETE') {
       res.writeHead(405, {
-        Allow: 'GET, POST, DELETE, OPTIONS',
         'Content-Type': 'application/json',
+        Allow: 'GET, POST, DELETE, OPTIONS',
       });
       res.end(JSON.stringify({ error: 'Method Not Allowed' }));
       return;
     }
 
-    // 4. Mandatory Authentication: verify bearer token
+    // 4. Transport credential check
     const authHeader = req.headers.authorization;
-    if (!verifyBearerToken(authHeader, config.expectedToken)) {
+    if (!this.bridge.verifyTransportAuth(authHeader)) {
       if (method === 'POST') {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(
@@ -283,7 +251,7 @@ export class ChatGptRemoteAdapter {
             jsonrpc: '2.0',
             id: null,
             error: {
-              code: -32000,
+              code: -32001,
               message: 'UNAUTHENTICATED',
               data: { code: 'UNAUTHENTICATED' },
             },
@@ -296,13 +264,12 @@ export class ChatGptRemoteAdapter {
       return;
     }
 
-    // 5. Session identification & rate limiting
-    let sessionId = req.headers['mcp-session-id'];
-    if (Array.isArray(sessionId)) {
-      sessionId = sessionId[0];
-    }
-    if (sessionId !== undefined && sessionId.length > 0) {
-      if (!/^[a-zA-Z0-9_-]{1,64}$/.test(sessionId)) {
+    // 5. Rate limiting & concurrency bounding
+    const rawSessionId = req.headers['mcp-session-id'];
+    const presentedSessionId = Array.isArray(rawSessionId) ? rawSessionId[0] : rawSessionId;
+
+    if (presentedSessionId !== undefined && presentedSessionId.length > 0) {
+      if (!/^[a-zA-Z0-9_-]{1,64}$/.test(presentedSessionId)) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(
           JSON.stringify({
@@ -313,11 +280,9 @@ export class ChatGptRemoteAdapter {
         );
         return;
       }
-    } else {
-      sessionId = randomUUID();
     }
 
-    const sessionKey = `chatgpt:${sessionId}`;
+    const sessionKey = `chatgpt:${presentedSessionId ?? 'pre-session'}`;
     const consumeResult = this.limiter.consume(sessionKey);
     if (!consumeResult.consumed) {
       res.writeHead(429, { 'Content-Type': 'application/json' });
@@ -344,27 +309,21 @@ export class ChatGptRemoteAdapter {
           id: null,
           error: {
             code: -32000,
-            message: 'RATE_LIMIT_EXCEEDED',
-            data: { code: 'RATE_LIMIT_EXCEEDED' },
+            message: 'CONCURRENCY_LIMIT_EXCEEDED',
+            data: { code: 'CONCURRENCY_LIMIT_EXCEEDED' },
           },
         }),
       );
       return;
     }
 
-    this.sessions.set(sessionId, {
-      sessionId,
-      createdAt: Date.now(),
-      lastActive: Date.now(),
-    });
-
     try {
       if (method === 'GET') {
-        await this.handleGet(req, res, sessionId);
+        await this.handleGet(req, res, presentedSessionId, authHeader);
       } else if (method === 'DELETE') {
-        this.handleDelete(req, res, sessionId);
+        this.handleDelete(req, res, presentedSessionId, authHeader);
       } else {
-        await this.handlePost(req, res, sessionId, config.maxRequestBodyBytes);
+        await this.handlePost(req, res, presentedSessionId, authHeader, config.maxRequestBodyBytes);
       }
     } finally {
       holdResult.release();
@@ -377,39 +336,58 @@ export class ChatGptRemoteAdapter {
   private async handleGet(
     req: http.IncomingMessage,
     res: http.ServerResponse,
-    sessionId: string,
+    presentedSessionId: string | undefined,
+    authHeader: string | undefined,
   ): Promise<void> {
     const acceptHeader = req.headers.accept ?? '';
     if (acceptHeader.includes('text/event-stream')) {
-      res.writeHead(200, {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache',
-        Connection: 'keep-alive',
-        'Mcp-Session-Id': sessionId,
-      });
-      res.write(`event: endpoint\ndata: ${this.resolvedConfig?.path ?? '/mcp'}\n\n`);
+      try {
+        const activeSession = this.bridge.validateSession(presentedSessionId, authHeader);
+        res.writeHead(200, {
+          'Content-Type': 'text/event-stream',
+          'Cache-Control': 'no-cache',
+          Connection: 'keep-alive',
+          'Mcp-Session-Id': activeSession.sessionId,
+        });
+        res.write(`event: endpoint\ndata: ${this.resolvedConfig?.path ?? '/mcp'}\n\n`);
 
-      const keepAliveInterval = setInterval(() => {
-        if (!res.writableEnded) {
-          res.write(': keepalive\n\n');
+        const keepAliveInterval = setInterval(() => {
+          if (!res.writableEnded) {
+            res.write(': keepalive\n\n');
+          }
+        }, 15000);
+
+        req.on('close', () => {
+          clearInterval(keepAliveInterval);
+        });
+        return;
+      } catch (err: unknown) {
+        if (err instanceof ArcError && err.code === 'INVALID_SESSION_TOKEN') {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(
+            JSON.stringify({
+              jsonrpc: '2.0',
+              id: null,
+              error: { code: -32000, message: 'INVALID_SESSION_TOKEN' },
+            }),
+          );
+          return;
         }
-      }, 15000);
-
-      req.on('close', () => {
-        clearInterval(keepAliveInterval);
-      });
-      return;
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unauthorized', message: 'Authentication required' }));
+        return;
+      }
     }
 
     res.writeHead(200, {
       'Content-Type': 'application/json',
-      'Mcp-Session-Id': sessionId,
+      ...(presentedSessionId ? { 'Mcp-Session-Id': presentedSessionId } : {}),
     });
     res.end(
       JSON.stringify({
         status: 'ok',
         transport: 'chatgpt-remote',
-        sessionId,
+        activeSessions: this.bridge.getActiveSessionCount(),
       }),
     );
   }
@@ -420,36 +398,107 @@ export class ChatGptRemoteAdapter {
   private handleDelete(
     _req: http.IncomingMessage,
     res: http.ServerResponse,
-    sessionId: string,
+    presentedSessionId: string | undefined,
+    authHeader: string | undefined,
   ): void {
-    this.sessions.delete(sessionId);
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(
-      JSON.stringify({
-        jsonrpc: '2.0',
-        result: { sessionClosed: true },
-      }),
-    );
+    try {
+      this.bridge.validateSession(presentedSessionId, authHeader);
+      this.bridge.revokeSession(presentedSessionId);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          result: { sessionClosed: true },
+        }),
+      );
+    } catch (err: unknown) {
+      if (err instanceof ArcError && err.code === 'INVALID_SESSION_TOKEN') {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: null,
+            error: { code: -32000, message: 'INVALID_SESSION_TOKEN' },
+          }),
+        );
+        return;
+      }
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unauthorized', message: 'Authentication required' }));
+    }
   }
 
   /**
-   * Handles POST requests: reads JSON-RPC payload and dispatches tools.
+   * Handles POST requests: receives MCP JSON-RPC payloads.
    */
   private async handlePost(
     req: http.IncomingMessage,
     res: http.ServerResponse,
-    sessionId: string,
-    maxBodyBytes: number,
+    presentedSessionId: string | undefined,
+    authHeader: string | undefined,
+    maxRequestBodyBytes: number,
   ): Promise<void> {
-    // Read request body with strict size ceiling
-    const rawBody = await this.readRequestBody(req, maxBodyBytes);
-    if (rawBody === null) {
-      res.writeHead(413, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Payload Too Large' }));
+    const rawContentType = req.headers['content-type'] ?? '';
+    const contentType = rawContentType.split(';')[0].trim().toLowerCase();
+    if (contentType !== 'application/json') {
+      res.writeHead(415, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          jsonrpc: '2.0',
+          id: null,
+          error: {
+            code: -32700,
+            message: "Unsupported Media Type: expected 'application/json'",
+          },
+        }),
+      );
       return;
     }
 
-    // Parse JSON
+    const rawContentLength = req.headers['content-length'];
+    if (rawContentLength !== undefined) {
+      const parsedLength = parseInt(rawContentLength, 10);
+      if (!Number.isFinite(parsedLength) || parsedLength > maxRequestBodyBytes) {
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: null,
+            error: {
+              code: -32000,
+              message: `Payload Too Large: request exceeds maximum of ${maxRequestBodyBytes} bytes`,
+            },
+          }),
+        );
+        return;
+      }
+    }
+
+    let bodyBuffer = Buffer.alloc(0);
+    let bytesReceived = 0;
+
+    for await (const chunk of req) {
+      const chunkBuf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      bytesReceived += chunkBuf.length;
+      if (bytesReceived > maxRequestBodyBytes) {
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: null,
+            error: {
+              code: -32000,
+              message: `Payload Too Large: request exceeds maximum of ${maxRequestBodyBytes} bytes`,
+            },
+          }),
+        );
+        return;
+      }
+      bodyBuffer = Buffer.concat([bodyBuffer, chunkBuf]);
+    }
+
+    const rawBody = bodyBuffer.toString('utf8');
+
     let parsed: unknown;
     try {
       parsed = JSON.parse(rawBody);
@@ -459,33 +508,37 @@ export class ChatGptRemoteAdapter {
         JSON.stringify({
           jsonrpc: '2.0',
           id: null,
-          error: { code: -32700, message: 'Parse error' },
+          error: { code: -32700, message: 'Parse error: malformed JSON' },
         }),
       );
       return;
     }
 
-    // Nesting depth defense
     if (exceedsMaxJsonNestingDepth(parsed)) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(
         JSON.stringify({
           jsonrpc: '2.0',
           id: null,
-          error: { code: -32600, message: 'Invalid Request: JSON nesting exceeds limit' },
+          error: {
+            code: -32600,
+            message: 'Invalid Request: JSON payload nesting exceeds depth limit',
+          },
         }),
       );
       return;
     }
 
-    // Batching refusal (fail-closed per MCP specification)
     if (Array.isArray(parsed)) {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(
         JSON.stringify({
           jsonrpc: '2.0',
           id: null,
-          error: { code: -32600, message: 'JSON-RPC batching is not supported.' },
+          error: {
+            code: -32600,
+            message: 'Invalid Request: JSON-RPC batching is not supported',
+          },
         }),
       );
       return;
@@ -497,7 +550,7 @@ export class ChatGptRemoteAdapter {
         JSON.stringify({
           jsonrpc: '2.0',
           id: null,
-          error: { code: -32600, message: 'Invalid Request' },
+          error: { code: -32600, message: 'Invalid Request: expected JSON object' },
         }),
       );
       return;
@@ -518,54 +571,76 @@ export class ChatGptRemoteAdapter {
     // Dispatch JSON-RPC methods
     switch (method) {
       case 'initialize': {
-        res.writeHead(200, {
-          'Content-Type': 'application/json',
-          'Mcp-Session-Id': sessionId,
-        });
-        res.end(
-          JSON.stringify({
-            jsonrpc: '2.0',
-            id: requestId,
-            result: {
-              protocolVersion: '2024-11-05',
-              capabilities: { tools: {} },
-              serverInfo: { name: 'cesspace-arc', version: '1.0.0' },
-            },
-          }),
-        );
+        try {
+          const initResult = this.bridge.createSession(authHeader);
+          res.writeHead(200, {
+            'Content-Type': 'application/json',
+            'Mcp-Session-Id': initResult.sessionId,
+          });
+          res.end(
+            JSON.stringify({
+              jsonrpc: '2.0',
+              id: requestId,
+              result: initResult,
+            }),
+          );
+        } catch (err: unknown) {
+          this.handleAuthOrBridgeError(err, requestId, res);
+        }
         return;
       }
 
       case 'notifications/initialized': {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ jsonrpc: '2.0', id: requestId, result: {} }));
+        try {
+          this.bridge.validateSession(presentedSessionId, authHeader);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ jsonrpc: '2.0', id: requestId, result: {} }));
+        } catch (err: unknown) {
+          this.handleAuthOrBridgeError(err, requestId, res);
+        }
         return;
       }
 
       case 'ping': {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ jsonrpc: '2.0', id: requestId, result: {} }));
+        try {
+          this.bridge.validateSession(presentedSessionId, authHeader);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ jsonrpc: '2.0', id: requestId, result: {} }));
+        } catch (err: unknown) {
+          this.handleAuthOrBridgeError(err, requestId, res);
+        }
         return;
       }
 
       case 'tools/list': {
-        const tools = this.sink.getRegisteredTools ? this.sink.getRegisteredTools() : [];
-        res.writeHead(200, {
-          'Content-Type': 'application/json',
-          'Mcp-Session-Id': sessionId,
-        });
-        res.end(
-          JSON.stringify({
-            jsonrpc: '2.0',
-            id: requestId,
-            result: { tools },
-          }),
-        );
+        try {
+          const activeSession = this.bridge.validateSession(presentedSessionId, authHeader);
+          const tools = this.bridge.getRegisteredTools();
+          res.writeHead(200, {
+            'Content-Type': 'application/json',
+            'Mcp-Session-Id': activeSession.sessionId,
+          });
+          res.end(
+            JSON.stringify({
+              jsonrpc: '2.0',
+              id: requestId,
+              result: { tools },
+            }),
+          );
+        } catch (err: unknown) {
+          this.handleAuthOrBridgeError(err, requestId, res);
+        }
         return;
       }
 
       case 'tools/call': {
-        await this.handleToolCall(jsonRpcMsg.params, requestId, sessionId, res);
+        await this.handleToolCall(
+          jsonRpcMsg.params,
+          requestId,
+          presentedSessionId,
+          authHeader,
+          res,
+        );
         return;
       }
 
@@ -587,12 +662,14 @@ export class ChatGptRemoteAdapter {
   }
 
   /**
-   * Handles tools/call: validates arguments, derives CompleteActor, and executes via shared sink.
+   * Handles tools/call: delegates session validation, parameter guard, CompleteActor
+   * derivation, and execution entirely to the server-owned ChatGptAuthBridge.
    */
   private async handleToolCall(
     params: unknown,
     requestId: string | number | null,
-    sessionId: string,
+    presentedSessionId: string | undefined,
+    authHeader: string | undefined,
     res: http.ServerResponse,
   ): Promise<void> {
     if (typeof params !== 'object' || params === null || Array.isArray(params)) {
@@ -624,12 +701,7 @@ export class ChatGptRemoteAdapter {
       return;
     }
 
-    const registeredTools = this.sink.getRegisteredTools ? this.sink.getRegisteredTools() : [];
-    const isKnown = this.sink.isRegisteredTool
-      ? this.sink.isRegisteredTool(name)
-      : registeredTools.some((t) => t.name === name);
-
-    if (!isKnown) {
+    if (!this.bridge.isRegisteredTool(name)) {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(
         JSON.stringify({
@@ -646,38 +718,17 @@ export class ChatGptRemoteAdapter {
         ? (toolArgs as Record<string, unknown>)
         : {};
 
-    // Parameter actor-field injection guard (prevents spoofing internal actor state)
-    const injection = findActorFieldInjection(parameters);
-    if (injection !== null) {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(
-        JSON.stringify({
-          jsonrpc: '2.0',
-          id: requestId,
-          error: {
-            code: -32602,
-            message: `Invalid parameters for tool '${name}': reserved actor or transport identity field is not permitted.`,
-          },
-        }),
-      );
-      return;
-    }
-
-    // Construct the authoritative server-derived CompleteActor
-    const actor: CompleteActor = {
-      clientId: 'chatgpt-client',
-      clientType: 'chatgpt-remote',
-      deviceId: 'chatgpt-tunnel-gateway',
-      sessionId,
-      authenticated: true,
-    };
-
     try {
-      const callResult = await this.sink.executeAuthenticatedToolCall(actor, name, parameters);
+      const callResult = await this.bridge.executeToolCall({
+        presentedSessionId,
+        authorizationHeader: authHeader,
+        toolName: name,
+        parameters,
+      });
 
       res.writeHead(200, {
         'Content-Type': 'application/json',
-        'Mcp-Session-Id': sessionId,
+        ...(presentedSessionId ? { 'Mcp-Session-Id': presentedSessionId } : {}),
       });
       res.end(
         JSON.stringify({
@@ -690,64 +741,64 @@ export class ChatGptRemoteAdapter {
         }),
       );
     } catch (err: unknown) {
-      if (err instanceof ArcError) {
-        // Known protocol error from pipeline (e.g. unknown tool or unauthenticated)
-        if ((err.code as string) === 'UNREGISTERED_TOOL' || err.message.includes('Unknown tool')) {
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(
-            JSON.stringify({
-              jsonrpc: '2.0',
-              id: requestId,
-              error: { code: -32601, message: err.message },
-            }),
-          );
-          return;
-        }
+      this.handleAuthOrBridgeError(err, requestId, res);
+    }
+  }
 
-        res.writeHead(200, {
-          'Content-Type': 'application/json',
-          'Mcp-Session-Id': sessionId,
-        });
+  /**
+   * Translates ArcErrors and authentication failures into proper wire responses.
+   */
+  private handleAuthOrBridgeError(
+    err: unknown,
+    requestId: string | number | null,
+    res: http.ServerResponse,
+  ): void {
+    if (err instanceof ArcError) {
+      if (err.code === 'UNAUTHENTICATED') {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(
           JSON.stringify({
             jsonrpc: '2.0',
             id: requestId,
-            result: {
-              isError: true,
-              content: [
-                {
-                  type: 'text',
-                  text: JSON.stringify({
-                    error: err.code,
-                    category: err.category,
-                    message: err.message,
-                  }),
-                },
-              ],
+            error: {
+              code: -32001,
+              message: 'UNAUTHENTICATED',
+              data: { code: 'UNAUTHENTICATED' },
             },
           }),
         );
         return;
       }
 
-      // Check generic unknown tool error shape
-      const errMsg = err instanceof Error ? err.message : String(err);
-      if (errMsg.includes('Unknown tool') || errMsg.includes('not a tool')) {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
+      if (err.code === 'INVALID_SESSION_TOKEN') {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(
           JSON.stringify({
             jsonrpc: '2.0',
             id: requestId,
-            error: { code: -32601, message: errMsg },
+            error: {
+              code: -32000,
+              message: 'INVALID_SESSION_TOKEN',
+              data: { code: 'INVALID_SESSION_TOKEN' },
+            },
           }),
         );
         return;
       }
 
-      res.writeHead(200, {
-        'Content-Type': 'application/json',
-        'Mcp-Session-Id': sessionId,
-      });
+      if (err.code === 'INVALID_REQUEST_SCHEMA') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: requestId,
+            error: { code: -32602, message: err.message },
+          }),
+        );
+        return;
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(
         JSON.stringify({
           jsonrpc: '2.0',
@@ -757,47 +808,22 @@ export class ChatGptRemoteAdapter {
             content: [
               {
                 type: 'text',
-                text: JSON.stringify({
-                  error: 'INTERNAL_ERROR',
-                  category: 'SYSTEM',
-                  message: 'Tool execution failed.',
-                }),
+                text: JSON.stringify(err.toJSON(), null, 2),
               },
             ],
           },
         }),
       );
+      return;
     }
-  }
 
-  /**
-   * Reads request body into a string, enforcing byte limit.
-   * Returns null if the body exceeds maxBytes.
-   */
-  private readRequestBody(req: http.IncomingMessage, maxBytes: number): Promise<string | null> {
-    return new Promise((resolve, reject) => {
-      let totalBytes = 0;
-      const chunks: Buffer[] = [];
-
-      req.on('data', (chunk: Buffer) => {
-        totalBytes += chunk.length;
-        if (totalBytes > maxBytes) {
-          req.pause();
-          resolve(null);
-          return;
-        }
-        chunks.push(chunk);
-      });
-
-      req.on('end', () => {
-        if (totalBytes <= maxBytes) {
-          resolve(Buffer.concat(chunks).toString('utf8'));
-        }
-      });
-
-      req.on('error', (err) => {
-        reject(err);
-      });
-    });
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        jsonrpc: '2.0',
+        id: requestId,
+        error: { code: -32603, message: 'Internal error' },
+      }),
+    );
   }
 }

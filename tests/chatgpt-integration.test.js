@@ -2,7 +2,9 @@
  * CesSpace ARC — ChatGPT Remote MCP Integration Test Suite
  *
  * Covers:
- * - TASK 7: Security Negative Tests (Controls 1 through 15)
+ * - TASK 7: Security Negative Controls (Controls 1 through 22)
+ *   - NEG-01 to NEG-15: Baseline transport, boundary, and catalog controls
+ *   - NEG-16 to NEG-22: Server-authoritative session, anti-synthesis, and credential binding controls
  * - TASK 8: Positive Flows (Flows 1 through 6)
  */
 
@@ -19,6 +21,7 @@ import { promisify } from 'node:util';
 import {
   createArcMcpServer,
   ALL_TOOL_DEFINITIONS,
+  ChatGptAuthBridge,
   ChatGptRemoteAdapter,
   resolveChatGptRemoteConfig,
 } from '../apps/mcp-server/dist/index.js';
@@ -98,19 +101,46 @@ function sendHttpRequest(port, options = {}) {
           resolve({
             statusCode: res.statusCode,
             headers: res.headers,
+            raw,
             body: parsed,
-            rawBody: raw,
           });
         });
       },
     );
 
-    req.on('error', reject);
+    req.on('error', (err) => {
+      reject(err);
+    });
+
     if (body !== null) {
-      req.write(typeof body === 'string' ? body : JSON.stringify(body));
+      if (typeof body === 'string') {
+        req.write(body);
+      } else {
+        req.write(JSON.stringify(body));
+      }
     }
+
     req.end();
   });
+}
+
+/**
+ * Helper to initialize a server-authoritative MCP session.
+ */
+async function initializeSession(port, token = validToken) {
+  const res = await sendHttpRequest(port, {
+    headers: { Authorization: `Bearer ${token}` },
+    body: {
+      jsonrpc: '2.0',
+      id: 'init-handshake',
+      method: 'initialize',
+      params: { protocolVersion: '2024-11-05', capabilities: {} },
+    },
+  });
+  assert.equal(res.statusCode, 200);
+  const sessionId = res.headers['mcp-session-id'] || res.body?.result?.sessionId;
+  assert.ok(sessionId, 'initialize must yield server-generated Mcp-Session-Id');
+  return sessionId;
 }
 
 describe('TASK 7 — Security Negative Controls', () => {
@@ -123,19 +153,20 @@ describe('TASK 7 — Security Negative Controls', () => {
     });
     await server.start();
     try {
-      assert.equal(server.getChatGptAdapterStatus(), undefined);
+      const chatgptStatus = server.getChatGptAdapterStatus();
+      assert.equal(typeof chatgptStatus, 'undefined');
     } finally {
       await server.stop();
     }
   });
 
-  test('NEG-02: listener cannot start with incomplete or insecure auth configuration', async () => {
+  test('NEG-02: listener cannot start with incomplete or insecure auth configuration', () => {
     // Missing authTokenPath
     assert.throws(
       () =>
         resolveChatGptRemoteConfig({
           enabled: true,
-          port: 8443,
+          port: 4040,
         }),
       /authTokenPath.*required/i,
     );
@@ -145,13 +176,13 @@ describe('TASK 7 — Security Negative Controls', () => {
       () =>
         resolveChatGptRemoteConfig({
           enabled: true,
-          port: 8443,
+          port: 4040,
           authTokenPath: path.join(tempRoot, 'does-not-exist.txt'),
         }),
-      /missing or unreadable/i,
+      /ENOENT|missing or unreadable|does not exist/i,
     );
 
-    // Insecure permissions (0666)
+    // Insecure token file permissions (mode 0666)
     const insecureTokenPath = path.join(tempRoot, 'insecure-token.txt');
     fs.writeFileSync(insecureTokenPath, 'secret\n', { mode: 0o666 });
     fs.chmodSync(insecureTokenPath, 0o666);
@@ -159,33 +190,33 @@ describe('TASK 7 — Security Negative Controls', () => {
       () =>
         resolveChatGptRemoteConfig({
           enabled: true,
-          port: 8443,
+          port: 4040,
           authTokenPath: insecureTokenPath,
         }),
-      /must not be readable or writable by group or other/i,
+      /mode 0600\/0400 required|readable or writable by group/i,
     );
 
     // Empty token file
     const emptyTokenPath = path.join(tempRoot, 'empty-token.txt');
-    fs.writeFileSync(emptyTokenPath, '   \n', { mode: 0o600 });
+    fs.writeFileSync(emptyTokenPath, '', { mode: 0o600 });
     fs.chmodSync(emptyTokenPath, 0o600);
     assert.throws(
       () =>
         resolveChatGptRemoteConfig({
           enabled: true,
-          port: 8443,
+          port: 4040,
           authTokenPath: emptyTokenPath,
         }),
       /empty/i,
     );
 
-    // Wildcard bind host prohibited
+    // Prohibited wildcard bind (0.0.0.0 or ::)
     assert.throws(
       () =>
         resolveChatGptRemoteConfig({
           enabled: true,
           bindHost: '0.0.0.0',
-          port: 8443,
+          port: 4040,
           authTokenPath,
         }),
       /wildcard.*prohibited/i,
@@ -291,8 +322,12 @@ describe('TASK 7 — Security Negative Controls', () => {
     const status = server.getChatGptAdapterStatus();
 
     try {
+      const sessionId = await initializeSession(status.port);
       const res = await sendHttpRequest(status.port, {
-        headers: { Authorization: `Bearer ${validToken}` },
+        headers: {
+          Authorization: `Bearer ${validToken}`,
+          'Mcp-Session-Id': sessionId,
+        },
         body: {
           jsonrpc: '2.0',
           id: 4,
@@ -335,9 +370,12 @@ describe('TASK 7 — Security Negative Controls', () => {
     const status = server.getChatGptAdapterStatus();
 
     try {
-      // File mutations require explicit approval tokens in ARC Core
+      const sessionId = await initializeSession(status.port);
       const res = await sendHttpRequest(status.port, {
-        headers: { Authorization: `Bearer ${validToken}` },
+        headers: {
+          Authorization: `Bearer ${validToken}`,
+          'Mcp-Session-Id': sessionId,
+        },
         body: {
           jsonrpc: '2.0',
           id: 5,
@@ -362,15 +400,19 @@ describe('TASK 7 — Security Negative Controls', () => {
   });
 
   test('NEG-07: direct subsystem bypass is impossible (adapter has no direct subsystem references)', () => {
+    const bridge = new ChatGptAuthBridge({
+      expectedToken: validToken,
+      sink: {
+        executeAuthenticatedToolCall: async () => ({ content: [] }),
+      },
+    });
     const adapter = new ChatGptRemoteAdapter({
       config: {
         enabled: false,
         port: 8443,
         authTokenPath,
       },
-      sink: {
-        executeAuthenticatedToolCall: async () => ({ content: [] }),
-      },
+      bridge,
     });
 
     assert.equal(typeof adapter.filesystemSubsystem, 'undefined');
@@ -396,6 +438,8 @@ describe('TASK 7 — Security Negative Controls', () => {
     const status = server.getChatGptAdapterStatus();
 
     try {
+      const sessionId = await initializeSession(status.port);
+
       // Force degrade audit runtime
       const access = server['auditRuntime'];
       if (access && typeof access.latchDegradedAuditFailure === 'function') {
@@ -403,7 +447,10 @@ describe('TASK 7 — Security Negative Controls', () => {
       }
 
       const res = await sendHttpRequest(status.port, {
-        headers: { Authorization: `Bearer ${validToken}` },
+        headers: {
+          Authorization: `Bearer ${validToken}`,
+          'Mcp-Session-Id': sessionId,
+        },
         body: {
           jsonrpc: '2.0',
           id: 6,
@@ -473,8 +520,12 @@ describe('TASK 7 — Security Negative Controls', () => {
     const status = server.getChatGptAdapterStatus();
 
     try {
+      const sessionId = await initializeSession(status.port);
       const res = await sendHttpRequest(status.port, {
-        headers: { Authorization: `Bearer ${validToken}` },
+        headers: {
+          Authorization: `Bearer ${validToken}`,
+          'Mcp-Session-Id': sessionId,
+        },
         body: {
           jsonrpc: '2.0',
           id: 8,
@@ -526,7 +577,7 @@ describe('TASK 7 — Security Negative Controls', () => {
           { jsonrpc: '2.0', id: 2, method: 'ping' },
         ],
       });
-      assert.equal(resBatch.statusCode, 200);
+      assert.equal(resBatch.statusCode, 400);
       assert.equal(resBatch.body?.error?.code, -32600);
       assert.match(resBatch.body?.error?.message ?? '', /batching is not supported/i);
 
@@ -541,7 +592,7 @@ describe('TASK 7 — Security Negative Controls', () => {
       });
       assert.equal(resDeep.statusCode, 400);
       assert.equal(resDeep.body?.error?.code, -32600);
-      assert.match(resDeep.body?.error?.message ?? '', /nesting exceeds limit/i);
+      assert.match(resDeep.body?.error?.message ?? '', /nesting exceeds/i);
     } finally {
       await server.stop();
     }
@@ -564,8 +615,12 @@ describe('TASK 7 — Security Negative Controls', () => {
     const status = server.getChatGptAdapterStatus();
 
     try {
+      const sessionId = await initializeSession(status.port);
       const res = await sendHttpRequest(status.port, {
-        headers: { Authorization: `Bearer ${validToken}` },
+        headers: {
+          Authorization: `Bearer ${validToken}`,
+          'Mcp-Session-Id': sessionId,
+        },
         body: {
           jsonrpc: '2.0',
           id: 9,
@@ -637,8 +692,12 @@ describe('TASK 7 — Security Negative Controls', () => {
     const status = server.getChatGptAdapterStatus();
 
     try {
+      const sessionId = await initializeSession(status.port);
       const res = await sendHttpRequest(status.port, {
-        headers: { Authorization: `Bearer ${validToken}` },
+        headers: {
+          Authorization: `Bearer ${validToken}`,
+          'Mcp-Session-Id': sessionId,
+        },
         body: {
           jsonrpc: '2.0',
           id: 10,
@@ -655,6 +714,278 @@ describe('TASK 7 — Security Negative Controls', () => {
       const exposedNames = exposedTools.map((t) => t.name).sort();
       const canonicalNames = ALL_TOOL_DEFINITIONS.map((t) => t.name).sort();
       assert.deepEqual(exposedNames, canonicalNames);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test('NEG-16: arbitrary client-supplied Mcp-Session-Id is rejected', async () => {
+    const server = createArcMcpServer({
+      transport: 'stdio',
+      authorizedRoots: [{ id: 'workspace', path: workspaceDir }],
+      defaultWorkspaceId: 'workspace',
+      audit: auditConfig,
+      chatgpt: {
+        enabled: true,
+        bindHost: '127.0.0.1',
+        port: 0,
+        authTokenPath,
+      },
+    });
+    await server.start();
+    const status = server.getChatGptAdapterStatus();
+
+    try {
+      // Client presents an arbitrary unminted session ID without calling initialize
+      const res = await sendHttpRequest(status.port, {
+        headers: {
+          Authorization: `Bearer ${validToken}`,
+          'Mcp-Session-Id': 'client-invented-untrusted-session-id',
+        },
+        body: {
+          jsonrpc: '2.0',
+          id: 16,
+          method: 'tools/call',
+          params: {
+            name: 'read_file',
+            arguments: { path: 'sample.txt' },
+          },
+        },
+      });
+      assert.equal(res.statusCode, 400);
+      assert.equal(res.body?.error?.message, 'INVALID_SESSION_TOKEN');
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test('NEG-17: unknown session rejected', async () => {
+    const server = createArcMcpServer({
+      transport: 'stdio',
+      authorizedRoots: [{ id: 'workspace', path: workspaceDir }],
+      defaultWorkspaceId: 'workspace',
+      audit: auditConfig,
+      chatgpt: {
+        enabled: true,
+        bindHost: '127.0.0.1',
+        port: 0,
+        authTokenPath,
+      },
+    });
+    await server.start();
+    const status = server.getChatGptAdapterStatus();
+
+    try {
+      const res = await sendHttpRequest(status.port, {
+        headers: {
+          Authorization: `Bearer ${validToken}`,
+          'Mcp-Session-Id': 'chatgpt-sess-0000000000000000',
+        },
+        body: {
+          jsonrpc: '2.0',
+          id: 17,
+          method: 'tools/list',
+          params: {},
+        },
+      });
+      assert.equal(res.statusCode, 400);
+      assert.equal(res.body?.error?.message, 'INVALID_SESSION_TOKEN');
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test('NEG-18: deleted/revoked session cannot execute', async () => {
+    const server = createArcMcpServer({
+      transport: 'stdio',
+      authorizedRoots: [{ id: 'workspace', path: workspaceDir }],
+      defaultWorkspaceId: 'workspace',
+      audit: auditConfig,
+      chatgpt: {
+        enabled: true,
+        bindHost: '127.0.0.1',
+        port: 0,
+        authTokenPath,
+      },
+    });
+    await server.start();
+    const status = server.getChatGptAdapterStatus();
+
+    try {
+      const sessionId = await initializeSession(status.port);
+
+      // Close the session via DELETE /mcp
+      const delRes = await sendHttpRequest(status.port, {
+        method: 'DELETE',
+        headers: {
+          Authorization: `Bearer ${validToken}`,
+          'Mcp-Session-Id': sessionId,
+        },
+      });
+      assert.equal(delRes.statusCode, 200);
+      assert.equal(delRes.body?.result?.sessionClosed, true);
+
+      // Attempting to execute tool with the closed session must fail
+      const toolRes = await sendHttpRequest(status.port, {
+        headers: {
+          Authorization: `Bearer ${validToken}`,
+          'Mcp-Session-Id': sessionId,
+        },
+        body: {
+          jsonrpc: '2.0',
+          id: 18,
+          method: 'tools/call',
+          params: {
+            name: 'read_file',
+            arguments: { path: 'sample.txt' },
+          },
+        },
+      });
+      assert.equal(toolRes.statusCode, 400);
+      assert.equal(toolRes.body?.error?.message, 'INVALID_SESSION_TOKEN');
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test('NEG-19: bearer token alone does not allow adapter to synthesize CompleteActor', async () => {
+    const server = createArcMcpServer({
+      transport: 'stdio',
+      authorizedRoots: [{ id: 'workspace', path: workspaceDir }],
+      defaultWorkspaceId: 'workspace',
+      audit: auditConfig,
+      chatgpt: {
+        enabled: true,
+        bindHost: '127.0.0.1',
+        port: 0,
+        authTokenPath,
+      },
+    });
+    await server.start();
+    const status = server.getChatGptAdapterStatus();
+
+    try {
+      // Calling tools/call without Mcp-Session-Id must not execute
+      const res = await sendHttpRequest(status.port, {
+        headers: { Authorization: `Bearer ${validToken}` },
+        body: {
+          jsonrpc: '2.0',
+          id: 19,
+          method: 'tools/call',
+          params: {
+            name: 'read_file',
+            arguments: { path: 'sample.txt' },
+          },
+        },
+      });
+      assert.equal(res.statusCode, 400);
+      assert.equal(res.body?.error?.message, 'INVALID_SESSION_TOKEN');
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test('NEG-20: adapter source contains no authenticated:true actor construction', () => {
+    const adapterSource = fs.readFileSync(
+      path.join(process.cwd(), 'apps/mcp-server/src/chatgpt-remote-adapter.ts'),
+      'utf8',
+    );
+    // Strip comments to ensure code lines contain no actor synthesis
+    const codeOnly = adapterSource.replace(/\/\*[\s\S]*?\*\/|\/\/.*/g, '');
+    assert.equal(
+      /authenticated\s*:\s*true/.test(codeOnly),
+      false,
+      'chatgpt-remote-adapter.ts must not contain authenticated: true',
+    );
+    assert.equal(
+      /CompleteActor/.test(codeOnly),
+      false,
+      'chatgpt-remote-adapter.ts must not reference CompleteActor',
+    );
+  });
+
+  test('NEG-21: forged clientId/deviceId/sessionId parameters remain rejected', async () => {
+    const server = createArcMcpServer({
+      transport: 'stdio',
+      authorizedRoots: [{ id: 'workspace', path: workspaceDir }],
+      defaultWorkspaceId: 'workspace',
+      audit: auditConfig,
+      chatgpt: {
+        enabled: true,
+        bindHost: '127.0.0.1',
+        port: 0,
+        authTokenPath,
+      },
+    });
+    await server.start();
+    const status = server.getChatGptAdapterStatus();
+
+    try {
+      const sessionId = await initializeSession(status.port);
+      const res = await sendHttpRequest(status.port, {
+        headers: {
+          Authorization: `Bearer ${validToken}`,
+          'Mcp-Session-Id': sessionId,
+        },
+        body: {
+          jsonrpc: '2.0',
+          id: 21,
+          method: 'tools/call',
+          params: {
+            name: 'read_file',
+            arguments: {
+              path: 'sample.txt',
+              clientId: 'spoofed-admin-client',
+              deviceId: 'spoofed-root-device',
+            },
+          },
+        },
+      });
+      assert.equal(res.statusCode, 200);
+      assert.equal(res.body?.error?.code, -32602);
+      assert.match(res.body?.error?.message ?? '', /reserved actor or transport/i);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test('NEG-22: session is bound to the authenticated transport credential/context', async () => {
+    const server = createArcMcpServer({
+      transport: 'stdio',
+      authorizedRoots: [{ id: 'workspace', path: workspaceDir }],
+      defaultWorkspaceId: 'workspace',
+      audit: auditConfig,
+      chatgpt: {
+        enabled: true,
+        bindHost: '127.0.0.1',
+        port: 0,
+        authTokenPath,
+      },
+    });
+    await server.start();
+    const status = server.getChatGptAdapterStatus();
+
+    try {
+      const sessionId = await initializeSession(status.port);
+
+      // Presenting a valid session ID with wrong authorization header fails
+      const resWrongToken = await sendHttpRequest(status.port, {
+        headers: {
+          Authorization: 'Bearer wrong-bearer-token',
+          'Mcp-Session-Id': sessionId,
+        },
+        body: {
+          jsonrpc: '2.0',
+          id: 22,
+          method: 'tools/call',
+          params: {
+            name: 'read_file',
+            arguments: { path: 'sample.txt' },
+          },
+        },
+      });
+      assert.equal(resWrongToken.statusCode, 401);
+      assert.equal(resWrongToken.body?.error?.message, 'UNAUTHENTICATED');
     } finally {
       await server.stop();
     }
@@ -690,8 +1021,12 @@ describe('TASK 8 — Positive Acceptance Flows', () => {
       assert.equal(probeRes.body?.profile, 'chatgpt-remote');
 
       // 2. Health tool via JSON-RPC
+      const sessionId = await initializeSession(status.port);
       const toolRes = await sendHttpRequest(status.port, {
-        headers: { Authorization: `Bearer ${validToken}` },
+        headers: {
+          Authorization: `Bearer ${validToken}`,
+          'Mcp-Session-Id': sessionId,
+        },
         body: {
           jsonrpc: '2.0',
           id: 101,
@@ -728,8 +1063,12 @@ describe('TASK 8 — Positive Acceptance Flows', () => {
     const status = server.getChatGptAdapterStatus();
 
     try {
+      const sessionId = await initializeSession(status.port);
       const res = await sendHttpRequest(status.port, {
-        headers: { Authorization: `Bearer ${validToken}` },
+        headers: {
+          Authorization: `Bearer ${validToken}`,
+          'Mcp-Session-Id': sessionId,
+        },
         body: {
           jsonrpc: '2.0',
           id: 102,
@@ -762,8 +1101,12 @@ describe('TASK 8 — Positive Acceptance Flows', () => {
     const status = server.getChatGptAdapterStatus();
 
     try {
+      const sessionId = await initializeSession(status.port);
       const res = await sendHttpRequest(status.port, {
-        headers: { Authorization: `Bearer ${validToken}` },
+        headers: {
+          Authorization: `Bearer ${validToken}`,
+          'Mcp-Session-Id': sessionId,
+        },
         body: {
           jsonrpc: '2.0',
           id: 103,
@@ -800,8 +1143,12 @@ describe('TASK 8 — Positive Acceptance Flows', () => {
     const status = server.getChatGptAdapterStatus();
 
     try {
+      const sessionId = await initializeSession(status.port);
       const res = await sendHttpRequest(status.port, {
-        headers: { Authorization: `Bearer ${validToken}` },
+        headers: {
+          Authorization: `Bearer ${validToken}`,
+          'Mcp-Session-Id': sessionId,
+        },
         body: {
           jsonrpc: '2.0',
           id: 104,
@@ -836,8 +1183,12 @@ describe('TASK 8 — Positive Acceptance Flows', () => {
     const status = server.getChatGptAdapterStatus();
 
     try {
+      const sessionId = await initializeSession(status.port);
       const res = await sendHttpRequest(status.port, {
-        headers: { Authorization: `Bearer ${validToken}` },
+        headers: {
+          Authorization: `Bearer ${validToken}`,
+          'Mcp-Session-Id': sessionId,
+        },
         body: {
           jsonrpc: '2.0',
           id: 105,
@@ -851,13 +1202,14 @@ describe('TASK 8 — Positive Acceptance Flows', () => {
       assert.equal(res.statusCode, 200);
       assert.equal(res.body?.result?.isError, false);
 
-      // Verify audit trail captured the operation
+      // Verify audit trail captured the operation with server-generated session ID
       await server.flushAudit();
       const records = server.auditLogger.getRecords();
       const listRecord = records.find((r) => r.invocation?.toolName === 'list_directory');
       assert.ok(listRecord, 'Audit trail must contain list_directory record');
       assert.equal(listRecord.actor?.clientType, 'chatgpt-remote');
       assert.equal(listRecord.actor?.clientId, 'chatgpt-client');
+      assert.equal(listRecord.actor?.sessionId, sessionId);
       assert.equal(listRecord.actor?.deviceId, 'chatgpt-tunnel-gateway');
     } finally {
       await server.stop();

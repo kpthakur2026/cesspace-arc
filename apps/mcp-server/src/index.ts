@@ -57,7 +57,8 @@ import { RemoteGateway, type RemoteGatewayStatus } from './remote-gateway.js';
 import { readRemoteRequestContext, RemoteMcpSurface } from './remote-mcp-surface.js';
 import { GatewayDeviceAdministration } from './device-administration.js';
 import type { RemoteConfig } from './remote-config.js';
-import type { ChatGptRemoteConfig } from './chatgpt-profile.js';
+import { type ChatGptRemoteConfig, resolveChatGptRemoteConfig } from './chatgpt-profile.js';
+import { ChatGptAuthBridge } from './chatgpt-auth-bridge.js';
 import { ChatGptRemoteAdapter, type ChatGptAdapterStatus } from './chatgpt-remote-adapter.js';
 import {
   ARC_APPROVAL_KEY,
@@ -1787,6 +1788,8 @@ export class ArcMcpServer implements IArcMcpServer {
   private readonly remoteConfig?: RemoteConfig;
   /** ChatGPT remote profile configuration (opt-in only). */
   private readonly chatgptConfig?: ChatGptRemoteConfig;
+  /** ChatGPT server-owned authentication bridge. */
+  private chatgptAuthBridge?: ChatGptAuthBridge;
   /** ChatGPT remote adapter instance. Present only when enabled and running. */
   private chatgptAdapter?: ChatGptRemoteAdapter;
   private defaultWorkspaceId?: string;
@@ -4475,9 +4478,15 @@ export class ArcMcpServer implements IArcMcpServer {
 
     // ChatGPT remote MCP integration profile: starts if explicitly enabled.
     if (this.chatgptConfig?.enabled) {
+      const resolved = resolveChatGptRemoteConfig(this.chatgptConfig);
+      this.chatgptAuthBridge = new ChatGptAuthBridge({
+        expectedToken: resolved.expectedToken,
+        sink: this,
+        auditLogger: this.auditLogger,
+      });
       this.chatgptAdapter = new ChatGptRemoteAdapter({
         config: this.chatgptConfig,
-        sink: this,
+        bridge: this.chatgptAuthBridge,
         auditLogger: this.auditLogger,
       });
       await this.chatgptAdapter.start();
@@ -4666,6 +4675,13 @@ export class ArcMcpServer implements IArcMcpServer {
    */
   public getChatGptAdapterStatus(): ChatGptAdapterStatus | undefined {
     return this.chatgptAdapter?.getStatus();
+  }
+
+  /**
+   * The server-owned ChatGPT authentication bridge, if active.
+   */
+  public getChatGptAuthBridge(): ChatGptAuthBridge | undefined {
+    return this.chatgptAuthBridge;
   }
 
   /** Bounded, non-secret remote gateway status. Undefined in stdio mode. */
@@ -4857,6 +4873,10 @@ export class ArcMcpServer implements IArcMcpServer {
     if (this.chatgptAdapter !== undefined) {
       await this.chatgptAdapter.stop();
       this.chatgptAdapter = undefined;
+    }
+    if (this.chatgptAuthBridge !== undefined) {
+      this.chatgptAuthBridge.revokeAllSessions();
+      this.chatgptAuthBridge = undefined;
     }
     if (this.remoteGateway !== undefined) {
       await this.remoteGateway.stop();
@@ -5147,7 +5167,13 @@ export {
   verifyBearerToken,
 } from './chatgpt-profile.js';
 export {
+  ChatGptAuthBridge,
+  type ChatGptAuthBridgeDeps,
+  type ChatGptExecutionSink,
+  type ChatGptSessionRecord,
+} from './chatgpt-auth-bridge.js';
+export {
   ChatGptRemoteAdapter,
   type ChatGptAdapterStatus,
-  type ChatGptExecutionSink,
+  type ChatGptRemoteAdapterDeps,
 } from './chatgpt-remote-adapter.js';
