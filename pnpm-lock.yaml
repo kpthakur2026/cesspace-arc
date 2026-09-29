@@ -248,6 +248,18 @@ importers:
         specifier: workspace:*
         version: link:../protocol
 
+  packages/config:
+    dependencies:
+      '@cesspace-arc/audit':
+        specifier: workspace:*
+        version: link:../audit
+      '@cesspace-arc/auth':
+        specifier: workspace:*
+        version: link:../auth
+      yaml:
+        specifier: 2.9.1
+        version: 2.9.1
+
   packages/filesystem:
     dependencies:
       '@cesspace-arc/protocol':

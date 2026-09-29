@@ -1,0 +1,92 @@
+{
+  "format": "cesspace-arc-release-profile-v1",
+  "profile": "core",
+  "reason": "hosted profile not shipped",
+  "reviewedSource": {
+    "commit": "f094b1bbad325e102792b3c568e21a3bd83e2bcf",
+    "tree": "3fbbc499a3dd4b2d3fabd2cecbccf980f1eabfc5"
+  },
+  "productVersion": "1.0.0",
+  "healthStage": "ARC-1.0",
+  "expectedProductionTools": 25,
+  "expectedDeterministicRegistryEntries": 5,
+  "distributionFormat": "cesspace-arc-source-distribution-v1",
+  "schemas": {
+    "config": 2,
+    "state": 2,
+    "migration": 1
+  },
+  "capabilities": {
+    "hostedConnectivity": false,
+    "oauthOidc": false,
+    "multiTenantAccounts": false,
+    "relay": false,
+    "publicMcpHosting": false,
+    "directoryPublishing": false,
+    "metering": false,
+    "billing": false,
+    "subscriptions": false
+  },
+  "platforms": [
+    {
+      "target": "linux-x64",
+      "classification": "SUPPORTED",
+      "evidence": "EVIDENCE_EXECUTED",
+      "requirements": [
+        "authoritative-install",
+        "config-preflight",
+        "migration",
+        "runtime-health",
+        "mcp-protocol-regression"
+      ]
+    },
+    {
+      "target": "wsl-linux-x64",
+      "classification": "DEVELOPMENT_COMPATIBLE",
+      "evidence": "DECLARED_DEVELOPMENT_COMPATIBLE",
+      "requirements": []
+    },
+    {
+      "target": "linux-arm64",
+      "classification": "VALIDATION_ONLY",
+      "evidence": "DECLARED_VALIDATION_ONLY",
+      "requirements": []
+    },
+    {
+      "target": "darwin-arm64",
+      "classification": "VALIDATION_ONLY",
+      "evidence": "DECLARED_VALIDATION_ONLY",
+      "requirements": []
+    },
+    {
+      "target": "darwin-x64",
+      "classification": "VALIDATION_ONLY",
+      "evidence": "DECLARED_VALIDATION_ONLY",
+      "requirements": []
+    },
+    {
+      "target": "win32",
+      "classification": "UNSUPPORTED",
+      "evidence": "UNSUPPORTED",
+      "requirements": []
+    }
+  ],
+  "controlAccounting": {
+    "implementedNegative": ["ARC10-NEG-001..022", "ARC10-NEG-068..080"],
+    "implementedFlows": ["ARC10-FLOW-01..05", "ARC10-FLOW-15..18"],
+    "profileNotShippedNegative": [
+      {
+        "range": "ARC10-NEG-023..067",
+        "classification": "PROFILE_NOT_SHIPPED",
+        "rationale": "Tasks 3-6 are absent and no hosted surface is declared by the Core release."
+      }
+    ],
+    "profileNotShippedFlows": [
+      {
+        "range": "ARC10-FLOW-06..14",
+        "classification": "NOT_APPLICABLE_TO_CORE_RELEASE",
+        "rationale": "Hosted positive flows are not claimed because the hosted profile is not shipped."
+      }
+    ]
+  }
+}
