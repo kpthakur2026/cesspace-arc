@@ -63,10 +63,24 @@ name must not be assumed to be official solely because of its name.
 
 ## ChatGPT integration identity
 
-CesSpace ARC 1.0.0 Core does not ship a hosted ChatGPT connector.
+The tagged CesSpace ARC `1.0.0` Core release predates the private ChatGPT MCP
+integration and does not include a CesSpace-hosted ChatGPT connector.
 
-If an official ChatGPT integration, app, connector, or remote MCP endpoint is
-published in the future, its canonical publisher identity and endpoint/listing
+Current development on the canonical `main` branch includes an official,
+private/operator-managed ChatGPT-compatible remote MCP integration. It is
+designed to run on infrastructure controlled by the ARC operator and to connect
+through an operator-managed secure tunnel or private remote connection.
+
+This integration does not constitute a CesSpace-hosted ChatGPT service, public
+relay, hosted account system, or ChatGPT App Directory listing.
+
+Until a newer tagged release is published, users should not assume that the
+ChatGPT integration is part of the `1.0.0` release artifact solely because it
+exists on `main`.
+
+If an official ChatGPT App Directory listing, CesSpace-hosted connector,
+managed remote MCP endpoint, or other hosted ChatGPT distribution is published
+in the future, its canonical publisher identity and listing/endpoint
 information must be recorded here.
 
 ## Verification
