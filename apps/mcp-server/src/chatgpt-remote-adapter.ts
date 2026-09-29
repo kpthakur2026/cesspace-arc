@@ -33,6 +33,7 @@ import {
   type ResolvedChatGptRemoteConfig,
 } from './chatgpt-profile.js';
 import type { ChatGptAuthBridge } from './chatgpt-auth-bridge.js';
+import { checkRequestAuthority, writeAuthorityRefusal } from './remote-request-authority.js';
 
 export const MAX_HEADER_BYTES = 16 * 1024; // 16 KiB
 
@@ -173,27 +174,25 @@ export class ChatGptRemoteAdapter {
       return;
     }
 
-    // 1. Host header validation (DNS rebinding and tunnel spoofing protection)
-    if (config.tunnelHostname !== undefined) {
-      const rawHost = req.headers.host;
-      if (!rawHost) {
-        res.writeHead(403, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Forbidden', message: 'Missing Host header' }));
-        return;
-      }
-      const hostOnly = rawHost.split(':')[0].toLowerCase();
-      if (hostOnly !== config.tunnelHostname.toLowerCase()) {
-        res.writeHead(403, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Forbidden', message: 'Host header mismatch' }));
-        return;
-      }
-    }
-
-    // 2. Path routing
+    // 1. Path routing
     const parsedUrl = new URL(req.url ?? '/', 'http://localhost');
     const pathname = parsedUrl.pathname;
 
-    // Handle health probe
+    // Unknown paths remain bounded (404)
+    if (pathname !== config.path && pathname !== '/health') {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Not Found' }));
+      return;
+    }
+
+    // 2. Request authority validation (Host and Origin validation via shared validator)
+    const refusal = checkRequestAuthority(req.headers, config.tunnelHostname);
+    if (refusal !== null) {
+      writeAuthorityRefusal(res, refusal);
+      return;
+    }
+
+    // 3. Handle health probe
     if (pathname === '/health') {
       const authHeader = req.headers.authorization;
       if (!this.bridge.verifyTransportAuth(authHeader)) {
@@ -210,13 +209,6 @@ export class ChatGptRemoteAdapter {
           timestamp: new Date().toISOString(),
         }),
       );
-      return;
-    }
-
-    // Verify MCP path
-    if (pathname !== config.path) {
-      res.writeHead(404, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'Not Found' }));
       return;
     }
 

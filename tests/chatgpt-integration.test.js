@@ -14,6 +14,7 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
+import net from 'node:net';
 import path from 'node:path';
 import { execFile as execFileCallback, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -990,6 +991,169 @@ describe('TASK 7 — Security Negative Controls', () => {
       await server.stop();
     }
   });
+
+  test('NEG-23: wrong Host header is refused with 403 when tunnelHostname is configured', async () => {
+    const server = createArcMcpServer({
+      transport: 'stdio',
+      authorizedRoots: [{ id: 'workspace', path: workspaceDir }],
+      defaultWorkspaceId: 'workspace',
+      audit: auditConfig,
+      chatgpt: {
+        enabled: true,
+        bindHost: '127.0.0.1',
+        port: 0,
+        tunnelHostname: 'arc-tunnel.internal',
+        authTokenPath,
+      },
+    });
+    await server.start();
+    const status = server.getChatGptAdapterStatus();
+
+    try {
+      const res = await sendHttpRequest(status.port, {
+        headers: {
+          Host: 'evil.test',
+          Authorization: `Bearer ${validToken}`,
+        },
+        body: {
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'initialize',
+          params: { protocolVersion: '2024-11-05', capabilities: {} },
+        },
+      });
+      assert.equal(res.statusCode, 403);
+      assert.deepEqual(res.body, { error: 'Forbidden' });
+      assert.equal(res.headers['access-control-allow-origin'], undefined);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test('NEG-24: missing Host header is refused with 403 when tunnelHostname is configured', async () => {
+    const server = createArcMcpServer({
+      transport: 'stdio',
+      authorizedRoots: [{ id: 'workspace', path: workspaceDir }],
+      defaultWorkspaceId: 'workspace',
+      audit: auditConfig,
+      chatgpt: {
+        enabled: true,
+        bindHost: '127.0.0.1',
+        port: 0,
+        tunnelHostname: 'arc-tunnel.internal',
+        authTokenPath,
+      },
+    });
+    await server.start();
+    const status = server.getChatGptAdapterStatus();
+
+    try {
+      // Send raw HTTP request with no Host header over a net.Socket
+      const responseText = await new Promise((resolve, reject) => {
+        const client = net.createConnection({ port: status.port, host: '127.0.0.1' }, () => {
+          client.write('POST /mcp HTTP/1.0\r\nContent-Length: 0\r\n\r\n');
+        });
+        let data = '';
+        client.on('data', (chunk) => {
+          data += chunk.toString('utf8');
+        });
+        client.on('end', () => resolve(data));
+        client.on('error', reject);
+      });
+      assert.match(responseText, /^HTTP\/1\.[01] 403/);
+      assert.match(responseText, /"error":"Forbidden"/);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test('NEG-25: hostile Origin header is refused with 403 Forbidden', async () => {
+    const server = createArcMcpServer({
+      transport: 'stdio',
+      authorizedRoots: [{ id: 'workspace', path: workspaceDir }],
+      defaultWorkspaceId: 'workspace',
+      audit: auditConfig,
+      chatgpt: {
+        enabled: true,
+        bindHost: '127.0.0.1',
+        port: 0,
+        tunnelHostname: 'arc-tunnel.internal',
+        authTokenPath,
+      },
+    });
+    await server.start();
+    const status = server.getChatGptAdapterStatus();
+
+    try {
+      const res = await sendHttpRequest(status.port, {
+        headers: {
+          Host: 'arc-tunnel.internal',
+          Origin: 'https://evil.test',
+          Authorization: `Bearer ${validToken}`,
+        },
+        body: {
+          jsonrpc: '2.0',
+          id: 1,
+          method: 'initialize',
+          params: { protocolVersion: '2024-11-05', capabilities: {} },
+        },
+      });
+      assert.equal(res.statusCode, 403);
+      assert.deepEqual(res.body, { error: 'Forbidden' });
+      assert.equal(res.headers['access-control-allow-origin'], undefined);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test('NEG-26: unknown path remains bounded 404 Not Found', async () => {
+    const server = createArcMcpServer({
+      transport: 'stdio',
+      authorizedRoots: [{ id: 'workspace', path: workspaceDir }],
+      defaultWorkspaceId: 'workspace',
+      audit: auditConfig,
+      chatgpt: {
+        enabled: true,
+        bindHost: '127.0.0.1',
+        port: 0,
+        tunnelHostname: 'arc-tunnel.internal',
+        authTokenPath,
+      },
+    });
+    await server.start();
+    const status = server.getChatGptAdapterStatus();
+
+    try {
+      const res = await sendHttpRequest(status.port, {
+        path: '/unknown-probe',
+        headers: {
+          Host: 'evil.test',
+          Origin: 'https://evil.test',
+          Authorization: `Bearer ${validToken}`,
+        },
+      });
+      assert.equal(res.statusCode, 404);
+      assert.deepEqual(res.body, { error: 'Not Found' });
+      assert.equal(res.headers['access-control-allow-origin'], undefined);
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test('NEG-27: adapter imports shared remote-request-authority and performs no direct Host/Origin header reads', () => {
+    const adapterSource = fs.readFileSync(
+      path.join(process.cwd(), 'apps/mcp-server/src/chatgpt-remote-adapter.ts'),
+      'utf8',
+    );
+    assert.match(adapterSource, /from '\.\/remote-request-authority\.js'/);
+    assert.match(adapterSource, /checkRequestAuthority\(/);
+    const headerRead = /headers\s*(\.\s*(host|origin)\b|\[\s*['"](host|origin)['"]\s*\])/;
+    assert.equal(
+      headerRead.test(adapterSource),
+      false,
+      'chatgpt-remote-adapter.ts must not read Host or Origin headers directly',
+    );
+  });
 });
 
 describe('TASK 8 — Positive Acceptance Flows', () => {
@@ -1230,6 +1394,43 @@ describe('TASK 8 — Positive Acceptance Flows', () => {
       assert.equal(res.isError, undefined);
       const payload = JSON.parse(res.content[0].text);
       assert.equal(payload.content, 'hello from arc workspace\n');
+    } finally {
+      await server.stop();
+    }
+  });
+
+  test('FLOW-07: tunnel-authenticated request with matching Host header succeeds', async () => {
+    const server = createArcMcpServer({
+      transport: 'stdio',
+      authorizedRoots: [{ id: 'workspace', path: workspaceDir }],
+      defaultWorkspaceId: 'workspace',
+      audit: auditConfig,
+      chatgpt: {
+        enabled: true,
+        bindHost: '127.0.0.1',
+        port: 0,
+        tunnelHostname: 'arc-tunnel.internal',
+        authTokenPath,
+      },
+    });
+    await server.start();
+    const status = server.getChatGptAdapterStatus();
+
+    try {
+      const res = await sendHttpRequest(status.port, {
+        headers: {
+          Host: 'arc-tunnel.internal',
+          Authorization: `Bearer ${validToken}`,
+        },
+        body: {
+          jsonrpc: '2.0',
+          id: 'init-flow-07',
+          method: 'initialize',
+          params: { protocolVersion: '2024-11-05', capabilities: {} },
+        },
+      });
+      assert.equal(res.statusCode, 200);
+      assert.equal(res.body?.result?.protocolVersion, '2024-11-05');
     } finally {
       await server.stop();
     }
