@@ -713,18 +713,20 @@ export class ProcessRegistry implements IProcessRegistry {
     record.state = 'TERMINATING';
 
     // Terminate process tree using process group if available (-pid), else child.kill
-    const killTarget = (sig: 'SIGTERM' | 'SIGKILL') => {
+    const killTarget = (sig: 'SIGTERM' | 'SIGKILL'): boolean => {
       try {
         if (pid && process.platform !== 'win32') {
           process.kill(-pid, sig);
+          return true;
         } else {
-          child.kill(sig);
+          return child.kill(sig);
         }
       } catch {
         try {
-          child.kill(sig);
+          return child.kill(sig);
         } catch {
           // Child may have already exited
+          return false;
         }
       }
     };
@@ -744,10 +746,7 @@ export class ProcessRegistry implements IProcessRegistry {
     if (signal === 'SIGTERM') {
       record._killTimer = setTimeout(() => {
         try {
-          if (
-            (pid && process.platform !== 'win32') ||
-            (child.exitCode === null && child.signalCode === null)
-          ) {
+          if (killTarget('SIGKILL')) {
             this.emitLifecycleEvent({
               eventType: 'PROCESS_SIGKILL_ESCALATED',
               timestamp: new Date().toISOString(),
@@ -757,7 +756,6 @@ export class ProcessRegistry implements IProcessRegistry {
               executable: record.executable,
               signal: 'SIGKILL',
             });
-            killTarget('SIGKILL');
           }
         } catch {
           // ignore

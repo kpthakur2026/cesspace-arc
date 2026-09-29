@@ -151,11 +151,10 @@ export async function spawnAndControlProcess(
     record._killTimer = setTimeout(() => {
       try {
         if (child.pid && process.platform !== 'win32') {
-          processRegistry.notifySigkillEscalated(record.processId);
           process.kill(-child.pid, 'SIGKILL');
-        } else if (child.exitCode === null && child.signalCode === null) {
           processRegistry.notifySigkillEscalated(record.processId);
-          child.kill('SIGKILL');
+        } else if (child.exitCode === null && child.signalCode === null && child.kill('SIGKILL')) {
+          processRegistry.notifySigkillEscalated(record.processId);
         }
       } catch {
         // ESRCH / already-dead process group should be handled harmlessly
