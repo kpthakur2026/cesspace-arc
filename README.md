@@ -119,6 +119,7 @@ The complete architecture and security foundation of CesSpace ARC is documented 
 | [**RC-07 Final Integration Report**](docs/architecture/rc07-final-integration-report.md) | RC-07 acceptance evidence: architecture summary, control coverage table, and final quality gates.          |
 | [**RC-08 Scope & Acceptance**](docs/architecture/rc08-scope-acceptance.md)               | Detailed scope, threat model, cross-client compatibility, fuzzing policy, and 90 negative controls.        |
 | [**ARC 1.0 Scope & Acceptance**](docs/architecture/arc10-scope-acceptance.md)            | Normative distribution, hosted-profile, stable-release architecture, and acceptance freeze.                |
+| [**ARC Core Distribution**](docs/distribution/installation.md)                           | Signed source-bundle verification, locked installation, prefix ownership, and safe uninstall.              |
 | [**Engineering Governance**](docs/governance/engineering-governance.md)                  | Mandatory project engineering, stage-gate, and security governance rules.                                  |
 | [**Security Policy**](SECURITY.md)                                                       | Vulnerability disclosure, responsible reporting, and safety invariants.                                    |
 | [**Contributing Guide**](CONTRIBUTING.md)                                                | Guidelines for contributing code, tests, and security negative controls.                                   |
