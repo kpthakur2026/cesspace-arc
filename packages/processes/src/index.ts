@@ -475,7 +475,22 @@ export class ProcessRegistry implements IProcessRegistry {
     }
 
     const available = MAX_PROCESS_BUFFER_BYTES - currentTotal;
-    const slice = chunk.length > available ? chunk.subarray(0, available) : chunk;
+    // When the frozen byte ceiling cuts through a multibyte character, retain
+    // only the complete UTF-8 prefix. Process output is surfaced as text, so a
+    // raw byte slice here would otherwise manufacture U+FFFD in the bounded
+    // response even though the child emitted valid UTF-8.
+    let slice = chunk;
+    if (chunk.length > available) {
+      // A stream event may itself start with continuation bytes for a code
+      // point begun by the preceding event. Find the safe cap against the
+      // bounded concatenated stream, not against this event in isolation.
+      const streamChunks = stream === 'stdout' ? record._stdoutChunks : record._stderrChunks;
+      const retainedStreamBytes =
+        stream === 'stdout' ? record.totalStdoutBytes : record.totalStderrBytes;
+      const combined = Buffer.concat([...streamChunks, chunk], retainedStreamBytes + chunk.length);
+      const safeCombined = sliceUtf8Safe(combined, 0, retainedStreamBytes + available).slice;
+      slice = safeCombined.subarray(retainedStreamBytes);
+    }
 
     if (stream === 'stdout') {
       record._stdoutChunks.push(slice);
