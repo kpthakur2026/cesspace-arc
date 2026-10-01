@@ -67,7 +67,7 @@ official repository:
 
 https://github.com/kpthakur2026/cesspace-arc
 
-A third-party package, MCP server, Claude extension, ChatGPT integration,
+A third-party package, MCP server, third-party extension or integration,
 container image, binary, installer, or hosted service must not claim to be an
 official CesSpace ARC distribution unless the official publisher has
 explicitly published or authorized it.

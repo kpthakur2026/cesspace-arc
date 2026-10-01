@@ -8,7 +8,7 @@
 
 ## Context
 
-AI coding agents and developer tooling (including Claude Code, Codex, Antigravity, OpenCode, and DeepSeek-driven agents) need to interact with remote and local development machines to inspect workspaces, run commands, and review diffs.
+MCP-compatible AI clients and developer tooling need to interact with remote and local development machines to inspect workspaces, run commands, and review diffs.
 
 Historically, tools have either used proprietary WebSocket/REST protocols, ad-hoc shell wrappers, or vendor-locked interfaces. This fragments tool development and forces users to create custom bridges for every model provider. Furthermore, exposing raw SSH or unsanitized shell execution gives autonomous agents excessive ambient authority.
 
@@ -28,7 +28,7 @@ CesSpace ARC will act as an authoritative MCP server exposing controlled tools (
 
 ### Positive
 
-- **Vendor Neutrality:** Compatible with Claude Code, Antigravity, ChatGPT/Codex clients, OpenCode, and future MCP-compliant agents without modification.
+- **Vendor Neutrality:** Compatible with standards-conformant MCP clients without modification.
 - **Strong Typing:** Leverages JSON Schema to validate tool arguments prior to policy processing.
 - **Interoperability:** Plugs directly into modern AI developer tools supporting MCP out of the box.
 

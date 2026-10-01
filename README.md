@@ -14,7 +14,7 @@
 
 ## 1. Mission & Vision
 
-Modern AI coding agents (Claude Code, Antigravity, OpenAI Codex, OpenCode, DeepSeek agents) require rich interactions with host environments—reading files, inspecting diffs, running tests, and executing builds. However, giving autonomous agents unrestricted ambient access (such as open SSH keys, raw `/bin/sh` evaluation, or unfettered root access) creates severe security risks:
+Modern MCP-compatible AI clients and coding agents require rich interactions with host environments—reading files, inspecting diffs, running tests, and executing builds. However, giving autonomous agents unrestricted ambient access (such as open SSH keys, raw `/bin/sh` evaluation, or unfettered root access) creates severe security risks:
 
 - Accidental or malicious filesystem destruction.
 - Credential harvesting (`~/.ssh`, `~/.aws`, `.env`).
@@ -28,7 +28,7 @@ Modern AI coding agents (Claude Code, Antigravity, OpenAI Codex, OpenCode, DeepS
 ## 2. High-Level Target Architecture
 
 ```text
-AI Client / Coding Agent (Claude Code / Antigravity / Codex / DeepSeek)
+AI Client / Coding Agent
                           │
                           ▼
              MCP Interface (JSON-RPC 2.0)

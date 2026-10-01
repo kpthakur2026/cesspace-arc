@@ -10,7 +10,7 @@
 
 **CesSpace ARC** (Agent Remote Control) is a secure, vendor-neutral **agent-to-machine control plane** that establishes a hardened boundary between semi-autonomous AI coding agents and underlying host machines, virtual machines, and development environments.
 
-Modern AI coding agents (such as Claude Code, Antigravity/AGY, OpenAI Codex, OpenCode, and DeepSeek-driven agents) require interaction with local development environments—inspecting files, searching codebases, running tests, reading diffs, and managing processes. However, granting autonomous agents direct, unrestricted access to a machine (such as open SSH keys, raw shell execution, or unrestricted filesystem access) creates unacceptable security risks, including:
+Modern MCP-compatible AI clients and coding agents require interaction with local development environments—inspecting files, searching codebases, running tests, reading diffs, and managing processes. However, granting autonomous agents direct, unrestricted access to a machine (such as open SSH keys, raw shell execution, or unrestricted filesystem access) creates unacceptable security risks, including:
 
 - Arbitrary code execution and prompt-driven command injection.
 - Secret exfiltration (`~/.ssh`, `~/.aws`, `.env`, environment variables).
@@ -27,7 +27,7 @@ Modern AI coding agents (such as Claude Code, Antigravity/AGY, OpenAI Codex, Ope
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────────┐
 │                               AI Clients & Coding Agents                                │
-│       (Claude Code / Antigravity / OpenAI Codex / OpenCode / DeepSeek Agents)          │
+│                     (MCP-compatible clients and agents)                         │
 └────────────────────────────────────────────┬────────────────────────────────────────────┘
                                              │
                                              ▼
@@ -128,9 +128,9 @@ The host subsystems execute permitted actions within strict containment:
 CesSpace ARC is explicitly designed to remain independent of any single AI model vendor or cloud provider:
 
 - **Protocol Neutrality:** Built entirely on open standards (MCP, JSON-RPC 2.0).
-- **Client Agnostic:** Compatible with any standard MCP client (Codex, Claude Code, Antigravity, OpenCode, DeepSeek, custom agent loops).
+- **Client Agnostic:** Compatible with standard MCP clients and custom agent loops.
 - **Environment Agnostic:** Runs on Linux development VMs, containers, bare-metal developer workstations, and remote development hosts.
-- **No Cloud-Specific Dependencies:** Does not require AWS, GCP, or Azure services to function; configuration is self-contained.
+- **No Cloud-Specific Dependencies:** Does not require cloud-provider services to function; configuration is self-contained.
 
 ---
 

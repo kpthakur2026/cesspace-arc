@@ -15,7 +15,7 @@ CesSpace ARC partitions the system into **four distinct security zones separated
 ```
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
 │ ZONE 0: UNTRUSTED CLIENT DOMAIN                                                        │
-│ - External AI Agents (Claude Code, Antigravity, Codex, DeepSeek, OpenCode)             │
+│ - External MCP-compatible AI clients and agents                                  │
 │ - Third-party MCP clients, IDE plugins, terminal extensions                            │
 │ - Potential Vector: Prompt Injection, Malicious Tool Calling, Payload Manipulation    │
 └───────────────────────────────────────────┬────────────────────────────────────────────┘

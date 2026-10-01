@@ -47,41 +47,37 @@ distribution channel explicitly listed in this document or in an official
 repository release.
 
 The project currently does not declare any third-party marketplace publisher,
-Claude Desktop extension-directory listing, ChatGPT app listing, npm package,
-container registry image, hosted relay, or hosted CesSpace ARC service as an
-official production distribution unless such a channel is subsequently added
+third-party extension or app-directory listing, public package-registry entry,
+container-registry image, hosted relay, or hosted CesSpace ARC service as an
+official production distribution unless such a channel is explicitly added
 here by the official project.
 
-## Claude Desktop extension identity
+## Third-party extension identity
 
-When an official CesSpace ARC Claude Desktop extension is published, its
-publisher identity and canonical listing URL must be added to this document
-before or together with the public release.
+No third-party extension distribution is currently designated as an official
+CesSpace ARC distribution. A package using the CesSpace ARC name must not be
+assumed to be official solely because of its name.
 
-Until that happens, a .mcpb package or Claude extension using the CesSpace ARC
-name must not be assumed to be official solely because of its name.
+## Private remote integration identity
 
-## ChatGPT integration identity
-
-The tagged CesSpace ARC `1.0.0` Core release predates the private ChatGPT MCP
-integration and does not include a CesSpace-hosted ChatGPT connector.
+The tagged CesSpace ARC `1.0.0` Core release predates the private remote MCP
+integration and does not include a CesSpace-hosted remote connector.
 
 Current development on the canonical `main` branch includes an official,
-private/operator-managed ChatGPT-compatible remote MCP integration. It is
+private/operator-managed remote MCP integration. It is
 designed to run on infrastructure controlled by the ARC operator and to connect
 through an operator-managed secure tunnel or private remote connection.
 
-This integration does not constitute a CesSpace-hosted ChatGPT service, public
-relay, hosted account system, or ChatGPT App Directory listing.
+This integration does not constitute a CesSpace-hosted remote MCP service, public
+relay, hosted account system, or third-party app-directory listing.
 
 Until a newer tagged release is published, users should not assume that the
-ChatGPT integration is part of the `1.0.0` release artifact solely because it
+private remote integration is part of the `1.0.0` release artifact solely because it
 exists on `main`.
 
-If an official ChatGPT App Directory listing, CesSpace-hosted connector,
-managed remote MCP endpoint, or other hosted ChatGPT distribution is published
-in the future, its canonical publisher identity and listing/endpoint
-information must be recorded here.
+No third-party app-directory listing, CesSpace-hosted connector, or managed
+remote MCP endpoint is currently designated as an official production
+distribution.
 
 ## Verification
 

@@ -43,7 +43,7 @@ This repository (`kpthakur2026/cesspace-arc`) is **public**.
 
 Under no circumstances may any contributor or automated agent commit:
 
-- API keys (OpenAI, DeepSeek, Google, Anthropic, AWS, GCP, Azure)
+- third-party API keys and cloud-provider credentials
 - SSH private keys (`id_rsa`, `id_ed25519`, etc.)
 - OAuth client secrets, access tokens, refresh tokens
 - Service account credentials (JSON/P12/PEM)

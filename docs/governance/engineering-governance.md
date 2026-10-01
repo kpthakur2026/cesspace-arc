@@ -66,9 +66,9 @@ Every stage follows a strict linear verification cycle:
 The following actions are strictly forbidden within this repository:
 
 - **Executing remote commands or opening outbound reverse shells.**
-- **Accessing files outside the repository root** (e.g., inspecting `/home`, `~/.ssh`, `~/.aws`, `~/.config`, `/etc`).
+- **Accessing files outside the repository root** (for example user credential directories or host system paths).
 - **Modifying `.git/hooks` or `.git/config`** directly.
-- **Copying code from Desktop Commander** or any proprietary external source with incompatible licensing.
+- **Copying code from proprietary external sources** or any source with incompatible licensing.
 - **Adding mock credentials that resemble live production keys** (use generic placeholders like `EXAMPLE_TOKEN_DO_NOT_USE`).
 - **Weakening path sanitization** or introducing path-traversal vulnerabilities (`../`).
 - **Proceeding across stage boundaries** without explicit instruction and approval.
@@ -77,11 +77,10 @@ The following actions are strictly forbidden within this repository:
 
 ## 4. Current Repository State & Context
 
-- **Current Stage:** `RC-01` (Read-Only MCP Core — Pending Independent Review).
-- **Active Branch:** `feat/rc-01-readonly-mcp-core`.
-- **Base:** `main` (Approved RC-00 Baseline).
-- **Allowed Scope:** Read-only inspection tools (health, list_directory, read_file, search_files, search_text, git_status, git_diff, git_log, system_status), Minimal Security Kernel (`packages/policy`, `packages/audit`), local stdio MCP server (`apps/mcp-server`), and unit/negative security tests.
-- **Forbidden Scope for RC-01:** Terminal command execution (`run_command`), host file writes (`write_file`, `apply_patch`), mutating git operations (`commit`, `push`, `checkout -b`), remote network listeners, authentication services, device enrollment, or cloud deployments.
+- **Current stable release:** `1.0.0`.
+- **Public repository role:** CesSpace ARC Core source, verification, operator documentation, and security/privacy material.
+- **Runtime scope:** the released Core control plane and current `main` development that preserves the documented security invariants.
+- **Public-surface rule:** private CesSpace strategy, commercial planning, internal delivery sequencing, and private infrastructure details do not belong on the public branch. See [Public Repository Policy](public-repository-policy.md).
 
 ---
 
