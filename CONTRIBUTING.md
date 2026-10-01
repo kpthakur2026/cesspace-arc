@@ -1,58 +1,74 @@
 # Contributing to CesSpace ARC
 
-Thank you for your interest in contributing to **CesSpace ARC**!
+Thank you for your interest in contributing to **CesSpace ARC**.
 
-CesSpace ARC is a secure, vendor-neutral agent-to-machine control plane. Because this project mediates between autonomous AI agents and execution machines, **security, correctness, and auditability take priority over speed of delivery.**
+CesSpace ARC is a security-sensitive agent-to-machine control plane. Security, correctness, auditability, compatibility, and maintainability take priority over speed of delivery.
 
----
+## Contribution principles
 
-## 1. Core Contribution Rules
+1. **Security by default:** New capabilities must preserve default-deny and fail-closed behavior.
+2. **No policy bypass:** Privileged operations must continue to traverse the established ARC security pipeline.
+3. **Negative testing required:** Security-sensitive changes must include tests proving unauthorized, malformed, or malicious inputs are rejected.
+4. **Secret hygiene:** Never commit credentials, private keys, tokens, private infrastructure details, or realistic secret material.
+5. **Small, reviewable changes:** Keep pull requests focused and avoid unrelated refactors.
+6. **Independent review:** Changes require maintainer review before merge.
+7. **Compatibility discipline:** Changes to protocol, tool schemas, policy semantics, audit formats, or platform support must include corresponding documentation and regression coverage.
 
-1. **Stage-Gate Discipline:** Work proceeds strictly through designated Release Candidates (RC-00 through RC-08). Never submit PRs implementing features from future stages.
-2. **Security by Default:** All new tools, capabilities, or modifications must adhere to **Default Deny** and **Fail Closed** semantics.
-3. **Mandatory Negative Controls:** Every PR introducing a security boundary, policy check, or path validator **must include negative tests** proving that unauthorized, malformed, or malicious inputs fail closed.
-4. **Zero Secret Policy:** Never commit secrets, tokens, private keys, or internal network topology. Public Git history is permanent. Run secret checks before submitting.
-5. **Quality Gates Must Pass:** All format checks, linter runs, typechecks, tests, and `git diff --check` must pass cleanly without suppression (`|| true` or `--no-verify`).
-6. **No Self-Approval:** All changes require independent review and approval by repository maintainers.
+## Development workflow
 
----
+Create a topic branch from the current default branch. Clear branch names are preferred, for example:
 
-## 2. Development Workflow
+- `feat/<topic>`
+- `fix/<topic>`
+- `docs/<topic>`
+- `test/<topic>`
 
-### Branching Strategy
+Use clear, atomic commits. Conventional commit-style messages are encouraged, for example:
 
-- Feature branches must follow the naming pattern:
-  - `feat/rc-XX-<feature-name>` (e.g., `feat/rc-00-architecture`)
-  - `fix/rc-XX-<issue-description>`
-  - `docs/<topic>`
-- Do not submit PRs targeting protected branches with unreviewed work.
+- `feat(policy): add bounded policy capability`
+- `fix(filesystem): reject unsafe path transition`
+- `docs(security): clarify disclosure process`
+- `test(audit): add redaction regression coverage`
 
-### Commit Guidelines
+## Required verification
 
-- Use clear, conventional commit messages:
-  - `feat(policy): implement AST-based command whitelist`
-  - `fix(filesystem): prevent symlink traversal across workspace root`
-  - `docs(threat-model): add indirect prompt injection analysis`
-  - `test(audit): add negative assertions for unredacted token logging`
-- Ensure commits are atomic and cleanly formatted. Run `git diff --check` before committing.
+Before submitting a pull request, run the checks relevant to the change. The normal repository gate is:
 
----
+```bash
+pnpm install --frozen-lockfile
+pnpm run check:format
+pnpm run lint
+pnpm run typecheck
+pnpm run test
+pnpm run build
+pnpm run check:docs
+pnpm run check:secrets
+```
 
-## 3. Pull Request Checklist
+Also run `git diff --check` and review the complete diff before submission.
 
-Before submitting a Pull Request, confirm that:
+## Pull request expectations
 
-- [ ] The change belongs strictly to the active release candidate stage.
-- [ ] No files or directories outside approved scope have been modified.
-- [ ] `git diff --check` returns zero errors or trailing whitespace issues.
-- [ ] Static checks, linters, and typechecks pass with zero warnings or errors.
-- [ ] Negative test cases are included for any policy, path, or execution logic.
-- [ ] No secrets, real credentials, or private internal IP addresses are present.
-- [ ] Documentation and ADRs have been updated to reflect architectural changes.
-- [ ] The PR description includes explicit verification evidence.
+A pull request should:
 
----
+- explain the problem and the proposed change;
+- identify security or compatibility impact when applicable;
+- include tests for behavior changes;
+- include negative tests for security boundaries;
+- update operator or architecture documentation when public contracts change;
+- contain no unrelated generated files, credentials, private data, or hidden infrastructure assumptions;
+- preserve required licensing and attribution.
 
-## 4. Code of Conduct
+Changes that modify the public tool catalog, authentication model, policy semantics, workspace boundary, audit integrity, remote transport, or release process require especially careful review.
 
-All contributors and participants are required to adhere to the [Code of Conduct](CODE_OF_CONDUCT.md).
+## Security reports
+
+Do not report suspected vulnerabilities through a public issue or pull request. Follow the private process in [SECURITY.md](SECURITY.md).
+
+## Public repository scope
+
+The public repository is governed by the [Public Repository Policy](docs/governance/public-repository-policy.md). Private CesSpace strategy, commercial planning, internal delivery sequencing, and private infrastructure details are out of scope for public contributions.
+
+## Code of Conduct
+
+All contributors and participants must follow the [Code of Conduct](CODE_OF_CONDUCT.md).

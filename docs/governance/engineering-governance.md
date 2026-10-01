@@ -1,96 +1,71 @@
 # Engineering Governance — CesSpace ARC
 
 > **Repository:** `kpthakur2026/cesspace-arc`
-> **Status:** Stage-Gated Engineering Rules
-> **Classification:** Project Governance Specification
+> **Status:** Active project governance
+> **Classification:** Public engineering specification
 
----
+## Purpose
 
-## 1. Core Mission & Inviolable Directives
+This document defines the public engineering rules for changes to CesSpace ARC Core. It describes review, security, compatibility, and release expectations without exposing private CesSpace product planning or internal delivery sequencing.
 
-CesSpace ARC is a secure, vendor-neutral **agent-to-machine control plane** designed to provide controlled, policy-enforced access to development environments without exposing unrestricted host access to external clients or automated tools.
+## Core principles
 
-Because this repository contains the core security architecture, policy enforcement, and audit mechanisms of that control plane, **all development work operating on this codebase must adhere strictly to these operational constraints.**
+1. **Security invariants are authoritative.** Default deny, fail closed, least privilege, mandatory policy mediation, workspace containment, explicit approval, and auditability must not be weakened.
+2. **Authentication and authorization remain separate.** Establishing caller identity never grants host authority by itself.
+3. **No direct privileged bypass.** Filesystem, Git, terminal, process, approval, and audit-sensitive behavior must remain behind the governed ARC execution path.
+4. **Negative testing is mandatory.** Security boundaries require tests proving blocked behavior stays blocked.
+5. **Secrets do not belong in Git.** Credentials, private topology, customer data, private keys, and production configuration must never be committed.
+6. **Protected branches require review.** Changes are developed on topic branches and merged only after maintainer review and required checks.
+7. **Compatibility changes are explicit.** Protocol, schema, policy, audit, platform-support, and release-format changes require documentation and regression coverage.
+8. **Public claims must be evidence-backed.** Released functionality, supported platforms, and security statements must match the canonical source and release evidence.
 
-### Mandatory Operating Principles
+## Review model
 
-1. **Strict Stage Adherence:** Execute **only** the work explicitly assigned to the current Release Candidate (RC) stage. Never implement features belonging to subsequent stages ahead of time.
-2. **Independent Review Boundary:** When a stage is complete, development must stop immediately. No contributor or process may self-approve its own stage. Present the complete diff, verification evidence, and git status, and wait for independent review and approval.
-3. **Zero Bypasses:** Never use `|| true`, `--no-verify`, `--force`, or equivalent workarounds to bypass failing tests, typechecks, linters, or security checks. If a check fails, the root cause must be resolved within policy.
-4. **Permanent Secret Hygiene:** Never introduce secrets, API keys, credentials, private IP addresses, or internal infrastructure details into this public repository. Once committed to Git, data must be treated as permanently compromised.
-5. **No Direct Mutations to Protected Branches:** Never commit directly to `main` or push to remote branches without explicit authorization. Never merge your own pull requests without independent review.
-6. **No Independent Service Exposure:** Never bind listeners to public network interfaces, start detached long-running background daemons outside sandbox bounds, or deploy services during development stages.
-7. **Negative Testing Mandatory:** Every security control must be backed by negative tests proving that unauthorized, malformed, or malicious attempts are properly rejected with default-deny behavior.
+Changes should be small enough to review directly and should include the evidence needed to evaluate correctness and security impact.
 
----
+A security-sensitive change normally includes:
 
-## 2. Stage-Gate Lifecycle
+- implementation diff;
+- positive behavior tests;
+- negative or adversarial tests;
+- documentation updates when a public contract changes;
+- format, lint, type, test, build, documentation, and secret-scan results as applicable.
 
-Every stage follows a strict linear verification cycle:
+## Change boundaries
 
-```text
-  ┌──────────┐
-  │   PLAN   │  Analyze requirements, architecture, and threat impact
-  └────┬─────┘
-       ▼
-  ┌──────────┐
-  │IMPLEMENT │  Write minimal, type-safe, modular code and documentation
-  └────┬─────┘
-       ▼
-  ┌──────────┐
-  │   TEST   │  Unit tests, format checks, linting, typechecking
-  └────┬─────┘
-       ▼
-  ┌──────────┐
-  │ NEGATIVE │  Verify fail-closed and default-deny security controls
-  │ CONTROLS │
-  └────┬─────┘
-       ▼
-  ┌──────────┐
-  │ EVIDENCE │  Generate git diff --check, status, and verification log
-  └────┬─────┘
-       ▼
-  ┌──────────┐
-  │  REVIEW  │  STOP HERE. Hand off for independent review
-  └────┬─────┘
-       ▼
-  ┌──────────┐
-  │ APPROVAL │  Explicit authorization required to enter next stage
-  └──────────┘
-```
+The following are prohibited in public repository changes:
 
----
+- weakening or bypassing security checks to make a test pass;
+- suppressing required verification with force or no-verify mechanisms;
+- committing secrets, credentials, private topology, or customer data;
+- copying code from incompatible or proprietary sources;
+- adding public network exposure, hosted-service behavior, or production deployment assumptions without an approved and reviewed architecture;
+- introducing undocumented changes to authentication, authorization, policy, audit, workspace, or release trust boundaries;
+- adding private CesSpace strategy, commercial planning, internal delivery sequencing, or private infrastructure details to public documentation.
 
-## 3. Prohibited Actions
+## Release and maintenance
 
-The following actions are strictly forbidden within this repository:
+The current stable release is `1.0.0`.
 
-- **Executing remote commands or opening outbound reverse shells.**
-- **Accessing files outside the repository root** (for example user credential directories or host system paths).
-- **Modifying `.git/hooks` or `.git/config`** directly.
-- **Copying code from proprietary external sources** or any source with incompatible licensing.
-- **Adding mock credentials that resemble live production keys** (use generic placeholders like `EXAMPLE_TOKEN_DO_NOT_USE`).
-- **Weakening path sanitization** or introducing path-traversal vulnerabilities (`../`).
-- **Proceeding across stage boundaries** without explicit instruction and approval.
+Release changes must preserve reproducibility, provenance, dependency integrity, platform support truth, and the published security/privacy boundary. A release is not considered supported merely because code exists on the default branch.
 
----
+Historical acceptance and verification documents may remain in the repository where source, tests, or release tooling still reference them. They are engineering evidence rather than the primary public product documentation.
 
-## 4. Current Repository State & Context
+## Verification baseline
 
-- **Current stable release:** `1.0.0`.
-- **Public repository role:** CesSpace ARC Core source, verification, operator documentation, and security/privacy material.
-- **Runtime scope:** the released Core control plane and current `main` development that preserves the documented security invariants.
-- **Public-surface rule:** private CesSpace strategy, commercial planning, internal delivery sequencing, and private infrastructure details do not belong on the public branch. See [Public Repository Policy](public-repository-policy.md).
+Before merge, run the checks applicable to the change. The normal baseline includes:
 
----
+1. `git diff --check`
+2. formatting
+3. linting
+4. TypeScript typechecking
+5. automated tests
+6. build verification
+7. documentation link checks
+8. secret and credential scanning
 
-## 5. Verification Checklist
+Security-sensitive changes may require additional targeted verification.
 
-Before declaring any stage complete, the following must be executed and documented:
+## Public repository boundary
 
-1. `git diff --check` (clean whitespace, zero merge conflicts).
-2. Secret scanning check (Gitleaks and repository policy check).
-3. Documentation completeness and link verification.
-4. Static typecheck and linting (TypeScript `tsc --build`, ESLint).
-5. Output of `git status` demonstrating clean tracking.
-6. Complete diff summary detailing all created and modified files.
+The [Public Repository Policy](public-repository-policy.md) governs what belongs in the public ARC repository. Public engineering documentation should be sufficient for users, contributors, operators, and security reviewers without exposing private CesSpace planning or infrastructure.

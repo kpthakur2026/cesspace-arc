@@ -29,7 +29,7 @@ Public repository content must not include:
 - internal business or commercial strategy;
 - unreleased pricing or packaging strategy;
 - private website or hosted-service implementation roadmaps;
-- internal handoff notes, temporary completion reports, or chat-derived plans;
+- internal handoff notes, temporary completion reports, or internal planning notes;
 - speculative release dates or unsupported capability claims;
 - competitor comparisons or promotional name-dropping;
 - private customer, tenant, account, or operational data.

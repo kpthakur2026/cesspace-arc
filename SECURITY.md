@@ -86,15 +86,12 @@ We welcome vulnerability reports from the security community, researchers, and u
 
 ## 4. Supported Versions
 
-Only the current active release candidate or stable branch receives security updates.
+The current stable release receives security updates unless the project explicitly announces support for an additional version.
 
 | Version                                     | Supported          | Notes                                    |
 | :------------------------------------------ | :----------------- | :--------------------------------------- |
 | `1.0.0`                                     | :white_check_mark: | Current stable CesSpace ARC Core release |
 | `0.8.0-rc08` and earlier release candidates | :x:                | Superseded by the stable release         |
-
-Security fixes are targeted at the current stable release unless the project
-explicitly announces support for an additional version.
 
 ---
 
