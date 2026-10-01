@@ -1,0 +1,39 @@
+name: Feature request
+description: Propose a focused improvement to CesSpace ARC Core.
+title: '[Feature] '
+labels: ['enhancement']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please describe the problem first. Public issues are not the place for private CesSpace roadmap, commercial, customer, or infrastructure information.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: What user or operator problem does this address?
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the smallest useful public-facing change.
+    validations:
+      required: true
+
+  - type: textarea
+    id: security
+    attributes:
+      label: Security and compatibility considerations
+      description: Note any impact on policy, approvals, audit, protocol, workspace containment, execution, transport, or compatibility.
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Public-scope confirmation
+      options:
+        - label: This proposal does not include private strategy, customer information, credentials, or internal infrastructure.
+          required: true

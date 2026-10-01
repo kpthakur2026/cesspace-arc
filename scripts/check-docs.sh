@@ -1,19 +1,34 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # CesSpace ARC — Documentation & Link Verification Script
-# Verifies all required RC-00 architecture and policy documents exist.
+# Verifies required public, governance, architecture, and policy documents exist.
 # ==============================================================================
 set -euo pipefail
 
-echo "==> [1/2] Verifying presence of required RC-00 documentation..."
+echo "==> [1/2] Verifying presence of required repository documentation..."
 
 REQUIRED_DOCS=(
   "README.md"
+  "GOVERNANCE.md"
+  "MAINTAINERS.md"
+  "SUPPORT.md"
+  "PUBLISHER.md"
+  "PRIVACY.md"
+  "TRADEMARKS.md"
   "docs/governance/engineering-governance.md"
+  "docs/governance/public-repository-policy.md"
   "SECURITY.md"
   "CONTRIBUTING.md"
   "CODE_OF_CONDUCT.md"
   "LICENSE"
+  ".github/CODEOWNERS"
+  ".github/PULL_REQUEST_TEMPLATE.md"
+  ".github/ISSUE_TEMPLATE/bug_report.yml"
+  ".github/ISSUE_TEMPLATE/feature_request.yml"
+  ".github/ISSUE_TEMPLATE/documentation.yml"
+  ".github/ISSUE_TEMPLATE/config.yml"
+  ".github/dependabot.yml"
+  ".github/workflows/codeql.yml"
   "docs/architecture/overview.md"
   "docs/architecture/trust-boundaries.md"
   "docs/architecture/security-invariants.md"
@@ -71,7 +86,14 @@ const path = require("path");
 
 const files = [
   "README.md",
+  "GOVERNANCE.md",
+  "MAINTAINERS.md",
+  "SUPPORT.md",
+  "PUBLISHER.md",
+  "PRIVACY.md",
+  "TRADEMARKS.md",
   "docs/governance/engineering-governance.md",
+  "docs/governance/public-repository-policy.md",
   "SECURITY.md",
   "CONTRIBUTING.md",
   "docs/adr/README.md"

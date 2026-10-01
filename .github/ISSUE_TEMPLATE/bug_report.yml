@@ -1,0 +1,71 @@
+name: Bug report
+description: Report a reproducible defect in CesSpace ARC.
+title: '[Bug] '
+labels: ['bug']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for helping improve CesSpace ARC. Do not include credentials, private infrastructure, or sensitive data. Security vulnerabilities must be reported through the private process in SECURITY.md.
+
+  - type: input
+    id: version
+    attributes:
+      label: ARC version
+      description: Provide the released version, tag, or commit you tested.
+      placeholder: '1.0.0'
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Linux x86-64
+        - WSL Linux userspace
+        - Linux arm64 (validation-only)
+        - macOS (validation-only)
+        - Other / unsupported
+    validations:
+      required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Problem
+      description: Describe the observed behavior.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Reproduction steps
+      description: Provide the smallest safe reproduction you can.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: Include relevant logs or errors only after removing secrets, host paths, tokens, and private data.
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety checks
+      options:
+        - label: I have removed credentials, private infrastructure details, and sensitive data.
+          required: true
+        - label: This is not a security vulnerability requiring private disclosure.
+          required: true

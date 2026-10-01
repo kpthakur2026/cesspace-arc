@@ -144,6 +144,8 @@ Trademark and branding rules are documented in [TRADEMARKS.md](TRADEMARKS.md).
 
 Contributions are welcome subject to the security and review requirements in [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md).
 
+Project stewardship and support boundaries are documented in [GOVERNANCE.md](GOVERNANCE.md), [MAINTAINERS.md](MAINTAINERS.md), and [SUPPORT.md](SUPPORT.md).
+
 ## License
 
 CesSpace ARC Core is licensed under the [Apache License, Version 2.0](LICENSE).

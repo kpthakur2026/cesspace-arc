@@ -1,0 +1,21 @@
+# CesSpace ARC code ownership
+#
+# CODEOWNERS names only the official ARC maintainer authority. Additional
+# maintainers should be added only through an explicit governance decision.
+
+/                                      @kpthakur2026
+/.github/                               @kpthakur2026
+/apps/                                  @kpthakur2026
+/packages/                              @kpthakur2026
+/tests/                                 @kpthakur2026
+/scripts/                               @kpthakur2026
+/release/                               @kpthakur2026
+/docs/                                  @kpthakur2026
+/SECURITY.md                            @kpthakur2026
+/PRIVACY.md                             @kpthakur2026
+/PUBLISHER.md                           @kpthakur2026
+/TRADEMARKS.md                          @kpthakur2026
+/CONTRIBUTING.md                        @kpthakur2026
+/GOVERNANCE.md                          @kpthakur2026
+/MAINTAINERS.md                         @kpthakur2026
+/SUPPORT.md                             @kpthakur2026
