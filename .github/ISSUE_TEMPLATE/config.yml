@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/kpthakur2026/cesspace-arc/security/policy
+    about: Report suspected vulnerabilities privately. Do not open a public issue.
+  - name: Support and usage guidance
+    url: https://github.com/kpthakur2026/cesspace-arc/blob/main/SUPPORT.md
+    about: Review support boundaries and where to ask for help.

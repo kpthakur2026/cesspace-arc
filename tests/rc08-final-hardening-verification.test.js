@@ -625,7 +625,12 @@ test('RC08-NEG-090: promotion provenance and every authoritative current version
   const verifier = fs.readFileSync('scripts/verify-rc08.sh', 'utf8');
   assert.match(verifier, /EXPECTED_VERSION="0\.8\.0-rc08"/);
   assert.match(verifier, /EXPECTED_STAGE="RC-08"/);
-  assert.match(fs.readFileSync('README.md', 'utf8'), /\| \*\*RC-08\*\*.*\| Implemented \|/);
+  const readme = fs.readFileSync('README.md', 'utf8');
+  assert.match(readme, /current stable release is \*\*CesSpace ARC Core 1\.0\.0\*\*/i);
+  assert.match(
+    readme,
+    /Historical release-candidate acceptance documents remain in the repository/,
+  );
 });
 
 test('RC08-FLOW-18: approved production arc_verify runs the complete frozen check-only suite once', async () => {
