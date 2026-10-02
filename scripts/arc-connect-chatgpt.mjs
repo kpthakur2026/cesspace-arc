@@ -49,6 +49,7 @@ export function resolveConnectionPaths(env = process.env) {
     configRoot,
     stateRoot,
     arcTokenFile: path.join(configRoot, 'arc-token'),
+    claudeTokenFile: path.join(configRoot, 'claude-token'),
     arcAuthorizationHeaderFile: path.join(configRoot, 'arc-authorization-header'),
     apiKeyFile: path.join(configRoot, 'openai-api-key'),
     connectionFile: path.join(configRoot, 'connection.json'),
@@ -182,10 +183,16 @@ async function resolveApiKeyFile(paths, selectedFile) {
 function ensureArcSecrets(paths) {
   if (!fs.existsSync(paths.arcTokenFile))
     writePrivateFile(paths.arcTokenFile, `${crypto.randomBytes(32).toString('hex')}\n`);
+  if (!fs.existsSync(paths.claudeTokenFile))
+    writePrivateFile(paths.claudeTokenFile, `${crypto.randomBytes(32).toString('hex')}\n`);
   assertPrivateRegularFile(paths.arcTokenFile, 'ARC ChatGPT token file');
+  assertPrivateRegularFile(paths.claudeTokenFile, 'ARC Claude local token file');
   const token = fs.readFileSync(paths.arcTokenFile, 'utf8').trim();
-  if (!/^[A-Fa-f0-9]{64}$/.test(token))
-    fail('ARC_TOKEN_INVALID', 'ARC ChatGPT token file is invalid.');
+  const claudeToken = fs.readFileSync(paths.claudeTokenFile, 'utf8').trim();
+  if (!/^[A-Fa-f0-9]{64}$/.test(token) || !/^[A-Fa-f0-9]{64}$/.test(claudeToken))
+    fail('ARC_TOKEN_INVALID', 'ARC local transport token file is invalid.');
+  if (token === claudeToken)
+    fail('ARC_TOKEN_INVALID', 'ChatGPT and Claude local transport tokens must be distinct.');
   writePrivateFile(paths.arcAuthorizationHeaderFile, `Bearer ${token}`);
   assertPrivateRegularFile(paths.arcAuthorizationHeaderFile, 'ARC Authorization header file');
 }
@@ -329,22 +336,10 @@ async function waitFor(predicate, timeoutMs, label) {
 
 async function probeArc(tokenFile, port = DEFAULT_PORT) {
   const token = fs.readFileSync(tokenFile, 'utf8').trim();
-  const response = await fetch(`http://127.0.0.1:${port}/mcp`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: 'arc-connect-probe',
-      method: 'initialize',
-      params: {
-        protocolVersion: '2024-11-05',
-        capabilities: {},
-        clientInfo: { name: 'cesspace-arc-connect', version: '1.0' },
-      },
-    }),
-  });
-  if (response.status !== 200 || !response.headers.get('mcp-session-id')) return false;
-  return true;
+  const response = await fetch(`http://127.0.0.1:${port}/health`, {
+    headers: { Authorization: `Bearer ${token}` },
+  }).catch(() => null);
+  return Boolean(response?.ok);
 }
 
 async function startAdapter({ prefix, stateDirectory, paths }) {
@@ -356,15 +351,24 @@ async function startAdapter({ prefix, stateDirectory, paths }) {
     processAlive(existingPid) &&
     processCommandLine(existingPid).includes('arc-integration-chatgpt-private.mjs')
   ) {
-    if (await probeArc(paths.arcTokenFile)) return existingPid;
+    const chatgptHealthy = await probeArc(paths.arcTokenFile);
+    const claudeHealthy = await probeArc(paths.claudeTokenFile);
+    if (chatgptHealthy && claudeHealthy) return existingPid;
+    if (chatgptHealthy && !claudeHealthy) {
+      fail(
+        'ADAPTER_RESTART_REQUIRED',
+        'The running ARC adapter predates Claude-local credential support. Stop it cleanly before reconnecting so ARC can restart with both server-owned credentials.',
+      );
+    }
     fail(
       'ADAPTER_AUTH_MISMATCH',
-      'A helper-managed ARC adapter is already running but did not accept the stored connection token. Refusing to terminate it automatically.',
+      'A helper-managed ARC adapter is already running but did not accept the stored ChatGPT credential. Refusing to terminate it automatically.',
     );
   }
   const env = {
     ...process.env,
     CESSPACE_ARC_CHATGPT_TOKEN_FILE: paths.arcTokenFile,
+    CESSPACE_ARC_CLAUDE_TOKEN_FILE: paths.claudeTokenFile,
     CESSPACE_ARC_CHATGPT_PORT: String(DEFAULT_PORT),
     CESSPACE_ARC_CHATGPT_BIND_HOST: '127.0.0.1',
   };
@@ -381,7 +385,10 @@ async function startAdapter({ prefix, stateDirectory, paths }) {
           : '';
         fail('ADAPTER_START_FAILED', log || 'ARC private ChatGPT adapter exited during startup.');
       }
-      return probeArc(paths.arcTokenFile).catch(() => false);
+      return Promise.all([
+        probeArc(paths.arcTokenFile),
+        probeArc(paths.claudeTokenFile),
+      ]).then((results) => results.every(Boolean));
     },
     10000,
     'ARC private ChatGPT adapter',
