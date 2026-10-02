@@ -226,3 +226,56 @@ test('ARC-CONNECT-02: installed launcher preserves stdio default and exposes Cla
   assert.match(source, /Usage: cesspace-arc proxy claude/);
   assert.match(source, /arc-integration-stdio\.mjs/);
 });
+
+
+test('ARC-CONNECT-02: server-owned credentials produce distinct ChatGPT and Claude actors', async () => {
+  const { ChatGptAuthBridge } = await import('../apps/mcp-server/dist/chatgpt-auth-bridge.js');
+  const bridge = new ChatGptAuthBridge({
+    expectedToken: 'chatgpt-credential',
+    additionalCredentials: [
+      {
+        expectedToken: 'claude-credential',
+        actor: {
+          clientId: 'claude-client',
+          clientType: 'claude-local',
+          deviceId: 'claude-desktop-local',
+        },
+        sessionPrefix: 'claude-sess',
+      },
+    ],
+    sink: {
+      async executeAuthenticatedToolCall() {
+        return { content: [{ type: 'text', text: 'ok' }] };
+      },
+    },
+  });
+
+  const chatgpt = bridge.createSession('Bearer chatgpt-credential');
+  const claude = bridge.createSession('Bearer claude-credential');
+  assert.match(chatgpt.sessionId, /^chatgpt-sess-/);
+  assert.match(claude.sessionId, /^claude-sess-/);
+
+  const chatgptRecord = bridge.validateSession(chatgpt.sessionId, 'Bearer chatgpt-credential');
+  const claudeRecord = bridge.validateSession(claude.sessionId, 'Bearer claude-credential');
+  assert.deepEqual(chatgptRecord.actor, {
+    clientId: 'chatgpt-client',
+    clientType: 'chatgpt-remote',
+    deviceId: 'chatgpt-tunnel-gateway',
+  });
+  assert.deepEqual(claudeRecord.actor, {
+    clientId: 'claude-client',
+    clientType: 'claude-local',
+    deviceId: 'claude-desktop-local',
+  });
+  assert.throws(
+    () => bridge.validateSession(claude.sessionId, 'Bearer chatgpt-credential'),
+    /credential binding mismatch|Authentication required/i,
+  );
+});
+
+test('ARC-CONNECT-02: private adapter launcher has clean signal shutdown and optional Claude credential wiring', () => {
+  const source = fs.readFileSync(path.resolve('scripts/arc-integration-chatgpt-private.mjs'), 'utf8');
+  assert.match(source, /CESSPACE_ARC_CLAUDE_TOKEN_FILE/);
+  assert.match(source, /process\.once\('SIGTERM'/);
+  assert.match(source, /await server\.stop\(\)/);
+});
