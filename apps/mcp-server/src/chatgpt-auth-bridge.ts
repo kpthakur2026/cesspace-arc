@@ -46,9 +46,22 @@ export interface ChatGptExecutionSink {
   isRegisteredTool?: (name: string) => boolean;
 }
 
+export interface ChatGptTransportActor {
+  clientId: string;
+  clientType: string;
+  deviceId: string;
+}
+
+export interface ChatGptAdditionalCredential {
+  expectedToken: string;
+  actor: ChatGptTransportActor;
+  sessionPrefix: string;
+}
+
 export interface ChatGptAuthBridgeDeps {
   expectedToken: string;
   sink: ChatGptExecutionSink;
+  additionalCredentials?: ChatGptAdditionalCredential[];
   sessionTtlMs?: number;
   maxActiveSessions?: number;
   auditLogger?: AuditLogger;
@@ -58,8 +71,12 @@ export const DEFAULT_CHATGPT_SESSION_TTL_MS = 60 * 60 * 1000; // 1 hour
 export const DEFAULT_MAX_ACTIVE_CHATGPT_SESSIONS = 100;
 
 export class ChatGptAuthBridge {
-  private readonly expectedToken: string;
-  private readonly credentialHash: string;
+  private readonly credentials: Array<{
+    expectedToken: string;
+    credentialHash: string;
+    actor: ChatGptTransportActor;
+    sessionPrefix: string;
+  }>;
   private readonly sink: ChatGptExecutionSink;
   private readonly sessionTtlMs: number;
   private readonly maxActiveSessions: number;
@@ -69,8 +86,47 @@ export class ChatGptAuthBridge {
     if (typeof deps.expectedToken !== 'string' || deps.expectedToken.length === 0) {
       throw new Error('ChatGptAuthBridge requires a non-empty expectedToken.');
     }
-    this.expectedToken = deps.expectedToken;
-    this.credentialHash = crypto.createHash('sha256').update(this.expectedToken).digest('hex');
+    const credentialInputs: ChatGptAdditionalCredential[] = [
+      {
+        expectedToken: deps.expectedToken,
+        actor: {
+          clientId: 'chatgpt-client',
+          clientType: 'chatgpt-remote',
+          deviceId: 'chatgpt-tunnel-gateway',
+        },
+        sessionPrefix: 'chatgpt-sess',
+      },
+      ...(deps.additionalCredentials ?? []),
+    ];
+    const seenTokens = new Set<string>();
+    this.credentials = credentialInputs.map((credential) => {
+      if (
+        typeof credential.expectedToken !== 'string' ||
+        credential.expectedToken.length === 0 ||
+        seenTokens.has(credential.expectedToken)
+      ) {
+        throw new Error('ChatGptAuthBridge transport credentials must be non-empty and unique.');
+      }
+      if (!/^[a-z][a-z0-9-]{0,31}$/u.test(credential.sessionPrefix)) {
+        throw new Error('ChatGptAuthBridge sessionPrefix is invalid.');
+      }
+      for (const value of [
+        credential.actor.clientId,
+        credential.actor.clientType,
+        credential.actor.deviceId,
+      ]) {
+        if (typeof value !== 'string' || value.trim().length === 0 || value.length > 128) {
+          throw new Error('ChatGptAuthBridge actor identity is invalid.');
+        }
+      }
+      seenTokens.add(credential.expectedToken);
+      return {
+        expectedToken: credential.expectedToken,
+        credentialHash: crypto.createHash('sha256').update(credential.expectedToken).digest('hex'),
+        actor: { ...credential.actor },
+        sessionPrefix: credential.sessionPrefix,
+      };
+    });
     this.sink = deps.sink;
     this.sessionTtlMs = deps.sessionTtlMs ?? DEFAULT_CHATGPT_SESSION_TTL_MS;
     this.maxActiveSessions = deps.maxActiveSessions ?? DEFAULT_MAX_ACTIVE_CHATGPT_SESSIONS;
@@ -79,8 +135,16 @@ export class ChatGptAuthBridge {
   /**
    * Verifies the transport-level Bearer authorization header against the expected token.
    */
+  private resolveCredential(authorizationHeader: string | undefined | null) {
+    return (
+      this.credentials.find((credential) =>
+        verifyBearerToken(authorizationHeader, credential.expectedToken),
+      ) ?? null
+    );
+  }
+
   public verifyTransportAuth(authorizationHeader: string | undefined | null): boolean {
-    return verifyBearerToken(authorizationHeader, this.expectedToken);
+    return this.resolveCredential(authorizationHeader) !== null;
   }
 
   /**
@@ -94,7 +158,8 @@ export class ChatGptAuthBridge {
     capabilities: { tools: Record<string, unknown> };
     serverInfo: { name: string; version: string };
   } {
-    if (!this.verifyTransportAuth(authorizationHeader)) {
+    const credential = this.resolveCredential(authorizationHeader);
+    if (credential === null) {
       throw ArcError.unauthenticated('Authentication required.');
     }
 
@@ -105,20 +170,16 @@ export class ChatGptAuthBridge {
     }
 
     // Server-minted session ID
-    const sessionId = `chatgpt-sess-${crypto.randomBytes(16).toString('hex')}`;
+    const sessionId = `${credential.sessionPrefix}-${crypto.randomBytes(16).toString('hex')}`;
     const now = Date.now();
 
     const record: ChatGptSessionRecord = {
       sessionId,
-      credentialHash: this.credentialHash,
+      credentialHash: credential.credentialHash,
       createdAt: now,
       lastActiveAt: now,
       revoked: false,
-      actor: {
-        clientId: 'chatgpt-client',
-        clientType: 'chatgpt-remote',
-        deviceId: 'chatgpt-tunnel-gateway',
-      },
+      actor: { ...credential.actor },
     };
 
     this.sessions.set(sessionId, record);
@@ -149,7 +210,8 @@ export class ChatGptAuthBridge {
     }
 
     // 2. Transport credential verification
-    if (!this.verifyTransportAuth(authorizationHeader)) {
+    const credential = this.resolveCredential(authorizationHeader);
+    if (credential === null) {
       throw ArcError.unauthenticated('Authentication required.');
     }
 
@@ -173,7 +235,7 @@ export class ChatGptAuthBridge {
     }
 
     // 6. Credential binding check (detects token rotation/tampering)
-    if (session.credentialHash !== this.credentialHash) {
+    if (session.credentialHash !== credential.credentialHash) {
       session.revoked = true;
       this.sessions.delete(presentedSessionId);
       throw ArcError.unauthenticated('Session credential binding mismatch.');
