@@ -279,3 +279,56 @@ test('ARC-CONNECT-02: private adapter launcher has clean signal shutdown and opt
   assert.match(source, /process\.once\('SIGTERM'/);
   assert.match(source, /await server\.stop\(\)/);
 });
+
+
+test('ARC-CONNECT-02: private profile validates a distinct owner-only Claude token selector', async () => {
+  const { resolveChatGptRemoteConfig } = await import('../apps/mcp-server/dist/chatgpt-profile.js');
+  const root = tempRoot('arc-connect02-profile-');
+  try {
+    const chatgptToken = path.join(root, 'chatgpt-token');
+    const claudeToken = path.join(root, 'claude-token');
+    fs.writeFileSync(chatgptToken, 'a'.repeat(64) + '\n', { mode: 0o600 });
+    fs.writeFileSync(claudeToken, 'b'.repeat(64) + '\n', { mode: 0o600 });
+    fs.chmodSync(chatgptToken, 0o600);
+    fs.chmodSync(claudeToken, 0o600);
+
+    const resolved = resolveChatGptRemoteConfig({
+      enabled: true,
+      bindHost: '127.0.0.1',
+      port: 4318,
+      authTokenPath: chatgptToken,
+      claudeLocalAuthTokenPath: claudeToken,
+    });
+    assert.equal(resolved.expectedToken, 'a'.repeat(64));
+    assert.equal(resolved.expectedClaudeLocalToken, 'b'.repeat(64));
+
+    fs.writeFileSync(claudeToken, 'a'.repeat(64) + '\n', { mode: 0o600 });
+    assert.throws(
+      () =>
+        resolveChatGptRemoteConfig({
+          enabled: true,
+          bindHost: '127.0.0.1',
+          port: 4318,
+          authTokenPath: chatgptToken,
+          claudeLocalAuthTokenPath: claudeToken,
+        }),
+      /must be distinct/,
+    );
+
+    fs.writeFileSync(claudeToken, 'b'.repeat(64) + '\n', { mode: 0o644 });
+    fs.chmodSync(claudeToken, 0o644);
+    assert.throws(
+      () =>
+        resolveChatGptRemoteConfig({
+          enabled: true,
+          bindHost: '127.0.0.1',
+          port: 4318,
+          authTokenPath: chatgptToken,
+          claudeLocalAuthTokenPath: claudeToken,
+        }),
+      /owner-only permissions/,
+    );
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
