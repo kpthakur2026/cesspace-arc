@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "cesspace-arc": {
+      "command": "node",
+      "args": [
+        "/absolute/path/to/arc-prefix/runtime/scripts/arc-integration-stdio.mjs",
+        "/absolute/path/to/arc-core-state"
+      ]
+    }
+  }
+}

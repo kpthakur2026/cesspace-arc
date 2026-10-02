@@ -84,6 +84,7 @@ Start with the operator documentation:
 - [Installation](docs/distribution/installation.md)
 - [Configuration & Upgrade](docs/distribution/configuration-upgrade.md)
 - [Stable Release](docs/distribution/stable-release.md)
+- [MCP Client Integrations](docs/integrations/README.md)
 
 Example configuration and policy templates are available under [`examples/`](examples/).
 
