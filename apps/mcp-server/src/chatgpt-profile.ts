@@ -56,6 +56,11 @@ export interface ChatGptRemoteConfig {
    * owned by the running process user.
    */
   authTokenPath: string;
+  /**
+   * Optional owner-only bearer-token file for the local Claude stdio bridge.
+   * This is a selector only; the token bytes never enter config or argv.
+   */
+  claudeLocalAuthTokenPath?: string;
   /** Transport endpoint path (defaults to '/mcp'). */
   path?: string;
   /** Request body ceiling in bytes (defaults to 1 MiB, bounded between 1 KiB and 4 MiB). */
@@ -69,6 +74,8 @@ export interface ResolvedChatGptRemoteConfig {
   tunnelHostname?: string;
   authTokenPath: string;
   expectedToken: string;
+  claudeLocalAuthTokenPath?: string;
+  expectedClaudeLocalToken?: string;
   path: string;
   maxRequestBodyBytes: number;
 }
@@ -79,6 +86,7 @@ const ALLOWED_CONFIG_KEYS = new Set([
   'port',
   'tunnelHostname',
   'authTokenPath',
+  'claudeLocalAuthTokenPath',
   'path',
   'maxRequestBodyBytes',
 ]);
@@ -200,6 +208,52 @@ export function resolveChatGptRemoteConfig(input: unknown): ResolvedChatGptRemot
     throw new Error(`ChatGPT auth token file is empty: ${authTokenPath}`);
   }
 
+  let claudeLocalAuthTokenPath: string | undefined;
+  let expectedClaudeLocalToken: string | undefined;
+  if (record.claudeLocalAuthTokenPath !== undefined) {
+    if (
+      typeof record.claudeLocalAuthTokenPath !== 'string' ||
+      record.claudeLocalAuthTokenPath.trim().length === 0
+    ) {
+      throw new Error("Field 'claudeLocalAuthTokenPath' must be a non-empty string if provided.");
+    }
+    claudeLocalAuthTokenPath = record.claudeLocalAuthTokenPath.trim();
+    let claudeStat: fs.Stats;
+    try {
+      claudeStat = fs.lstatSync(claudeLocalAuthTokenPath);
+    } catch {
+      throw new Error(
+        `Claude local auth token file is missing or unreadable: ${claudeLocalAuthTokenPath}`,
+      );
+    }
+    if (claudeStat.isSymbolicLink() || !claudeStat.isFile()) {
+      throw new Error(
+        `Claude local auth token file must be a regular file, not a symlink: ${claudeLocalAuthTokenPath}`,
+      );
+    }
+    if (typeof process.getuid === 'function' && claudeStat.uid !== process.getuid()) {
+      throw new Error('Claude local auth token file must be owned by the process user.');
+    }
+    if ((claudeStat.mode & 0o077) !== 0) {
+      throw new Error('Claude local auth token file must have owner-only permissions.');
+    }
+    let claudeContents: string;
+    try {
+      claudeContents = fs.readFileSync(claudeLocalAuthTokenPath, 'utf8');
+    } catch {
+      throw new Error(
+        `Failed to read Claude local auth token file: ${claudeLocalAuthTokenPath}`,
+      );
+    }
+    expectedClaudeLocalToken = claudeContents.trim();
+    if (expectedClaudeLocalToken.length === 0) {
+      throw new Error(`Claude local auth token file is empty: ${claudeLocalAuthTokenPath}`);
+    }
+    if (expectedClaudeLocalToken === expectedToken) {
+      throw new Error('Claude local and ChatGPT transport tokens must be distinct.');
+    }
+  }
+
   let pathStr = DEFAULT_CHATGPT_PATH;
   if (record.path !== undefined) {
     if (typeof record.path !== 'string' || !record.path.startsWith('/')) {
@@ -230,6 +284,9 @@ export function resolveChatGptRemoteConfig(input: unknown): ResolvedChatGptRemot
     tunnelHostname,
     authTokenPath,
     expectedToken,
+    ...(claudeLocalAuthTokenPath
+      ? { claudeLocalAuthTokenPath, expectedClaudeLocalToken }
+      : {}),
     path: pathStr,
     maxRequestBodyBytes,
   };
