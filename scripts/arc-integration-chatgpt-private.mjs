@@ -80,10 +80,25 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   }
 
   startPrivateChatGptIntegration(stateDirectory)
-    .then(({ status }) => {
+    .then(({ server, status }) => {
       process.stderr.write(
         `CesSpace ARC private ChatGPT-compatible MCP adapter listening on ${status.bindHost}:${status.port}${status.path}\n`,
       );
+      let stopping = false;
+      const shutdown = async (signal) => {
+        if (stopping) return;
+        stopping = true;
+        try {
+          await server.stop();
+          process.stderr.write(`CesSpace ARC private adapter stopped cleanly on ${signal}.\n`);
+          process.exit(0);
+        } catch (error) {
+          process.stderr.write(`Failed to stop private adapter cleanly: ${error.message}\n`);
+          process.exit(1);
+        }
+      };
+      process.once('SIGTERM', () => void shutdown('SIGTERM'));
+      process.once('SIGINT', () => void shutdown('SIGINT'));
     })
     .catch((error) => {
       process.stderr.write(
