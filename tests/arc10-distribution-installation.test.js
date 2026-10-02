@@ -9,6 +9,7 @@ import {
   ARCHIVE_FILE,
   ARC_STAGE,
   ARC_VERSION,
+  CURRENT_INSTALL_FILES,
   EXPECTED_REGISTRY_COUNT,
   EXPECTED_TOOL_COUNT,
   INVENTORY_FILE,
@@ -382,6 +383,9 @@ test('source archive bytes and executable modes equal representative exact HEAD 
     'package.json',
     'apps/mcp-server/src/index.ts',
     'scripts/arc10-build-distribution.mjs',
+    'scripts/arc-integration-stdio.mjs',
+    'scripts/arc-integration-chatgpt-private.mjs',
+    'scripts/arc-core-init.mjs',
   ]) {
     const entry = archive.entries.find((candidate) => candidate.path === relativePath);
     assert.ok(entry, `${relativePath} must be selected from HEAD`);
@@ -549,6 +553,13 @@ test('ARC10-NEG-012 preserves package, CLI, health, distribution, tool, and regi
   assert.equal(installed.ownership.version, ARC_VERSION);
   assert.equal(installed.ownership.stage, ARC_STAGE);
   assert.equal(installed.ownership.sourceCommit, verified.manifest.source.commit);
+  assert.deepEqual(installed.ownership.files, [...CURRENT_INSTALL_FILES]);
+  for (const relative of CURRENT_INSTALL_FILES) {
+    const stat = await fs.promises.lstat(path.join(installed.prefix, relative));
+    assert.equal(stat.isFile(), true, `${relative} must be a regular launcher file`);
+    assert.equal(stat.isSymbolicLink(), false, `${relative} must not be a symlink`);
+    assert.equal(stat.mode & 0o111, 0o111, `${relative} must be executable`);
+  }
 });
 
 test('ARC10-FLOW-01 performs verified frozen source installation, real health startup, shutdown, and uninstall', async () => {
