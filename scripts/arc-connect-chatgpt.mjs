@@ -385,10 +385,9 @@ async function startAdapter({ prefix, stateDirectory, paths }) {
           : '';
         fail('ADAPTER_START_FAILED', log || 'ARC private ChatGPT adapter exited during startup.');
       }
-      return Promise.all([
-        probeArc(paths.arcTokenFile),
-        probeArc(paths.claudeTokenFile),
-      ]).then((results) => results.every(Boolean));
+      return Promise.all([probeArc(paths.arcTokenFile), probeArc(paths.claudeTokenFile)]).then(
+        (results) => results.every(Boolean),
+      );
     },
     10000,
     'ARC private ChatGPT adapter',

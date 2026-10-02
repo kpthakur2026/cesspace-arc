@@ -36,10 +36,7 @@ function homeDirectory(env = process.env) {
   return home;
 }
 
-export function resolveClaudeDesktopConfigPath(
-  env = process.env,
-  platform = process.platform,
-) {
+export function resolveClaudeDesktopConfigPath(env = process.env, platform = process.platform) {
   const home = homeDirectory(env);
   if (platform === 'linux') {
     const base = env.XDG_CONFIG_HOME?.trim()
@@ -48,7 +45,13 @@ export function resolveClaudeDesktopConfigPath(
     return path.join(base, 'Claude', 'claude_desktop_config.json');
   }
   if (platform === 'darwin') {
-    return path.join(home, 'Library', 'Application Support', 'Claude', 'claude_desktop_config.json');
+    return path.join(
+      home,
+      'Library',
+      'Application Support',
+      'Claude',
+      'claude_desktop_config.json',
+    );
   }
   if (platform === 'win32') {
     const appData = env.APPDATA?.trim();
@@ -57,7 +60,10 @@ export function resolveClaudeDesktopConfigPath(
     }
     return path.join(appData, 'Claude', 'claude_desktop_config.json');
   }
-  fail('CLAUDE_PLATFORM_UNSUPPORTED', 'Claude Desktop configuration path is unsupported on this platform.');
+  fail(
+    'CLAUDE_PLATFORM_UNSUPPORTED',
+    'Claude Desktop configuration path is unsupported on this platform.',
+  );
 }
 
 function assertSafeConfigFile(filePath) {
@@ -121,7 +127,8 @@ export function loadClaudeConfig(filePath) {
       'Claude Desktop config directory is missing. Install and launch Claude Desktop once, then retry.',
     );
   }
-  if (!parentStat.isDirectory()) fail('CLAUDE_CONFIG_DIR_INVALID', 'Claude config parent is not a directory.');
+  if (!parentStat.isDirectory())
+    fail('CLAUDE_CONFIG_DIR_INVALID', 'Claude config parent is not a directory.');
   const state = assertSafeConfigFile(absolute);
   if (!state.exists) return { path: absolute, mode: 0o600, config: {} };
   return {
@@ -135,7 +142,10 @@ function atomicWriteConfig(filePath, config, mode = 0o600) {
   const temp = `${filePath}.cesspace-arc-${process.pid}.tmp`;
   const bytes = `${JSON.stringify(config, null, 2)}\n`;
   if (Buffer.byteLength(bytes, 'utf8') > CONFIG_MAX_BYTES) {
-    fail('CLAUDE_CONFIG_TOO_LARGE', 'Updated Claude Desktop config exceeds the supported size bound.');
+    fail(
+      'CLAUDE_CONFIG_TOO_LARGE',
+      'Updated Claude Desktop config exceeds the supported size bound.',
+    );
   }
   fs.writeFileSync(temp, bytes, { mode: 0o600, flag: 'wx' });
   try {
@@ -425,10 +435,12 @@ export async function manageClaudeConnection({
     let adapterHealthy = false;
     if (fs.existsSync(paths.claudeTokenFile)) {
       try {
-        const token = fs.readFileSync(
-          assertPrivateRegularFile(paths.claudeTokenFile, 'ARC Claude local token file'),
-          'utf8',
-        ).trim();
+        const token = fs
+          .readFileSync(
+            assertPrivateRegularFile(paths.claudeTokenFile, 'ARC Claude local token file'),
+            'utf8',
+          )
+          .trim();
         adapterHealthy = await probeAdapter(token);
       } catch {
         adapterHealthy = false;

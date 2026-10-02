@@ -241,9 +241,7 @@ export function resolveChatGptRemoteConfig(input: unknown): ResolvedChatGptRemot
     try {
       claudeContents = fs.readFileSync(claudeLocalAuthTokenPath, 'utf8');
     } catch {
-      throw new Error(
-        `Failed to read Claude local auth token file: ${claudeLocalAuthTokenPath}`,
-      );
+      throw new Error(`Failed to read Claude local auth token file: ${claudeLocalAuthTokenPath}`);
     }
     expectedClaudeLocalToken = claudeContents.trim();
     if (expectedClaudeLocalToken.length === 0) {
@@ -284,9 +282,7 @@ export function resolveChatGptRemoteConfig(input: unknown): ResolvedChatGptRemot
     tunnelHostname,
     authTokenPath,
     expectedToken,
-    ...(claudeLocalAuthTokenPath
-      ? { claudeLocalAuthTokenPath, expectedClaudeLocalToken }
-      : {}),
+    ...(claudeLocalAuthTokenPath ? { claudeLocalAuthTokenPath, expectedClaudeLocalToken } : {}),
     path: pathStr,
     maxRequestBodyBytes,
   };

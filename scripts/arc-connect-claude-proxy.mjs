@@ -73,7 +73,8 @@ export function readPrivateBearerToken(filePath) {
     fail('ARC_TOKEN_INVALID', 'ARC local adapter token has an invalid size.');
   }
   const token = fs.readFileSync(filePath, 'utf8').trim();
-  if (!/^[A-Fa-f0-9]{64}$/.test(token)) fail('ARC_TOKEN_INVALID', 'ARC local adapter token is invalid.');
+  if (!/^[A-Fa-f0-9]{64}$/.test(token))
+    fail('ARC_TOKEN_INVALID', 'ARC local adapter token is invalid.');
   return token;
 }
 

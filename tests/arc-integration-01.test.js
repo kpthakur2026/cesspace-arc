@@ -50,17 +50,14 @@ test('ARC-INTEGRATION-01: launcher rejects malformed port selectors', () => {
   }
 });
 
-test('ARC-INTEGRATION-01: local MCP example launches from validated Core state', () => {
+test('ARC-INTEGRATION-01: local Claude example uses the shared ARC transport proxy without secrets', () => {
   const json = JSON.parse(read('examples/integrations/claude-local.mcp.json'));
   const profile = json.mcpServers?.['cesspace-arc'];
   assert.ok(profile);
-  assert.equal(profile.command, 'node');
-  assert.deepEqual(profile.args, [
-    '/absolute/path/to/arc-prefix/runtime/scripts/arc-integration-stdio.mjs',
-    '/absolute/path/to/arc-core-state',
-  ]);
+  assert.equal(profile.command, '/absolute/path/to/arc-prefix/bin/cesspace-arc');
+  assert.deepEqual(profile.args, ['proxy', 'claude']);
   assert.equal('env' in profile, false);
-  assert.equal(JSON.stringify(profile).includes('token'), false);
+  assert.doesNotMatch(JSON.stringify(profile), /token|secret|api[_-]?key/i);
 });
 
 test('ARC-INTEGRATION-01: both launchers use the neutral Core-state preflight projection', () => {
@@ -96,8 +93,10 @@ test('ARC-INTEGRATION-01: integration docs preserve product and security truth',
 
   assert.match(index, /ARC Core 1\.0\.0/);
   assert.match(index, /without a CesSpace account/);
-  assert.match(claude, /Core state directory/);
+  assert.match(claude, /validated ARC Core state|validates the existing ARC Core state/i);
   assert.match(claude, /stdio/i);
+  assert.match(claude, /single-writer/i);
+  assert.match(claude, /shared loopback ARC adapter/i);
   assert.match(chatgpt, /disabled by default/);
   assert.match(chatgpt, /owner-only regular file/i);
   assert.match(chatgpt, /policy, approval, containment, and audit/i);

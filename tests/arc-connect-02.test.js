@@ -189,10 +189,10 @@ test('ARC-CONNECT-02: stdio bridge forwards authentication and server-generated 
         },
       );
     }
-    return new Response(
-      JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { tools: [] } }),
-      { status: 200, headers: { 'Content-Type': 'application/json' } },
-    );
+    return new Response(JSON.stringify({ jsonrpc: '2.0', id: request.id, result: { tools: [] } }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
   };
 
   const init = await forwardMcpMessage({
@@ -226,7 +226,6 @@ test('ARC-CONNECT-02: installed launcher preserves stdio default and exposes Cla
   assert.match(source, /Usage: cesspace-arc proxy claude/);
   assert.match(source, /arc-integration-stdio\.mjs/);
 });
-
 
 test('ARC-CONNECT-02: server-owned credentials produce distinct ChatGPT and Claude actors', async () => {
   const { ChatGptAuthBridge } = await import('../apps/mcp-server/dist/chatgpt-auth-bridge.js');
@@ -274,12 +273,14 @@ test('ARC-CONNECT-02: server-owned credentials produce distinct ChatGPT and Clau
 });
 
 test('ARC-CONNECT-02: private adapter launcher has clean signal shutdown and optional Claude credential wiring', () => {
-  const source = fs.readFileSync(path.resolve('scripts/arc-integration-chatgpt-private.mjs'), 'utf8');
+  const source = fs.readFileSync(
+    path.resolve('scripts/arc-integration-chatgpt-private.mjs'),
+    'utf8',
+  );
   assert.match(source, /CESSPACE_ARC_CLAUDE_TOKEN_FILE/);
   assert.match(source, /process\.once\('SIGTERM'/);
   assert.match(source, /await server\.stop\(\)/);
 });
-
 
 test('ARC-CONNECT-02: private profile validates a distinct owner-only Claude token selector', async () => {
   const { resolveChatGptRemoteConfig } = await import('../apps/mcp-server/dist/chatgpt-profile.js');
