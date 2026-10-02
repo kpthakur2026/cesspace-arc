@@ -48,4 +48,28 @@ Verification completes before extraction, dependency installation, build, or pre
 
 Default uninstall removes only paths recorded by the ownership manifest and empty ARC-created directories. Workspace data, configuration, durable audit data, and unrelated files are preserved. Explicit user-data deletion is outside Task 1. Reinstallation uses the same verification and locked-build path.
 
-This tooling does not provide OAuth/OIDC, hosted relay, public MCP hosting, ChatGPT or Claude connectors, directory publishing, tenancy, metering, billing, or subscriptions. Building or verifying a stable artifact does not publish it.
+## First-run Core setup
+
+A verified ARC installation provides three user-scoped launchers under `<user-prefix>/bin`:
+
+- `cesspace-arc-setup` creates the local Core state for one explicitly selected workspace;
+- `cesspace-arc` starts the local stdio MCP server from that validated Core state;
+- `cesspace-arc-chatgpt` starts the opt-in private ChatGPT-compatible MCP profile from the same Core state.
+
+Create the initial state with:
+
+```text
+<user-prefix>/bin/cesspace-arc-setup /absolute/path/to/authorized/workspace
+```
+
+By default the state is written under `~/.config/cesspace-arc/state`. The setup command refuses to overwrite an existing state directory. It generates a local Ed25519 audit checkpoint keypair, initializes an empty local device trust store and durable audit store, writes the strict Core configuration, and runs the production Core preflight before reporting success.
+
+The generated policy follows ARC's conservative compatibility policy: read-only inspection and bounded process supervision are available inside the selected workspace; file mutations and deterministic verification/test execution remain approval-gated. System trees and secret-path protection remain enforced by ARC's security kernel.
+
+After setup, a standards-conformant local MCP client can use `<user-prefix>/bin/cesspace-arc` as its stdio command. The client does not need a CesSpace account and does not receive authority outside the configured workspace.
+
+## Core access and commercial boundary
+
+ARC Core is free and open source under Apache-2.0. Local Core installation and use require **no CesSpace login, no CesSpace account, no credit card, no license key, and no subscription**. The website may distribute the installer and documentation, but it does not become a machine-control hop and receives no local ARC filesystem, terminal, approval, or audit authority.
+
+This tooling does not provide OAuth/OIDC, hosted relay, public MCP hosting, directory publishing, tenancy, metering, billing, or subscriptions. Building or verifying a stable artifact does not publish it.

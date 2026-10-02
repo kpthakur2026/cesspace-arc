@@ -23,6 +23,12 @@ export const INVENTORY_FILE = 'dependencies.json';
 export const PROVENANCE_FILE = 'provenance.json';
 export const RELEASE_PROFILE_FILE = 'arc10-release-profile.json';
 export const OWNERSHIP_FILE = '.cesspace-arc-install.json';
+export const LEGACY_INSTALL_FILES = Object.freeze(['bin/cesspace-arc']);
+export const CURRENT_INSTALL_FILES = Object.freeze([
+  'bin/cesspace-arc',
+  'bin/cesspace-arc-setup',
+  'bin/cesspace-arc-chatgpt',
+]);
 export const ARC_VERSION = '1.0.0';
 export const ARC_STAGE = 'ARC-1.0';
 export const EXPECTED_TOOL_COUNT = 25;
@@ -32,6 +38,8 @@ const SOURCE_PATTERNS = [
   /^(?:LICENSE|README\.md|SECURITY\.md|package\.json|pnpm-lock\.yaml|pnpm-workspace\.yaml|tsconfig(?:\.base)?\.json)$/,
   /^(?:apps|packages)\/[^/]+\/(?:package\.json|tsconfig\.json|src\/.*)$/,
   /^scripts\/arc10-[^/]+\.mjs$/,
+  /^scripts\/arc-integration-[^/]+\.mjs$/,
+  /^scripts\/arc-core-init\.mjs$/,
   /^docs\/distribution\/.*$/,
   /^release\/arc10-release-profile\.json$/,
 ];
@@ -672,10 +680,46 @@ export async function installDistribution({
     await command(commandRunner, 'pnpm', ['build'], { cwd: sourceStage });
     const launcherDir = path.join(prefixStage, 'bin');
     await fs.promises.mkdir(launcherDir, { recursive: true });
-    await fs.promises.symlink(
-      '../runtime/apps/mcp-server/dist/index.js',
-      path.join(launcherDir, 'cesspace-arc'),
-    );
+    const localLauncher = [
+      '#!/bin/sh',
+      'set -eu',
+      'PREFIX=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)',
+      ': "${HOME:?HOME is required}"',
+      'STATE_DIR=${CESSPACE_ARC_STATE_DIR:-"$HOME/.config/cesspace-arc/state"}',
+      'exec node "$PREFIX/runtime/scripts/arc-integration-stdio.mjs" "$STATE_DIR"',
+      '',
+    ].join('\n');
+    const setupLauncher = [
+      '#!/bin/sh',
+      'set -eu',
+      'PREFIX=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)',
+      ': "${HOME:?HOME is required}"',
+      'if [ "$#" -lt 1 ] || [ "$#" -gt 2 ]; then',
+      '  echo "Usage: cesspace-arc-setup <workspace> [state-directory]" >&2',
+      '  exit 2',
+      'fi',
+      'STATE_DIR=${2:-${CESSPACE_ARC_STATE_DIR:-"$HOME/.config/cesspace-arc/state"}}',
+      `exec node "$PREFIX/runtime/scripts/arc-core-init.mjs" "$PREFIX/${OWNERSHIP_FILE}" "$1" "$STATE_DIR"`,
+      '',
+    ].join('\n');
+    const chatgptLauncher = [
+      '#!/bin/sh',
+      'set -eu',
+      'PREFIX=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)',
+      ': "${HOME:?HOME is required}"',
+      'STATE_DIR=${CESSPACE_ARC_STATE_DIR:-"$HOME/.config/cesspace-arc/state"}',
+      'exec node "$PREFIX/runtime/scripts/arc-integration-chatgpt-private.mjs" "$STATE_DIR"',
+      '',
+    ].join('\n');
+    await fs.promises.writeFile(path.join(launcherDir, 'cesspace-arc'), localLauncher, {
+      mode: 0o755,
+    });
+    await fs.promises.writeFile(path.join(launcherDir, 'cesspace-arc-setup'), setupLauncher, {
+      mode: 0o755,
+    });
+    await fs.promises.writeFile(path.join(launcherDir, 'cesspace-arc-chatgpt'), chatgptLauncher, {
+      mode: 0o755,
+    });
     const ownership = {
       format: 'cesspace-arc-install-ownership-v1',
       version: ARC_VERSION,
@@ -683,7 +727,7 @@ export async function installDistribution({
       sourceCommit: verified.manifest.source.commit,
       sourceTree: verified.manifest.source.tree,
       profile: 'core',
-      files: ['bin/cesspace-arc'],
+      files: [...CURRENT_INSTALL_FILES],
       trees: ['runtime'],
     };
     await fs.promises.writeFile(
@@ -723,11 +767,14 @@ export async function uninstallDistribution({ prefix }) {
       'ARC ownership manifest is missing or invalid',
     );
   }
+  const filesProjection = Array.isArray(ownership.files) ? canonicalJson(ownership.files) : null;
+  const filesAreRecognized =
+    filesProjection === canonicalJson(LEGACY_INSTALL_FILES) ||
+    filesProjection === canonicalJson(CURRENT_INSTALL_FILES);
   if (
     ownership.format !== 'cesspace-arc-install-ownership-v1' ||
-    !Array.isArray(ownership.files) ||
+    !filesAreRecognized ||
     !Array.isArray(ownership.trees) ||
-    canonicalJson(ownership.files) !== canonicalJson(['bin/cesspace-arc']) ||
     canonicalJson(ownership.trees) !== canonicalJson(['runtime'])
   ) {
     throw new DistributionError('OWNERSHIP_MANIFEST_INVALID', 'ARC ownership manifest is invalid');
