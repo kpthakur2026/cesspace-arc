@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { execFile as execFileCallback } from 'node:child_process';
+import { execFile as execFileCallback, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -85,6 +85,96 @@ async function installedHealth(prefix, workspace) {
     return await client.health();
   } finally {
     await client.close();
+  }
+}
+
+async function installedLauncherHealth(prefix, workspace, stateDirectory, homeDirectory) {
+  const setup = path.join(prefix, 'bin', 'cesspace-arc-setup');
+  const launcher = path.join(prefix, 'bin', 'cesspace-arc');
+  const environment = {
+    ...process.env,
+    HOME: homeDirectory,
+    CESSPACE_ARC_STATE_DIR: stateDirectory,
+  };
+  await execFile(setup, [workspace, stateDirectory], {
+    env: environment,
+    maxBuffer: 32 * 1024 * 1024,
+  });
+
+  const proc = spawn(launcher, [], {
+    env: environment,
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  let id = 0;
+  let buffer = '';
+  let stderr = '';
+  const pending = new Map();
+  proc.stderr.on('data', (chunk) => {
+    stderr += chunk.toString('utf8');
+  });
+  proc.stdout.on('data', (chunk) => {
+    buffer += chunk.toString('utf8');
+    let newline = buffer.indexOf('\n');
+    while (newline !== -1) {
+      const line = buffer.slice(0, newline).trim();
+      buffer = buffer.slice(newline + 1);
+      if (line) {
+        const message = JSON.parse(line);
+        const waiter = pending.get(message.id);
+        if (waiter) {
+          pending.delete(message.id);
+          waiter.resolve(message);
+        }
+      }
+      newline = buffer.indexOf('\n');
+    }
+  });
+
+  const request = (method, params = {}) => {
+    const requestId = ++id;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pending.delete(requestId);
+        reject(new Error(`Installed ARC launcher request timed out: ${stderr}`));
+      }, 15_000);
+      pending.set(requestId, {
+        resolve(value) {
+          clearTimeout(timer);
+          resolve(value);
+        },
+      });
+      proc.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', id: requestId, method, params })}\n`);
+    });
+  };
+
+  try {
+    const initialized = await request('initialize', {
+      protocolVersion: '2025-11-25',
+      capabilities: {},
+      clientInfo: { name: 'arc-dist01-launcher', version: '1.0.0' },
+    });
+    if (initialized.error) throw new Error(JSON.stringify(initialized.error));
+    proc.stdin.write(
+      `${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized', params: {} })}\n`,
+    );
+    const response = await request('tools/call', { name: 'health', arguments: {} });
+    if (response.error) throw new Error(JSON.stringify(response.error));
+    const text = response.result.content.find((item) => item.type === 'text')?.text;
+    return JSON.parse(text);
+  } finally {
+    proc.stdin.end();
+    if (proc.exitCode === null) {
+      await new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          proc.kill('SIGKILL');
+          resolve();
+        }, 3000);
+        proc.once('exit', () => {
+          clearTimeout(timer);
+          resolve();
+        });
+      });
+    }
   }
 }
 
@@ -582,6 +672,38 @@ test('ARC10-FLOW-01 performs verified frozen source installation, real health st
   assert.equal(health.stage, ARC_STAGE);
   await uninstallDistribution({ prefix });
   await assert.rejects(fs.promises.access(path.join(prefix, 'runtime')), { code: 'ENOENT' });
+});
+
+test('ARC-DIST-01-FLOW-01 installs, initializes Core state, and serves MCP health through the installed launcher', async () => {
+  const root = await temporaryDirectory('arc-dist01-installed-flow-');
+  const prefix = path.join(root, 'prefix');
+  const workspace = path.join(root, 'workspace');
+  const home = path.join(root, 'home');
+  const state = path.join(home, '.config', 'cesspace-arc', 'state');
+  await fs.promises.mkdir(workspace, { recursive: true });
+  await fs.promises.mkdir(home, { recursive: true });
+
+  await installDistribution({
+    bundleDir: bundle,
+    trustedPublicKey: keys.publicKey,
+    prefix,
+  });
+
+  const health = await installedLauncherHealth(prefix, workspace, state, home);
+  assert.equal(health.version, ARC_VERSION);
+  assert.equal(health.stage, ARC_STAGE);
+  assert.equal(fs.existsSync(path.join(state, 'core-config.json')), true);
+  assert.equal(fs.existsSync(path.join(state, 'secrets', 'audit-signing.pem')), true);
+
+  const config = JSON.parse(
+    await fs.promises.readFile(path.join(state, 'core-config.json'), 'utf8'),
+  );
+  assert.equal(config.workspaces[0].root, fs.realpathSync(workspace));
+  assert.equal('account' in config, false);
+  assert.equal('billing' in config, false);
+
+  await uninstallDistribution({ prefix });
+  assert.equal(fs.existsSync(path.join(state, 'core-config.json')), true);
 });
 
 test('ARC10-FLOW-02 produces equivalent normalized release evidence in independent clean builders', async () => {
