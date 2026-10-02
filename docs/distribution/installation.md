@@ -68,6 +68,14 @@ The generated policy follows ARC's conservative compatibility policy: read-only 
 
 After setup, a standards-conformant local MCP client can use `<user-prefix>/bin/cesspace-arc` as its stdio command. The client does not need a CesSpace account and does not receive authority outside the configured workspace.
 
+For ChatGPT, after the operator creates an OpenAI Secure MCP Tunnel associated with the intended ChatGPT workspace, the installed launcher also provides:
+
+```text
+<user-prefix>/bin/cesspace-arc connect chatgpt --tunnel-id tunnel_...
+```
+
+This helper keeps ARC bound to loopback, preserves Core policy/approval/audit authority, stores local connection secrets as owner-only files, uses an operator-installed supported `tunnel-client`, and reports the exact Tunnel/No-authentication settings to use in ChatGPT. The Platform API key is never accepted as a command-line value.
+
 ## Core access and commercial boundary
 
 ARC Core is free and open source under Apache-2.0. Local Core installation and use require **no CesSpace login, no CesSpace account, no credit card, no license key, and no subscription**. The website may distribute the installer and documentation, but it does not become a machine-control hop and receives no local ARC filesystem, terminal, approval, or audit authority.
