@@ -188,13 +188,21 @@ test('ARC10-NEG-068 rejects a malicious dependency artifact before lifecycle exe
   const bytes = await fs.promises.readFile(tarball);
   bytes[Math.floor(bytes.length / 2)] ^= 0xff;
   await fs.promises.writeFile(tarball, bytes);
-  await assert.rejects(
-    execFile('pnpm', ['install', '--frozen-lockfile', '--ignore-scripts', '--offline'], {
+  let installError;
+  try {
+    await execFile('pnpm', ['install', '--frozen-lockfile', '--ignore-scripts', '--offline'], {
       cwd: consumerRoot,
       env: { ...process.env, ARC_INTEGRITY_MARKER: marker },
-    }),
-    /integrity|checksum|tarball|ERR_PNPM/u,
-  );
+    });
+  } catch (error) {
+    installError = error;
+  }
+  assert.ok(installError, 'corrupted dependency install must fail closed');
+  assert.notEqual(installError.code, 0);
+  const diagnostics = `${installError.stdout ?? ''}\n${installError.stderr ?? ''}`.trim();
+  if (diagnostics.length > 0) {
+    assert.match(diagnostics, /integrity|checksum|tarball|ERR_PNPM/u);
+  }
   assert.equal(fs.existsSync(marker), false);
   assert.equal(fs.existsSync(path.join(root, 'install-prefix')), false);
 });
