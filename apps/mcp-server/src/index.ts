@@ -4481,6 +4481,21 @@ export class ArcMcpServer implements IArcMcpServer {
       const resolved = resolveChatGptRemoteConfig(this.chatgptConfig);
       this.chatgptAuthBridge = new ChatGptAuthBridge({
         expectedToken: resolved.expectedToken,
+        ...(resolved.expectedClaudeLocalToken
+          ? {
+              additionalCredentials: [
+                {
+                  expectedToken: resolved.expectedClaudeLocalToken,
+                  actor: {
+                    clientId: 'claude-client',
+                    clientType: 'claude-local',
+                    deviceId: 'claude-desktop-local',
+                  },
+                  sessionPrefix: 'claude-sess',
+                },
+              ],
+            }
+          : {}),
         sink: this,
         auditLogger: this.auditLogger,
       });
