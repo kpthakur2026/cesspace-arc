@@ -214,12 +214,22 @@ function ensureAdapterSecrets(paths) {
   if (!fs.existsSync(paths.arcTokenFile)) {
     writePrivateFile(paths.arcTokenFile, `${crypto.randomBytes(32).toString('hex')}\n`);
   }
-  assertPrivateRegularFile(paths.arcTokenFile, 'ARC local adapter token file');
-  const token = fs.readFileSync(paths.arcTokenFile, 'utf8').trim();
-  if (!/^[A-Fa-f0-9]{64}$/.test(token)) fail('ARC_TOKEN_INVALID', 'ARC local adapter token is invalid.');
-  writePrivateFile(paths.arcAuthorizationHeaderFile, `Bearer ${token}`);
+  if (!fs.existsSync(paths.claudeTokenFile)) {
+    writePrivateFile(paths.claudeTokenFile, `${crypto.randomBytes(32).toString('hex')}\n`);
+  }
+  assertPrivateRegularFile(paths.arcTokenFile, 'ARC ChatGPT token file');
+  assertPrivateRegularFile(paths.claudeTokenFile, 'ARC Claude local token file');
+  const chatgptToken = fs.readFileSync(paths.arcTokenFile, 'utf8').trim();
+  const claudeToken = fs.readFileSync(paths.claudeTokenFile, 'utf8').trim();
+  if (!/^[A-Fa-f0-9]{64}$/.test(chatgptToken) || !/^[A-Fa-f0-9]{64}$/.test(claudeToken)) {
+    fail('ARC_TOKEN_INVALID', 'ARC local transport token is invalid.');
+  }
+  if (chatgptToken === claudeToken) {
+    fail('ARC_TOKEN_INVALID', 'ChatGPT and Claude local transport tokens must be distinct.');
+  }
+  writePrivateFile(paths.arcAuthorizationHeaderFile, `Bearer ${chatgptToken}`);
   assertPrivateRegularFile(paths.arcAuthorizationHeaderFile, 'ARC Authorization header file');
-  return token;
+  return { chatgptToken, claudeToken };
 }
 
 function readPid(filePath) {
@@ -280,7 +290,7 @@ function spawnDetached(file, args, { env, logFile, pidFile }) {
   return child.pid;
 }
 
-async function waitForAdapter(pid, token, paths) {
+async function waitForAdapter(pid, tokens, paths) {
   const deadline = Date.now() + 10000;
   while (Date.now() < deadline) {
     if (!processAlive(pid)) {
@@ -289,7 +299,11 @@ async function waitForAdapter(pid, token, paths) {
         : '';
       fail('ADAPTER_START_FAILED', log || 'ARC private loopback adapter exited during startup.');
     }
-    if (await probeAdapter(token)) return;
+    const readiness = await Promise.all([
+      probeAdapter(tokens.chatgptToken),
+      probeAdapter(tokens.claudeToken),
+    ]);
+    if (readiness.every(Boolean)) return;
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
   fail('ADAPTER_START_TIMEOUT', 'ARC private loopback adapter did not become healthy in time.');
@@ -298,19 +312,25 @@ async function waitForAdapter(pid, token, paths) {
 async function ensureSharedAdapter({ prefix, stateDirectory, paths }) {
   ensurePrivateDirectory(paths.configRoot);
   ensurePrivateDirectory(paths.stateRoot);
-  const token = ensureAdapterSecrets(paths);
+  const tokens = ensureAdapterSecrets(paths);
   const pid = readPid(paths.adapterPidFile);
   if (processAlive(pid)) {
     if (!processCommandLine(pid).includes('arc-integration-chatgpt-private.mjs')) {
       fail('PID_OWNERSHIP_MISMATCH', 'ARC adapter PID file refers to an unexpected process.');
     }
-    if (!(await probeAdapter(token))) {
+    const chatgptHealthy = await probeAdapter(tokens.chatgptToken);
+    const claudeHealthy = await probeAdapter(tokens.claudeToken);
+    if (chatgptHealthy && claudeHealthy) return { pid, reused: true };
+    if (chatgptHealthy && !claudeHealthy) {
       fail(
-        'ADAPTER_AUTH_MISMATCH',
-        'The running ARC adapter did not accept the stored local credential. Refusing to replace it.',
+        'ADAPTER_RESTART_REQUIRED',
+        'The running ARC adapter predates Claude-local credential support. Stop it cleanly before reconnecting so ARC can restart with both server-owned credentials.',
       );
     }
-    return { pid, reused: true };
+    fail(
+      'ADAPTER_AUTH_MISMATCH',
+      'The running ARC adapter did not accept the stored transport credentials. Refusing to replace it.',
+    );
   }
   removeFileIfExists(paths.adapterPidFile);
   const script = path.join(prefix, 'runtime', 'scripts', 'arc-integration-chatgpt-private.mjs');
@@ -320,6 +340,7 @@ async function ensureSharedAdapter({ prefix, stateDirectory, paths }) {
   const env = {
     ...process.env,
     CESSPACE_ARC_CHATGPT_TOKEN_FILE: paths.arcTokenFile,
+    CESSPACE_ARC_CLAUDE_TOKEN_FILE: paths.claudeTokenFile,
     CESSPACE_ARC_CHATGPT_PORT: String(DEFAULT_PORT),
     CESSPACE_ARC_CHATGPT_BIND_HOST: '127.0.0.1',
   };
@@ -328,7 +349,7 @@ async function ensureSharedAdapter({ prefix, stateDirectory, paths }) {
     logFile: paths.adapterLogFile,
     pidFile: paths.adapterPidFile,
   });
-  await waitForAdapter(startedPid, token, paths);
+  await waitForAdapter(startedPid, tokens, paths);
   return { pid: startedPid, reused: false };
 }
 
@@ -402,10 +423,10 @@ export async function manageClaudeConnection({
 
   if (args.action === 'status') {
     let adapterHealthy = false;
-    if (fs.existsSync(paths.arcTokenFile)) {
+    if (fs.existsSync(paths.claudeTokenFile)) {
       try {
         const token = fs.readFileSync(
-          assertPrivateRegularFile(paths.arcTokenFile, 'ARC local adapter token file'),
+          assertPrivateRegularFile(paths.claudeTokenFile, 'ARC Claude local token file'),
           'utf8',
         ).trim();
         adapterHealthy = await probeAdapter(token);
