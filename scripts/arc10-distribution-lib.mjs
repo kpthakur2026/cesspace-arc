@@ -718,7 +718,7 @@ export async function installDistribution({
       '    exit 2',
       '  fi',
       '  shift 2',
-      '  exec node "$PREFIX/runtime/scripts/arc-claude-stdio-proxy.mjs" "$@"',
+      '  exec node "$PREFIX/runtime/scripts/arc-connect-claude-proxy.mjs" "$@"',
       'fi',
       'exec node "$PREFIX/runtime/scripts/arc-integration-stdio.mjs" "$STATE_DIR"',
       '',
