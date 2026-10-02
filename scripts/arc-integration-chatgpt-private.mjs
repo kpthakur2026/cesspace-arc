@@ -41,12 +41,17 @@ export function resolvePrivateChatGptProfile(env = process.env) {
     DEFAULT_PORT,
   );
   const tunnelHostname = env.CESSPACE_ARC_CHATGPT_TUNNEL_HOSTNAME?.trim() || undefined;
+  const claudeLocalAuthTokenPath =
+    env.CESSPACE_ARC_CLAUDE_TOKEN_FILE?.trim() || undefined;
 
   return {
     enabled: true,
     bindHost,
     port,
     authTokenPath: path.resolve(authTokenPath),
+    ...(claudeLocalAuthTokenPath
+      ? { claudeLocalAuthTokenPath: path.resolve(claudeLocalAuthTokenPath) }
+      : {}),
     ...(tunnelHostname ? { tunnelHostname } : {}),
   };
 }
