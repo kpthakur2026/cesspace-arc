@@ -16,9 +16,27 @@ The ChatGPT adapter:
 - uses server-generated MCP sessions;
 - routes tool execution through ARC's existing policy, approval, containment, and audit pipeline.
 
-## Start the private adapter
+## Preferred connection helper
 
-Build/install ARC and prepare a valid Core state through the normal Core configuration lifecycle. Then create a token file outside the repository:
+After installing ARC Core and creating a valid Core state, create an OpenAI Secure MCP Tunnel in the OpenAI Platform UI and associate it with the ChatGPT workspace that will use ARC. Then run:
+
+```text
+cesspace-arc connect chatgpt --tunnel-id tunnel_...
+```
+
+The helper validates Core preflight and audit integrity, creates owner-only local connection secrets, starts the loopback-only ARC adapter, configures `tunnel-client` with file-backed secret references, runs its doctor check, starts the tunnel daemon, and waits for both ARC MCP initialization and tunnel readiness.
+
+ARC Core does not download, bundle, or own the external tunnel runtime. Install the supported `tunnel-client` from the platform tunnel settings first, or provide its absolute path with `--tunnel-client`. This preserves Core's vendor-neutral local execution boundary.
+
+The Platform API key is never accepted as a command-line value. If no protected key file already exists, the helper prompts for it with hidden input and stores it locally with mode `0600`. An existing owner-only key file can instead be selected with `--api-key-file`.
+
+In ChatGPT custom MCP settings select **Tunnel**, use the operator-created `tunnel_...` identifier, and select **No authentication**. ARC's bearer credential remains local between `tunnel-client` and the loopback adapter; it is not entered into ChatGPT.
+
+Re-running the command reuses the saved tunnel identifier and owner-only secrets unless the operator explicitly supplies a different tunnel ID or key file.
+
+## Manual private-adapter path
+
+The steps below remain available for advanced operation and debugging. Build/install ARC and prepare a valid Core state through the normal Core configuration lifecycle. Then create a token file outside the repository:
 
 ```text
 umask 077
