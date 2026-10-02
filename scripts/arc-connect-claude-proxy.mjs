@@ -25,7 +25,7 @@ function fail(code, message) {
 function defaultTokenFile(env = process.env) {
   const home = env.HOME?.trim();
   if (!home || !path.isAbsolute(home)) fail('HOME_REQUIRED', 'HOME must be an absolute path.');
-  return path.join(home, '.config', 'cesspace-arc', 'connect', 'chatgpt', 'arc-token');
+  return path.join(home, '.config', 'cesspace-arc', 'connect', 'chatgpt', 'claude-token');
 }
 
 export function resolveClaudeProxyConfig(env = process.env) {
