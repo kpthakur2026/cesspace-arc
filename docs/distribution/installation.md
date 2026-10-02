@@ -76,6 +76,18 @@ For ChatGPT, after the operator creates an OpenAI Secure MCP Tunnel associated w
 
 This helper keeps ARC bound to loopback, preserves Core policy/approval/audit authority, stores local connection secrets as owner-only files, uses an operator-installed supported `tunnel-client`, and reports the exact Tunnel/No-authentication settings to use in ChatGPT. The Platform API key is never accepted as a command-line value.
 
+For Claude Desktop on the same machine, the installed launcher provides:
+
+```text
+<user-prefix>/bin/cesspace-arc connect claude
+<user-prefix>/bin/cesspace-arc status claude
+<user-prefix>/bin/cesspace-arc disconnect claude
+```
+
+The Claude helper validates Core first, reuses or starts the same loopback ARC adapter, and atomically merges a local `cesspace-arc` MCP entry into Claude Desktop's configuration. Claude launches `cesspace-arc proxy claude`, a transport-only stdio bridge into that shared ARC process. No ARC bearer token or other secret is written into Claude configuration, and the proxy contains no filesystem, Git, terminal, process, policy, approval, or audit implementation of its own.
+
+The shared adapter is intentional: ARC's durable audit store is single-writer, so ChatGPT and Claude must not each start an independent ARC process against the same Core state.
+
 ## Core access and commercial boundary
 
 ARC Core is free and open source under Apache-2.0. Local Core installation and use require **no CesSpace login, no CesSpace account, no credit card, no license key, and no subscription**. The website may distribute the installer and documentation, but it does not become a machine-control hop and receives no local ARC filesystem, terminal, approval, or audit authority.
