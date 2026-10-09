@@ -486,6 +486,28 @@ function effectiveTokens(limiter, key) {
   return Math.min(LAYER_C_BURST, bucket.tokens + elapsed / LAYER_C_REFILL_MS);
 }
 
+/** A stable copy of the fields needed to account for one Layer C charge. */
+function tokenSnapshot(limiter, key) {
+  const bucket = limiter.getBucket(key);
+  assert.ok(bucket, `the session key ${key} must be retained`);
+  return { tokens: bucket.tokens, lastRefillMs: bucket.lastRefillMs };
+}
+
+/**
+ * Tokens charged between two bucket snapshots, excluding lazy refill.
+ *
+ * A successful `consume` first projects the stored balance to its monotonic
+ * `lastRefillMs`, then subtracts one. Projecting the before snapshot to that
+ * same recorded instant accounts for refill before admission without counting
+ * refill during the rest of the asynchronous request.
+ */
+function tokensCharged(before, after) {
+  const elapsed = after.lastRefillMs - before.lastRefillMs;
+  assert.ok(elapsed >= 0, 'the monotonic refill snapshot must not move backwards');
+  const availableAtConsume = Math.min(LAYER_C_BURST, before.tokens + elapsed / LAYER_C_REFILL_MS);
+  return availableAtConsume - after.tokens;
+}
+
 /**
  * Empties one session's Layer C rate budget through the SAME primitive the
  * admission authority uses, and returns how many tokens were available.
@@ -602,18 +624,18 @@ describe('CesSpace ARC — RC-05 Task 8 correction: gateway admission gaps', () 
 
       // Token accounting is measured on the same table the tool path uses. The
       // bucket is taken below its cap first, so no accrual is clamped.
-      const beforeList = effectiveTokens(limiter, key);
+      const beforePing = tokenSnapshot(limiter, key);
       const ping = await request(port, {
         method: 'POST',
         headers: { ...MCP_POST_HEADERS, ...sessionHeaders(sessionId, token) },
         body: nonToolBody(3, 'ping'),
       });
       assertSucceeded(ping, 3, 'ping');
-      const afterPing = effectiveTokens(limiter, key);
-      const pingSpent = beforeList - afterPing;
-      assert.ok(
-        Math.abs(pingSpent - 1) <= 0.25,
-        `a non-tool authenticated request spends ONE token, spent ${pingSpent}`,
+      const afterPing = tokenSnapshot(limiter, key);
+      assert.equal(
+        tokensCharged(beforePing, afterPing),
+        1,
+        'a non-tool authenticated request spends ONE token',
       );
       onlyKey(limiter, key);
 
@@ -621,11 +643,11 @@ describe('CesSpace ARC — RC-05 Task 8 correction: gateway admission gaps', () 
       // one, so the stream shares the request budget rather than escaping it.
       const streamed = await openStream(port, sessionId, token);
       assert.equal(streamed.res.statusCode, 200);
-      const afterStream = effectiveTokens(limiter, key);
-      const streamSpent = afterPing - afterStream;
-      assert.ok(
-        Math.abs(streamSpent - 1) <= 0.25,
-        `an authenticated GET SSE request spends ONE token, spent ${streamSpent}`,
+      const afterStream = tokenSnapshot(limiter, key);
+      assert.equal(
+        tokensCharged(afterPing, afterStream),
+        1,
+        'an authenticated GET SSE request spends ONE token',
       );
       onlyKey(limiter, key);
       streamed.req.destroy();
@@ -725,7 +747,7 @@ describe('CesSpace ARC — RC-05 Task 8 correction: gateway admission gaps', () 
       });
       assertSucceeded(warm, 2, 'warm-up');
 
-      const before = effectiveTokens(limiter, key);
+      const before = tokenSnapshot(limiter, key);
       const call = await request(port, {
         method: 'POST',
         headers: { ...MCP_POST_HEADERS, ...sessionHeaders(sessionId, token) },
@@ -737,17 +759,12 @@ describe('CesSpace ARC — RC-05 Task 8 correction: gateway admission gaps', () 
       const health = JSON.parse(result.content[0].text);
       assert.equal(health.enrolledDevicesCount, 1, 'the shared pipeline really ran');
 
-      // Read the raw token value stored in the bucket right after the consume
-      // (no lazy-refill projection — wall-clock accrual during the async HTTP
-      // round trip would otherwise make the delta appear less than 1).
-      const bucketAfter = limiter.getBucket(key);
-      assert.ok(bucketAfter, 'bucket must still be retained after the call');
-      const spent = before - bucketAfter.tokens;
+      const after = tokenSnapshot(limiter, key);
 
       // Exactly one: zero would mean the transport bypassed Layer C for a tool
       // call, and two would mean the call was charged once at the transport and
       // again inside the bridge.
-      assert.ok(Math.abs(spent - 1) <= 0.25, `a tool call spends ONE token, spent ${spent}`);
+      assert.equal(tokensCharged(before, after), 1, 'a tool call spends ONE token');
     } finally {
       await server.stop();
     }
