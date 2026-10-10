@@ -48,6 +48,7 @@ import {
   remoteRateLimitFailure,
 } from '../apps/mcp-server/dist/remote-execution.js';
 import {
+  BoundedRequestLimiter,
   LAYER_C_BURST,
   LAYER_C_REQUESTS_PER_MINUTE,
   MAX_LAYER_C_KEYS,
@@ -486,6 +487,27 @@ function effectiveTokens(limiter, key) {
   return Math.min(LAYER_C_BURST, bucket.tokens + elapsed / LAYER_C_REFILL_MS);
 }
 
+/** A stable copy of the fields needed to account for one Layer C charge. */
+function tokenSnapshot(limiter, key) {
+  const bucket = limiter.getBucket(key);
+  assert.ok(bucket, `the session key ${key} must be retained`);
+  return { tokens: bucket.tokens, lastRefillMs: bucket.lastRefillMs };
+}
+
+/**
+ * Tokens charged between two bucket snapshots, excluding lazy refill.
+ *
+ * A successful consume first projects the stored balance to its monotonic
+ * lastRefillMs, then subtracts one. Projecting the before snapshot to that same
+ * instant excludes asynchronous response latency without relaxing the debit.
+ */
+function tokensCharged(before, after) {
+  const elapsed = after.lastRefillMs - before.lastRefillMs;
+  assert.ok(elapsed >= 0, 'the monotonic refill snapshot must not move backwards');
+  const availableAtConsume = Math.min(LAYER_C_BURST, before.tokens + elapsed / LAYER_C_REFILL_MS);
+  return availableAtConsume - after.tokens;
+}
+
 /**
  * Empties one session's Layer C rate budget through the SAME primitive the
  * admission authority uses, and returns how many tokens were available.
@@ -566,6 +588,33 @@ function assertAuthorityRefused(res, label) {
 // ===========================================================================
 
 describe('CesSpace ARC — RC-05 Task 8 correction: gateway admission gaps', () => {
+  test('RC05-NEG-56: fractional residual credit permits only an exact one-token debit', async () => {
+    let now = 1_000;
+    const limiter = new BoundedRequestLimiter({
+      requestsPerMinute: LAYER_C_REQUESTS_PER_MINUTE,
+      burst: 2,
+      maxKeys: 1,
+      getMonotonicTimeMs: () => now,
+    });
+    const key = 'device:session';
+    assert.equal(limiter.consume(key).consumed, true);
+    assert.equal(limiter.consume(key).consumed, true);
+
+    now += 50;
+    assert.deepEqual(limiter.consume(key), { consumed: false, reason: 'RATE_LIMIT' });
+    const drained = tokenSnapshot(limiter, key);
+    assert.equal(drained.tokens, 0.25, 'the denied drain retains fractional credit');
+
+    await Promise.resolve();
+    now += 150;
+    const admitted = limiter.consume(key);
+    assert.equal(admitted.consumed, true, 'only the residual refill time is required');
+    const after = tokenSnapshot(limiter, key);
+    assert.equal(after.lastRefillMs - drained.lastRefillMs, 150);
+    assert.equal(tokensCharged(drained, after), 1, 'admission still debits exactly one token');
+    assert.deepEqual(limiter.consume(key), { consumed: false, reason: 'RATE_LIMIT' });
+  });
+
   // =========================================================================
   // §21.1 Layer C: EVERY authenticated MCP request, on the ONE table
   // =========================================================================
@@ -602,31 +651,23 @@ describe('CesSpace ARC — RC-05 Task 8 correction: gateway admission gaps', () 
 
       // Token accounting is measured on the same table the tool path uses. The
       // bucket is taken below its cap first, so no accrual is clamped.
-      const beforeList = effectiveTokens(limiter, key);
+      const beforePing = tokenSnapshot(limiter, key);
       const ping = await request(port, {
         method: 'POST',
         headers: { ...MCP_POST_HEADERS, ...sessionHeaders(sessionId, token) },
         body: nonToolBody(3, 'ping'),
       });
       assertSucceeded(ping, 3, 'ping');
-      const afterPing = effectiveTokens(limiter, key);
-      const pingSpent = beforeList - afterPing;
-      assert.ok(
-        Math.abs(pingSpent - 1) <= 0.25,
-        `a non-tool authenticated request spends ONE token, spent ${pingSpent}`,
-      );
+      const afterPing = tokenSnapshot(limiter, key);
+      assert.equal(tokensCharged(beforePing, afterPing), 1);
       onlyKey(limiter, key);
 
       // ...and a GET is charged on exactly the same key, not a stream-specific
       // one, so the stream shares the request budget rather than escaping it.
       const streamed = await openStream(port, sessionId, token);
       assert.equal(streamed.res.statusCode, 200);
-      const afterStream = effectiveTokens(limiter, key);
-      const streamSpent = afterPing - afterStream;
-      assert.ok(
-        Math.abs(streamSpent - 1) <= 0.25,
-        `an authenticated GET SSE request spends ONE token, spent ${streamSpent}`,
-      );
+      const afterStream = tokenSnapshot(limiter, key);
+      assert.equal(tokensCharged(afterPing, afterStream), 1);
       onlyKey(limiter, key);
       streamed.req.destroy();
     } finally {
@@ -670,9 +711,8 @@ describe('CesSpace ARC — RC-05 Task 8 correction: gateway admission gaps', () 
       for (const [label, shape, expectedId] of refusedKinds) {
         for (let attempt = 0; ; attempt += 1) {
           drainBudget(limiter, key);
-          // Measured from the moment the budget was emptied: a token can only
-          // have been granted if a whole refill interval has passed since then.
-          const drainedAt = performance.now();
+          const drained = tokenSnapshot(limiter, key);
+          assert.ok(drained.tokens < 1, `${label}: drain must leave less than one token`);
           const res =
             shape.method === 'GET'
               ? await getBounded(port, sessionId, token)
@@ -681,7 +721,7 @@ describe('CesSpace ARC — RC-05 Task 8 correction: gateway admission gaps', () 
                   headers: { ...MCP_POST_HEADERS, ...sessionHeaders(sessionId, token) },
                   body: shape.body,
                 });
-          const elapsed = performance.now() - drainedAt;
+          const after = tokenSnapshot(limiter, key);
           // Layer C is refused on the MCP channel, so the refusal is recognised
           // by its JSON-RPC error code rather than by an HTTP status.
           if (res.body.includes('RATE_LIMIT_EXCEEDED')) {
@@ -691,10 +731,16 @@ describe('CesSpace ARC — RC-05 Task 8 correction: gateway admission gaps', () 
             });
             break;
           }
-          assert.ok(
-            elapsed >= LAYER_C_REFILL_MS - 20,
-            `${label}: only a refill may explain a ${res.status} after ${elapsed}ms`,
+          // A drain can retain fractional credit. If dispatch crosses the
+          // residual refill time, admission is legitimate only if the exact
+          // consume-time projection reached one and exactly one token was
+          // debited. Response-completion latency is deliberately irrelevant.
+          const availableAtConsume = Math.min(
+            LAYER_C_BURST,
+            drained.tokens + (after.lastRefillMs - drained.lastRefillMs) / LAYER_C_REFILL_MS,
           );
+          assert.ok(availableAtConsume >= 1, `${label}: admission requires one accrued token`);
+          assert.equal(tokensCharged(drained, after), 1, `${label}: admission debits exactly one`);
           assert.ok(attempt < 4, `${label}: the budget must refuse the request`);
         }
       }
@@ -725,7 +771,7 @@ describe('CesSpace ARC — RC-05 Task 8 correction: gateway admission gaps', () 
       });
       assertSucceeded(warm, 2, 'warm-up');
 
-      const before = effectiveTokens(limiter, key);
+      const before = tokenSnapshot(limiter, key);
       const call = await request(port, {
         method: 'POST',
         headers: { ...MCP_POST_HEADERS, ...sessionHeaders(sessionId, token) },
@@ -740,14 +786,12 @@ describe('CesSpace ARC — RC-05 Task 8 correction: gateway admission gaps', () 
       // Read the raw token value stored in the bucket right after the consume
       // (no lazy-refill projection — wall-clock accrual during the async HTTP
       // round trip would otherwise make the delta appear less than 1).
-      const bucketAfter = limiter.getBucket(key);
-      assert.ok(bucketAfter, 'bucket must still be retained after the call');
-      const spent = before - bucketAfter.tokens;
+      const after = tokenSnapshot(limiter, key);
 
       // Exactly one: zero would mean the transport bypassed Layer C for a tool
       // call, and two would mean the call was charged once at the transport and
       // again inside the bridge.
-      assert.ok(Math.abs(spent - 1) <= 0.25, `a tool call spends ONE token, spent ${spent}`);
+      assert.equal(tokensCharged(before, after), 1, 'a tool call spends ONE token');
     } finally {
       await server.stop();
     }

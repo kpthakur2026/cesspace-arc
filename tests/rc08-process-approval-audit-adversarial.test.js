@@ -86,6 +86,15 @@ function alive(pid) {
   }
 }
 
+async function waitFor(predicate, timeoutMs = 5_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (predicate()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  return predicate();
+}
+
 async function waitForDead(pid, attempts = 40) {
   for (let index = 0; index < attempts; index += 1) {
     if (!alive(pid)) return true;
@@ -319,7 +328,13 @@ test('RC08-NEG-052: stubborn child records ordered SIGTERM then SIGKILL and leav
   assert.ok(types.indexOf('PROCESS_SIGKILL_ESCALATED') > types.indexOf('PROCESS_SIGTERM_SENT'));
   assert.match(record.state, /^(TIMED_OUT|TERMINATED)$/);
   assert.equal(record._killTimer, undefined);
-  assert.deepEqual(fs.existsSync(processStateDir) ? fs.readdirSync(processStateDir) : [], []);
+  assert.equal(
+    await waitFor(
+      () => !fs.existsSync(processStateDir) || fs.readdirSync(processStateDir).length === 0,
+    ),
+    true,
+    'bounded post-exit cleanup must remove the proven-dead process artifact',
+  );
 });
 
 test('RC08-NEG-053: process-group cleanup reaps a stubborn descendant and PID reuse is skipped', async () => {
@@ -337,7 +352,13 @@ test('RC08-NEG-053: process-group cleanup reaps a stubborn descendant and PID re
   const descendantPid = Number(descendantMatch[1]);
   await new Promise((resolve) => setTimeout(resolve, 1300));
   assert.equal(await waitForDead(descendantPid), true, 'no descendant may survive escalation');
-  assert.deepEqual(fs.existsSync(processStateDir) ? fs.readdirSync(processStateDir) : [], []);
+  assert.equal(
+    await waitFor(
+      () => !fs.existsSync(processStateDir) || fs.readdirSync(processStateDir).length === 0,
+    ),
+    true,
+    'bounded post-exit cleanup must remove the proven-dead descendant artifact',
+  );
 
   if (process.platform === 'linux') {
     const stateDir = path.join(tempRoot, 'neg053-reused-state');

@@ -347,7 +347,14 @@ test('RC08-NEG-061: per-workspace process concurrency refuses the fifth real sup
     await stopAllProcesses(server);
     await Promise.allSettled(launches);
   }
-  assert.deepEqual(fs.existsSync(processStateDir) ? fs.readdirSync(processStateDir) : [], []);
+  assert.equal(
+    await waitFor(
+      () => !fs.existsSync(processStateDir) || fs.readdirSync(processStateDir).length === 0,
+      2_000,
+    ),
+    true,
+    'bounded post-exit cleanup must remove every proven-dead process artifact',
+  );
 });
 
 test('RC08-NEG-062: global process concurrency caps ten real children and never queues process eleven', async () => {
@@ -384,7 +391,14 @@ test('RC08-NEG-062: global process concurrency caps ten real children and never 
     await Promise.allSettled(launches);
   }
   assert.equal(server.processRegistry.countRunning(), 0);
-  assert.deepEqual(fs.existsSync(processStateDir) ? fs.readdirSync(processStateDir) : [], []);
+  assert.equal(
+    await waitFor(
+      () => !fs.existsSync(processStateDir) || fs.readdirSync(processStateDir).length === 0,
+      2_000,
+    ),
+    true,
+    'bounded post-exit cleanup must remove every proven-dead process artifact',
+  );
 });
 
 test('RC08-NEG-063: concurrent durable audit appends preserve one contiguous hash chain', async () => {
@@ -809,6 +823,138 @@ test('RC08-NEG-070: persisted process restart sweep reaps a matching orphan and 
   assert.equal(stale.swept.length, 0);
   assert.equal(stale.skipped.length, 1);
   assert.equal(alive(process.pid), true);
+});
+
+test('RC08 cleanup rechecks are idempotent across close/escalation race orderings', async () => {
+  for (const closeBeforeEscalation of [true, false]) {
+    const stateDir = path.join(
+      tempRoot,
+      `cleanup-order-${closeBeforeEscalation ? 'close-first' : 'escalation-first'}`,
+    );
+    fs.mkdirSync(stateDir);
+    const registry = new ProcessRegistry();
+    registry.setProcessStateDir(stateDir);
+    const record = registry.registerProcess({
+      workspaceId: 'ws',
+      actor: ACTOR,
+      executable: process.execPath,
+      sanitizedArgs: [],
+      cwd: tempRoot,
+      startedAt: new Date().toISOString(),
+      state: 'TERMINATING',
+      timedOut: false,
+    });
+    const artifact = path.join(stateDir, `${record.processId}.json`);
+    fs.writeFileSync(
+      artifact,
+      JSON.stringify({ processId: record.processId, pid: 999999, executable: process.execPath }),
+    );
+
+    let probes = 0;
+    registry.isPersistedProcessGroupDead = () => {
+      probes += 1;
+      return probes >= 3;
+    };
+
+    if (closeBeforeEscalation) {
+      record._killTimer = { pendingEscalation: true };
+      registry.markCompleted(record.processId, null, 'SIGKILL');
+      assert.equal(record._cleanupTimer, undefined, 'close must wait for escalation finalization');
+      record._killTimer = undefined;
+    } else {
+      record._killTimer = undefined;
+      registry.markCompleted(record.processId, null, 'SIGKILL');
+    }
+
+    registry.schedulePostExitCleanup(record.processId);
+    registry.schedulePostExitCleanup(record.processId);
+    assert.equal(await waitFor(() => !fs.existsSync(artifact), 2_000), true);
+    assert.equal(probes, 3, 'one immediate probe plus bounded serialized rechecks');
+    assert.equal(record._cleanupTimer, undefined);
+  }
+});
+
+test('RC08 cleanup exhaustion retains evidence and shutdown cancels its retry timer', async () => {
+  const stateDir = path.join(tempRoot, 'cleanup-exhaustion');
+  fs.mkdirSync(stateDir);
+  const registry = new ProcessRegistry();
+  registry.setProcessStateDir(stateDir);
+  const record = registry.registerProcess({
+    workspaceId: 'ws',
+    actor: ACTOR,
+    executable: process.execPath,
+    sanitizedArgs: [],
+    cwd: tempRoot,
+    startedAt: new Date().toISOString(),
+    state: 'TERMINATING',
+    timedOut: false,
+  });
+  const artifact = path.join(stateDir, `${record.processId}.json`);
+  fs.writeFileSync(
+    artifact,
+    JSON.stringify({ processId: record.processId, pid: 999999, executable: process.execPath }),
+  );
+  registry.isPersistedProcessGroupDead = () => false;
+
+  registry.markCompleted(record.processId, null, 'SIGKILL');
+  assert.equal(
+    await waitFor(
+      () => record._cleanupAttempts === 20 && record._cleanupTimer === undefined,
+      2_000,
+    ),
+    true,
+  );
+  assert.equal(fs.existsSync(artifact), true, 'ambiguous ownership evidence must remain durable');
+
+  record._cleanupAttempts = undefined;
+  registry.schedulePostExitCleanup(record.processId);
+  assert.ok(record._cleanupTimer, 'a new bounded cleanup pass must schedule a retry');
+  registry.clear();
+  assert.equal(record._cleanupTimer, undefined, 'shutdown must cancel the pending recheck');
+  assert.equal(
+    fs.existsSync(artifact),
+    true,
+    'shutdown must not delete unproven ownership evidence',
+  );
+});
+
+test('RC08 cleanup fails closed for malformed identity and ignores a reused leader identity', () => {
+  if (process.platform !== 'linux') return;
+  const stateDir = path.join(tempRoot, 'cleanup-identity-proof');
+  fs.mkdirSync(stateDir);
+  const registry = new ProcessRegistry();
+  registry.setProcessStateDir(stateDir);
+  const processId = 'arc-proc-cleanup-proof';
+  const artifact = path.join(stateDir, `${processId}.json`);
+
+  fs.writeFileSync(artifact, JSON.stringify({ processId, pid: 999999, executable: 'node' }));
+  assert.equal(
+    registry.isPersistedProcessGroupDead(processId),
+    false,
+    'missing Linux ownership fields must retain durable evidence',
+  );
+
+  const selfStat = getProcessStatInfo(process.pid);
+  assert.ok(selfStat);
+  fs.writeFileSync(
+    artifact,
+    JSON.stringify({
+      processId,
+      pid: process.pid,
+      pgid: 999999,
+      sid: 999999,
+      statStartTime: `${BigInt(selfStat.starttime) - 1n}`,
+      executable: process.execPath,
+      startedAt: new Date().toISOString(),
+      workspaceId: 'ws',
+    }),
+  );
+  assert.equal(
+    registry.isPersistedProcessGroupDead(processId),
+    true,
+    'a reused PID is not the persisted leader and must never be treated as owned',
+  );
+  assert.equal(alive(process.pid), true, 'the reused PID must remain untouched');
 });
 
 test('RC08-FLOW-14: ten concurrent read-only operations remain bounded, isolated, and durably ordered', async () => {
