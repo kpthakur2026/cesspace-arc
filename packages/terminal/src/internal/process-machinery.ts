@@ -160,22 +160,7 @@ export async function spawnAndControlProcess(
         // ESRCH / already-dead process group should be handled harmlessly
       } finally {
         record._killTimer = undefined;
-        if (record.completedAt) {
-          setTimeout(() => {
-            let clean = true;
-            if (child.pid && process.platform !== 'win32') {
-              try {
-                process.kill(-child.pid, 0);
-                clean = false;
-              } catch {
-                clean = true;
-              }
-            }
-            if (clean) {
-              processRegistry.unpersistProcessState(record.processId);
-            }
-          }, 50).unref();
-        }
+        processRegistry.schedulePostExitCleanup(record.processId);
       }
     }, 1000);
     record._killTimer.unref();

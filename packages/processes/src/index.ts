@@ -73,6 +73,8 @@ export interface ProcessRecord {
   _pid?: number;
   _timeoutTimer?: NodeJS.Timeout;
   _killTimer?: NodeJS.Timeout;
+  _cleanupTimer?: NodeJS.Timeout;
+  _cleanupAttempts?: number;
   _stdoutChunks: Buffer[];
   _stderrChunks: Buffer[];
 }
@@ -229,6 +231,9 @@ export class ProcessRegistry implements IProcessRegistry {
   private inFlightSinks = new Set<Promise<void>>();
   public processStateDir?: string;
 
+  private static readonly POST_EXIT_CLEANUP_INTERVAL_MS = 50;
+  private static readonly POST_EXIT_CLEANUP_MAX_ATTEMPTS = 20;
+
   constructor(sinks?: IProcessLifecycleSink[]) {
     if (sinks) {
       this.lifecycleSinks = [...sinks];
@@ -248,7 +253,8 @@ export class ProcessRegistry implements IProcessRegistry {
       }
       const filePath = path.join(this.processStateDir, `${record.processId}.json`);
       const statInfo = getProcessStatInfo(pid);
-      const statStartTime = statInfo?.starttime ?? getProcessStatStartTime(pid);
+      if (process.platform === 'linux' && !statInfo) return false;
+      const statStartTime = statInfo?.starttime;
       const pgid = statInfo?.pgrp ?? (process.platform !== 'win32' ? pid : undefined);
       const sid = statInfo?.session ?? (process.platform !== 'win32' ? pid : undefined);
       const cmdline = getProcessCmdline(pid);
@@ -280,6 +286,95 @@ export class ProcessRegistry implements IProcessRegistry {
     } catch {
       // ignore
     }
+  }
+
+  /**
+   * Proves that the exact persisted process identity has no live leader or
+   * descendant. Ambiguous, malformed, inaccessible, or reused identities fail
+   * closed by retaining the durable ownership artifact.
+   */
+  public isPersistedProcessGroupDead(processId: string): boolean {
+    if (!this.processStateDir) return true;
+    const filePath = path.join(this.processStateDir, `${processId}.json`);
+
+    let state: ActiveProcessPersistedState;
+    try {
+      state = JSON.parse(fs.readFileSync(filePath, 'utf8')) as ActiveProcessPersistedState;
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+      return false;
+    }
+    if (state.processId !== processId || !Number.isSafeInteger(state.pid) || state.pid <= 1) {
+      return false;
+    }
+
+    if (process.platform === 'linux') {
+      const { pgid, sid } = state;
+      if (
+        !state.statStartTime ||
+        !/^\d+$/.test(state.statStartTime) ||
+        typeof pgid !== 'number' ||
+        !Number.isSafeInteger(pgid) ||
+        pgid <= 1 ||
+        typeof sid !== 'number' ||
+        !Number.isSafeInteger(sid) ||
+        sid <= 1
+      ) {
+        return false;
+      }
+
+      const leader = readLinuxProcessStat(state.pid);
+      if (leader.status === 'ambiguous') return false;
+      if (
+        leader.status === 'present' &&
+        leader.info.starttime === state.statStartTime &&
+        leader.info.processState !== 'Z'
+      ) {
+        return false;
+      }
+      const members = findDetachedGroupMembersForCleanup(state);
+      return members !== undefined && members.length === 0;
+    }
+
+    try {
+      process.kill(state.pid, 0);
+      return false;
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code !== 'ESRCH') return false;
+    }
+    if (process.platform !== 'win32') {
+      try {
+        process.kill(-(state.pgid ?? state.pid), 0);
+        return false;
+      } catch (error: unknown) {
+        if ((error as NodeJS.ErrnoException).code !== 'ESRCH') return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Idempotently performs an immediate proof, then bounded post-exit rechecks.
+   * Exhaustion intentionally leaves the artifact for the startup orphan sweep.
+   */
+  public schedulePostExitCleanup(processId: string): void {
+    const record = this.processes.get(processId);
+    if (!record || !record.completedAt || record._killTimer || record._cleanupTimer) return;
+
+    if (this.isPersistedProcessGroupDead(processId)) {
+      record._cleanupAttempts = undefined;
+      this.unpersistProcessState(processId);
+      return;
+    }
+
+    const attempts = record._cleanupAttempts ?? 0;
+    if (attempts >= ProcessRegistry.POST_EXIT_CLEANUP_MAX_ATTEMPTS) return;
+    record._cleanupAttempts = attempts + 1;
+    record._cleanupTimer = setTimeout(() => {
+      record._cleanupTimer = undefined;
+      this.schedulePostExitCleanup(processId);
+    }, ProcessRegistry.POST_EXIT_CLEANUP_INTERVAL_MS);
+    record._cleanupTimer.unref();
   }
 
   public registerLifecycleSink(sink: IProcessLifecycleSink): void {
@@ -763,22 +858,7 @@ export class ProcessRegistry implements IProcessRegistry {
           // ignore
         } finally {
           record._killTimer = undefined;
-          if (record.completedAt) {
-            setTimeout(() => {
-              let clean = true;
-              if (pid && process.platform !== 'win32') {
-                try {
-                  process.kill(-pid, 0);
-                  clean = false;
-                } catch {
-                  clean = true;
-                }
-              }
-              if (clean) {
-                this.unpersistProcessState(record.processId);
-              }
-            }, 50).unref();
-          }
+          this.schedulePostExitCleanup(record.processId);
         }
       }, 1000);
       record._killTimer.unref();
@@ -828,24 +908,7 @@ export class ProcessRegistry implements IProcessRegistry {
       new Date(record.completedAt).getTime() - new Date(record.startedAt).getTime(),
     );
 
-    // Do NOT delete durable process ownership state while an escalation timer is active.
-    // Retain the state until process-group cleanup is authoritatively finished.
-    const hasEscalationObligation = Boolean(record._killTimer);
-    if (!hasEscalationObligation) {
-      const pid = record._pid ?? record._child?.pid;
-      let groupClean = true;
-      if (pid && process.platform !== 'win32' && (wasTimedOut || wasTerminating)) {
-        try {
-          process.kill(-pid, 0);
-          groupClean = false;
-        } catch {
-          groupClean = true;
-        }
-      }
-      if (groupClean) {
-        this.unpersistProcessState(processId);
-      }
-    }
+    this.schedulePostExitCleanup(processId);
 
     const eventType: ProcessLifecycleEventType = wasTimedOut
       ? 'PROCESS_EXITED'
@@ -885,7 +948,6 @@ export class ProcessRegistry implements IProcessRegistry {
 
   public clear(): void {
     for (const record of this.processes.values()) {
-      this.unpersistProcessState(record.processId);
       if (record._timeoutTimer) {
         clearTimeout(record._timeoutTimer);
         record._timeoutTimer = undefined;
@@ -893,6 +955,10 @@ export class ProcessRegistry implements IProcessRegistry {
       if (record._killTimer) {
         clearTimeout(record._killTimer);
         record._killTimer = undefined;
+      }
+      if (record._cleanupTimer) {
+        clearTimeout(record._cleanupTimer);
+        record._cleanupTimer = undefined;
       }
       const isAlive = record.state === 'RUNNING' || record.state === 'TERMINATING';
       if (isAlive && record._child) {
@@ -905,6 +971,8 @@ export class ProcessRegistry implements IProcessRegistry {
         } catch {
           // ignore
         }
+      } else if (record.completedAt && this.isPersistedProcessGroupDead(record.processId)) {
+        this.unpersistProcessState(record.processId);
       }
     }
     this.processes.clear();
@@ -934,27 +1002,47 @@ export interface ProcessStatInfo {
   pgrp: number;
   session: number;
   starttime: string;
+  processState: string;
 }
 
-export function getProcessStatInfo(pid: number): ProcessStatInfo | undefined {
-  if (process.platform !== 'linux') return undefined;
+type LinuxProcessStatRead =
+  { status: 'present'; info: ProcessStatInfo } | { status: 'absent' } | { status: 'ambiguous' };
+
+function readLinuxProcessStat(pid: number): LinuxProcessStatRead {
   try {
     const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
     const lastParen = stat.lastIndexOf(')');
-    if (lastParen === -1) return undefined;
+    if (lastParen === -1) return { status: 'ambiguous' };
     const rest = stat
       .slice(lastParen + 2)
       .trim()
       .split(/\s+/);
-    return {
-      pid,
-      pgrp: Number(rest[2]),
-      session: Number(rest[3]),
-      starttime: rest[19],
-    };
-  } catch {
-    return undefined;
+    const pgrp = Number(rest[2]);
+    const session = Number(rest[3]);
+    const starttime = rest[19];
+    const processState = rest[0];
+    if (
+      !/^[A-Z]$/.test(processState ?? '') ||
+      !Number.isSafeInteger(pgrp) ||
+      pgrp < 0 ||
+      !Number.isSafeInteger(session) ||
+      session < 0 ||
+      !starttime ||
+      !/^\d+$/.test(starttime)
+    ) {
+      return { status: 'ambiguous' };
+    }
+    return { status: 'present', info: { pid, pgrp, session, starttime, processState } };
+  } catch (error: unknown) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return code === 'ENOENT' || code === 'ESRCH' ? { status: 'absent' } : { status: 'ambiguous' };
   }
+}
+
+export function getProcessStatInfo(pid: number): ProcessStatInfo | undefined {
+  if (process.platform !== 'linux') return undefined;
+  const result = readLinuxProcessStat(pid);
+  return result.status === 'present' ? result.info : undefined;
 }
 
 export function getProcessStatStartTime(pid: number): string | undefined {
@@ -1010,6 +1098,60 @@ export function findDetachedGroupMembers(state: ActiveProcessPersistedState): nu
     }
   }
 
+  return members;
+}
+
+/** Cleanup proof variant: undefined means the group scan was not authoritative. */
+function findDetachedGroupMembersForCleanup(
+  state: ActiveProcessPersistedState,
+): number[] | undefined {
+  const targetPgid = state.pgid;
+  const targetSid = state.sid;
+  if (
+    typeof targetPgid !== 'number' ||
+    !Number.isSafeInteger(targetPgid) ||
+    targetPgid <= 1 ||
+    typeof targetSid !== 'number' ||
+    !Number.isSafeInteger(targetSid) ||
+    targetSid <= 1 ||
+    !state.statStartTime ||
+    !/^\d+$/.test(state.statStartTime)
+  ) {
+    return undefined;
+  }
+
+  let rootStartTimeTicks: bigint;
+  try {
+    rootStartTimeTicks = BigInt(state.statStartTime);
+  } catch {
+    return undefined;
+  }
+
+  let entries: string[];
+  try {
+    entries = fs.readdirSync('/proc');
+  } catch {
+    return undefined;
+  }
+
+  const members: number[] = [];
+  for (const entry of entries) {
+    if (!/^\d+$/.test(entry)) continue;
+    const pid = Number(entry);
+    if (pid <= 1 || pid === process.pid || pid === state.pid) continue;
+    const result = readLinuxProcessStat(pid);
+    if (result.status === 'ambiguous') return undefined;
+    if (result.status === 'absent') continue;
+    const statInfo = result.info;
+    if (statInfo.pgrp !== targetPgid && statInfo.session !== targetSid) continue;
+    if (statInfo.processState === 'Z') continue;
+    try {
+      if (BigInt(statInfo.starttime) < rootStartTimeTicks) continue;
+    } catch {
+      return undefined;
+    }
+    members.push(pid);
+  }
   return members;
 }
 

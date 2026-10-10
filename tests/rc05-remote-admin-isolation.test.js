@@ -144,7 +144,7 @@ function primaryClient() {
  * state manager the server actually serves from, the policy engine it actually
  * evaluates with, the trust-store file, and the single session authority.
  */
-async function startIsolated({ tag }) {
+async function startIsolated({ tag, approvalOptions }) {
   counter += 1;
   const storePath = path.join(tempRoot, `devices-${tag}-${counter}.json`);
   const client = primaryClient();
@@ -162,7 +162,7 @@ async function startIsolated({ tag }) {
   const dir = makeSecureDir(`${tag}-admin`);
   const endpoint = path.join(dir, 'admin.sock');
   const operator = generateOperator();
-  const approvals = new ApprovalStateManager();
+  const approvals = new ApprovalStateManager(approvalOptions);
   const audit = new AuditLogger();
   const registry = new WorkspaceRegistry();
 
@@ -413,6 +413,32 @@ function assertUnknownTool(res, label) {
   return payload;
 }
 
+/** Every stored authority field, excluding only the derived live countdown. */
+function approvalAuthority(snapshot) {
+  return {
+    requestId: snapshot.requestId,
+    state: snapshot.state,
+    toolName: snapshot.toolName,
+    executionPayloadHash: snapshot.executionPayloadHash,
+    binding: snapshot.binding,
+    createdAt: snapshot.createdAt,
+    expiresAt: snapshot.expiresAt,
+    reviewMaterialBytes: snapshot.reviewMaterialBytes,
+    reviewSummary: snapshot.reviewSummary,
+  };
+}
+
+function assertCountdownAdvancedSafely(before, after) {
+  assert.equal(Number.isInteger(before.remainingSeconds), true);
+  assert.equal(Number.isInteger(after.remainingSeconds), true);
+  assert.ok(after.remainingSeconds <= before.remainingSeconds, 'countdown must never increase');
+  assert.ok(after.remainingSeconds > 0, 'the live approval must not expire during this case');
+  assert.equal(after.expiresAt, before.expiresAt, 'the authoritative expiry is immutable');
+  const wallSeconds = Math.ceil((Date.parse(after.expiresAt) - Date.parse(after.createdAt)) / 1000);
+  assert.ok(before.remainingSeconds <= wallSeconds);
+  assert.ok(after.remainingSeconds <= wallSeconds);
+}
+
 // ---------------------------------------------------------------------------
 // Local admin channel client (the SAME protocol the operator CLI speaks)
 // ---------------------------------------------------------------------------
@@ -599,7 +625,11 @@ describe('CesSpace ARC — RC-05 Task 9: Remote administration isolation', () =>
   });
 
   test('RC05-NEG-74..79: every covered control category returns exact -32601 on the real tools/call path', async () => {
-    const fixture = await startIsolated({ tag: 'per-control' });
+    let monotonicNow = 10_000_000_000n;
+    const fixture = await startIsolated({
+      tag: 'per-control',
+      approvalOptions: { getMonotonicTime: () => monotonicNow },
+    });
     try {
       // A REAL pending approval exists, so a pipeline-reached `approve` would
       // have something to act on, and a REAL second live session exists, so a
@@ -617,7 +647,7 @@ describe('CesSpace ARC — RC-05 Task 9: Remote administration isolation', () =>
       const session = await initializeSession(fixture.port, fixture.client);
       const other = await initializeSession(fixture.port, fixture.client);
 
-      const approvalsBefore = JSON.stringify(fixture.approvals.listActive());
+      const approvalBefore = fixture.approvals.listActive()[0];
       const storeBefore = trustStoreBytes(fixture.storePath);
       const policyHashBefore = policyHashOf(fixture);
       const decisionBefore = await remoteReadFile(fixture, session, 'README.md');
@@ -692,8 +722,19 @@ describe('CesSpace ARC — RC-05 Task 9: Remote administration isolation', () =>
         }
       }
 
+      // Cross a whole-second monotonic boundary deterministically. The derived
+      // countdown must move independently of every immutable authority field.
+      monotonicNow += 1_100_000_000n;
+
       // RC05-NEG-74/75: approval state unchanged, no token ever minted.
-      assert.equal(JSON.stringify(fixture.approvals.listActive()), approvalsBefore);
+      const approvalAfter = fixture.approvals.listActive()[0];
+      assert.deepEqual(approvalAuthority(approvalAfter), approvalAuthority(approvalBefore));
+      assertCountdownAdvancedSafely(approvalBefore, approvalAfter);
+      assert.equal(
+        approvalAfter.remainingSeconds,
+        approvalBefore.remainingSeconds - 1,
+        'the injected monotonic clock crosses exactly one countdown boundary',
+      );
       assert.equal(fixture.approvals.getRequest(pending.requestId).state, 'PENDING');
       assert.equal(fixture.approvals.getRequest(pending.requestId).token, undefined);
 
